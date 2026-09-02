@@ -178,19 +178,24 @@ exception named explicitly in a module-level `KNOWN_GAPS`. Measured results:
 |---|---|
 | macOS 26.x, arm64 | Attack corpus **fully blocked** (one documented gap: `/Users/Shared` is readable) |
 | GitHub `macos-latest` runner | **`DYLD_INSERT_LIBRARIES` injection is NOT blocked** |
-| Linux (bubblewrap), **privileged container** | **`filesystem_write` and `vault_integrity` classes NOT blocked** — see caveat below |
-| Linux (bubblewrap), unprivileged host | **not yet measured** |
+| Linux (bubblewrap), unprivileged host — Ubuntu 26.04, bwrap 0.11.1 | **CONFIRMED BROKEN: `filesystem_write` 3/5, vault writable and exfiltratable** |
+| Linux (bubblewrap), privileged container | Same defect, one class *fewer* visible |
 
-**The Linux result is not yet interpretable, and must not be read as a clean
-bill of health or as a confirmed hole.** It was measured inside a `--privileged`
-container, because bubblewrap cannot create its namespaces on an unprivileged CI
-runner — privilege was the price of testing the Linux executor at all. But
-`--privileged` plausibly weakens the very confinement under test. Two
-explanations fit the evidence: the executor genuinely fails to confine writes
-and protect the vault, or the container defeats guarantees that hold on a normal
-host. **There is no unprivileged Linux measurement yet.** Tracked in issue #3,
-whose `Done when` is exactly that measurement. Until it exists, treat analyst
-mode on Linux as unverified.
+> ### ⚠️ Linux confinement is CONFIRMED BROKEN — do not rely on it
+>
+> Measured on an unprivileged Ubuntu 26.04 host with bubblewrap 0.11.1 and
+> unprivileged user namespaces enabled. Sandboxed code **can write into `$HOME`,
+> write outside its granted `work/` directory, open the vault read-write, and
+> `VACUUM INTO` a copy of the vault to a path of its choosing.** Those are
+> precisely the guarantees claimed below.
+>
+> This was initially suspected to be an artifact of the `--privileged` container
+> CI needs to run bubblewrap at all. It is not: the real host shows **one more**
+> unblocked class than CI did, so privilege was masking part of it.
+>
+> **Until issue #3 is fixed, treat analyst mode on Linux as unconfined** —
+> equivalent to running model-written Python as your own user. Do not point it
+> at data you would not let an arbitrary script read or overwrite.
 
 The macOS discrepancy is a real open question, not a test artifact: the same
 corpus passes on one macOS configuration and fails on another, which means the

@@ -164,6 +164,35 @@ and it is confined at the OS level rather than by inspecting the code:
 - The bytes off fd 3 are treated as untrusted and validated into either a typed
   result envelope or a typed refusal. Nothing in between is accepted.
 
+### Enforcement is OS-dependent — verify on your own platform
+
+**The sandbox is defence in depth, not a guaranteed boundary against a hostile
+model.** Its enforcement varies by operating system and version, and the project
+measures this rather than assuming it.
+
+`tests/test_analyst_sandbox.py` runs an attack corpus of 34+ attempts across
+nine classes and requires **100% blocking per class**, with any accepted
+exception named explicitly in a module-level `KNOWN_GAPS`. Measured results:
+
+| Platform | Result |
+|---|---|
+| macOS 26.x, arm64 | Attack corpus **fully blocked** (one documented gap: `/Users/Shared` is readable) |
+| GitHub `macos-latest` runner | **`DYLD_INSERT_LIBRARIES` injection is NOT blocked** |
+| Linux (bubblewrap) | Requires privileges to create namespaces; unavailable or partial on restricted hosts |
+
+The macOS discrepancy is a real open question, not a test artifact: the same
+corpus passes on one macOS configuration and fails on another, which means the
+seatbelt profile is relying on a protection that is not universally present.
+
+The corpus assertion is deliberately left **strict and failing** where the gap
+exists, rather than absorbed into `KNOWN_GAPS` to produce a green tick — that
+would delete the finding instead of fixing it. The CI job that runs it is
+informational for the same reason.
+
+**What this means for you:** run the sandbox suite on your own platform before
+relying on the confinement, and do not expose analyst mode to untrusted input on
+a host where an escape would matter.
+
 Note the residual risk honestly: the sandbox confines *execution*, and the
 question and the schema summary still go to whichever model backend you
 configured.

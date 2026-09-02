@@ -182,6 +182,13 @@ If the host has no supported sandbox (neither macOS nor Linux-with-bubblewrap),
 analyst mode **fails closed**. It does not fall back to running the code
 unconfined.
 
+> ⚠️ **The sandbox is defence in depth, not a guaranteed boundary.** Enforcement
+> is OS-dependent, and it is measured rather than assumed: the attack corpus is
+> fully blocked on macOS 26.x arm64 but `DYLD_INSERT_LIBRARIES` injection is
+> **not** blocked on GitHub's `macos-latest` runner. Run
+> `pytest tests/test_analyst_sandbox.py` on your own platform before relying on
+> the confinement, and see [SECURITY.md](SECURITY.md) for the measured results.
+
 ## LLM backends
 
 The LLM layer is pluggable and is the only module that talks to a model. Select a

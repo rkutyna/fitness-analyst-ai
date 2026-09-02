@@ -32,8 +32,8 @@ Python; if there genuinely is not, we would rather not ship the feature.
 Python 3.11+ on macOS or Linux.
 
 ```bash
-git clone https://github.com/rkutyna/fitness-analysis-ai.git
-cd fitness-analysis-ai
+git clone https://github.com/rkutyna/fitness-analyst-ai.git
+cd fitness-analyst-ai
 python3.11 -m venv .venv
 ./.venv/bin/pip install -e ".[dev]"
 ```

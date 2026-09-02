@@ -1,4 +1,4 @@
-# Fitness Analysis AI — an Apple Health analysis engine
+# Fitness Analyst AI — an Apple Health analysis engine
 
 Turn your Apple Health export into a deduplicated SQLite vault and let a language model answer questions about it — where every number is computed in Python, not by the model.
 
@@ -89,8 +89,8 @@ Four layers, and the boundary between them is the point:
 Requires Python 3.11+ on macOS or Linux, and your own Apple Health export.
 
 ```bash
-git clone https://github.com/rkutyna/fitness-analysis-ai.git
-cd fitness-analysis-ai
+git clone https://github.com/rkutyna/fitness-analyst-ai.git
+cd fitness-analyst-ai
 python3.11 -m venv .venv
 ./.venv/bin/pip install -e ".[dev]"
 ```

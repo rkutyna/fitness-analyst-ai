@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fitness-analysis-ai"
+name = "fitness-analyst-ai"
 version = "0.1.0"
 description = "Apple Health export to a deduplicated SQLite vault, deterministic analysis in Python, and an MCP tool surface an LLM can ask questions of."
 readme = "README.md"
@@ -75,9 +75,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/rkutyna/fitness-analysis-ai"
-Repository = "https://github.com/rkutyna/fitness-analysis-ai"
-Issues = "https://github.com/rkutyna/fitness-analysis-ai/issues"
+Homepage = "https://github.com/rkutyna/fitness-analyst-ai"
+Repository = "https://github.com/rkutyna/fitness-analyst-ai"
+Issues = "https://github.com/rkutyna/fitness-analyst-ai/issues"
 
 [tool.setuptools]
 packages = ["health_advisor"]

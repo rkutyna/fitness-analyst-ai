@@ -107,12 +107,17 @@ def _user_bus_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
+# Applied per-test, NOT module-wide: the two tests above this point are unit
+# tests (one drives the bridge directly, one monkeypatches systemd-run) and run
+# fine with no bus. A module-level mark skipped those too and cost real
+# coverage on macOS.
+needs_user_bus = pytest.mark.skipif(
     not _user_bus_available(),
     reason="needs a systemd user session bus (systemd-run --user); "
            "unavailable in containers — run on a Linux desktop session")
 
 
+@needs_user_bus
 def test_transient_query_round_trip_is_parent_observed(tmp_path):
     vault = tmp_path / "vault.db"
     import sqlite3
@@ -135,6 +140,7 @@ def test_transient_query_round_trip_is_parent_observed(tmp_path):
 
 
 @LINUX_TRANSIENT
+@needs_user_bus
 def test_transient_child_cannot_reach_repo_or_vault(tmp_path):
     package = tmp_path / "production-repo"
     (package / "data").mkdir(parents=True)
@@ -176,6 +182,7 @@ emit("isolation", ["facts"], ["text"], [[json.dumps(facts, sort_keys=True)]])
 
 
 @LINUX_TRANSIENT
+@needs_user_bus
 def test_transient_runs_do_not_leave_owned_directories(tmp_path):
     executor = sb.TransientUnitExecutor()
     for index in range(2):

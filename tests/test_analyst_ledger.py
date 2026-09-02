@@ -5,7 +5,7 @@ in-process (no sandbox needed for any of this -- the ledger is a property of
 the sqlite3 connection, not of the process it runs in).
 
 Covers A2 `Done when` 1 and 2 from
-docs/product/reviews/analyst-mode-proposal.md:
+the analyst-mode design, restated in SECURITY.md:
 
   1. the zero-read refusal: code that emits numeric tables without ever
      touching `conn` is refused, with the exact reason string, and the

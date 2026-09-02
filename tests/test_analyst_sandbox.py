@@ -1,4 +1,4 @@
-"""A1's escape corpus (#115 / M7, docs/product/reviews/analyst-mode-proposal.md
+"""A1's escape corpus (#115 / M7, the analyst-mode design, restated in SECURITY.md
 §8's A1 task). Every measurement here is a real `sandbox-exec` invocation
 against the real `data/health.db` fixture (read-only throughout — nothing
 here ever opens it writable) or a synthetic vault under `tmp_path`.

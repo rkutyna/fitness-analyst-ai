@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fitness-analysis-ai"
+version = "0.1.0"
+description = "Apple Health export to a deduplicated SQLite vault, deterministic analysis in Python, and an MCP tool surface an LLM can ask questions of."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+# Attribution lives in LICENSE and [project.urls]. There is deliberately no
+# `authors` field: the no-personal-data CI job scans the tree for identifying
+# strings, and the project's canonical GitHub URL is its single sanctioned
+# exception.
+keywords = [
+    "apple-health",
+    "healthkit",
+    "quantified-self",
+    "sqlite",
+    "mcp",
+    "model-context-protocol",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Healthcare Industry",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+
+# Runtime dependencies, carried over from requirements.txt at the pins the
+# modules were verified against. httpx is listed under "dev / testing" there,
+# but `health_advisor/llm.py` imports it at module level, so it is a runtime
+# dependency here.
+dependencies = [
+    # --- REST receiver (receiver.py) ---
+    "fastapi==0.136.3",
+    "uvicorn[standard]==0.49.0",
+    "pydantic==2.13.4",
+    # transitive (pinned for reproducibility)
+    "starlette==1.3.0",
+    "anyio==4.13.0",
+    "h11==0.16.0",
+    "httptools==0.8.0",
+    "uvloop==0.22.1",
+    "watchfiles==1.2.0",
+    "websockets==16.0",
+    "python-dotenv==1.2.2",
+    "pydantic-core==2.46.4",
+    # --- MCP server (mcp_server.py) + analysis ---
+    "mcp==1.27.2",
+    "numpy==2.4.6",
+    "scipy==1.17.1",
+    # --- vault envelope encryption (vault_crypto.py) ---
+    "cryptography==50.0.0",
+    # transitive (cryptography -> cffi -> pycparser)
+    "cffi==2.1.1",
+    "pycparser==3.0",
+    # --- HTTP transport for the OpenRouter/Ollama LLM backends (llm.py) ---
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/rkutyna/fitness-analysis-ai"
+Repository = "https://github.com/rkutyna/fitness-analysis-ai"
+Issues = "https://github.com/rkutyna/fitness-analysis-ai/issues"
+
+[tool.setuptools]
+packages = ["health_advisor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "scripts"]
+addopts = "-q"
+markers = [
+    "live: hits the local Ollama model; skipped by default, run with -m live",
+]
+
+[tool.setuptools.package-data]
+health_advisor = ["schema.sql"]

@@ -1,0 +1,42 @@
+# Health Advisor — local Apple Health analysis pipeline
+# Python 3.11+. Backfill/normalization use only the standard library.
+# These pins cover the FastAPI receiver. The MCP server dep is added at Checkpoint 4.
+
+# --- REST receiver (receiver.py) ---
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+pydantic==2.13.4
+
+# transitive (pinned for reproducibility)
+starlette==1.3.0
+anyio==4.13.0
+h11==0.16.0
+httptools==0.8.0
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==16.0
+python-dotenv==1.2.2
+pydantic-core==2.46.4
+
+# --- MCP server (mcp_server.py) ---
+mcp==1.27.2
+numpy==2.4.6
+scipy==1.17.1
+
+# --- vault envelope encryption (vault_crypto.py) ---
+# Undeclared until 2026-08-25 (#98). `vault_crypto.py` has imported
+# `cryptography` at module level since it was written, and `pip show` reported
+# `Required-by:` EMPTY in this venv -- it was installed by hand and the pins
+# never caught up. Invisible on the Mac; on any clean install (a container
+# build, a fresh venv) `import health_advisor.vault_crypto` raised
+# ModuleNotFoundError. D1 cites that module as its `encoded in`.
+# Pinned at the versions the module was verified against.
+cryptography==50.0.0
+
+# transitive (cryptography -> cffi -> pycparser), pinned like the block above
+cffi==2.1.1
+pycparser==3.0
+
+# --- dev / testing ---
+httpx==0.28.1
+pytest==8.3.4

@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # BOTH runners are required, not decoration: the analyst sandbox has a
+        # different executor per OS (bubblewrap on Linux, seatbelt on macOS),
+        # so a single runner leaves half of that subsystem untested.
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bubblewrap (Linux analyst sandbox executor)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Show environment
+        run: |
+          python -VV
+          python -c "import sys; print('platform:', sys.platform)"
+          pip --version
+
+      # Tests marked `live` hit a local Ollama model and are auto-skipped by
+      # tests/conftest.py unless the marker is selected explicitly.
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build a synthetic demo vault
+        run: python -m health_advisor.demo --out data/demo.db --days 200
+
+      - name: Sandbox tests against the demo vault
+        env:
+          HA_TEST_VAULT: ${{ github.workspace }}/data/demo.db
+        run: python -m pytest tests/test_analyst_sandbox.py -o addopts= -q
+
+  no-personal-data:
+    name: no-personal-data
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan the tree for identifying strings
+        run: |
+          set -uo pipefail
+
+          # Each alphabetic term wraps its first character in a character class
+          # -- [x]yz is a regex that matches xyz -- so that THIS FILE does not
+          # itself contain the literal strings it forbids. The workflow is
+          # therefore scanned like every other file rather than being excluded
+          # from its own check. The IP patterns are already literal-free: the
+          # escaped dots mean the dotted quad does not appear here either.
+          PATTERN='[r]oger|[r]kutyna|[p]izzamon123|[t]ail3e15cb|[r]k-minipc|[z]270|100\.102\.251\.38|100\.106\.86\.37|100\.126\.105\.110'
+
+          # LICENSE legitimately names the copyright holder, and .git is history
+          # rather than tree content. The single whitelisted line shape is the
+          # project's own canonical GitHub URL, which necessarily contains the
+          # owner's account name (pyproject [project.urls], README, CONTRIBUTING).
+          hits=$(grep -rniE "$PATTERN" . \
+                   --exclude-dir=.git \
+                   --exclude-dir=.venv \
+                   --exclude-dir=__pycache__ \
+                   --exclude='*.pyc' \
+                   --exclude=LICENSE \
+                 | grep -viE 'github\.com/[r]kutyna/fitness-analysis-ai' \
+                 || true)
+
+          if [ -n "$hits" ]; then
+            count=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+            echo "::error::found $count line(s) containing identifying strings"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+
+          echo "clean: no identifying strings found"

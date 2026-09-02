@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+*.db
+*.db-wal
+*.db-shm
+export.zip
+apple_health_export/
+.DS_Store
+*.egg-info/
+dist/
+build/
+.pytest_cache/

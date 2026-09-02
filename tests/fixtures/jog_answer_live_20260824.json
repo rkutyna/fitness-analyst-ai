@@ -1,0 +1,96 @@
+{
+ "captured": "synthetic",
+ "claims": [
+  {
+   "field": "mean",
+   "metric": "jog_minutes",
+   "period": {
+    "end": "2026-08-24",
+    "period_starts": [
+     "2026-07-27",
+     "2026-08-03",
+     "2026-08-10",
+     "2026-08-17"
+    ],
+    "start": "2026-07-27"
+   },
+   "source": {
+    "path": "$.result.block_comparison.blocks.recent.mean",
+    "sequence": 1
+   },
+   "value": 50.1
+  },
+  {
+   "field": "mean",
+   "metric": "jog_minutes",
+   "period": {
+    "end": "2026-07-27",
+    "period_starts": [
+     "2026-06-29",
+     "2026-07-06",
+     "2026-07-13",
+     "2026-07-20"
+    ],
+    "start": "2026-06-29"
+   },
+   "source": {
+    "path": "$.result.block_comparison.blocks.prior.mean",
+    "sequence": 1
+   },
+   "value": 50.2
+  },
+  {
+   "field": "mean_delta",
+   "metric": "jog_minutes",
+   "operands": [
+    {
+     "field": "mean",
+     "metric": "jog_minutes",
+     "period": {
+      "end": "2026-08-24",
+      "period_starts": [
+       "2026-07-27",
+       "2026-08-03",
+       "2026-08-10",
+       "2026-08-17"
+      ],
+      "start": "2026-07-27"
+     },
+     "source": {
+      "path": "$.result.block_comparison.blocks.recent.mean",
+      "sequence": 1
+     },
+     "value": 50.1
+    },
+    {
+     "field": "mean",
+     "metric": "jog_minutes",
+     "period": {
+      "end": "2026-07-27",
+      "period_starts": [
+       "2026-06-29",
+       "2026-07-06",
+       "2026-07-13",
+       "2026-07-20"
+      ],
+      "start": "2026-06-29"
+     },
+     "source": {
+      "path": "$.result.block_comparison.blocks.prior.mean",
+      "sequence": 1
+     },
+     "value": 50.2
+    }
+   ],
+   "operation": "difference",
+   "period": "comparison",
+   "source": {
+    "path": "$.result.block_comparison.change.mean_delta",
+    "sequence": 1
+   },
+   "value": -0.1
+  }
+ ],
+ "note": "SYNTHETIC. The live capture this file replaced held real personal figures and was not published. Every number here is invented and chosen so the shape, and the verifier behaviour it pins, are unchanged: three figures, one of them a derived difference, against the committed jog ledger.",
+ "text": "Average weekly jog minutes:\n- Last 4 complete weeks (Jul 27-Aug 23): 50.1 min/week\n- The 4 weeks before (Jun 29-Jul 26): 50.2 min/week\nEssentially unchanged: a decrease of 0.1 min/week."
+}

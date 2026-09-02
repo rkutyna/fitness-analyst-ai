@@ -1,0 +1,299 @@
+{
+ "note": "SYNTHETIC. #187's amended criterion 5 kept the corpus in the repo because the battery it was measured against was lost (#172). The prose here is invented for this public repo -- no captured answer text -- but each case is one documented branch of `strip_dates_and_names`, and the assertion is the exact surviving token list. `kind` records intent: 'strip' means the case exists because a date or name term is removed, 'keep' because a figure must survive.",
+ "cases": [
+  {
+   "id": "iso_date",
+   "kind": "strip",
+   "prose": "On 2026-08-21 you logged 42 jog minutes.",
+   "tokens": [
+    "42"
+   ],
+   "why": "A full ISO date locates a point in time; only the 42 is a claim."
+  },
+  {
+   "id": "iso_year_month",
+   "kind": "strip",
+   "prose": "The 2026-04 quarter averaged 38.5 jog minutes a week.",
+   "tokens": [
+    "38.5"
+   ],
+   "why": "The bare year-month form, without which the label shreds into 2026 and -04."
+  },
+  {
+   "id": "prose_month_day",
+   "kind": "strip",
+   "prose": "Aug 21 was the longest session at 6.2 miles.",
+   "tokens": [
+    "6.2"
+   ],
+   "why": "Month plus day is a calendar reference."
+  },
+  {
+   "id": "prose_month_day_year",
+   "kind": "strip",
+   "prose": "Jul 9, 2026 was the first of 12 planned tempo sessions.",
+   "tokens": [
+    "12"
+   ],
+   "why": "The optional year must not leave 2026 behind as a figure."
+  },
+  {
+   "id": "prose_month_year",
+   "kind": "strip",
+   "prose": "July 2026 totalled 214 jog minutes.",
+   "tokens": [
+    "214"
+   ],
+   "why": "The month-year alternative is tried first; the day form would match 'July 20' and leave the token 26."
+  },
+  {
+   "id": "prose_day_range",
+   "kind": "strip",
+   "prose": "July 6-13 you averaged 48.9 minutes a session.",
+   "tokens": [
+    "48.9"
+   ],
+   "why": "A day range in the first element is a date, not a measured range."
+  },
+  {
+   "id": "clock_with_meridiem",
+   "kind": "strip",
+   "prose": "You fell asleep at 11:41 PM and slept 7.4 hours.",
+   "tokens": [
+    "7.4"
+   ],
+   "why": "A 12-hour clock time with AM/PM is a time of day."
+  },
+  {
+   "id": "day_list_terminated_by_bracket",
+   "kind": "strip",
+   "prose": "The rest of the block (Aug 19, 21, 22, 23) recorded walking only.",
+   "tokens": [],
+   "why": "#187: a comma-separated day list that terminates cleanly is one date."
+  },
+  {
+   "id": "day_list_terminated_by_period",
+   "kind": "strip",
+   "prose": "The walking-only days were Aug 19, 21 and 23.",
+   "tokens": [],
+   "why": "'and' is a separator and a sentence-final period terminates the run."
+  },
+  {
+   "id": "zone_name",
+   "kind": "strip",
+   "prose": "Zone 2 work made up 63 of those minutes.",
+   "tokens": [
+    "63"
+   ],
+   "why": "Zone 2 is a name from the plan's heart-rate model."
+  },
+  {
+   "id": "race_distance_name",
+   "kind": "strip",
+   "prose": "Your 5k pace held at 9.4 min/mi.",
+   "tokens": [
+    "9.4"
+   ],
+   "why": "5k and 10k are race distances, not counts."
+  },
+  {
+   "id": "authored_week_label",
+   "kind": "strip",
+   "prose": "Week 7 closed with 3 hard sessions.",
+   "tokens": [
+    "3"
+   ],
+   "why": "A capitalised Week label is an authored plan ordinal."
+  },
+  {
+   "id": "scale_denominator_five",
+   "kind": "strip",
+   "prose": "You rated sleep 3 out of 5 and energy 4 out of 5.",
+   "tokens": [
+    "3",
+    "4"
+   ],
+   "why": "#217: the denominator is a constant of the check-in scale; the numerator stays graded."
+  },
+  {
+   "id": "scale_denominator_hundred",
+   "kind": "strip",
+   "prose": "Readiness scored 82 out of 100 this morning.",
+   "tokens": [
+    "82"
+   ],
+   "why": "The readiness composite is the other of the two published scales."
+  },
+  {
+   "id": "unit_suffix",
+   "kind": "keep",
+   "prose": "You weighed 84.2kg at the last weigh-in.",
+   "tokens": [
+    "84.2"
+   ],
+   "why": "Units are open-ended, so a digit followed by letters stays a figure."
+  },
+  {
+   "id": "pace_lane_range",
+   "kind": "keep",
+   "prose": "Your easy lane is 14-15 min/mi.",
+   "tokens": [
+    "14",
+    "15"
+   ],
+   "why": "A hyphen between measurements is a range; both ends stay graded and neither is folded into a negative."
+  },
+  {
+   "id": "bare_clock_is_a_pace",
+   "kind": "keep",
+   "prose": "You held 7:30 per mile through the final rep.",
+   "tokens": [
+    "7",
+    "30"
+   ],
+   "why": "A bare mm:ss is a pace or a duration; only a marked 12-hour clock is stripped."
+  },
+  {
+   "id": "digit_inside_a_name",
+   "kind": "keep",
+   "prose": "Your VO2max estimate is 48.3.",
+   "tokens": [
+    "48.3"
+   ],
+   "why": "The leading guard keeps the 2 of VO2max out while the real figure stays."
+  },
+  {
+   "id": "a1c_name",
+   "kind": "keep",
+   "prose": "Your A1c reading was 5.2 this quarter.",
+   "tokens": [
+    "5.2"
+   ],
+   "why": "Same guard, a different name."
+  },
+  {
+   "id": "lowercase_week_determiner",
+   "kind": "keep",
+   "prose": "This week 3 sessions are logged.",
+   "tokens": [
+    "3"
+   ],
+   "why": "The Week label is case-sensitive on purpose: the determiner phrase must not strip a real count."
+  },
+  {
+   "id": "day_shaped_guard_is_a_range",
+   "kind": "keep",
+   "prose": "On Aug 19, 44 jog minutes were recorded.",
+   "tokens": [
+    "44"
+   ],
+   "why": "44 is not a day, so the continuation tail cannot eat it."
+  },
+  {
+   "id": "day_list_guard_decimal",
+   "kind": "keep",
+   "prose": "On Aug 19, 44.0 minutes of that were jogging.",
+   "tokens": [
+    "44.0"
+   ],
+   "why": "A decimal disqualifies a continuation element; half-eating a figure would fabricate a different number."
+  },
+  {
+   "id": "day_list_guard_thousands",
+   "kind": "keep",
+   "prose": "On Aug 19, 12,500 steps were recorded.",
+   "tokens": [
+    "12,500"
+   ],
+   "why": "A thousands separator disqualifies it for the same reason."
+  },
+  {
+   "id": "day_list_terminated_by_word",
+   "kind": "keep",
+   "prose": "Aug 19, 21 and 22 were rest days.",
+   "tokens": [
+    "21",
+    "22"
+   ],
+   "why": "A run followed by a word is not a date list; a bare day left graded is the tolerable failure."
+  },
+  {
+   "id": "day_list_all_or_nothing",
+   "kind": "keep",
+   "prose": "Since Aug 19, 8, 9, 12 were your resting HR readings",
+   "tokens": [
+    "8,",
+    "9,",
+    "12"
+   ],
+   "why": "The atomic run cannot succeed partially: the trailing word protects the interior elements too. The trailing comma rides along in the token because the tokenizer treats it as a thousands separator; `_rule_r_matches` strips it before comparing."
+  },
+  {
+   "id": "range_continuation_unsupported",
+   "kind": "keep",
+   "prose": "Aug 19, 21-23 were travel days.",
+   "tokens": [
+    "21",
+    "23"
+   ],
+   "why": "A range as a continuation element is deliberately not supported."
+  },
+  {
+   "id": "scale_without_anchor",
+   "kind": "keep",
+   "prose": "3 out of 5 planned sessions were completed.",
+   "tokens": [
+    "3",
+    "5"
+   ],
+   "why": "No rating anchor, so the denominator is a genuine published count."
+  },
+  {
+   "id": "scale_other_denominator",
+   "kind": "keep",
+   "prose": "You scored 3 out of 500 on the composite.",
+   "tokens": [
+    "3",
+    "500"
+   ],
+   "why": "Only the two published constants are blanked; any other value stays graded."
+  },
+  {
+   "id": "bare_five_is_not_a_scale",
+   "kind": "keep",
+   "prose": "You slept 5 h.",
+   "tokens": [
+    "5"
+   ],
+   "why": "The pattern strips a denominator slot, never a digit."
+  },
+  {
+   "id": "negative_figure",
+   "kind": "keep",
+   "prose": "Your weight trend is -0.4 lb per week.",
+   "tokens": [
+    "-0.4"
+   ],
+   "why": "A minus sign is part of the figure and must reach the gate."
+  },
+  {
+   "id": "visible_range_is_not_folded",
+   "kind": "keep",
+   "prose": "Recovery walks ran 29-30 minutes.",
+   "tokens": [
+    "29",
+    "30"
+   ],
+   "why": "Removing the separator would fabricate 2930."
+  },
+  {
+   "id": "percent_figure",
+   "kind": "keep",
+   "prose": "Jog volume rose 12.5% over the block.",
+   "tokens": [
+    "12.5"
+   ],
+   "why": "A percentage is a measurement."
+  }
+ ]
+}

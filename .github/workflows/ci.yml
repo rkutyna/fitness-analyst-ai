@@ -27,7 +27,10 @@ jobs:
     # Linux half of the sandbox — the reason this matrix exists — untested.
     # Privileged CI is a smell, and it is the narrower one: the alternative was
     # skipping the executor tests altogether and calling that a pass.
-    container: ${{ matrix.os == 'ubuntu-latest' && fromJSON('{"image":"ubuntu:24.04","options":"--privileged"}') || null }}
+    # The image already carries CPython 3.11, so actions/setup-python is skipped
+    # on Linux -- inside a bare ubuntu container it installs to a toolcache that
+    # is not on PATH, and every later step dies with exit 127.
+    container: ${{ matrix.os == 'ubuntu-latest' && fromJSON('{"image":"python:3.11-bookworm","options":"--privileged"}') || null }}
 
     steps:
       - name: Container prerequisites
@@ -35,12 +38,14 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl git sudo bubblewrap systemd dbus-user-session \
-            build-essential
+            bubblewrap systemd dbus-user-session
+          bwrap --version
+          python -VV
 
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
+        if: runner.os != 'Linux'
         with:
           python-version: "3.11"
 

@@ -1,7 +1,7 @@
 """Acquisition policy for the evidence corpus: hosts, licences, rate limits.
 
 This module is the machine-readable half of
-``docs/product/corpus/SOURCES.md``. That document is the acquisition contract,
+the corpus acquisition contract (issue #22 in this repository carries its measurements),
 verified live; this file is the part of it that a script cannot forget.
 
 Three properties, each enforced here rather than by discipline:

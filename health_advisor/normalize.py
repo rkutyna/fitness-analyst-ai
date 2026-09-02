@@ -443,6 +443,8 @@ MIRROR_SOURCES = {"Sync Solver": "2019-01-16"}
 # is not a whole-day source precedence rule: concurrent samples inside one
 # workout window need an activity-device winner. Labels are matched as complete
 # source strings; a pipe-joined label is deliberately not split.
+# Deployment default carried over from the first deployment; making this a
+# per-vault setting is tracked in issue #6.
 WORKOUT_SOURCE_ARBITRATION_FROM = "2026-08-21"
 
 # The largest value one honest sample of a metric carries. Above this the row

@@ -244,6 +244,8 @@ BLOCK_BRIDGE_HR_MIN = 130.0    # bpm; same floor, and for the same reason
 #
 # The literal stays a literal. Aliasing it to EASY_JOG_CEILING would still be
 # the coupling defect above; the two agreeing today is a decision, not a link.
+# Deployment default carried over from the first deployment; making this a
+# per-vault setting is tracked in issue #6.
 BLOCK_QUALIFY_HR_MAX = 155.0
 
 # Bedtime plan bands from P7-1, adopted at the Week 7 review on 2026-08-16.

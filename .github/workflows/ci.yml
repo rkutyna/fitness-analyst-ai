@@ -127,3 +127,27 @@ jobs:
           fi
 
           echo "clean: no identifying strings found"
+
+          # Pronouns refer to one specific vault owner; issue #6 requires the
+          # engine package to use vault-neutral language.
+          pronouns=$(grep -rniE "\b(he|his|him)\b" health_advisor --include='*.py' || true)
+          if [ -n "$pronouns" ]; then
+            echo "::error::found pronouns referring to one vault owner"
+            printf '%s\n' "$pronouns"
+            exit 1
+          fi
+
+          # Two deployment anchors remain literals for consumers (issue #6
+          # tracks making them per-vault settings); demo.py's end date is the
+          # synthetic vault's own anchor. Anything else is a new personal
+          # parameter and fails here.
+          dates=$(grep -rnE '^[A-Z_]+ *= *"20[0-9]{2}-[0-9]{2}-[0-9]{2}"' health_advisor \
+                    | grep -v 'health_advisor/normalize.py:.*WORKOUT_SOURCE_ARBITRATION_FROM' \
+                    | grep -v 'health_advisor/analysis.py:.*SUBSCORE_K_RESCALED_ON' \
+                    | grep -v 'health_advisor/demo.py:.*DEFAULT_END_DATE' \
+                    || true)
+          if [ -n "$dates" ]; then
+            echo "::error::found module-level ISO date constants"
+            printf '%s\n' "$dates"
+            exit 1
+          fi

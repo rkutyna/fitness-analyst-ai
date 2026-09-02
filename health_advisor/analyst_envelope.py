@@ -2,7 +2,7 @@
 
 Analyst mode lets model-written code answer a question the curated tools
 cannot. What that code emits crosses a process boundary as untrusted bytes on
-fd 3 (``docs/product/reviews/analyst-mode-proposal.md`` S4.3), and this module
+fd 3 (the analyst-mode design; its runtime half is restated in SECURITY.md), and this module
 is the validator on the far side: raw bytes in, either a validated
 ``Envelope`` or a typed ``Refusal`` out. Nothing in between is trusted.
 ``Refusal.reason`` is a parent-authored headline and is never a fragment of

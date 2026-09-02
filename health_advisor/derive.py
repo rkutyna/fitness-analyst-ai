@@ -112,7 +112,7 @@ def compute_sleep_timing(intervals: list[Interval], day: str) -> dict | None:
     }
     # Absence is not zero (E7-2). `sleep_awake` exists for 2019 and 2026 only,
     # yet float(len(awakes)) was written unconditionally — so 2,444 of 2,535
-    # stored zeros (96%) meant "the watch does not report this", not "he slept
+    # stored zeros (96%) meant "the watch does not report this", not "the vault owner slept
     # through". wear_hours() in this module already returns None for exactly
     # this reason; awakenings now do too. The test is whether the metric was
     # recorded ANYWHERE that day, not whether it survived MIN_AWAKE_MIN — a
@@ -310,7 +310,7 @@ def _dial_for_day(conn, day: str) -> dict:
     stored zeros mean "not measured"; that is E7-2, and this does not repeat it.)
 
     Across a multi-session day jog minutes SUM and the block is the MAX: the
-    question the block answers is how long he can run continuously, and
+    question the block answers is how long a user can run continuously, and
     2026-07-17 carries two running workouts.
     """
     from . import analysis as A          # lazy: analysis imports metrics, not derive

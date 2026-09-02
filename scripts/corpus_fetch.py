@@ -16,7 +16,7 @@ The counterpart is `scripts/corpus_ingest.py`, which builds the corpus from
 what this program writes and never touches the network. The handoff between
 them is a JSON registry plus a directory of extracted text files.
 
-The acquisition contract is `docs/product/corpus/SOURCES.md`; its policy —
+The acquisition contract is stated in `health_advisor.corpus_sources` (see issue #22 for its measurements); its policy —
 hosts, licence gate, rate limit — is in `health_advisor.corpus_sources` and is
 not restated here. Three of its findings shape this file directly:
 
@@ -93,7 +93,7 @@ FORBIDDEN_IMPORTS: tuple[str, ...] = (
 # The topic plans — what to fetch, and in what proportion
 # --------------------------------------------------------------------------- #
 #
-# Weighted from `docs/product/corpus/EVIDENCE-HARVEST.md`'s ranking of topics
+# Weighted from the maintainer's evidence-harvest ranking of topics (a design note; the weights below are the record)
 # by how many load-bearing assertions depend on them. Rank 1 (injury risk and
 # volume ramp) is both the largest cluster and the worst sourced — 12 of ~20
 # assertions unsourced — so it gets the largest share. Query terms are the ones

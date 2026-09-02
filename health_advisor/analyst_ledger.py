@@ -1,7 +1,7 @@
 """analyst_ledger.py -- an authorizer-backed, ledgered read-only connection.
 
 Analyst mode is the mode where the model writes the Python
-(``docs/product/reviews/analyst-mode-proposal.md`` S1). The ``conn`` handed to
+(the analyst-mode design, restated in SECURITY.md). The ``conn`` handed to
 that code must let a run's provenance be established from something the model
 cannot spoof: SQLite's own ``set_authorizer`` callback fires per access with
 ``(action, arg1, arg2, dbname, trigger)``, and for ``SQLITE_READ`` that is

@@ -49,6 +49,9 @@ SLEEP_TARGET_MIN = 7.5 * 60
 SUBSCORE_K = 1.25
 # E8-4: this is an instrument change, not a new athlete state. Trend lines must
 # not compare scores from opposite sides of the SUBSCORE_K rescale.
+# Deployment-history anchor carried over from the first deployment (the date
+# its stored scores were rescaled); a fresh vault has no scores before it.
+# Making this per-vault is tracked in issue #6.
 SUBSCORE_K_RESCALED_ON = "2026-07-31"
 READINESS_SMOOTH_DAYS = 3
 GREEN, RED = 67, 34
@@ -269,7 +272,7 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True) -> dict
     return {
         "unbridged_min": mx.r(plain_len * bm, 1),
         "bridged_min": best["minutes"] if best else 0.0,
-        # None, not 0.0: "no block qualified" and "he ran for zero minutes" are
+        # None, not 0.0: "no block qualified" and "a user ran for zero minutes" are
         # different facts and the ramp treats them differently.
         "qualified_min": qualified[0]["minutes"] if qualified else None,
         "avg_hr_longest_block": best["mean_hr"] if best else None,
@@ -311,10 +314,10 @@ def metric_noise_floor(conn, metric: str, as_of: str,
 
     The autocorrelation inflation matters: consecutive days are not independent
     observations, and ignoring it makes a weekly mean look more precise than it
-    is. At his measured values a WEEKLY mean has MDC 4.75 bpm against an expected
-    training effect of 0-3 bpm — which is why reporting resting HR weekly could
-    never have detected anything, and why the cadence moved to 4-week blocks
-    (MDC 2.37), where the effect finally sits inside the floor.
+    is. The per-vault computation gives a WEEKLY mean MDC against the expected
+    training effect; reporting resting HR weekly can therefore miss a small
+    effect, which is why the cadence moved to 4-week blocks where the effect
+    sits inside the floor.
 
     Returns sd_day/rho/mdc95 = None when the window has too few consecutive
     pairs to estimate them. A noise floor guessed from six days is worse than
@@ -824,10 +827,10 @@ def readiness(conn, as_of: str | None = None) -> dict:
 # What replaces it: a WEEKLY read, where seven days of averaging make the number
 # mean something; and an alert that stays silent unless a component crosses a
 # detectable threshold on two consecutive days. One bad morning is noise. Two in
-# a row is the smallest pattern worth interrupting him for — and anything looser
+# a row is the smallest pattern worth interrupting a user for — and anything looser
 # is the daily composite again under another name.
 READINESS_ALERT_DAYS = 2
-# Thresholds are deviations from the man's own baseline, not absolutes, and they
+# Thresholds are deviations from the user's own baseline, not absolutes, and they
 # are set where the deviation exceeds what the instrument's day-to-day noise can
 # produce. See metric_noise_floor(): a change smaller than the MDC is not a
 # change, it is the measurement.

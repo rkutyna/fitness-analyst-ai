@@ -176,8 +176,9 @@ _ALLOWED_EXTRA = "-'’.,%/"
 _FTS5_OPERATORS = frozenset({"AND", "OR", "NOT", "NEAR"})
 
 # Used ONLY for the degenerate-query refusal below -- never to drop a term from
-# the search itself. `docs/product/corpus/RELEVANCE-MEASUREMENT.md` S3 measured
-# "OR of all terms" at 81% top-5 hit rate and every narrower strategy far
+# the search itself. Issue #22 in this repository (no bm25 threshold separates
+# relevant from irrelevant retrieval) carries the measurement: "OR of all terms"
+# at 81% top-5 hit rate and every narrower strategy far
 # worse, so the executed query is that strategy with nothing removed. A query
 # that consists of nothing BUT these is not a narrower strategy; it is a query
 # with no content word in it at all.
@@ -285,10 +286,11 @@ def _terms(query, caps: CiteCaps) -> list[str]:
 def build_match_expression(query, *, caps: CiteCaps = CITE_CAPS) -> str:
     """The FTS5 MATCH expression for ``query``: every term quoted, OR-ed.
 
-    OR because it is what was measured. `RELEVANCE-MEASUREMENT.md` S3:
-    OR-of-all-terms retrieves 81% top-5 against the real corpus; AND of the two
-    rarest present terms collapses that to 19% and AND of three to 6%. Both AND
-    strategies were rejected there and are not offered here.
+    OR because it is what was measured. Issue #22 in this repository (no bm25
+    threshold separates relevant from irrelevant retrieval) carries the
+    measurement: OR-of-all-terms retrieves 81% top-5 against the real corpus;
+    AND of the two rarest present terms collapses that to 19% and AND of three
+    to 6%. Both AND strategies were rejected there and are not offered here.
 
     Every term is wrapped in FTS5 double quotes with any embedded quote
     doubled. The escape is belt-and-braces -- `_terms` has already refused a
@@ -545,7 +547,7 @@ def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
     is the single most important property of this signature. Measured over 16
     real coaching questions against the 45-document corpus plus a 20-document
     null control of plant genomics and materials science
-    (`docs/product/corpus/RELEVANCE-MEASUREMENT.md` S2): all 16 questions
+    (issue #22 in this repository, which carries the measurement): all 16 questions
     retrieved passages from the irrelevant corpus, and **12 of 16 of those
     outscored the worst genuinely relevant hit** -- best null bm25 -14.08
     against worst true -6.82. No absolute bm25 value separates relevant from

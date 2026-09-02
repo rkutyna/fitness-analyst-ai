@@ -18,7 +18,8 @@ from typing import Any, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from health_advisor import agents, db  # noqa: E402
+from health_advisor import agents, mcp_server  # noqa: E402
+from health_advisor.context import VaultContext  # noqa: E402
 from health_advisor.numeric_tokens import NUM_RE  # noqa: E402
 
 
@@ -130,17 +131,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--as-of", required=True, help="deep-dive snapshot date")
     args = parser.parse_args(argv)
 
-    # The payload SOURCE is imported here, not at module scope: the probe
-    # spaces, `measure_payload` and `control` are the instrument, and they are
-    # useful (and tested) on any payload. Only the CLI needs a deep-dive run.
-    from health_advisor import deepdive_levers  # noqa: PLC0415
-
-    conn = db.connect(args.db, read_only=True)
-    try:
-        result = deepdive_levers.run(conn, args.as_of)
-        scoreboard = deepdive_levers.render(result)
-    finally:
-        conn.close()
+    # The payload comes from an engine-native MCP tool over the supplied vault.
+    # The probe spaces, `measure_payload` and `control` remain independent of
+    # that source and are useful (and tested) on any payload.
+    ctx = VaultContext.local(args.db, user_id="demo")
+    tools = mcp_server.build_tools(ctx)
+    result = tools["get_briefing"](scope="deep", day=args.as_of)
+    scoreboard = str(result)
 
     whole = measure_payload(result)
     rendered, scoreboard_tokens = scoreboard_payload(scoreboard)

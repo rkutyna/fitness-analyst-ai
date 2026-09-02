@@ -1,6 +1,6 @@
 """A1 — the analyst-mode sandbox executor (#115 / M7).
 
-Spec: docs/product/reviews/analyst-mode-proposal.md — read §2 (the runtime),
+Spec: the analyst-mode design, restated in SECURITY.md — read the runtime section,
 §4.6 (the split run directory), and §8's A1 task definition before touching
 this file.
 

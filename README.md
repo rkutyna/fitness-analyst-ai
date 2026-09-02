@@ -95,7 +95,9 @@ python3.11 -m venv .venv
 ./.venv/bin/pip install -e ".[dev]"
 ```
 
-An editable install (`-e .`) is convenient while developing, but a plain
+On a pyenv-managed machine `python3.11` is a shim that refuses unless that
+version is selected — `PYENV_VERSION=3.11.x` in the environment, or `pyenv shell
+3.11.x` first. An editable install (`-e .`) is convenient while developing, but a plain
 `pip install .` works too — the canonical schema ships inside the package as
 `health_advisor/schema.sql`, so an installed copy is self-contained.
 
@@ -103,7 +105,7 @@ An editable install (`-e .`) is convenient while developing, but a plain
 Apple Health export:
 
 ```bash
-python -m health_advisor.demo --out data/demo.db --days 730
+./.venv/bin/python -m health_advisor.demo --out data/demo.db --days 730
 ```
 
 That writes a deterministic multi-device vault — records, workouts, sleep

@@ -87,6 +87,32 @@ def test_failed_transient_unit_exposes_named_systemd_result(monkeypatch):
 
 
 @LINUX_TRANSIENT
+def _user_bus_available() -> bool:
+    """Can `systemd-run --user` actually reach a user session bus?
+
+    These tests drive a transient user unit, which needs a running systemd
+    user session and its D-Bus socket. A container (CI) has neither, and
+    systemd-run fails with "Failed to connect to bus: No medium found". That
+    is the environment being unable to run the test — not a result — so it
+    skips rather than failing, and rather than being quietly deleted.
+    """
+    if not shutil.which("systemd-run"):
+        return False
+    try:
+        return subprocess.run(
+            ["systemd-run", "--user", "--quiet", "--collect", "--wait",
+             "--", "true"],
+            capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _user_bus_available(),
+    reason="needs a systemd user session bus (systemd-run --user); "
+           "unavailable in containers — run on a Linux desktop session")
+
+
 def test_transient_query_round_trip_is_parent_observed(tmp_path):
     vault = tmp_path / "vault.db"
     import sqlite3

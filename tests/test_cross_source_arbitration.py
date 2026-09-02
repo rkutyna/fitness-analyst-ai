@@ -13,6 +13,8 @@ exist in the archive and are resolved separately:
 """
 from __future__ import annotations
 
+import pytest
+
 from health_advisor import db as dbmod
 
 WATCH = "Demo’s Apple Watch"
@@ -49,7 +51,12 @@ def test_renpho_whole_day_blob_is_excluded_from_the_daily_sum(conn):
     _add(conn, "basal_energy", "2026-07-09", WATCH, [0.02] * 100)
     _add(conn, "basal_energy", "2026-07-09", "RENPHO Health", [371.8] * 6, start_hour=15)
 
-    assert _daily(conn, "basal_energy", "2026-07-09")["sum"] == 2.0
+    # approx, not ==: this is an accumulated float sum (100 x 0.02). It lands
+    # on exactly 2.0 on arm64 and on 2.0000000000000013 on x86_64, so an
+    # equality assertion here passes by luck of the platform. What the test
+    # is actually about is WHICH rows survived arbitration, not the last bit
+    # of the sum.
+    assert _daily(conn, "basal_energy", "2026-07-09")["sum"] == pytest.approx(2.0)
 
 
 def test_blob_is_excluded_even_when_labelled_with_the_watch(conn):
@@ -59,7 +66,9 @@ def test_blob_is_excluded_even_when_labelled_with_the_watch(conn):
     _add(conn, "basal_energy", "2026-07-21", MERGED, [0.02] * 50, start_hour=17)
 
     row = _daily(conn, "basal_energy", "2026-07-21")
-    assert row["sum"] == 3.0  # 150 stream samples kept, 5 blobs dropped
+    # approx for the same reason as above; `count` below is the assertion
+    # that carries the meaning — 150 stream samples kept, 5 blobs dropped.
+    assert row["sum"] == pytest.approx(3.0)
     assert row["count"] == 150
 
 

@@ -98,6 +98,13 @@ jobs:
           # from its own check. The IP patterns are already literal-free: the
           # escaped dots mean the dotted quad does not appear here either.
           PATTERN='[r]oger|[r]kutyna|[p]izzamon123|[t]ail3e15cb|[r]k-minipc|[z]270|100\.102\.251\.38|100\.106\.86\.37|100\.126\.105\.110'
+          # Symlink TARGETS are not file contents: grep never sees them, and a
+          # link pointing into a personal checkout carries that path verbatim.
+          # Scan them explicitly, tree and index alike.
+          links=$(git ls-files -s | awk '$1==120000 {print $4}')
+          for l in $links; do
+            if readlink "$l" | grep -Eq "$PATTERN"; then echo "symlink target leaks identity: $l -> $(readlink "$l")"; exit 1; fi
+          done
 
           # LICENSE legitimately names the copyright holder, and .git is history
           # rather than tree content. The single whitelisted line shape is the

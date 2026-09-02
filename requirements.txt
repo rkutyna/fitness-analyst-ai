@@ -19,7 +19,7 @@ python-dotenv==1.2.2
 pydantic-core==2.46.4
 
 # --- MCP server (mcp_server.py) ---
-mcp==1.27.2
+mcp==1.28.1
 numpy==2.4.6
 scipy==1.17.1
 

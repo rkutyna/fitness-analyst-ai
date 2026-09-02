@@ -178,7 +178,19 @@ exception named explicitly in a module-level `KNOWN_GAPS`. Measured results:
 |---|---|
 | macOS 26.x, arm64 | Attack corpus **fully blocked** (one documented gap: `/Users/Shared` is readable) |
 | GitHub `macos-latest` runner | **`DYLD_INSERT_LIBRARIES` injection is NOT blocked** |
-| Linux (bubblewrap) | Requires privileges to create namespaces; unavailable or partial on restricted hosts |
+| Linux (bubblewrap), **privileged container** | **`filesystem_write` and `vault_integrity` classes NOT blocked** — see caveat below |
+| Linux (bubblewrap), unprivileged host | **not yet measured** |
+
+**The Linux result is not yet interpretable, and must not be read as a clean
+bill of health or as a confirmed hole.** It was measured inside a `--privileged`
+container, because bubblewrap cannot create its namespaces on an unprivileged CI
+runner — privilege was the price of testing the Linux executor at all. But
+`--privileged` plausibly weakens the very confinement under test. Two
+explanations fit the evidence: the executor genuinely fails to confine writes
+and protect the vault, or the container defeats guarantees that hold on a normal
+host. **There is no unprivileged Linux measurement yet.** Tracked in issue #3,
+whose `Done when` is exactly that measurement. Until it exists, treat analyst
+mode on Linux as unverified.
 
 The macOS discrepancy is a real open question, not a test artifact: the same
 corpus passes on one macOS configuration and fails on another, which means the

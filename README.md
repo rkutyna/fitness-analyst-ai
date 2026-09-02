@@ -188,6 +188,8 @@ unconfined.
 > **not** blocked on GitHub's `macos-latest` runner. Run
 > `pytest tests/test_analyst_sandbox.py` on your own platform before relying on
 > the confinement, and see [SECURITY.md](SECURITY.md) for the measured results.
+> **On Linux the confinement is not yet verified at all** — the only measurement
+> so far ran under a privileged container, which may itself defeat it (issue #3).
 
 ## LLM backends
 

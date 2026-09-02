@@ -1,4 +1,4 @@
-"""Spawn the MCP server as a subprocess and talk to it over stdio like Hermes
+"""Spawn the MCP server as a subprocess and talk to it over stdio like an agent
 will: initialize, list tools, call two tools. Confirms the protocol layer."""
 import asyncio
 import os

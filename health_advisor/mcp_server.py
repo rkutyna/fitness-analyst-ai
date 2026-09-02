@@ -1,5 +1,5 @@
 """Health MCP server — curated, parameterized, read-only-by-default tools over
-stdio so Hermes can spawn it. The agent reaches the DB ONLY through these tools
+stdio so the agent can spawn it. The agent reaches the DB ONLY through these tools
 (no raw SQL). Every tool computes server-side on a bounded copy and returns a
 COMPACT summary — never a huge raw result set.
 
@@ -806,13 +806,15 @@ def _impact_period_keys(start: str, end: str, by: str) -> list[date]:
     return keys
 
 
-def _impact_days_covered(key: date, by: str, start: str, end: str) -> int:
+def _impact_days_covered(key: date, by: str, start: str, end: str,
+                         *, as_of: str | None = None) -> int:
     """Days of this period that are inside the requested range AND have already
     happened. 5 of 7 on a Friday is why a mid-week week-over-week number reads
     as a collapse."""
     span = 1 if by == "day" else 7
     first = max(key, date.fromisoformat(start))
-    last = min(key + timedelta(days=span - 1), date.fromisoformat(end), date.today())
+    horizon = date.fromisoformat(as_of) if as_of else date.today()
+    last = min(key + timedelta(days=span - 1), date.fromisoformat(end), horizon)
     return max(0, (last - first).days + 1)
 
 
@@ -902,7 +904,7 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
 
 
 def _impact_periods(rows: list[dict], start: str, end: str,
-                    by: str) -> list[dict]:
+                    by: str, *, as_of: str | None = None) -> list[dict]:
     """Return the gap-filled impact periods with their completeness labels.
 
     Both the ordinary impact tool and its block-comparison mode need exactly
@@ -913,11 +915,22 @@ def _impact_periods(rows: list[dict], start: str, end: str,
     if not rows:
         return []
 
+    # The query should already be bounded by this same horizon, but keep the
+    # pure presentation helper defensive: a future period must never become a
+    # published zero merely because a caller supplied an end beyond as_of.
+    horizon = date.fromisoformat(as_of) if as_of else date.today()
+    start_date = date.fromisoformat(start)
+    end_date = min(date.fromisoformat(end), horizon)
+    if start_date > horizon:
+        return []
+    end = end_date.isoformat()
+
     have = {r["period_start"]: r for r in rows}
     periods = []
     for key in _impact_period_keys(start, end, by):
         iso = key.isoformat()
-        covered = _impact_days_covered(key, by, start, end)
+        bucket_end = min(key + timedelta(days=6), end_date).isoformat()
+        covered = _impact_days_covered(key, by, start, end, as_of=as_of)
         row = have.get(iso) or {
             "period_start": iso, "jog_minutes": 0.0, "jog_miles": 0.0,
             "jog_pace_min_per_mi": None, "walk_minutes": 0.0, "walk_miles": 0.0,
@@ -928,7 +941,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
                         # Other fields in the row are impact context and stay
                         # available for Tier 1 path provenance.
                         "metric": "jog_minutes",
-                        "period": iso,
+                        "period": (iso if by == "day"
+                                   else f"{iso}:{bucket_end}"),
                         "days_covered": covered,
                         "partial": covered < (1 if by == "day" else 7)})
     _impact_change_pct(periods, by)
@@ -936,7 +950,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
 
 
 def _impact_block_comparison(periods: list[dict], start: str, end: str,
-                             weeks_per_block: int, anchor: str) -> dict:
+                             weeks_per_block: int, anchor: str,
+                             *, as_of: str | None = None) -> dict:
     """Aggregate adjacent weekly jog-minute blocks from labelled tool rows."""
     anchor_aliases = {
         "last_complete_week": "last_complete_week",
@@ -1005,7 +1020,7 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
             },
             "period_starts": starts,
             "weeks": [
-                {"metric": "jog_minutes", "period": row["period_start"],
+                {"metric": "jog_minutes", "period": row["period"],
                  "field": "jog_minutes", "value": row["jog_minutes"],
                  "days_covered": row["days_covered"],
                  "days_expected": 7, "partial": row["partial"],
@@ -1074,10 +1089,10 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
         "completeness": {
             "rule": (
                 "days_covered is the number of days inside the explicit start/end "
-                "range and no later than date.today(); a week is complete only "
+                "range and no later than the session as_of date; a week is complete only "
                 "when days_covered is 7"
             ),
-            "as_of": date.today().isoformat(),
+            "as_of": as_of or date.today().isoformat(),
             "end_default": False,
             "partial_trailing_week": {
                 "period_start": trailing["period_start"],
@@ -1135,8 +1150,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     only rounding noise. ``anchor`` must be ``last_complete_week`` or
     ``last_day_with_data``. The former drops a partial trailing week; the latter
     includes it. ``start`` and ``end`` are required and never default to today;
-    the completeness output still states that its rule is capped by
-    ``date.today()``.
+    the completeness output states the session's ``as_of`` horizon.
 
     Note that walk_minutes covers ALL ambulatory movement the watch saw, not
     just deliberate walks, so it runs far higher than session time — don't
@@ -1150,22 +1164,32 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
         return {"error": "start must be on or before end"}
     conn = ctx.read_only()
     try:
-        rows = A.impact_volume(conn, start, end, by=by)
-        sens = _jog_threshold_sensitivity(conn, start, end)
+        as_of = A._as_of(conn, None)
+        as_of_date = date.fromisoformat(as_of)
+        requested_start = date.fromisoformat(start)
+        if requested_start > as_of_date:
+            return {"start": start, "end": end, "by": by, "as_of": as_of,
+                    "count": 0, "periods": [],
+                    "reason": "window_after_as_of"}
+
+        effective_end = min(date.fromisoformat(end), as_of_date).isoformat()
+        rows = A.impact_volume(conn, start, effective_end, by=by)
+        sens = _jog_threshold_sensitivity(conn, start, effective_end)
         # Fill periods analysis had no rows for, then recompute the change
         # column over the complete sequence. The same labelled rows feed block
         # comparison. Do this while the read-only connection is open only
         # because the source rows are computed here; the helper itself is pure.
-        periods = _impact_periods(rows, start, end, by)
+        periods = _impact_periods(rows, start, effective_end, by, as_of=as_of)
     except ValueError as e:
         return {"error": str(e)}
     finally:
         conn.close()
     if not rows:
-        return {"start": start, "end": end, "by": by, "count": 0, "periods": [],
+        return {"start": start, "end": end, "by": by, "as_of": as_of,
+                "count": 0, "periods": [],
                 "note": "no distance samples in this range"}
 
-    out = {"start": start, "end": end, "by": by,
+    out = {"start": start, "end": end, "by": by, "as_of": as_of,
            "count": len(periods), "periods": periods,
            "jog_cadence_threshold_steps_per_min": A.IMPACT_JOG_CADENCE_MIN}
     for row in periods:
@@ -1186,7 +1210,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
             out["block_comparison_error"] = "weeks_per_block must be a positive integer"
         else:
             comparison = _impact_block_comparison(
-                periods, start, end, weeks_per_block, anchor
+                periods, start, end, weeks_per_block, anchor, as_of=as_of
             )
             if "error" in comparison:
                 out["block_comparison_error"] = comparison["error"]
@@ -1200,7 +1224,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
 
 @tool
 def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str | None = None) -> dict:
-    """How regular the user's sleep TIMING is, over the 2,525-day series.
+    """How regular the user's sleep TIMING is, over the whole sleep-timing series.
 
     'interval_regularity.match_pct' is NOT the Sleep Regularity Index and must
     not be compared against published SRI values. Real SRI is computed from
@@ -1227,8 +1251,10 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
     first band, so it is not a compliance score and its complement is not a
     shortfall: report all three counts, and never call a social night a miss.
 
-    This series runs continuously through the 2023-2025 watch gap, which makes
-    it the only variable able to connect 2019 to 2026. Sleep is attributed to
+    The sleep-timing series is typically the largest coherent one in the DB and
+    runs continuously through gaps in watch coverage, which can make it the only
+    variable that links a much earlier era of a training history to the present
+    one. Sleep is attributed to
     the WAKE day. Dates are local YYYY-MM-DD; both default to all of history."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
@@ -2154,8 +2180,8 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
         one is findable rather than permanent.
 
     `why` is REQUIRED and stored. Do not invent minutes to fill a gap, and do
-    not estimate from what was planned — if what the user actually did is not
-    recorded somewhere, say so and ask them rather than entering a number.
+    not estimate from a prescription — if what they actually did is not recorded
+    somewhere, say so and ask them rather than entering a number.
 
     Upserts on (day, source_note): a correction replaces, never accumulates.
     """

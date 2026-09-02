@@ -14,7 +14,7 @@ import sys
 import tempfile
 import uuid
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from . import db
 from . import facts as fact_store
@@ -193,6 +193,72 @@ def _read_ledger(path: str) -> list[dict]:
         return []
 
 
+def _window_override_path(ledger_path: str) -> str:
+    """Name the per-ask sidecar shared with a spawned codex MCP server."""
+    return os.fspath(ledger_path) + ".window_override.json"
+
+
+def _ask_calendar_today(ctx: VaultContext, as_of: str | None) -> date:
+    """Use the exact as-of horizon published by the tools for calendar math."""
+    if as_of is not None:
+        return date.fromisoformat(as_of)
+    from . import analysis
+
+    # Some prompt-only unit tests use an uninitialized context because their
+    # tool loop is mocked. Preserve the same empty-daily_metrics fallback as
+    # analysis._as_of without creating or mutating that test vault.
+    if not os.path.exists(ctx.db_path):
+        import sqlite3
+        empty = sqlite3.connect(":memory:")
+        try:
+            empty.execute("CREATE TABLE daily_metrics (date TEXT)")
+            return date.fromisoformat(analysis._as_of(empty, None))
+        finally:
+            empty.close()
+
+    conn = ctx.read_only()
+    try:
+        return date.fromisoformat(analysis._as_of(conn, None))
+    finally:
+        conn.close()
+
+
+def _calendar_window_config(ctx: VaultContext, question: str,
+                            as_of: str | None) -> tuple[dict, Any]:
+    """Resolve one question once and serialize the wrapper's instructions."""
+    from .calendar_window import CalendarWindow, resolve_window
+
+    resolved = resolve_window(question, _ask_calendar_today(ctx, as_of))
+    if resolved is None:
+        return {"status": "none", "reason": "no_calendar_phrase"}, None
+    if isinstance(resolved, tuple):
+        return {
+            "status": "multiple",
+            "reason": "multiple_calendar_phrases",
+            "phrases": [window.matched_phrase for window in resolved],
+        }, resolved
+    if not isinstance(resolved, CalendarWindow):
+        return {"status": "none", "reason": "invalid_calendar_resolution"}, None
+    return {
+        "status": "single",
+        "window": {
+            "start": resolved.start,
+            "end": resolved.end,
+            "matched_phrase": resolved.matched_phrase,
+            "by_hint": resolved.by_hint,
+        },
+    }, resolved
+
+
+def _write_window_override(path: str, config: dict) -> None:
+    """Publish the immutable ask window before either tool transport starts."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(config, fh, sort_keys=True, separators=(",", ":"))
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def _fallback_answer() -> str:
     """Render the safe no-claim answer through the shared fallback renderer."""
     from . import agents
@@ -239,6 +305,92 @@ def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],
         "tier2_metric_recomputed": tier_counts["metric"],
         "tool_calls": len(ledger),
     }
+
+
+ASK_CAUSES = (
+    "ok",
+    "transport_failed",
+    "backend_unavailable",
+    "empty_gather",
+    "gate_refused",
+    "no_gather_needed",
+    "judge_refused",
+)
+
+_BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
+    "openrouter_not_approved", "openrouter_provider_mismatch",
+    "openrouter_no_api_key", "binary_missing", "auth_failure", "no_api_key",
+})
+_TRANSPORT_FAILURE_OUTCOMES = frozenset({
+    "tool_loop_error", "tool_loop_deadline", "tool_loop_turns_exhausted",
+    "timeout", "rate_limited", "nonzero_exit", "process_error",
+    "backend_error", "research_loop_error", "research_loop_turns_exhausted",
+    "research_loop_turn_error_budget",
+})
+
+
+def _ask_loop_outcome(before: dict, after: dict) -> dict:
+    """Return the status event emitted by this loop call, if any.
+
+    ``llm.last_loop_status`` deliberately remains unchanged after a successful
+    loop.  Comparing its event id keeps an earlier failure from being reported
+    as the cause of a later answer.
+    """
+    before_id = before.get("call_id") if isinstance(before, dict) else None
+    after_id = after.get("call_id") if isinstance(after, dict) else None
+    if (after_id is not None and after_id != before_id
+            and isinstance(after.get("outcome"), str)):
+        return {"outcome": after["outcome"],
+                "detail": str(after.get("detail") or "")}
+    return {"outcome": "success", "detail": ""}
+
+
+def _status_outcome_family(status: dict) -> str:
+    """Map the loop's detailed vocabulary to public cause families."""
+    outcome = str(status.get("outcome") or "")
+    detail = status.get("detail") or ""
+    nested = {}
+    if outcome == "tool_loop_empty_answer" and isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict):
+                nested = parsed
+        except (TypeError, ValueError):
+            pass
+    effective = str(nested.get("outcome") or outcome)
+    if effective in _BACKEND_UNAVAILABLE_OUTCOMES:
+        return "backend_unavailable"
+    if effective in _TRANSPORT_FAILURE_OUTCOMES:
+        return "transport_failed"
+    if effective == "tool_loop_empty_answer":
+        return "empty_gather"
+    return "other"
+
+
+def _ask_cause(verification: dict, *, ledger: list[dict],
+               loop_outcomes: list[dict], judge_score: int | None = None,
+               no_gather_needed: bool = False) -> str:
+    """Derive the closed response cause from loop and Python-owned facts.
+
+    ``judge_score`` is ``None`` when no judge ran — the fact-template arm
+    never judges a kept answer — and only a score that did run and fell
+    below the pass mark reads as ``judge_refused``. Measured live 2026-09-01:
+    a defaulted 0 labelled every kept template answer as refused.
+    """
+    families = [_status_outcome_family(status) for status in loop_outcomes]
+    if "backend_unavailable" in families:
+        return "backend_unavailable"
+    if "transport_failed" in families:
+        return "transport_failed"
+    if no_gather_needed:
+        return "no_gather_needed"
+    if not ledger:
+        return "empty_gather"
+    if not verification.get("ok"):
+        return "gate_refused"
+    if judge_score is not None and judge_score < 70:
+        return "judge_refused"
+    return "ok"
 
 
 def _ask_judge(question: str, prose: str, verification: dict) -> int:
@@ -684,7 +836,9 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                     history: list[dict[str, Any]] | None = None,
                     capture: list | None = None,
                     analyst_query_fn=None,
-                    attachments: list[dict[str, Any]] | None = None) -> dict:
+                    attachments: list[dict[str, Any]] | None = None,
+                    audits: Mapping[str, tuple[Callable, Callable]] | None = None
+                    ) -> dict:
     """Answer one question through the provider-facing, ledgered coach path.
 
     This is kept outside FastAPI so the endpoint and tests exercise the same
@@ -705,7 +859,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
         # this returned assistant result.  Do not create a second conversation
         # here; this is the command form of the same in-process run_audit seam.
         result = run_audit(ctx, audit_match.group(1), as_of=as_of,
-                           analyst_query_fn=analyst_query_fn, persist=False)
+                           analyst_query_fn=analyst_query_fn, persist=False,
+                           audits=audits)
     else:
         result = _answer_question_inner(ctx, question, as_of=as_of,
                                         ledger_path=ledger_path, history=history,
@@ -745,6 +900,12 @@ def _fact_template_refusal_detail(template: str, scan: dict,
         return f"{reason}; {label}: " + ", ".join(
             repr(key) for key in unresolved)
     return reason or "empty template"
+
+
+def _fact_template_figure_count(scan: dict, facts: dict[str, dict]) -> int:
+    """Count numeric fact placeholders, excluding Python-owned period labels."""
+    return sum(1 for key in scan.get("placeholders", [])
+               if (facts.get(key) or {}).get("field") != "period_label")
 
 
 # Every branch requires an explicit data object. The first deploy shipped
@@ -906,6 +1067,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # The first turn is deliberately discarded. Its only job is to let the
     # model select read-only tools; the final narration turn cannot add tools
     # or facts after Python closes this ledger snapshot.
+    gather_status_before = llm.last_loop_status()
     llm.tool_loop(
         prompt + "\n\nUse the read-only tools needed to answer the question. "
         "After gathering the data, return a brief acknowledgement without "
@@ -916,6 +1078,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         submit_tool=False, ledger_index=False, submit_repair=False,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
         analyst_query_fn=analyst_query_fn)
+    gather_status = _ask_loop_outcome(gather_status_before,
+                                      llm.last_loop_status())
     ledger = _read_ledger(ledger_path)
     facts = {
         **fact_template.build_fact_set(ledger),
@@ -931,7 +1095,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "{fact|table=...|column=...|trend=...} for computed trends. Copy each "
         "key character-for-character from the CLOSED FACT SET below — a key "
         "outside braces, bolded, or quoted is not a placeholder and will be "
-        "refused. Never construct a key from parts, "
+        "refused. When a date or period name belongs in prose, use "
+        "{fact|metric=...|period=...|field=period_label}, for example, "
+        "Activity for {fact|metric=jog_minutes|period=s:2026-08-10:2026-08-16|field=period_label}. "
+        "Never construct a key from parts, "
         "invent a plausible key, calculate a figure or trend, choose a unit, "
         "or put digits in surrounding prose. Prescriptive coaching quantities "
         "such as sets, reps, weights, or durations belong in a literal advice "
@@ -952,11 +1119,14 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "USER QUESTION:\n" + question.strip() + "\n\n"
         "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
         fact_template.render_fact_set(facts))
+    final_status_before = llm.last_loop_status()
     raw = llm.tool_loop(
         final_prompt, ctx=ctx, tools=[], think=True, ledger_path=ledger_path,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
+    final_status = _ask_loop_outcome(final_status_before,
+                                     llm.last_loop_status())
     template = str(raw or "").strip()
     scan = fact_template.scan_template(template, facts)
     advice_quantities: list[str] = []
@@ -976,9 +1146,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "unsupported": list(scan["unresolved"]),
         "reason": ("ask answer has no tool-call ledger" if not ledger else
                    scan["reason"]),
-        "figures_verified": (len(scan["placeholders"])
+        "figures_verified": (_fact_template_figure_count(scan, facts)
                               if scan["ok"] else 0),
-        "figures_total": len(scan["placeholders"]),
+        "figures_total": _fact_template_figure_count(scan, facts),
         "advice_quantities": advice_quantities,
         "tier_counts": {"path": 0, "metric": 0},
         "tier1_path_bound": 0,
@@ -992,6 +1162,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     }
     interpolated = fact_template.interpolate_template(
         template, facts, advice_quantities=advice_quantities)
+    verification["cause"] = _ask_cause(
+        verification, ledger=ledger, loop_outcomes=[gather_status, final_status],
+        no_gather_needed=(not scan["placeholders"]
+                          and bool(scan["advice_quantities"])))
     _record_attempt(capture, 1, template, None, verification, 0, ledger)
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
@@ -1027,11 +1201,14 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "specific metric family whose data is unavailable; do not make a "
         "generic no-data claim.\n\nFAILING TEMPLATE:\n" + template +
         "\n\nEXACT GATE REFUSAL:\n" + refusal_detail)
+    retry_status_before = llm.last_loop_status()
     raw = llm.tool_loop(
         repair_prompt, ctx=ctx, tools=[], think=True, ledger_path=ledger_path,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
+    retry_status = _ask_loop_outcome(retry_status_before,
+                                     llm.last_loop_status())
     retry_template = str(raw or "").strip()
     retry_scan = fact_template.scan_template(retry_template, facts)
     retry_advice_quantities: list[str] = []
@@ -1045,9 +1222,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "unsupported": list(retry_scan["unresolved"]),
         "reason": ("ask answer has no tool-call ledger" if not ledger else
                    retry_scan["reason"]),
-        "figures_verified": (len(retry_scan["placeholders"])
+        "figures_verified": (_fact_template_figure_count(retry_scan, facts)
                               if retry_scan["ok"] else 0),
-        "figures_total": len(retry_scan["placeholders"]),
+        "figures_total": _fact_template_figure_count(retry_scan, facts),
         "advice_quantities": retry_advice_quantities,
         "tier_counts": {"path": 0, "metric": 0},
         "tier1_path_bound": 0,
@@ -1058,6 +1235,11 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     }
     retry_interpolated = fact_template.interpolate_template(
         retry_template, facts, advice_quantities=retry_advice_quantities)
+    retry_verification["cause"] = _ask_cause(
+        retry_verification, ledger=ledger,
+        loop_outcomes=[gather_status, retry_status],
+        no_gather_needed=(not retry_scan["placeholders"]
+                          and bool(retry_scan["advice_quantities"])))
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]
             and not retry_scan["advice_quantities"]):
@@ -1101,6 +1283,11 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         os.close(fd)
         ledger_path = temp_path
 
+    window_config, resolved_window = _calendar_window_config(
+        ctx, question, as_of)
+    window_sidecar_path = _window_override_path(ledger_path)
+    _write_window_override(window_sidecar_path, window_config)
+
     coach_preamble = (
         "You are the user's personal health coach. Answer the user's question "
         "directly and honestly using the supplied read-only health tools. Call "
@@ -1116,6 +1303,22 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
     if rendered_facts:
         prompt += rendered_facts + "\n\n"
     fact_template_enabled = _fact_template_enabled()
+    if resolved_window is not None:
+        if isinstance(resolved_window, tuple):
+            prompt += (
+                "PYTHON CALENDAR WINDOW: multiple calendar phrases were found "
+                "(" + ", ".join(window.matched_phrase for window in resolved_window)
+                + "). No calendar window override will be applied.\n\n")
+        else:
+            prompt += (
+                "PYTHON-RESOLVED CALENDAR WINDOW: the phrase "
+                f"{resolved_window.matched_phrase!r} means the inclusive window "
+                f"{resolved_window.start} through {resolved_window.end}. "
+                + ("The week bucket is Monday-anchored and Python will use "
+                   "by='week'. "
+                   if resolved_window.by_hint == "week" else "")
+                + "Python will enforce this window on eligible tools; use the "
+                "returned result and this scope in the answer.\n\n")
     prompt += "USER QUESTION:\n" + question.strip()
     if not fact_template_enabled:
         prompt += "\n\n" + ASK_CLAIM_INSTRUCTIONS
@@ -1137,6 +1340,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         # path that _verify_ask_answer refuses).
         # submit_tool=True: the claim channel arrives as a typed tool call
         # instead of being parsed back out of prose.
+        first_status_before = llm.last_loop_status()
         raw = llm.tool_loop(
             prompt, ctx=ctx, tools=tool_schemas, think=True,
             ledger_path=ledger_path, tool_names=llm.COACH_TOOLS,
@@ -1144,6 +1348,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             ledger_index=ledger_index, submit_repair=submit_repair,
             timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
             analyst_query_fn=analyst_query_fn)
+        first_loop_status = _ask_loop_outcome(first_status_before,
+                                              llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))
         if hasattr(raw, "claims") and raw.claims is not None:
             claims = raw.claims
@@ -1157,6 +1363,9 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 if verification.get("ok") else 0
         finally:
             verify_conn.close()
+        verification["cause"] = _ask_cause(
+            verification, ledger=ledger, loop_outcomes=[first_loop_status],
+            judge_score=score)
         _record_attempt(capture, 1, prose.strip(), claims, verification, score,
                         ledger)
         first_attempt = {
@@ -1178,6 +1387,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                         " Call a relevant tool again if needed, then return a "
                         "new claim-channel answer that fixes every reported "
                         "issue.")
+        retry_status_before = llm.last_loop_status()
         raw = llm.tool_loop(
             retry_prompt, ctx=ctx, tools=tool_schemas, think=True,
             ledger_path=ledger_path, tool_names=llm.COACH_TOOLS,
@@ -1185,6 +1395,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             ledger_index=ledger_index, submit_repair=submit_repair,
             timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
             analyst_query_fn=analyst_query_fn)
+        retry_loop_status = _ask_loop_outcome(retry_status_before,
+                                              llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))
         if hasattr(raw, "claims") and raw.claims is not None:
             claims = raw.claims
@@ -1197,6 +1409,9 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 if verification.get("ok") else 0
         finally:
             verify_conn.close()
+        verification["cause"] = _ask_cause(
+            verification, ledger=ledger, loop_outcomes=[retry_loop_status],
+            judge_score=score)
         _record_attempt(capture, 2, prose.strip(), claims, verification, score,
                         ledger)
         retry_attempt = {
@@ -1228,7 +1443,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 "text": suppressed_text,
                 "mode": "narration",
                 "tool_trace": selected["ledger"],
-                "verification": {**suppressed_verification, "retry": True},
+                "verification": {**suppressed_verification, "cause": "ok",
+                                  "retry": True},
             }
         fallback_verification = {
             **selected["verification"], "judge_score": selected["judge_score"],
@@ -1246,6 +1462,10 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             "verification": fallback_verification,
         }
     finally:
+        try:
+            os.unlink(window_sidecar_path)
+        except OSError:
+            pass
         if owned_ledger and temp_path:
             try:
                 os.unlink(temp_path)
@@ -1373,8 +1593,8 @@ def _append_turn_locked(
     already be inside a transaction (``BEGIN IMMEDIATE``) and decides when it
     ends. This is what lets a turn append and a projection write land in one
     atomic commit: ``append_turn`` below is the standalone wrapper that opens
-    its own transaction, and a caller that also writes a projection row can
-    append the turn and that row together so the pair cannot straddle a
+    its own transaction, and ``review.py`` is the second caller, appending a
+    turn and a review projection row together so the pair cannot straddle a
     process death. The ``MAX(sequence) + 1`` computation lives here alone —
     a second copy of it would be a correctness bug, not a style problem.
     """
@@ -1575,9 +1795,26 @@ def _narrate_audit(ctx: VaultContext, report: dict) -> dict:
             pass
 
 
+# The engine ships no audits. A deployment registers its own table once, at
+# import time, and every path that reaches run_audit without an explicit
+# `audits=` — including the typed `run_audit(<name>)` command that
+# answer_question recognises on /v1/ask — sees that table. An explicit
+# `audits=` still wins, which is what tests and one-off callers use.
+_AUDIT_REGISTRY: dict[str, tuple[Callable, Callable]] = {}
+
+
+def register_audits(audits: Mapping[str, tuple[Callable, Callable]]) -> None:
+    """Make `audits` (name -> (battery_fn, report_attachments_fn)) the
+    process-wide default for run_audit. Later registrations add or replace
+    by name; nothing is removed."""
+    _AUDIT_REGISTRY.update(audits)
+
+
 def run_audit(ctx: VaultContext, name: str, *, as_of: str | None = None,
               conversation_id: str | None = None, analyst_query_fn=None,
-              persist: bool = True) -> dict:
+              persist: bool = True,
+              audits: Mapping[str, tuple[Callable, Callable]] | None = None
+              ) -> dict:
     """Run a named deterministic audit and optionally persist a report turn.
 
     The persisted assistant turn uses the same ``attachments_json`` path as a
@@ -1585,12 +1822,9 @@ def run_audit(ctx: VaultContext, name: str, *, as_of: str | None = None,
     ``analyst_query_fn`` is the testable/in-process analyst seam used only by
     flagged follow-ups when the audit toggle is on.
     """
-    # Name -> (deterministic battery, attachment builder). The plan/coaching
-    # layer's personal audits are not part of this engine; the registry stays
-    # so an audit can be added without rebuilding the machinery around it.
-    audits: dict = {}
+    audit_registry = audits if audits is not None else _AUDIT_REGISTRY
     audit_name = name.strip() if isinstance(name, str) else None
-    if audit_name not in audits:
+    if audit_name not in audit_registry:
         raise ValueError(f"unknown audit: {name!r}")
     if as_of is None:
         conn = ctx.read_only()
@@ -1599,7 +1833,7 @@ def run_audit(ctx: VaultContext, name: str, *, as_of: str | None = None,
             as_of = row[0] if row and row[0] else date.today().isoformat()
         finally:
             conn.close()
-    battery, attachment_builder = audits[audit_name]
+    battery, attachment_builder = audit_registry[audit_name]
     report = battery(ctx, as_of, analyst_query=analyst_query_fn)
     attachments = attachment_builder(report)
     narration = _narrate_audit(ctx, report)

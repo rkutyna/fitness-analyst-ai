@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from datetime import date, timedelta
 from urllib.parse import quote, unquote
 
 from . import deepdive_verify as _verify
@@ -67,6 +68,139 @@ def _period_from_token(token: str):
 def _period_identity(period) -> str:
     """Canonical identity used to compare period objects without guessing."""
     return _period_token(period)
+
+
+_PERIOD_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+_MONTH_ABBREVIATIONS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+_MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _period_date(value: object) -> date | None:
+    """Parse only the ISO day spelling accepted as a period component."""
+    if not isinstance(value, str) or not _PERIOD_DAY_RE.fullmatch(value):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def _short_period_day(value: date) -> str:
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    return f"{weekdays[value.weekday()]} {_MONTH_ABBREVIATIONS[value.month - 1]} {value.day}"
+
+
+def _full_period_day(value: date) -> str:
+    return f"{_MONTH_NAMES[value.month - 1]} {value.day}"
+
+
+def _date_range_period_label(start: date, end: date) -> str | None:
+    """Name a validated inclusive range without inferring its metric."""
+    if end < start:
+        return None
+    if end - start == timedelta(days=6):
+        return f"the week of {_full_period_day(start)}"
+    return f"from {_short_period_day(start)} to {_short_period_day(end)}"
+
+
+def _period_label(period) -> str | None:
+    """Return a human label only for period shapes with explicit date meaning.
+
+    Weekly block periods carry their bucket starts, so their count and cadence
+    can be named directly (for example, ``the last 4 weeks``). Other shapes
+    are labelled from their explicit day or inclusive date range. Unknown or
+    malformed shapes return ``None`` rather than turning arbitrary structure
+    into a guessed date.
+    """
+    if isinstance(period, str):
+        day = _period_date(period)
+        if day is not None:
+            return _short_period_day(day)
+        match = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})", period)
+        if not match:
+            return None
+        start, end = (_period_date(match.group(index)) for index in (1, 2))
+        if start is None or end is None:
+            return None
+        return _date_range_period_label(start, end)
+
+    if isinstance(period, dict):
+        starts_raw = period.get("period_starts")
+        if starts_raw is not None:
+            if not isinstance(starts_raw, list) or not starts_raw:
+                return None
+            starts = [_period_date(value) for value in starts_raw]
+            if any(value is None for value in starts):
+                return None
+            starts = [value for value in starts if value is not None]
+            if len(starts) > 1:
+                steps = [(right - left).days
+                         for left, right in zip(starts, starts[1:])]
+                if all(step == 7 for step in steps):
+                    return f"the last {len(starts)} weeks"
+                if all(step == 1 for step in steps):
+                    return f"the last {len(starts)} days"
+                return None
+
+        start = _period_date(period.get("start"))
+        end = _period_date(period.get("end"))
+        if start is None or end is None:
+            return None
+        return _date_range_period_label(start, end)
+
+    if isinstance(period, (list, tuple)) and period:
+        starts = [_period_date(value) for value in period]
+        if any(value is None for value in starts):
+            return None
+        starts = [value for value in starts if value is not None]
+        if len(starts) < 2:
+            return None
+        steps = [(right - left).days
+                 for left, right in zip(starts, starts[1:])]
+        if all(step == 7 for step in steps):
+            return f"the last {len(starts)} weeks"
+        if all(step == 1 for step in steps):
+            return f"the last {len(starts)} days"
+    return None
+
+
+def _add_period_label_facts(facts: dict[str, dict]) -> None:
+    """Add one Python-owned label leaf for each closed metric/period pair."""
+    seen: set[tuple[str, str]] = set()
+    for fact in list(facts.values()):
+        metric = fact.get("metric")
+        period = fact.get("period")
+        if metric is None or period is None:
+            continue
+        identity = (str(metric), _period_identity(period))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        label = _period_label(period)
+        if label is None:
+            continue
+        key = fact_key(metric, period, "period_label")
+        if key in facts:
+            continue
+        facts[key] = {
+            "key": key,
+            "metric": metric,
+            "period": copy.deepcopy(period),
+            "field": "period_label",
+            "value": label,
+            "unit": None,
+            "display": label,
+            "source": {"sequence": (fact.get("source") or {}).get("sequence"),
+                        "period": copy.deepcopy(period)},
+        }
 
 
 def fact_key(metric: str, period, field: str) -> str:
@@ -320,6 +454,7 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
             "display": display,
             "source": source,
         }
+    _add_period_label_facts(facts)
     return facts
 
 

@@ -44,10 +44,10 @@ def _database(tmp_path, metric: str, values: list[float], *, d3: bool = True,
     return path, conn
 
 
-def _run(path):
+def _run(path, *extra):
     return subprocess.run(
         [sys.executable, "scripts/verify_daily_metrics.py", "--db", str(path),
-         "--derived-days", "0"],
+         "--derived-days", "0", *extra],
         capture_output=True, text=True,
     )
 
@@ -511,11 +511,10 @@ def test_16_count_avg_and_last_stay_checked_on_a_consolidated_row(tmp_path,
     assert "category two (genuine): 1" in result.stdout
 
 
-# --- 16a: `unit` is checked on a consolidated row and NOWHERE else ---------- #
+# --- 16a: all seven stored aggregate columns are compared ------------------- #
 
 def test_16a_unit_is_checked_on_a_consolidated_row(tmp_path):
-    """16a, first half. Check 4 is the only comparison of `unit` anywhere in
-    this script."""
+    """16a, first half. A consolidated row's unit remains checked by check 4."""
     path, conn = _consolidated(tmp_path, "step_count", name="unit-cons")
     conn.execute("UPDATE daily_metrics SET unit = 'furlong' "
                  "WHERE metric = 'step_count'")
@@ -528,19 +527,8 @@ def test_16a_unit_is_checked_on_a_consolidated_row(tmp_path):
     assert "furlong" in result.stdout
 
 
-def test_16a_unit_is_not_checked_on_a_records_row(tmp_path):
-    """16a, second half, and this assertion is deliberately pinning a GAP.
-
-    `min`, `max` and `unit` are built into `diffs()`'s `rebuilt` temp table and
-    have never entered its discrepancy predicate, which compares four columns:
-    count, sum, avg, last. So a
-    records-derived row can carry a wrong unit for ever and this script returns
-    0. D19 does not widen that predicate — widening it turns rows red for
-    pre-D19 reasons — it files the gap separately (D19 §Q2, item 1a).
-
-    The day somebody closes that gap, THIS assertion is what fails. That is the
-    intent: it has to be a deliberate edit, not a discovery.
-    """
+def test_16a_unit_disagreement_on_a_records_row_is_reported(tmp_path):
+    """16a, second half. Unit is an ungated hard comparison on records rows."""
     path, conn = _database(tmp_path, "step_count", [3.0, 7.0], name="unit-rec")
     conn.execute("UPDATE daily_metrics SET unit = 'furlong' "
                  "WHERE metric = 'step_count'")
@@ -548,19 +536,66 @@ def test_16a_unit_is_not_checked_on_a_records_row(tmp_path):
     conn.close()
 
     result = _run(path)
-    assert result.returncode == 0, result.stdout
-    assert "furlong" not in result.stdout
+    assert result.returncode == 1, result.stdout
+    assert "unit disagreements: 1" in result.stdout
+    assert "furlong" in result.stdout
 
 
-def test_16a_min_and_max_are_not_checked_either(tmp_path):
-    """The same gap, on the other two columns. Same reason, same intent."""
+def test_16a_null_unit_disagreement_on_a_records_row_is_reported(tmp_path):
+    """16a, unit comparison treats NULL versus a value as disagreement."""
+    path, conn = _database(tmp_path, "step_count", [3.0, 7.0], name="unit-null")
+    conn.execute("UPDATE daily_metrics SET unit = NULL "
+                 "WHERE metric = 'step_count'")
+    conn.commit()
+    conn.close()
+
+    result = _run(path)
+    assert result.returncode == 1, result.stdout
+    assert "unit disagreements: 1" in result.stdout
+
+
+def test_16a_min_and_max_are_checked_after_the_era_start(tmp_path):
+    """16a, third half. The explicit flag enables the two extrema checks."""
     path, conn = _database(tmp_path, "step_count", [3.0, 7.0], name="minmax")
     conn.execute("UPDATE daily_metrics SET min = -1.0, max = 12345.0 "
                  "WHERE metric = 'step_count'")
     conn.commit()
     conn.close()
 
-    assert _run(path).returncode == 0
+    result = _run(path, "--minmax-from", "2026-01-01")
+    assert result.returncode == 1, result.stdout
+    assert "min disagreements: 1" in result.stdout
+    assert "max disagreements: 1" in result.stdout
+
+
+def test_16a_min_and_max_before_the_era_are_historical(tmp_path):
+    """16a, fourth half. A pre-era mismatch is counted, never reported."""
+    path, conn = _database(tmp_path, "step_count", [3.0, 7.0], name="historical")
+    conn.execute("UPDATE daily_metrics SET min = -1.0, max = 12345.0 "
+                 "WHERE metric = 'step_count'")
+    conn.commit()
+    conn.close()
+
+    result = _run(path, "--minmax-from", "2026-08-21")
+    assert result.returncode == 0, result.stdout
+    assert "min disagreements: 0" in result.stdout
+    assert "max disagreements: 0" in result.stdout
+    assert "historical, min/max not compared: 1 rows" in result.stdout
+    assert "-1.0" not in result.stdout
+
+
+def test_16a_min_and_max_are_untouched_without_the_flag(tmp_path):
+    """16a, fifth half. Omitting the flag preserves today's min/max behavior."""
+    path, conn = _database(tmp_path, "step_count", [3.0, 7.0], name="no-minmax")
+    conn.execute("UPDATE daily_metrics SET min = -1.0, max = 12345.0 "
+                 "WHERE metric = 'step_count'")
+    conn.commit()
+    conn.close()
+
+    result = _run(path)
+    assert result.returncode == 0, result.stdout
+    assert "min/max not compared: --minmax-from not supplied" in result.stdout
+    assert "-1.0" not in result.stdout
 
 
 # --- 17: a pre-D19 database is not merely handled, it is untouched --------- #
@@ -571,12 +606,10 @@ def _strip_timings(text: str) -> str:
     return re.sub(r"\(\d+\.\d+s\)", "(TIMEs)", text)
 
 
-def test_17_a_pre_d19_database_produces_byte_identical_output(tmp_path):
+def test_17_a_pre_d19_database_preserves_legacy_output(tmp_path):
     """17. Neither `hk_daily_totals` nor `daily_metrics.source_kind`: the output
-    must match what this script printed before D19, byte for byte. Not "works
-    on an old vault" — IDENTICAL, because the whole D19 predicate reduces to the
-    pre-D19 one when the column is absent, and the counter line is suppressed
-    rather than printed as "0 checked"."""
+    keeps the pre-D19 verdict and all old check output. The new comparison status
+    lines are additive, so remove those before comparing the legacy bytes."""
     path, conn = _database(tmp_path, "step_count", [3.0, 7.0], name="pre-d19")
     conn.execute("DROP TABLE hk_daily_total_revisions")
     conn.execute("DROP TABLE hk_daily_totals")
@@ -587,7 +620,10 @@ def test_17_a_pre_d19_database_produces_byte_identical_output(tmp_path):
 
     old_code, old_out = _run_source(_baseline_source(), path)
     new_code, new_out = _run_source(_current_source(), path)
-    assert (new_code, _strip_timings(new_out)) == (old_code, _strip_timings(old_out))
+    new_legacy = re.sub(
+        r"^(unit disagreements:.*|min/max not compared:.*)\n", "",
+        _strip_timings(new_out), flags=re.MULTILINE)
+    assert (new_code, new_legacy) == (old_code, _strip_timings(old_out))
     assert "consolidated" not in new_out
 
 
@@ -598,7 +634,10 @@ def _final_select(source: str) -> str:
     compare what the file actually says today against what it said before D19.
     """
     body = source.split("def diffs(")[1].split("\ndef ")[0]
-    return body.split('return conn.execute(\n        f"""')[1].split('"""')[0]
+    marker = ('rows = conn.execute(\n        f"""'
+              if 'rows = conn.execute(\n        f"""' in body
+              else 'return conn.execute(\n        f"""')
+    return body.split(marker)[1].split('"""')[0]
 
 
 def test_the_d19_predicate_is_equivalent_to_the_pre_d19_one_without_the_column(
@@ -606,8 +645,8 @@ def test_the_d19_predicate_is_equivalent_to_the_pre_d19_one_without_the_column(
     """On a database with no `source_kind`, edit 1 must be a no-op — not
     "usually", exhaustively.
 
-    The snapshot in `data/health.db` is exactly this shape, so this is the
-    property that makes running the script against it safe. The interesting
+    A historical vault can have exactly this shape, so this is the property
+    that makes running the script against it safe. The interesting
     cases are the NULL ones: `(d.sum IS NULL) IS NOT (r.sum IS NULL)` is the
     term the D19 edit had to wrap, and a hand-edited three-valued predicate is
     where this kind of change goes wrong. So drive every combination of

@@ -25,6 +25,10 @@ compared here. A database with no `source_kind` column behaves exactly as it did
 before D19, down to the printed bytes.
 
     ./.venv/bin/python scripts/verify_daily_metrics.py [--db PATH] [--limit N]
+        [--minmax-from YYYY-MM-DD]
+
+The min/max comparison is opt-in: supply --minmax-from explicitly when enabling
+that comparison.
 """
 from __future__ import annotations
 
@@ -114,7 +118,58 @@ def d19_storage_present(conn) -> bool:
     return _has_column(conn, "daily_metrics", "source_kind")
 
 
-def diffs(conn) -> list[dict]:
+def _comparison_rows(conn, holes: str, kind: str) -> list[dict]:
+    """Return all stored/rebuilt pairs with the columns under comparison."""
+    return [dict(row) for row in conn.execute(
+        f"""
+        SELECT COALESCE(r.metric, d.metric) metric,
+               COALESCE(r.date, d.date) date,
+               d.metric d_metric, r.metric r_metric,
+               d.count s_count, r.count r_count,
+               d.sum s_sum, r.sum r_sum, d.avg s_avg, r.avg r_avg,
+               d.min s_min, r.min r_min, d.max s_max, r.max r_max,
+               d.last s_last, r.last r_last,
+               d.unit s_unit, r.unit r_unit
+        FROM rebuilt r FULL OUTER JOIN daily_metrics d
+          ON d.metric = r.metric AND d.date = r.date
+        WHERE COALESCE(r.metric, d.metric) NOT IN ({holes})
+          AND NOT (r.metric IS NULL AND {kind} = '{CONSOLIDATED}')
+        """,
+        tuple(DERIVED_METRICS),
+    )]
+
+
+def _minmax_disagrees(stored, rebuilt) -> bool:
+    """Use the sum comparison's measured tolerance for min/max as well."""
+    return not sums_match(stored, rebuilt)
+
+
+def historical_minmax_count(conn, minmax_from: str | None) -> int:
+    """Count comparable pre-era rows excluded from the min/max comparison."""
+    if minmax_from is None:
+        return 0
+    holes = ",".join("?" * len(DERIVED_METRICS))
+    kind = ("COALESCE(d.source_kind, 'records')"
+            if _has_column(conn, "daily_metrics", "source_kind") else "'records'")
+    return sum(
+        row["date"] < minmax_from
+        and row["r_metric"] is not None
+        and row["d_metric"] is not None
+        for row in conn.execute(
+            f"""
+            SELECT COALESCE(r.metric, d.metric) metric,
+                   COALESCE(r.date, d.date) date,
+                   r.metric r_metric, d.metric d_metric
+            FROM rebuilt r FULL OUTER JOIN daily_metrics d
+              ON d.metric = r.metric AND d.date = r.date
+            WHERE COALESCE(r.metric, d.metric) NOT IN ({holes})
+              AND NOT (r.metric IS NULL AND {kind} = '{CONSOLIDATED}')
+            """,
+            tuple(DERIVED_METRICS),
+        ))
+
+
+def diffs(conn, minmax_from: str | None = None) -> list[dict]:
     """Rows where the stored aggregate disagrees with a fresh rebuild.
 
     derive.py's sleep-timing and wear_hours metrics are computed straight into
@@ -161,7 +216,7 @@ def diffs(conn) -> list[dict]:
             """,
             (metric, date, *extra, metric, date, *extra, metric, date),
         )
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT COALESCE(r.metric, d.metric) metric,
                COALESCE(r.date, d.date) date,
@@ -174,11 +229,8 @@ def diffs(conn) -> list[dict]:
           -- D19: on a consolidated row `sum` is Apple's figure and is NOT
           -- derivable from `records`; consolidated_diffs() checks it against
           -- hk_daily_totals instead. count/avg/last remain records-derived and
-          -- stay checked here: three of the FOUR columns this predicate
-          -- actually compares. (min/max/unit are built into the `rebuilt`
-          -- SELECT above and have never been compared by anything at all — a
-          -- pre-existing gap, filed separately; D19 §Q2 and item 1a. It is
-          -- pinned by test 16a so that closing it is a deliberate act.)
+          -- stay checked here. Unit is also records-derived and is compared
+          -- ungated; min/max use the explicit era gate in Python below.
           --
           -- A consolidated total for a day with no raw samples has nothing to
           -- rebuild at all, so that pair is handed over whole rather than
@@ -189,11 +241,56 @@ def diffs(conn) -> list[dict]:
            OR ({kind} <> '{CONSOLIDATED}'
                AND ((d.sum IS NULL) IS NOT (r.sum IS NULL) OR d.sum <> r.sum))
            OR ABS(COALESCE(d.avg, 0) - COALESCE(r.avg, 0)) > ?
-           OR ABS(COALESCE(d.last, 0) - COALESCE(r.last, 0)) > ?)
+           OR ABS(COALESCE(d.last, 0) - COALESCE(r.last, 0)) > ?
+           OR NOT (d.unit IS r.unit))
         ORDER BY date DESC, metric
         """,
         (*DERIVED_METRICS, TOL, TOL),
     ).fetchall()
+
+    # Keep the established four-column SELECT and predicate intact above. The
+    # wider values are joined separately so old pre-D19 predicate tests can
+    # continue to exercise that exact SQL. Min/max candidates are filtered in
+    # Python because their comparison must reuse sums_match(), not SQL ==.
+    holes = ",".join("?" * len(DERIVED_METRICS))
+    kind = ("COALESCE(d.source_kind, 'records')"
+            if _has_column(conn, "daily_metrics", "source_kind") else "'records'")
+    details = _comparison_rows(conn, holes, kind)
+    detail_by_key = {(row["metric"], row["date"]): row for row in details}
+    out = []
+    seen = set()
+    for row in rows:
+        detail = detail_by_key[(row["metric"], row["date"])]
+        detail["unit_mismatch"] = (detail["d_metric"] is not None
+                                    and detail["r_metric"] is not None
+                                    and detail["s_unit"] != detail["r_unit"])
+        detail["min_mismatch"] = (minmax_from is not None
+                                   and detail["date"] >= minmax_from
+                                   and detail["d_metric"] is not None
+                                   and detail["r_metric"] is not None
+                                   and _minmax_disagrees(detail["s_min"], detail["r_min"]))
+        detail["max_mismatch"] = (minmax_from is not None
+                                   and detail["date"] >= minmax_from
+                                   and detail["d_metric"] is not None
+                                   and detail["r_metric"] is not None
+                                   and _minmax_disagrees(detail["s_max"], detail["r_max"]))
+        out.append(detail)
+        seen.add((detail["metric"], detail["date"]))
+
+    if minmax_from is not None:
+        for detail in details:
+            key = (detail["metric"], detail["date"])
+            if key in seen or detail["d_metric"] is None or detail["r_metric"] is None:
+                continue
+            if detail["date"] < minmax_from:
+                continue
+            detail["unit_mismatch"] = detail["s_unit"] != detail["r_unit"]
+            detail["min_mismatch"] = _minmax_disagrees(detail["s_min"], detail["r_min"])
+            detail["max_mismatch"] = _minmax_disagrees(detail["s_max"], detail["r_max"])
+            if detail["min_mismatch"] or detail["max_mismatch"]:
+                out.append(detail)
+    out.sort(key=lambda row: (row["date"], row["metric"]), reverse=True)
+    return out
 
 
 def classify_diffs(conn, rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -214,7 +311,12 @@ def classify_diffs(conn, rows: list[dict]) -> tuple[list[dict], list[dict]]:
     genuine: list[dict] = []
     for row in rows:
         metric = row["metric"]
-        if not vault.raw_series_available(metric):
+        if row.get("unit_mismatch") or row.get("min_mismatch") or row.get("max_mismatch"):
+            # These are direct correctness failures. D3 can legitimately
+            # explain count/avg/last differences on a bucketed series, but it
+            # cannot explain a unit or extrema mismatch.
+            genuine.append(row)
+        elif not vault.raw_series_available(metric):
             legitimate.append(row)
         elif (vault.raw_resolution_seconds(metric)
               and sums_match(row["s_sum"], row["r_sum"])):
@@ -475,23 +577,47 @@ def derived_diffs(conn, limit: int, days: list[str]) -> list[dict]:
     return out
 
 
+def _cli_date(value: str) -> str:
+    parsed = _as_date(value)
+    if parsed is None:
+        raise argparse.ArgumentTypeError("must be a valid YYYY-MM-DD date")
+    return parsed.isoformat()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default=str(LOCAL_DB_PATH))
     ap.add_argument("--limit", type=int, default=40, help="max discrepancies to print")
+    ap.add_argument(
+        "--minmax-from", metavar="YYYY-MM-DD",
+        type=_cli_date,
+        help="compare min/max on and after this date; measured recommendation: 2026-06-11 (not a default)",
+    )
     ap.add_argument("--derived-days", type=int, default=120,
                     help="how many recent days to re-derive and check (0 = all)")
     args = ap.parse_args()
 
     t0 = time.time()
     conn = dbmod.connect(args.db, read_only=True)
-    bad = diffs(conn)
+    bad = diffs(conn, args.minmax_from)
+    historical = historical_minmax_count(conn, args.minmax_from)
     n_records, n_daily = (
         conn.execute("SELECT COUNT(*) FROM records").fetchone()[0],
         conn.execute("SELECT COUNT(*) FROM daily_metrics").fetchone()[0],
     )
     print(f"{args.db}: {n_records:,} records -> {n_daily:,} daily_metrics rows "
           f"({time.time() - t0:.1f}s)")
+    unit_disagreements = sum(row["unit_mismatch"] for row in bad)
+    min_disagreements = sum(row["min_mismatch"] for row in bad)
+    max_disagreements = sum(row["max_mismatch"] for row in bad)
+    print(f"unit disagreements: {unit_disagreements}")
+    if args.minmax_from is None:
+        print("min/max not compared: --minmax-from not supplied; "
+              "historical, min/max not compared: 0 rows")
+    else:
+        print(f"min disagreements: {min_disagreements}")
+        print(f"max disagreements: {max_disagreements}")
+        print(f"historical, min/max not compared: {historical} rows")
 
     from health_advisor import derive
     # Every derived metric must be covered by the pass above, or a metric can be
@@ -577,9 +703,10 @@ def main() -> int:
               f"{' (truncated)' if len(bad) >= args.limit else ''}:")
         for r in bad[:args.limit]:
             print(f"  {r['date']}  {r['metric']:<28} "
-                  f"count {r['s_count']} vs {r['r_count']}  "
-                  f"sum {r['s_sum']} vs {r['r_sum']}  avg {r['s_avg']} vs {r['r_avg']}  "
-                  f"last {r['s_last']} vs {r['r_last']}")
+                 f"count {r['s_count']} vs {r['r_count']}  "
+                 f"sum {r['s_sum']} vs {r['r_sum']}  avg {r['s_avg']} vs {r['r_avg']}  "
+                 f"min {r['s_min']} vs {r['r_min']}  max {r['s_max']} vs {r['r_max']}  "
+                 f"last {r['s_last']} vs {r['r_last']}  unit {r['s_unit']!r} vs {r['r_unit']!r}")
         print("\n(stored vs rebuilt). Repair with recompute_daily_metrics(full=True).")
 
     if bad_derived:

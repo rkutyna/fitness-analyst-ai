@@ -49,6 +49,57 @@ def test_fact_set_is_closed_and_pairs_the_published_presentation():
         "Run: {" + plausible_missing + "}.", facts) is None
 
 
+def test_week_and_day_periods_publish_human_period_labels():
+    week_period = "2026-08-10:2026-08-16"
+    day_period = "2026-08-07"
+    block_period = {
+        "start": "2026-07-27", "end": "2026-08-17",
+        "period_starts": ["2026-07-27", "2026-08-03",
+                           "2026-08-10", "2026-08-17"],
+    }
+    week_facts = fact_template.build_fact_set(_ledger(period=week_period))
+    day_facts = fact_template.build_fact_set(_ledger(period=day_period))
+    block_facts = fact_template.build_fact_set(_ledger(period=block_period))
+
+    week_key = fact_template.fact_key("jog_minutes", week_period,
+                                      "period_label")
+    day_key = fact_template.fact_key("jog_minutes", day_period,
+                                     "period_label")
+    block_key = fact_template.fact_key("jog_minutes", block_period,
+                                       "period_label")
+    assert week_facts[week_key]["value"] == "the week of August 10"
+    assert day_facts[day_key]["value"] == "Fri Aug 7"
+    assert block_facts[block_key]["value"] == "the last 4 weeks"
+
+
+def test_period_label_placeholder_interpolates_date_without_digit_refusal():
+    period = "2026-08-10:2026-08-16"
+    facts = fact_template.build_fact_set(_ledger(period=period))
+    key = fact_template.fact_key("jog_minutes", period, "period_label")
+    template = "Training for {" + key + "}."
+
+    assert fact_template.scan_template(template, facts)[
+        "digits_outside_placeholders"] is False
+    assert fact_template.interpolate_template(template, facts) == (
+        "Training for the week of August 10.")
+
+
+def test_unknown_period_shape_publishes_no_label():
+    period = {"kind": "unknown", "window": "not a date"}
+    known_period = "2026-08-07"
+    facts = {
+        **fact_template.build_fact_set(_ledger(period=known_period)),
+        **fact_template.build_fact_set(_ledger(period=period)),
+    }
+
+    known_key = fact_template.fact_key("jog_minutes", known_period,
+                                      "period_label")
+    assert facts[known_key]["value"] == "Fri Aug 7"
+    assert not any(fact.get("field") == "period_label"
+                   and fact.get("period") == period
+                   for fact in facts.values())
+
+
 def test_digit_inside_placeholder_is_allowed_but_digit_in_prose_is_refused():
     facts = fact_template.build_fact_set(_ledger())
     key = fact_template.fact_key("jog_minutes", "2026-08-17", "mean")

@@ -87,8 +87,43 @@ def test_fact_template_flag_runs_gather_then_closed_set_narration(
     assert "VO2" in calls[1][0]
     assert "last 4 weeks" in calls[1][0]
     assert "ISO dates" in calls[1][0]
+    assert ("When a date or period name belongs in prose, use "
+            "{fact|metric=...|period=...|field=period_label}") in calls[1][0]
+    assert ("Activity for {fact|metric=jog_minutes|period=s:2026-08-10:2026-08-16|"
+            "field=period_label}.") in calls[1][0]
     assert calls[0][1]["tools"] == []
     assert calls[1][1]["tools"] == []
+
+
+def test_period_label_fact_is_excluded_from_figures_total(monkeypatch, vault):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    period = "2026-08-10:2026-08-16"
+    ledger = [{
+        "sequence": 1, "tool_name": "synthetic_metric", "arguments": {},
+        "result": {
+            "metric": "jog_minutes", "unit": "min", "period": period,
+            "mean": 50.1,
+            "presentation": {"metric": "jog_minutes", "period": period,
+                              "field": "presentation", "value": "50 m"},
+        },
+    }]
+    value_key = fact_template.fact_key("jog_minutes", period, "mean")
+    label_key = fact_template.fact_key("jog_minutes", period, "period_label")
+    responses = iter([
+        "acknowledged",
+        "During {" + label_key + "}, your run was {" + value_key + "}.",
+    ])
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: next(responses))
+
+    result = chat.answer_question(vault, "How was my run?")
+
+    assert result["mode"] == "narration"
+    assert result["text"] == "During the week of August 10, your run was 50 m."
+    assert result["verification"]["figures_total"] == 1
+    assert result["verification"]["figures_verified"] == 1
 
 
 def test_fact_template_advice_quantities_reach_public_verification(
@@ -640,7 +675,7 @@ ASK_RESULT_KEYS = {"text", "mode", "tool_trace", "verification"}
 ASK_VERIFICATION_KEYS = {
     "ok", "grounded", "unsupported", "reason", "verdict", "structural_claims",
     "figures_verified", "figures_total", "tier_counts", "tier1_path_bound",
-    "tier2_metric_recomputed", "tool_calls", "judge_score",
+    "tier2_metric_recomputed", "tool_calls", "judge_score", "cause",
 }
 CAPTURE_KEYS = {"attempt", "prose", "claims", "verification", "judge_score",
                 "ledger"}

@@ -20,18 +20,20 @@ HA_LLM_BACKEND:
 
 Every error degrades to "" and never raises, so the callers'
 grounding/judge/fallback gates always receive a clean string and a slow or down
-model can never crash a briefing. Interactive Telegram chat stays on the Hermes
-gateway and does NOT go through here."""
+model can never crash a briefing. Interactive chat is outside this model
+transport."""
 from __future__ import annotations
 
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import httpx
 import urllib.parse
@@ -47,8 +49,44 @@ OLLAMA_URL = os.environ.get("HA_OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.environ.get("HA_LLM_MODEL", "qwen3.5:9b-q4_K_M")
 KEEP_ALIVE = os.environ.get("HA_LLM_KEEP_ALIVE", "10m")  # stay resident across narrate→judge→retry
 OPENROUTER_URL = os.environ.get("HA_OPENROUTER_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.environ.get("HA_OPENROUTER_MODEL", "~deepseek/deepseek-v4-flash-latest")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("HA_OPENROUTER_MODEL")
+
+
+def _read_openrouter_api_key_file(path: str) -> str:
+    """Read and validate the explicitly configured OpenRouter key file."""
+    try:
+        raw = Path(path).read_text()
+    except OSError as exc:
+        raise RuntimeError(
+            f"HA_OPENROUTER_API_KEY_FILE={path!r} is set but could not be "
+            f"read ({exc}). Refusing to start rather than falling back to "
+            "OPENROUTER_API_KEY.") from exc
+
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode not in (0o600, 0o400):
+        raise RuntimeError(
+            f"refusing to start: {path} is mode {mode:o}; D16 requires 600 "
+            "or 400. Run chmod 600 on it (host side).")
+
+    key = "".join(raw.split())
+    if not key:
+        raise RuntimeError(
+            f"refusing to start: the OpenRouter key in {path} is empty "
+            "after trimming; refusing to fall back to OPENROUTER_API_KEY.")
+    return key
+
+
+OPENROUTER_API_KEY_FILE = os.environ.get(
+    "HA_OPENROUTER_API_KEY_FILE", "").strip()
+_OPENROUTER_API_KEY_ENV = os.environ.get("OPENROUTER_API_KEY")
+_OPENROUTER_API_KEY_FILE_VALUE = (
+    _read_openrouter_api_key_file(OPENROUTER_API_KEY_FILE)
+    if OPENROUTER_API_KEY_FILE else None)
+OPENROUTER_API_KEY = (_OPENROUTER_API_KEY_FILE_VALUE
+                      if OPENROUTER_API_KEY_FILE
+                      else (_OPENROUTER_API_KEY_ENV or ""))
+OPENROUTER_API_KEY_SOURCE = (
+    "file" if OPENROUTER_API_KEY_FILE else "env")
 # Unlike sampling defaults, this changes both cost and model behaviour. It is
 # deliberately absent when unstated: assert_backend_approved() refuses an
 # OpenRouter process that does not name `on`, `off` or `low` at its entry point.
@@ -251,8 +289,29 @@ def assert_backend_approved() -> None:
     assert_endpoint_approved(BACKEND)
     if BACKEND != "openrouter":
         return
-    approved_providers = _approved_openrouter_providers()
+    if (_OPENROUTER_API_KEY_FILE_VALUE is not None
+            and _OPENROUTER_API_KEY_ENV is not None
+            and _OPENROUTER_API_KEY_FILE_VALUE != _OPENROUTER_API_KEY_ENV):
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            "HA_OPENROUTER_API_KEY_FILE and OPENROUTER_API_KEY are both set "
+            "but disagree; remove one or make them identical. Refusing to "
+            "start rather than silently choosing different credentials.")
     known_models = ", ".join(sorted(APPROVED_OPENROUTER_PROVIDERS))
+    if OPENROUTER_MODEL is None:
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            "HA_OPENROUTER_MODEL is unset; set it to a pinned model "
+            f"(known models: {known_models})."
+        )
+    if OPENROUTER_MODEL.startswith("~"):
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            f"OPENROUTER_MODEL {OPENROUTER_MODEL!r} is a floating model; "
+            "set a pinned model "
+            f"(known models: {known_models})."
+        )
+    approved_providers = _approved_openrouter_providers()
     if approved_providers is None:
         raise RuntimeError(
             "LLM backend 'openrouter' is not approved under D15: "
@@ -831,12 +890,12 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
 
 
 # Read-only tools exposed to the deep-dive researcher. write_insight and the
-# the personal training-plan tools are intentionally absent from this build —
+# plan tools (get_planned_session/get_week_plan) are intentionally excluded —
 # the researcher only reads health metrics.
 RESEARCHER_TOOLS = ("list_available_metrics", "get_daily_series", "summarize_metric",
                     "compare_periods", "get_intraday", "list_workouts",
                     "get_latest", "get_briefing",
-                    # The two central plan rules are the +15%/week impact ramp
+                    # PLAN.md's two central rules are the +15%/week impact ramp
                     # and the 150 bpm HR cap. The weekly deep dive was asked to
                     # judge both while holding neither instrument: workout
                     # duration counts walk breaks (~2x impact) and a session
@@ -856,7 +915,8 @@ COACH_TOOLS = (
     "compare_periods", "get_intraday", "get_hr_zones", "list_workouts",
     "get_workout_segments", "get_impact_volume", "get_sleep_regularity",
     "get_training_load_detail", "get_run_form", "get_briefing", "get_latest",
-    "correlate_metrics", "scan_correlations", "get_subjective", "food_lookup",
+    "correlate_metrics", "scan_correlations", "get_planned_session",
+    "get_week_plan", "get_plan_overview", "get_subjective", "food_lookup",
     "food_meal_total", "get_weekly_series", "get_block_structure",
     "get_weekly_readiness", "get_benchmark_series", "get_monthly_running_power",
     "analyst_query",

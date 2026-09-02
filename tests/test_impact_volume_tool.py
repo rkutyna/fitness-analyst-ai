@@ -7,12 +7,12 @@ around that number. Three separate ways the week-over-week figure misled:
     "vs the previous period" silently spanned the gap;
   - the current week was compared against a whole one all week long (live:
     -71.3% on a Wednesday, no flag);
-  - the 16 min/mi jog cutoff sits inside the pace band Week 5 is training
-    toward, so slowing toward the plan's own target can drop buckets out of
+  - the jog cutoff sits inside the pace band used by the configured
+    classification, so slowing toward the target can drop buckets out of
     jog_minutes entirely.
 
 The numbers themselves must not move: a consistency test pins the tool's
-periods to analysis.impact_volume's.
+bucket values to analysis.impact_volume's while the tool adds its claim ranges.
 """
 from __future__ import annotations
 
@@ -21,6 +21,17 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from health_advisor import analysis as A
+from health_advisor import fact_template
+
+
+def _pin_as_of(conn, day: str = "2026-08-21"):
+    """Give the test vault the same horizon as the linked production snapshot."""
+    conn.execute(
+        "INSERT INTO daily_metrics (metric, date, count, sum, avg, min, max, last, unit) "
+        "VALUES ('step_count', ?, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 'count')",
+        (day,),
+    )
+    conn.commit()
 
 
 BLOCK_WEEK_VALUES = {
@@ -134,6 +145,37 @@ def test_a_week_with_no_samples_is_a_zero_row_not_a_missing_one(gapdb, tools):
     assert gap["no_data"] is True
 
 
+def test_fact_template_labels_impact_buckets_as_their_effective_ranges(
+        conn, tools):
+    """#271: the claim payload must name the bucket, not just its Monday."""
+    _pin_as_of(conn, "2026-08-21")
+    _emit(conn, "2026-08-10", "12:00", 20, 12.0)
+    _emit(conn, "2026-08-17", "12:00", 20, 12.0)
+    _emit(conn, "2026-08-18", "12:00", 20, 12.0)
+
+    def period_label(start, end, by, period_start):
+        result = tools.get_impact_volume(start, end, by=by)
+        ledger = [{"sequence": 1, "tool_name": "get_impact_volume",
+                   "arguments": {"start": start, "end": end, "by": by},
+                   "result": result}]
+        facts = {
+            **fact_template.build_fact_set(ledger),
+            **fact_template.build_attachment_facts(ledger),
+        }
+        row = next(row for row in result["periods"]
+                   if row["period_start"] == period_start)
+        key = fact_template.fact_key(
+            "jog_minutes", row["period"], "period_label")
+        return facts[key]["value"]
+
+    assert period_label("2026-08-17", "2026-08-21", "week", "2026-08-17") \
+        == "from Mon Aug 17 to Fri Aug 21"
+    assert period_label("2026-08-10", "2026-08-16", "week", "2026-08-10") \
+        == "the week of August 10"
+    assert period_label("2026-08-17", "2026-08-21", "day", "2026-08-18") \
+        == "Tue Aug 18"
+
+
 def test_the_week_after_a_gap_does_not_compare_across_it(gapdb, tools):
     """It used to read '0% change vs the previous period' against a week two
     weeks back, which is not the previous period."""
@@ -179,7 +221,8 @@ def test_full_week_change_pct_is_unchanged(conn, tools):
     assert out["periods"][1]["partial"] is False
 
 
-def test_tool_periods_still_match_analysis_exactly(partialdb, vault_path, tools):
+def test_tool_period_values_still_match_analysis_exactly(partialdb, vault_path,
+                                                         tools):
     """The tool wraps analysis.impact_volume; it must not restate its numbers."""
     from health_advisor import db as dbmod
     c = dbmod.connect(vault_path, read_only=True)
@@ -189,9 +232,49 @@ def test_tool_periods_still_match_analysis_exactly(partialdb, vault_path, tools)
         c.close()
     got = tools.get_impact_volume("2026-06-01", "2026-06-09", by="week")["periods"]
     for a, b in zip(rows, got):
-        for key in ("jog_minutes", "jog_miles", "jog_pace_min_per_mi",
-                    "walk_minutes", "walk_miles"):
-            assert a[key] == b[key], key
+        # The tool deliberately recomputes the comparison label after filling
+        # the sequence; every bucket-derived field must remain byte-identical.
+        comparable = set(a) - {"jog_change_pct"}
+        assert {key: b[key] for key in comparable} == {
+            key: a[key] for key in comparable
+        }
+        expected_end = min(
+            date.fromisoformat(a["period_start"]) + timedelta(days=6),
+            date.fromisoformat("2026-06-09"),
+        ).isoformat()
+        assert b["period"] == f'{a["period_start"]}:{expected_end}'
+
+
+def test_end_beyond_as_of_does_not_publish_a_future_week(conn, tools):
+    """#270: the end bound is seven days beyond the snapshot horizon."""
+    _pin_as_of(conn)
+    _emit(conn, "2026-08-17", "12:00", 600, 12.0)
+
+    out = tools.get_impact_volume(
+        "2026-08-17", "2026-08-28", by="week"
+    )
+
+    assert out["as_of"] == "2026-08-21"
+    assert out["count"] == 1
+    assert [row["period_start"] for row in out["periods"]] == ["2026-08-17"]
+    assert all(row["period_start"] < out["as_of"] for row in out["periods"])
+    at_live = next(row for row in out["jog_threshold_sensitivity"]
+                   if row["live_cutoff"])
+    assert at_live["jog_minutes"] == out["periods"][0]["jog_minutes"]
+
+
+def test_window_entirely_after_as_of_has_a_typed_reason(conn, tools):
+    _pin_as_of(conn)
+
+    out = tools.get_impact_volume(
+        "2026-08-22", "2026-08-28", by="week"
+    )
+
+    assert out == {
+        "start": "2026-08-22", "end": "2026-08-28", "by": "week",
+        "as_of": "2026-08-21", "count": 0, "periods": [],
+        "reason": "window_after_as_of",
+    }
 
 
 def test_four_week_blocks_pin_complete_and_last_day_anchors(blockdb, tools):
@@ -247,7 +330,7 @@ def test_block_output_names_anchor_and_partial_completeness(blockdb, tools):
     assert complete["anchor"] == "last_complete_week"
     assert complete["anchor_end"] == "2026-08-16"
     assert dropped["end_default"] is False
-    assert "date.today()" in dropped["rule"]
+    assert "session as_of" in dropped["rule"]
     partial = dropped["partial_trailing_week"]
     assert partial["period_start"] == "2026-08-17"
     assert partial["days_covered"] == 5
@@ -274,10 +357,10 @@ def test_block_output_exposes_each_value_used_by_the_mean(blockdb, tools):
     recent = out["blocks"]["recent"]
     assert [(w["metric"], w["period"], w["field"], w["value"])
             for w in recent["weeks"]] == [
-        ("jog_minutes", "2026-07-20", "jog_minutes", 68.0),
-        ("jog_minutes", "2026-07-27", "jog_minutes", 46.7),
-        ("jog_minutes", "2026-08-03", "jog_minutes", 32.7),
-        ("jog_minutes", "2026-08-10", "jog_minutes", 52.7),
+        ("jog_minutes", "2026-07-20:2026-07-26", "jog_minutes", 68.0),
+        ("jog_minutes", "2026-07-27:2026-08-02", "jog_minutes", 46.7),
+        ("jog_minutes", "2026-08-03:2026-08-09", "jog_minutes", 32.7),
+        ("jog_minutes", "2026-08-10:2026-08-16", "jog_minutes", 52.7),
     ]
     assert recent["mean"] == pytest.approx(
         sum(w["value"] for w in recent["weeks"]) / 4, abs=0.05)

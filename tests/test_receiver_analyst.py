@@ -161,13 +161,12 @@ def test_main_explicitly_selects_transient_executor(monkeypatch, tmp_path):
     uvicorn = SimpleNamespace(
         run=lambda app, **kwargs: selected.update(uvicorn_kwargs=kwargs)
     )
-    monkeypatch.setattr(receiver, "create_app", fake_create_app)
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
 
     assert receiver.main([
         "--vault", str(tmp_path / "vault.db"),
         "--analyst-executor", "transient",
-    ]) == 0
+    ], app_factory=fake_create_app) == 0
     assert selected["analyst_executor_factory"] is sb.TransientUnitExecutor
 
 

@@ -7,7 +7,7 @@
   its watermark until an explicit re-derivation migration moves that marker.
 - Binds to localhost by default (front with `tailscale serve`, never 0.0.0.0).
 
-Run:  python -m health_advisor.receiver --vault PATH [--host H --port P]
+Run:  the receiver module --vault PATH [--host H --port P]
 Env:  HA_SECRET_FILE (preferred) or HA_SHARED_SECRET; HA_REQUIRE_SECRET=1 makes
       "no secret at all" a startup failure instead of an unauthenticated receiver
       HEALTH_ADVISOR_ANALYST_EXECUTOR=transient explicitly selects the
@@ -31,8 +31,11 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from typing import Callable
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.responses import Response
 
 from . import db
 from . import chat
@@ -253,7 +256,8 @@ def _health(ctx):
             # Which path the secret came from — "file" or "env". Never the
             # secret. #101 needs this observable: "we deployed the file
             # version" is a claim, and this is the check.
-            "secret_source": SHARED_SECRET_SOURCE}
+            "secret_source": SHARED_SECRET_SOURCE,
+            "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE}
 
 
 def _ask_freshness(ctx, as_of: str | None) -> dict:
@@ -376,9 +380,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     small enough for the commit to be atomic, and an exception leaves records,
     tombstones, anchors, and the commit key all rolled back together.
     """
-    if SHARED_SECRET:
-        if x_health_secret != SHARED_SECRET:
-            raise HTTPException(status_code=401, detail="missing or bad shared secret")
+    _require_ingest_secret(x_health_secret)
 
     try:
         payload = json.loads(raw)
@@ -751,8 +753,15 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     })
 
 
+def _require_ingest_secret(x_health_secret: str | None) -> None:
+    if SHARED_SECRET and x_health_secret != SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="missing or bad shared secret")
+
+
 def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
-               analyst_executor_factory=analyst_sandbox.default_executor) -> FastAPI:
+               analyst_executor_factory=analyst_sandbox.default_executor,
+               ingest_guard: Callable[[], Response | None] | None = None,
+               health_extra: Callable[[], dict] | None = None) -> FastAPI:
     """One receiver bound to one user's vault.
 
     A factory rather than a module-level `app` because the vault has to be
@@ -771,13 +780,28 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     async def _raw_body(request: Request) -> bytes:
         return await _raw_body_for(ctx, request)
 
+    async def _ingest_body(request: Request):
+        # A deployment guard must run before this dependency reads the body.
+        # Returning its response as the dependency value lets the sync route
+        # short-circuit without moving the blocking ingest work onto the loop.
+        if ingest_guard is not None:
+            _require_ingest_secret(request.headers.get("x-health-secret"))
+            if refusal := ingest_guard():
+                return refusal
+        return await _raw_body(request)
+
     @app.get("/health")
     def health():
-        return _health(ctx)
+        payload = _health(ctx)
+        if health_extra is not None:
+            payload.update(health_extra())
+        return payload
 
     @app.post("/v1/ingest")
-    def healthkit_ingest(request: Request, raw: bytes = Depends(_raw_body),
+    def healthkit_ingest(request: Request, raw=Depends(_ingest_body),
                          x_health_secret: str | None = Header(default=None)):
+        if isinstance(raw, Response):
+            return raw
         return _healthkit_ingest(ctx, request, raw, x_health_secret)
 
     @app.post("/v1/analyst")
@@ -936,12 +960,12 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     return app
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:
     import argparse
 
     import uvicorn
 
-    ap = argparse.ArgumentParser(prog="python -m health_advisor.receiver")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--vault", "--db", dest="vault", required=True,
                     help="path to the vault this receiver ingests into")
     ap.add_argument("--user", default="local", help="user id this vault belongs to")
@@ -972,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
         executor_factory = analyst_sandbox.TransientUnitExecutor
     # Keep access logging disabled so request metadata cannot become a health-data
     # trail in the journal.
-    uvicorn.run(create_app(ctx, analyst_executor_factory=executor_factory),
+    uvicorn.run(app_factory(ctx, analyst_executor_factory=executor_factory),
                 host=args.host, port=args.port,
                 access_log=args.access_log, log_level="info")
     return 0

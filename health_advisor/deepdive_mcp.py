@@ -38,8 +38,18 @@ class _CallLedger:
 
     def __init__(self, path: str):
         self.path = os.fspath(path)
+        self.window_override = self._read_window_override()
         self._next_sequence = self._read_next_sequence()
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+
+    def _read_window_override(self):
+        """Read the ask window sidecar, which may be made by another process."""
+        try:
+            with open(self.path + ".window_override.json", encoding="utf-8") as fh:
+                value = json.load(fh)
+            return value if isinstance(value, dict) else None
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
 
     def _read_next_sequence(self) -> int:
         """Continue a ledger if a caller deliberately reuses its run path."""
@@ -80,7 +90,8 @@ class _CallLedger:
             "preview": encoded[:4096].decode("utf-8", errors="replace"),
         }, True, len(encoded)
 
-    def append(self, tool_name: str, arguments: dict, result) -> int:
+    def append(self, tool_name: str, arguments: dict, result,
+               *, window_override: dict | None = None) -> int:
         sequence = self._next_sequence
         result_value, result_elided, result_bytes = self._result_value(result)
         entry = {
@@ -91,6 +102,8 @@ class _CallLedger:
             "result_elided": result_elided,
             "result_bytes": result_bytes,
         }
+        if window_override is not None:
+            entry["window_override"] = self._json_value(window_override)
         with open(self.path, "a", encoding="utf-8") as fh:
             json.dump(entry, fh, sort_keys=True, separators=(",", ":"))
             fh.write("\n")
@@ -176,18 +189,25 @@ def _ledger_wrapper(tool_name: str, fn, ledger: _CallLedger | None):
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        arguments = _call_arguments(fn, args, kwargs)
+        signature = inspect.signature(fn)
+        partial = signature.bind_partial(*args, **kwargs)
+        model_arguments = dict(partial.arguments)
+        effective_arguments = dict(model_arguments)
+        override = _window_override_for_call(ledger, signature,
+                                             model_arguments, effective_arguments)
+        arguments = _call_arguments(fn, (), effective_arguments)
         try:
-            result = fn(*args, **kwargs)
+            result = fn(**effective_arguments)
         except Exception as exc:
             # A failed call is still a call observed by the server.  Recording
             # it makes a missing result explicit without changing MCP errors.
             ledger.append(tool_name, arguments, {
                 "_error_type": type(exc).__name__,
                 "_error": str(exc),
-            })
+            }, window_override=override)
             raise
-        sequence = ledger.append(tool_name, arguments, result)
+        sequence = ledger.append(tool_name, arguments, result,
+                                 window_override=override)
         # Keep the evidence record exactly as the server observed it, while
         # publishing its citation key to the model.  The private key is not a
         # result field and therefore cannot accidentally become claim evidence.
@@ -204,6 +224,42 @@ def _ledger_wrapper(tool_name: str, fn, ledger: _CallLedger | None):
 
     wrapped.__signature__ = inspect.signature(fn)
     return wrapped
+
+
+def _window_override_for_call(ledger: _CallLedger, signature, model_arguments,
+                              effective_arguments) -> dict | None:
+    """Apply the chat's single resolved window to one eligible tool call."""
+    config = ledger.window_override
+    if config is None:
+        return None
+    if config.get("status") != "single":
+        return {"applied": False, "reason": config.get("reason", "no_override"),
+                **({"phrases": config["phrases"]}
+                   if isinstance(config.get("phrases"), list) else {})}
+    window = config.get("window")
+    if (not isinstance(window, dict)
+            or not {"start", "end"} <= set(window)):
+        return {"applied": False, "reason": "invalid_window_override"}
+    parameters = signature.parameters
+    if "start" not in parameters or "end" not in parameters:
+        return {"applied": False, "reason": "tool_has_no_start_end",
+                "phrase": window.get("matched_phrase")}
+    model_sent = {name: model_arguments.get(name)
+                  for name in ("start", "end")
+                  if name in model_arguments}
+    if "by" in model_arguments:
+        model_sent["by"] = model_arguments["by"]
+    effective_arguments["start"] = window["start"]
+    effective_arguments["end"] = window["end"]
+    if window.get("by_hint") == "week" and "by" in parameters:
+        effective_arguments["by"] = "week"
+    applied = {"start": effective_arguments["start"],
+               "end": effective_arguments["end"]}
+    if "by" in effective_arguments:
+        applied["by"] = effective_arguments["by"]
+    return {"phrase": window.get("matched_phrase"),
+            "model_sent_window": model_sent,
+            "applied_window": applied}
 
 
 def build_server(ctx: VaultContext, *, scratch_path: str = "",

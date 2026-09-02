@@ -12,3 +12,4 @@ apple_health_export/
 dist/
 build/
 .pytest_cache/
+.claude/

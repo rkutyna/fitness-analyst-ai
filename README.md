@@ -188,10 +188,9 @@ unconfined.
 > **not** blocked on GitHub's `macos-latest` runner. Run
 > `pytest tests/test_analyst_sandbox.py` on your own platform before relying on
 > the confinement, and see [SECURITY.md](SECURITY.md) for the measured results.
-> **On Linux the confinement is CONFIRMED BROKEN** (issue #3): measured on an
-> unprivileged Ubuntu 26.04 host, sandboxed code can write to `$HOME`, write
-> outside its work directory, and both write and exfiltrate the vault. Treat
-> analyst mode on Linux as unconfined until that is fixed.
+> On Linux the confinement holds, but the attack corpus **over-reports** four
+> classes as unblocked — a scoring assumption that only fits macOS, not a hole
+> (issue #3). Verified: nothing escapes to the host.
 
 ## LLM backends
 

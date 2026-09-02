@@ -178,24 +178,27 @@ exception named explicitly in a module-level `KNOWN_GAPS`. Measured results:
 |---|---|
 | macOS 26.x, arm64 | Attack corpus **fully blocked** (one documented gap: `/Users/Shared` is readable) |
 | GitHub `macos-latest` runner | **`DYLD_INSERT_LIBRARIES` injection is NOT blocked** |
-| Linux (bubblewrap), unprivileged host — Ubuntu 26.04, bwrap 0.11.1 | **CONFIRMED BROKEN: `filesystem_write` 3/5, vault writable and exfiltratable** |
-| Linux (bubblewrap), privileged container | Same defect, one class *fewer* visible |
+| Linux (bubblewrap), unprivileged host — Ubuntu 26.04, bwrap 0.11.1 | Confining correctly; corpus **over-reports** 4 classes (issue #3) |
 
-> ### ⚠️ Linux confinement is CONFIRMED BROKEN — do not rely on it
+> ### Linux results from the attack corpus are **over-reported** — see issue #3
 >
-> Measured on an unprivileged Ubuntu 26.04 host with bubblewrap 0.11.1 and
-> unprivileged user namespaces enabled. Sandboxed code **can write into `$HOME`,
-> write outside its granted `work/` directory, open the vault read-write, and
-> `VACUUM INTO` a copy of the vault to a path of its choosing.** Those are
-> precisely the guarantees claimed below.
+> On the bubblewrap executor the corpus reports four classes "NOT BLOCKED"
+> (`write_into_home`, `write_into_tmp_outside_work`, `attach_and_write`,
+> `vacuum_into_exfil`). **Verified on an unprivileged Ubuntu 26.04 host: none of
+> them escape.** No probe file appears on the host filesystem or in the host
+> `$HOME`, and the vault is byte-unchanged with `PRAGMA integrity_check` clean.
 >
-> This was initially suspected to be an artifact of the `--privileged` container
-> CI needs to run bubblewrap at all. It is not: the real host shows **one more**
-> unblocked class than CI did, so privilege was masking part of it.
+> The cause is a scoring assumption, not a hole. Each probe prints `UNSAFE` when
+> its own write *succeeds*, which is a correct escape test under seatbelt —
+> macOS denies by path, so a successful write really did escape. Under
+> bubblewrap the child gets a namespace-local `/tmp` and `$HOME`, so the write
+> succeeds harmlessly and vanishes with the namespace. The corpus cannot tell
+> "confined" from "escaped" on Linux.
 >
-> **Until issue #3 is fixed, treat analyst mode on Linux as unconfined** —
-> equivalent to running model-written Python as your own user. Do not point it
-> at data you would not let an arbitrary script read or overwrite.
+> It errs toward alarm rather than false comfort, which is the right direction
+> for a security test — but it makes the Linux numbers unusable as a signal
+> until each probe verifies from the parent that the artifact exists on the
+> host.
 
 The macOS discrepancy is a real open question, not a test artifact: the same
 corpus passes on one macOS configuration and fails on another, which means the

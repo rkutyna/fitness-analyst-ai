@@ -21,10 +21,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # artifact self-contained; pyproject ships it as package data.
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
-# The shape of a vault, stamped into `vault_meta` when one is created and never
-# rewritten afterwards. Nothing reads it yet — that is the point. A migration
-# across every user's vault has to know what shape each one is in, and a vault
-# that never said cannot be asked: the answer would have to be inferred from its
+# The shape of a vault, stamped into `vault_meta` when one is created and
+# advanced only after the migration sequence has completed. A migration across
+# every user's vault has to know what shape each one is in, and a vault that
+# never said cannot be asked: the answer would have to be inferred from its
 # contents, per user, at the exact moment inference is least affordable. Three
 # lines now against that, decided 2026-08-22 (#11).
 #
@@ -52,14 +52,21 @@ VAULT_SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 30_000
 
 
+class _VaultConnection(sqlite3.Connection):
+    """Connection type used to retain the requested open mode locally."""
+
+
 def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
     """Open a connection with sane pragmas. read_only uses a URI immutable mode."""
     db_path = Path(db_path)
     if read_only:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, factory=_VaultConnection
+        )
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, factory=_VaultConnection)
+    conn._health_advisor_read_only = read_only
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     if not read_only:
@@ -329,8 +336,21 @@ def _apply_table_migrations(conn: sqlite3.Connection) -> None:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create all tables/indexes, then apply additive column migrations.
-    Safe to run repeatedly (IF NOT EXISTS + add-if-missing)."""
+    """Migrate a writable vault, then declare the shape that migration made.
+
+    A read-only connection is intentionally a no-op after the compatibility
+    check. Newer vaults are refused before any schema operation; older and
+    undeclared writable vaults are stamped only after all migrations succeed.
+    """
+    declared = vault_schema_version(conn)
+    if declared is not None and declared > VAULT_SCHEMA_VERSION:
+        raise ValueError(
+            f"vault declares schema version {declared}, newer than code version "
+            f"{VAULT_SCHEMA_VERSION}"
+        )
+    if getattr(conn, "_health_advisor_read_only", False):
+        return
+
     # Constraint changes are table migrations, not column migrations. Do this
     # before schema.sql so its IF NOT EXISTS triggers cannot preserve the old
     # assistant-only trigger on an existing vault.
@@ -344,13 +364,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     _apply_column_migrations(conn)
     _apply_table_migrations(conn)
     conn.executescript(SCHEMA_PATH.read_text())
-    # INSERT OR IGNORE, deliberately: opening an old vault with new code must
-    # not silently relabel it as the new shape. The stamp records what created
-    # the file, and a migration is what changes it.
-    conn.executemany(
-        "INSERT OR IGNORE INTO vault_meta (key, value) VALUES (?, ?)",
-        [("schema_version", str(VAULT_SCHEMA_VERSION)), ("created_at", utcnow_iso())],
-    )
     # W7-7: the treadmill benchmark is deliberately outside the raw workout
     # schema. Its four stage rows are a hand-recorded instrument, not Apple
     # Health workout data, and must survive re-ingestion of that data.
@@ -380,6 +393,27 @@ def init_db(conn: sqlite3.Connection) -> None:
     # did not exist during the pre-schema pass.
     _apply_column_migrations(conn)
     _apply_table_migrations(conn)
+
+    # The declaration is metadata about the shape after the complete
+    # migration sequence above, not about the code that happened to open the
+    # file. Preserve created_at while advancing an existing declaration;
+    # insert it for a pre-stamp vault or a fresh one. This is intentionally the
+    # last database operation before commit, so a failed migration cannot make
+    # the vault claim a shape it does not have.
+    if declared is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO vault_meta (key, value) VALUES (?, ?)",
+            ("schema_version", str(VAULT_SCHEMA_VERSION)),
+        )
+    elif declared < VAULT_SCHEMA_VERSION:
+        conn.execute(
+            "UPDATE vault_meta SET value = ? WHERE key = 'schema_version'",
+            (str(VAULT_SCHEMA_VERSION),),
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO vault_meta (key, value) VALUES (?, ?)",
+        ("created_at", utcnow_iso()),
+    )
     conn.commit()
 
 
@@ -441,11 +475,11 @@ def record_key(
 
 
 def vault_schema_version(conn: sqlite3.Connection) -> int | None:
-    """The shape this vault was created in, or None if it predates the stamp.
+    """The shape this vault currently declares, or None if it predates the stamp.
 
     None is a real answer and not an error: every vault built before
-    2026-08-22 is in that state, and a migration has to handle it by inspection
-    rather than by refusing.
+    2026-08-22 is in that state, and init_db handles it as a legacy vault by
+    running the migration sequence before adding the declaration.
     """
     try:
         row = conn.execute(

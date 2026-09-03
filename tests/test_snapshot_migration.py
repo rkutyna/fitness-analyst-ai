@@ -310,20 +310,92 @@ def test_a_vault_says_what_shape_it_was_built_in(snapshot, tmp_path):
     assert stamped["created_at"].startswith("20")
 
 
-def test_the_stamp_records_what_built_the_file_not_what_opened_it(vault_path):
-    """Opening an old vault with new code must not silently relabel it as the
-    new shape. The stamp is written once; a migration is what changes it."""
-    ctx = VaultContext.local(vault_path, user_id="u", writable=True)
-    conn = ctx.connect()
+def test_init_db_migrates_a_preexisting_vault_before_advancing_its_stamp(snapshot):
+    """An old declaration advances only after the legacy table is migrated."""
+    conn = dbmod.connect(snapshot)
+    try:
+        # Model a pre-existing v1 vault with rows in several tables and the
+        # v1 daily_metrics shape that lacks both additive columns.
+        conn.execute("DROP TABLE daily_metrics")
+        conn.execute(
+            "CREATE TABLE daily_metrics ("
+            "metric TEXT NOT NULL, date TEXT NOT NULL, count INTEGER NOT NULL, "
+            "sum REAL, avg REAL, min REAL, max REAL, unit TEXT, "
+            "PRIMARY KEY (metric, date))"
+        )
+        conn.execute(
+            "INSERT INTO daily_metrics "
+            "(metric, date, count, sum, avg, min, max, unit) "
+            "VALUES ('synthetic_metric', '2026-08-01', 1, 1, 1, 1, 1, 'unit')"
+        )
+        conn.execute(
+            "UPDATE vault_meta SET value = '1' WHERE key = 'schema_version'"
+        )
+        conn.commit()
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        )]
+        before = {
+            table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            for table in tables
+        }
+        assert dbmod.vault_schema_version(conn) == 1
+    finally:
+        conn.close()
+
+    conn = dbmod.connect(snapshot)
+    try:
+        dbmod.init_db(conn)
+        assert dbmod.vault_schema_version(conn) == dbmod.VAULT_SCHEMA_VERSION
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_metrics)")}
+        assert {"last", "source_kind"} <= columns
+        after = {
+            table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+    assert after == before
+
+
+def test_init_db_refuses_a_vault_newer_than_the_code(vault_path):
+    conn = dbmod.connect(vault_path)
     dbmod.init_db(conn)
-    conn.execute("UPDATE vault_meta SET value = '0' WHERE key = 'schema_version'")
+    conn.execute("UPDATE vault_meta SET value = '99' WHERE key = 'schema_version'")
     conn.commit()
-
-    dbmod.init_db(conn)          # a later open, by newer code
-
-    assert dbmod.vault_schema_version(conn) == 0, \
-        "init_db relabelled a vault it did not migrate"
     conn.close()
+
+    conn = dbmod.connect(vault_path)
+    try:
+        with pytest.raises(ValueError, match="newer than code version"):
+            dbmod.init_db(conn)
+        assert dbmod.vault_schema_version(conn) == 99
+    finally:
+        conn.close()
+
+
+def test_init_db_does_not_stamp_a_read_only_vault(vault_path):
+    conn = dbmod.connect(vault_path)
+    dbmod.init_db(conn)
+    conn.execute("UPDATE vault_meta SET value = '1' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    conn = dbmod.connect(vault_path, read_only=True)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        dbmod.init_db(conn)
+        assert dbmod.vault_schema_version(conn) == 1
+        assert not any(
+            "vault_meta" in sql.lower() and
+            ("insert" in sql.lower() or "update" in sql.lower())
+            for sql in statements
+        )
+    finally:
+        conn.close()
 
 
 def test_a_rebuild_keeps_the_owner_when_none_is_given(snapshot, tmp_path):

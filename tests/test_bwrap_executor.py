@@ -498,13 +498,22 @@ except Exception:
 open({str(run_dir / 'work' / 'work-child.txt')!r}, "w").write("allowed")
 facts["work_write"] = int(open({str(run_dir / 'work' / 'work-child.txt')!r}).read() == "allowed")
 facts["vault_rows"] = conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0]
+# Nothing binds the vault into this namespace any more (#37). A raw connect
+# to the host path therefore either fails or creates a fresh, empty file on
+# bubblewrap's private root -- measured on CI: CREATE TABLE "succeeds" there.
+# So the probe is whether the raw path can see the REAL vault's table; the
+# parent checks the host file itself after the run.
 try:
     c = sqlite3.connect({str(vault_path)!r})
+    c.execute("SELECT COUNT(*) FROM probe").fetchone()
+    facts["vault_raw_blocked"] = 0
+except Exception:
+    facts["vault_raw_blocked"] = 1
+try:
     c.execute("CREATE TABLE denied (value INTEGER)")
     c.commit()
-    facts["vault_write"] = 0
 except Exception:
-    facts["vault_write"] = 1
+    pass
 try:
     socket.gethostbyname("openrouter.ai")
     facts["network"] = 0
@@ -523,6 +532,13 @@ emit("sandbox", list(facts), ["count"] * len(facts), [list(facts.values())])
     assert result.tables[0]["name"] == "sandbox"
     assert result.tables[0]["rows"] == ((1, 1, 1, 1, 1, 1),)
     assert result.ledger["parent_observed"] is True
+    # The host vault is exactly as the parent built it: the probe table, and
+    # no "denied" table from the child's raw connect.
+    host = sqlite3.connect(vault_path)
+    tables = {row[0] for row in host.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    host.close()
+    assert tables == {"probe"}
 
 
 @LINUX_BWRAP

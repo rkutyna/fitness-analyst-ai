@@ -799,6 +799,8 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
             continue
         verify_conn = ctx.read_only()
         try:
+            # Pass the complete regenerated prose: _coach_grounding's ledger
+            # gate is sound only over the whole answer, never a span/sentence.
             verification = _verify_ask_answer(
                 verify_conn, regenerated, verified_claims, attempt["ledger"],
                 as_of=as_of)
@@ -1621,6 +1623,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
 
         verify_conn = ctx.read_only()
         try:
+            # Pass the complete first draft: _coach_grounding's ledger gate is
+            # sound only over the whole answer, never a span/sentence.
             verification = _verify_ask_answer(
                 verify_conn, prose.strip(), claims, ledger, as_of=as_of)
             score = (_ask_judge(question, prose.strip(), verification)
@@ -1673,6 +1677,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         ledger = _read_ledger(ledger_path)
         verify_conn = ctx.read_only()
         try:
+            # Pass the complete retry draft: _coach_grounding's ledger gate is
+            # sound only over the whole answer, never a span/sentence.
             verification = _verify_ask_answer(
                 verify_conn, prose.strip(), claims, ledger, as_of=as_of)
             score = (_ask_judge(question, prose.strip(), verification)

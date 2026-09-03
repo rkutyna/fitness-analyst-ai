@@ -393,6 +393,15 @@ def _scoped_grounding_claims(claims, payload) -> list[dict]:
 
 
 def _coach_grounding(prose: str, claims: list[dict], payload=None) -> tuple[bool, list[str]]:
+    """Ground numeric occurrences in one complete answer.
+
+    The ledger branch below counts numeric-token occurrences as a multiset;
+    one presentation claim can retire only one matching occurrence. This
+    function must therefore receive the complete answer, never a sentence or
+    span evaluated independently and then combined: independent calls let
+    the same claim pay for the same evidence once per fragment, weakening the
+    whole-answer gate.
+    """
     # Rule R runs exactly where the claim layer beneath it is exact: a ledger
     # payload. Non-ledger payloads use the same scoped claim resolver, with the
     # legacy tolerance because their published claim layer allows +/-0.5%;
@@ -471,6 +480,8 @@ def _research_grounding(prose: str, claims: list[dict],
     """Ground signed prose such as ``down 0.1`` to a signed claim value."""
     prose = _RESEARCH_BLOCK_ORDINAL_RE.sub(" ", prose or "")
     rule_r = _is_ledger(payload)
+    # Keep the complete research prose here. The occurrence multiset in
+    # _coach_grounding is not sound when sentence fragments share claims.
     grounded, bad = _coach_grounding(prose, claims, payload=payload)
     if grounded:
         return True, []
@@ -1622,6 +1633,8 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
     verified_claims = [claim for claim, result in
                        zip(claims, verdict["numbers"])
                        if isinstance(claim, dict) and result.get("ok")]
+    # Keep the complete ask prose here. The occurrence multiset in
+    # _coach_grounding is not sound when sentence fragments share claims.
     grounded, bad = _coach_grounding(
         prose, verified_claims, payload=payload)
     tier_counts = _binding_tier_counts(verdict["numbers"])

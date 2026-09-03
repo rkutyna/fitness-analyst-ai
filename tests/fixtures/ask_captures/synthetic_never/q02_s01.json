@@ -1,0 +1,56 @@
+{
+  "mode": "fallback",
+  "reason": "claim metric does not match ledger field",
+  "attempts": [
+    {
+      "attempt": 1,
+      "prose": "Synthetic value 12.5.",
+      "claims": [
+        {
+          "metric": "synthetic_metric",
+          "period": "synthetic_period",
+          "field": "value",
+          "value": 12.5,
+          "source": {"sequence": 1, "path": "$.result.value"}
+        }
+      ],
+      "verification": {"ok": true, "unsupported": []},
+      "ledger": []
+    },
+    {
+      "attempt": 2,
+      "prose": "Synthetic value 19.5.",
+      "claims": [
+        {
+          "metric": "synthetic_metric",
+          "period": "synthetic_period",
+          "field": "value",
+          "value": 12.5,
+          "source": {"sequence": 1, "path": "$.result.value"}
+        },
+        {
+          "metric": "synthetic_metric",
+          "period": "synthetic_period",
+          "field": "value",
+          "value": 19.5,
+          "source": {"sequence": 1, "path": "$.result.value"}
+        }
+      ],
+      "verification": {"ok": false, "unsupported": ["19.5"]},
+      "ledger": [
+        {
+          "sequence": 1,
+          "tool_name": "synthetic_tool",
+          "arguments": {},
+          "result": {
+            "metric": "synthetic_metric",
+            "period": "synthetic_period",
+            "value": 12.5,
+            "field_metrics": {"value": "synthetic_metric"}
+          },
+          "result_elided": false
+        }
+      ]
+    }
+  ]
+}

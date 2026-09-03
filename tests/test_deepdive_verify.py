@@ -49,6 +49,31 @@ def test_coach_grounding_does_not_cross_license_resting_hr_as_sleep_delta():
     assert unsupported == ["52"]
 
 
+def test_whole_answer_grounding_is_not_weakened_by_sentence_decomposition():
+    ledger = [{"sequence": 1, "tool_name": "synthetic_tool", "result": {}}]
+    claim = {"field": "presentation", "value": "20 minutes",
+             "metric": "synthetic_metric", "period": "synthetic_period"}
+    whole = ("Synthetic jogging was 20 minutes. "
+             "Synthetic walking was 20 minutes.")
+    sentences = [
+        "Synthetic jogging was 20 minutes.",
+        "Synthetic walking was 20 minutes.",
+    ]
+
+    whole_verdict = DV._coach_grounding(whole, [claim], payload=ledger)
+    sentence_verdicts = [
+        DV._coach_grounding(sentence, [claim], payload=ledger)
+        for sentence in sentences
+    ]
+
+    # One presentation claim pays for one occurrence in the complete answer.
+    # Calling the gate once per sentence would make both fragments pass.
+    assert whole_verdict == (False, ["20"])
+    assert sentence_verdicts == [(True, []), (True, [])]
+    assert whole_verdict[0] is False
+    assert all(verdict[0] for verdict in sentence_verdicts)
+
+
 def test_points_value_is_owned_by_the_enclosing_result_metric():
     ledger = _record({
         "metric": "sleep_asleep",

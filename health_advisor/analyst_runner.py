@@ -528,6 +528,7 @@ def _high_fd(fd: int) -> int:
 def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
                   limits: Any, vault_path: str):
     """Seatbelt invocation with fd 3 output and fd 4 query input/output."""
+    del vault_path
     run_dir_real, work_dir_real = executor._prepare_run_dir(run_dir)
     code_path = run_dir_real / "code.py"
     code_path.write_text(code, encoding="utf-8")
@@ -539,13 +540,11 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
         real_home=executor._real_home,
         pyenv_prefix=executor._pyenv_prefix,
         venv_dir=executor._venv_dir,
-        pkg_dir=executor._pkg_dir,
-        vault_path=os.path.realpath(vault_path),
+        pkg_dir=None,
         work_dir=str(work_dir_real),
     )
-    # The profile contains the vault literal for Seatbelt, but the child must
-    # not be able to read that parent-owned profile back as an information
-    # channel.
+    # The child must not be able to read the parent-owned profile back as an
+    # information channel.
     quoted_profile = sandbox._scheme_quote(str(profile_path))
     profile_text += f'\n(deny file-read-data (literal "{quoted_profile}"))\n'
     profile_path.write_text(profile_text, encoding="utf-8")

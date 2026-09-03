@@ -36,6 +36,8 @@ from pathlib import Path
 import pytest
 
 from health_advisor import analyst_sandbox as sb
+from health_advisor import analyst_envelope
+from health_advisor import analyst_runner
 
 # The vault these tests run against. Configurable on purpose: a public engine
 # should not hardcode one person's file. Point HA_TEST_VAULT at any populated
@@ -98,6 +100,16 @@ def vault_path() -> str:
             "`python -m health_advisor.demo` (see the README roadmap) and these "
             "tests run automatically")
     return str(REAL_VAULT)
+
+
+@pytest.fixture
+def query_vault_path(tmp_path) -> str:
+    """A small synthetic demo vault for query-channel assertions."""
+    from health_advisor.demo import build_demo_vault
+
+    path = tmp_path / "demo.db"
+    build_demo_vault(path, days=2)
+    return str(path)
 
 
 def _run(
@@ -285,26 +297,97 @@ def test_sandbox_overhead_vs_bare_python(executor, vault_path, tmp_path):
 # =========================================================================== #
 
 
-def test_generated_code_receives_conn_not_a_path(executor, vault_path, tmp_path):
-    run_dir = tmp_path / "no_path_leak"
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt query channel")
+def test_generated_code_receives_conn_not_a_path(query_vault_path, tmp_path):
     code = """
-import json, os
-names = sorted(k for k in dict(globals()) if not k.startswith("_"))
-leaked_path = False
-for k, v in list(globals().items()):
-    if isinstance(v, str) and ("health.db" in v or v == %r):
-        leaked_path = True
+assert callable(conn.execute)
+assert not any(
+    isinstance(value, str) and ("health.db" in value or value == %r)
+    for value in globals().values()
+)
 row = conn.execute("SELECT COUNT(*) FROM daily_metrics").fetchone()
-os.write(3, json.dumps({
-    "globals": names, "leaked_path": leaked_path, "count": row[0],
-}).encode())
-""" % (os.path.realpath(vault_path),)
-    res = _run(executor, code, vault_path, run_dir)
-    payload = res.fd3_as_json()
-    assert payload is not None, res.stderr
-    assert payload["leaked_path"] is False
-    assert "conn" in payload["globals"]
-    assert payload["count"] > 0  # proves conn is a live, working connection
+emit("connection_check", ["row_count"], ["count"], [[row[0]]])
+""" % (os.path.realpath(query_vault_path),)
+    res = analyst_runner.run_analyst_code(
+        code, query_vault_path, str(tmp_path / "no_path_leak"),
+        sb.SeatbeltExecutor())
+    assert isinstance(res, analyst_envelope.Envelope)
+    assert res.tables[0]["name"] == "connection_check"
+    assert res.tables[0]["rows"][0][0] > 0
+
+
+def _seatbelt_query_probe(code: str, bound_root: Path, tmp_path: Path):
+    """Invoke the same Seatbelt dispatch used by ``run_analyst_code``."""
+    executor = sb.SeatbeltExecutor(pkg_dir=str(bound_root))
+    # Make the synthetic bound root the denied home subtree. The run directory
+    # remains outside it, so the bootstrap itself can still be read.
+    executor._real_home = os.path.realpath(bound_root)
+    query_r, query_w = os.pipe()
+    try:
+        return analyst_runner._invoke_executor(
+            executor, code, str(tmp_path / "run"), query_r,
+            sb.RunLimits(wall_clock_s=5.0), str(bound_root / "data" / "demo.db"),
+        )
+    finally:
+        for fd in (query_r, query_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt regression")
+def test_seatbelt_query_channel_denies_secret_in_bound_root(tmp_path):
+    bound_root = tmp_path / "bound-root"
+    secret_path = bound_root / "systemd" / "receiver.env"
+    secret_path.parent.mkdir(parents=True)
+    secret_path.write_text("synthetic-secret", encoding="utf-8")
+
+    result = _seatbelt_query_probe(
+        f"""
+try:
+    open({str(secret_path)!r}, "rb").read()
+    print("UNSAFE secret")
+except Exception:
+    print("BLOCKED secret")
+""",
+        bound_root,
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert b"BLOCKED secret" in result.stdout
+    assert b"UNSAFE secret" not in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt regression")
+def test_seatbelt_query_channel_denies_vault_in_bound_root(tmp_path):
+    bound_root = tmp_path / "bound-root"
+    vault_path = bound_root / "data" / "demo.db"
+    vault_path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(str(vault_path))
+    connection.execute("CREATE TABLE marker (value TEXT)")
+    connection.execute("INSERT INTO marker VALUES ('synthetic')")
+    connection.commit()
+    connection.close()
+    os.chmod(vault_path, 0o444)
+
+    result = _seatbelt_query_probe(
+        f"""
+import sqlite3
+try:
+    direct = sqlite3.connect({str(vault_path)!r})
+    direct.execute("SELECT name FROM sqlite_master").fetchall()
+    direct.close()
+    print("UNSAFE vault")
+except Exception:
+    print("BLOCKED vault")
+""",
+        bound_root,
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert b"BLOCKED vault" in result.stdout
+    assert b"UNSAFE vault" not in result.stdout
 
 
 # =========================================================================== #
@@ -772,38 +855,52 @@ def _toctou_preplanted_profile_is_overwritten(executor, vault_path, run_dir: Pat
 
 
 def _toctou_vault_symlink_consistency(executor, tmp_root: Path) -> bool:
+    """The parent resolves the vault link when a run starts, never later.
+
+    The plain Seatbelt path gives the child no vault at all (#24), so the
+    probe runs through the query channel, where the parent opens the vault:
+    a run started against link->A reads A, a run started after the swap
+    reads B, and neither run's artifacts name either target's real path.
+    """
+    from health_advisor.demo import build_demo_vault
+
     vault_a = tmp_root / "toctou_vault_a.db"
     vault_b = tmp_root / "toctou_vault_b.db"
-    for p, marker in ((vault_a, "AAAA"), (vault_b, "BBBB")):
-        c = sqlite3.connect(str(p))
-        c.execute("CREATE TABLE marker (v TEXT)")
-        c.execute("INSERT INTO marker VALUES (?)", (marker,))
-        c.commit()
-        c.close()
-        os.chmod(p, 0o444)
+    build_demo_vault(vault_a, days=2)
+    build_demo_vault(vault_b, days=5)
     link_path = tmp_root / "toctou_vault_link.db"
     if link_path.exists() or link_path.is_symlink():
         link_path.unlink()
     os.symlink(vault_a, link_path)
 
-    code = "r = conn.execute('SELECT v FROM marker').fetchone(); print('BLOCKED', r[0])"
-    run_dir1 = tmp_root / "toctou_symlink_1"
-    res1 = _run(executor, code, str(link_path), run_dir1)
-    read_a = b"AAAA" in res1.stdout
+    code = ("row = conn.execute('SELECT COUNT(*) FROM daily_metrics').fetchone(); "
+            "emit('toctou', ['row_count'], ['count'], [[row[0]]])")
 
+    def count_for(run_dir: Path) -> int | None:
+        res = analyst_runner.run_analyst_code(
+            code, str(link_path), str(run_dir), sb.SeatbeltExecutor())
+        if not isinstance(res, analyst_envelope.Envelope) or not res.tables:
+            return None
+        return res.tables[0]["rows"][0][0]
+
+    run_dir1 = tmp_root / "toctou_symlink_1"
+    count_a = count_for(run_dir1)
     link_path.unlink()
     os.symlink(vault_b, link_path)
-    run_dir2 = tmp_root / "toctou_symlink_2"
-    res2 = _run(executor, code, str(link_path), run_dir2)
-    read_b = b"BBBB" in res2.stdout
+    count_b = count_for(tmp_root / "toctou_symlink_2")
 
-    # The FIRST run's own generated artifacts must still name vault_a's
-    # realpath — swapping the link afterward must not retroactively alter
-    # a run that already happened.
-    runner1 = (run_dir1 / "runner.py").read_text()
-    unaltered = os.path.realpath(vault_a) in runner1 and os.path.realpath(vault_b) not in runner1
+    # The FIRST run's own artifacts must not name either target: swapping
+    # the link afterward must not retroactively alter a run that happened.
+    real_a, real_b = os.path.realpath(vault_a), os.path.realpath(vault_b)
+    unaltered = True
+    for artifact in run_dir1.rglob("*"):
+        if artifact.is_file():
+            text = artifact.read_text(errors="replace")
+            if real_a in text or real_b in text:
+                unaltered = False
 
-    return read_a and read_b and unaltered
+    return (count_a is not None and count_b is not None
+            and count_a != count_b and unaltered)
 
 
 def _toctou_home_tmpdir_remap_ignored(executor, vault_path, run_dir: Path) -> bool:
@@ -906,16 +1003,16 @@ def test_fd3_abuse_write_after_close_does_not_hang_or_corrupt(executor, vault_pa
 # =========================================================================== #
 
 
-def test_normal_vault_read_still_works(executor, vault_path, tmp_path):
-    res = _run(
-        executor,
-        "r = conn.execute('SELECT COUNT(*) FROM daily_metrics').fetchone(); print('rows', r[0])",
-        vault_path, tmp_path / "run",
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt query channel")
+def test_normal_vault_read_still_works(query_vault_path, tmp_path):
+    res = analyst_runner.run_analyst_code(
+        "row = conn.execute('SELECT COUNT(*) FROM daily_metrics').fetchone(); "
+        "emit('daily_metrics', ['row_count'], ['count'], [[row[0]]])",
+        query_vault_path, str(tmp_path / "run"), sb.SeatbeltExecutor(),
     )
-    assert res.returncode == 0, res.stderr
-    assert b"rows " in res.stdout
-    count = int(res.stdout.split(b"rows ")[1].split(b"\n")[0])
-    assert count > 0
+    assert isinstance(res, analyst_envelope.Envelope)
+    assert res.tables[0]["name"] == "daily_metrics"
+    assert res.tables[0]["rows"][0][0] > 0
 
 
 # =========================================================================== #

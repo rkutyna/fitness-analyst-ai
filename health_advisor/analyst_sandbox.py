@@ -7,6 +7,9 @@ this file.
 This module is the **only substrate-aware seam** (§2.4):
 
     Analyst loop  ---> Executor (protocol)   .run(code, vault_path, run_dir, limits)
+                   Seatbelt `.run()` accepts `vault_path` for protocol parity but
+                   gives that child no vault; bwrap's legacy plain path keeps its
+                   explicit read-only vault bind.
                    +-> SeatbeltExecutor   (this file, macOS)
                    +-> BwrapExecutor      (this file, Linux)
                    +-> FargateExecutor    (production, unbuilt)
@@ -25,7 +28,8 @@ What this module does implement, per A1's `Must implement` (§8):
   this worktree symlinks `.venv` and `data/health.db` into the main checkout,
   and an unresolved symlink in the profile silently denies (§2.3 failure 3).
 - A bubblewrap mount namespace on Linux with the same split run-directory,
-  minimal environment, read-only vault, and fd-3 result-channel contracts.
+  minimal environment, read-only vault on the legacy plain path, query-channel,
+  and fd-3 result-channel contracts.
 - An absolute interpreter path, `python -I`, `cwd` inside the child-writable
   `work/` directory, and an `env -i`-style minimal environment — `PATH`,
   `TMPDIR`, `HOME` all pointed at `work/`. None of the parent's own
@@ -41,15 +45,14 @@ What this module does implement, per A1's `Must implement` (§8):
   kills the whole group with `os.killpg`, because a forked grandchild
   otherwise survives the direct child's death and can go on holding a SQLite
   lock (review finding 6, §3.5).
-- The vault connection is opened **by the parent-authored runner bootstrap**,
-  read-only, from a `realpath`-resolved literal the harness bakes into the
-  generated `runner.py` — the same way `profile.sb` bakes in paths. The
-  user's/model's own code (`code.py`) receives the live `conn` object as a
-  bound global; it is never handed the path string itself. (§3.1: "the
-  generated code never receives a vault path".) The full **ledgered** wrapper
-  around this connection — the authorizer, the refusal on zero reads — is
-  A2's `analyst_ledger.py`; this module hands over a plain read-only
-  `sqlite3.Connection`.
+- On the query-channel path, the parent-authored runner supplies the live
+  ledgered `conn` proxy over fd 4; the user's/model's own code (`code.py`)
+  receives that object as a bound global and never receives the vault path.
+  (§3.1: "the generated code never receives a vault path".) The Seatbelt
+  plain `run()` path supplies no connection at all; the legacy bwrap plain
+  path retains its explicit read-only vault bind. The full **ledgered**
+  wrapper — the authorizer and refusal on zero reads — is A2's
+  `analyst_ledger.py`.
 
 KNOWN, UNBLOCKED GAP (found during this work, not defended against here): a
 forked descendant that calls `os.setsid()` before the wall-clock deadline
@@ -79,7 +82,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.parse
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,16 +221,16 @@ def bridge_bidirectional(left: socket.socket, right: socket.socket) -> None:
 # The seatbelt profile (§2.5)
 # --------------------------------------------------------------------------- #
 
-# `(literal "$VAULT")` rather than `(subpath ...)`: the vault is one file, not
-# a directory, and `literal` is the tighter grant.
+# The query channel carries vault data over fd 4, so no vault path belongs in
+# this profile. An explicitly supplied package directory is the only optional
+# repository grant used by the plain executor path.
 _PROFILE_TEMPLATE = """\
 (version 1)
 (deny default)
 (allow process-exec* process-fork sysctl-read mach-lookup)
 (allow file-read*)
 (deny  file-read-data (subpath "{real_home}"))
-(allow file-read-data (subpath "{pyenv_prefix}") (subpath "{venv_dir}")
-                      (subpath "{pkg_dir}") (literal "{vault}"))
+(allow file-read-data (subpath "{pyenv_prefix}") (subpath "{venv_dir}"){pkg_dir_rule})
 (allow file-read* file-write* (subpath "{work_dir}"))
 (deny network*)
 """
@@ -244,22 +246,24 @@ def build_profile(
     real_home: str,
     pyenv_prefix: str,
     venv_dir: str,
-    pkg_dir: str,
-    vault_path: str,
+    pkg_dir: str | None,
     work_dir: str,
 ) -> str:
     """Render §2.5's profile. Every argument here must already be a
-    `os.path.realpath()` result — this function does not resolve symlinks
-    itself, because generating the profile is where the harness's other
-    knowledge (which paths are meant to be parent-owned vs. child-writable)
-    lives, and re-resolving here would hide a caller's mistake instead of
-    catching it."""
+    `os.path.realpath()` result, except an absent optional `pkg_dir` — this
+    function does not resolve symlinks itself, because generating the profile
+    is where the harness's other knowledge (which paths are meant to be
+    parent-owned vs. child-writable) lives, and re-resolving here would hide a
+    caller's mistake instead of catching it."""
+    pkg_dir_rule = (
+        f'(subpath "{_scheme_quote(pkg_dir)}")'
+        if pkg_dir is not None else ""
+    )
     return _PROFILE_TEMPLATE.format(
         real_home=_scheme_quote(real_home),
         pyenv_prefix=_scheme_quote(pyenv_prefix),
         venv_dir=_scheme_quote(venv_dir),
-        pkg_dir=_scheme_quote(pkg_dir),
-        vault=_scheme_quote(vault_path),
+        pkg_dir_rule=pkg_dir_rule,
         work_dir=_scheme_quote(work_dir),
     )
 
@@ -270,18 +274,14 @@ def build_profile(
 
 # This is NOT `health_advisor/analyst_runner.py` (that file, with the
 # ledgered `conn` and the real `emit()`, is A2's deliverable). This is the
-# minimal bootstrap A1 needs to exercise the executor itself: it opens the
-# vault read-only (so "the vault handle is opened by the parent, and
-# generated code never receives a path" is true even in A1, before the
-# ledger exists), then execs the run's `code.py` with `conn` bound and
-# nothing path-shaped bound anywhere.
+# minimal bootstrap A1 needs to exercise the executor itself. The plain
+# `run()` path has no data channel: its protocol-level `vault_path` argument
+# is ignored by this bootstrap and `conn` is None. Seatbelt denies the vault
+# itself; the legacy bwrap plain path supplies a separate explicit read-only
+# bind. The query-channel bootstrap in `analyst_runner` supplies the live
+# proxy instead.
 _RUNNER_TEMPLATE = """\
-import sqlite3 as _sqlite3
-
-try:
-    conn = _sqlite3.connect("file:{vault_uri}?mode=ro", uri=True)
-except Exception:
-    conn = None
+conn = None
 
 with open({code_path!r}, "r", encoding="utf-8") as _f:
     _src = _f.read()
@@ -294,9 +294,8 @@ exec(compile(_src, {code_path!r}, "exec"), _globals)
 """
 
 
-def _build_runner(*, vault_real: str, code_path_real: str) -> str:
-    vault_uri = urllib.parse.quote(vault_real)
-    return _RUNNER_TEMPLATE.format(vault_uri=vault_uri, code_path=code_path_real)
+def _build_runner(*, code_path_real: str) -> str:
+    return _RUNNER_TEMPLATE.format(code_path=code_path_real)
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +323,7 @@ class SeatbeltExecutor:
         self._python = os.path.realpath(python_executable or sys.executable)
         self._venv_dir = os.path.realpath(sys.prefix)
         self._pyenv_prefix = os.path.realpath(sys.base_prefix)
-        self._pkg_dir = os.path.realpath(pkg_dir or str(REPO_ROOT))
+        self._pkg_dir = os.path.realpath(pkg_dir) if pkg_dir is not None else None
         self._real_home = os.path.realpath(os.path.expanduser("~"))
         if not os.path.exists(self.SANDBOX_EXEC):
             raise RuntimeError(
@@ -358,9 +357,16 @@ class SeatbeltExecutor:
         run_dir: str,
         limits: RunLimits | None = None,
     ) -> RawResult:
+        """Run without exposing the vault to the child.
+
+        ``vault_path`` remains in the protocol for executor parity, but this
+        plain path does not open or bind it; the bootstrap gives the child
+        ``conn = None``. Only an explicitly supplied ``pkg_dir`` may be
+        granted in the profile.
+        """
         limits = limits or RunLimits()
         run_dir_real, work_dir_real = self._prepare_run_dir(run_dir)
-        vault_real = os.path.realpath(vault_path)
+        del vault_path
 
         # Parent-owned artifacts (§4.6): profile.sb, code.py, and the
         # generated runner all live directly under $RUNDIR, never under
@@ -368,7 +374,7 @@ class SeatbeltExecutor:
         code_path = run_dir_real / "code.py"
         code_path.write_text(code, encoding="utf-8")
 
-        runner_src = _build_runner(vault_real=vault_real, code_path_real=str(code_path))
+        runner_src = _build_runner(code_path_real=str(code_path))
         runner_path = run_dir_real / "runner.py"
         runner_path.write_text(runner_src, encoding="utf-8")
 
@@ -377,7 +383,6 @@ class SeatbeltExecutor:
             pyenv_prefix=self._pyenv_prefix,
             venv_dir=self._venv_dir,
             pkg_dir=self._pkg_dir,
-            vault_path=vault_real,
             work_dir=str(work_dir_real),
         )
         profile_path = run_dir_real / "profile.sb"
@@ -580,7 +585,7 @@ class BwrapExecutor:
         self._python = os.path.realpath(python_executable or sys.executable)
         self._venv_dir = os.path.realpath(sys.prefix)
         self._pyenv_prefix = os.path.realpath(sys.base_prefix)
-        self._pkg_dir = os.path.realpath(pkg_dir or str(REPO_ROOT))
+        self._pkg_dir = os.path.realpath(pkg_dir) if pkg_dir is not None else None
         self._real_home = os.path.realpath(os.path.expanduser("~"))
         if not os.path.exists(self.BWRAP):
             raise RuntimeError(
@@ -620,14 +625,18 @@ class BwrapExecutor:
             "--symlink", "usr/bin", "/bin",
             "--symlink", "usr/sbin", "/sbin",
             "--ro-bind", self._pyenv_prefix, self._pyenv_prefix,
-            "--ro-bind", self._pkg_dir, self._pkg_dir,
         ]
+        if self._pkg_dir is not None:
+            argv.extend(["--ro-bind", self._pkg_dir, self._pkg_dir])
         if not (
-            self._is_subpath(self._venv_dir, self._pkg_dir)
+            (self._pkg_dir is not None
+             and self._is_subpath(self._venv_dir, self._pkg_dir))
             or self._is_subpath(self._venv_dir, self._pyenv_prefix)
         ):
             argv.extend(["--ro-bind", self._venv_dir, self._venv_dir])
         argv.extend([
+            # This is the legacy plain path. The production query path uses
+            # _build_query_argv(), which has no vault or repository bind.
             "--ro-bind", vault_real, vault_real,
             "--ro-bind", str(run_dir_real), str(run_dir_real),
             "--bind", str(work_dir_real), str(work_dir_real),
@@ -871,7 +880,7 @@ class BwrapExecutor:
         # directly under $RUNDIR, never under work/.
         code_path = run_dir_real / "code.py"
         code_path.write_text(code, encoding="utf-8")
-        runner_src = _build_runner(vault_real=vault_real, code_path_real=str(code_path))
+        runner_src = _build_runner(code_path_real=str(code_path))
         runner_path = run_dir_real / "runner.py"
         runner_path.write_text(runner_src, encoding="utf-8")
 

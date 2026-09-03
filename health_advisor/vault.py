@@ -195,6 +195,14 @@ UNIT_SYSTEMS: dict[str, dict[str, str]] = {
     "metric": {"distance": "km", "mass": "kg", "energy": "kJ"},
 }
 
+# Canonical workout storage is imperial. Consumers use these factors when a
+# vault asks for metric presentation; keeping them here prevents each consumer
+# from becoming a second source of truth.
+UNIT_CONVERSION_FACTORS: dict[str, float] = {
+    "distance_mi_to_km": 1.609344,
+    "energy_kcal_to_kj": 4.184,
+}
+
 
 def local_timezone(conn: sqlite3.Connection) -> str | None:
     """The IANA zone this vault's local dates are declared in, or None.
@@ -207,9 +215,7 @@ def local_timezone(conn: sqlite3.Connection) -> str | None:
     attributed by the per-sample offset carried in the export, and that stays
     the fallback -- removing it would silently re-attribute a decade of data.
     """
-    row = conn.execute(
-        "SELECT value FROM vault_meta WHERE key = 'local_timezone'").fetchone()
-    return row[0] if row else None
+    return _vault_meta_value(conn, "local_timezone")
 
 
 def set_local_timezone(conn: sqlite3.Connection, zone: str | None) -> None:
@@ -232,9 +238,7 @@ def set_local_timezone(conn: sqlite3.Connection, zone: str | None) -> None:
 
 def unit_system(conn: sqlite3.Connection) -> str | None:
     """The declared unit system name, or None if this vault has not said."""
-    row = conn.execute(
-        "SELECT value FROM vault_meta WHERE key = 'unit_system'").fetchone()
-    return row[0] if row else None
+    return _vault_meta_value(conn, "unit_system")
 
 
 def set_unit_system(conn: sqlite3.Connection, name: str | None) -> None:

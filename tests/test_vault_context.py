@@ -314,6 +314,38 @@ def test_an_undeclared_vault_reads_none_and_is_not_defaulted(tmp_path):
     }
 
 
+def test_settings_tolerates_an_absent_vault_meta_table_and_reads_declarations(
+        tmp_path):
+    """A pre-settings vault has no metadata table and is still undeclared."""
+    absent_path = tmp_path / "absent.db"
+    conn = dbmod.connect(absent_path)
+    dbmod.init_db(conn)
+    conn.execute("DROP TABLE vault_meta")
+    conn.commit()
+    conn.close()
+
+    blank = VaultContext.local(absent_path).settings()
+    assert blank == {
+        "local_timezone": None, "unit_system": None, "units": None,
+        "workout_source_arbitration_from": None, "block_qualify_hr_max": None,
+    }
+
+    declared_path = tmp_path / "declared.db"
+    conn = dbmod.connect(declared_path)
+    dbmod.init_db(conn)
+    vaultmod.set_local_timezone(conn, "Europe/Berlin")
+    vaultmod.set_unit_system(conn, "metric")
+    conn.commit()
+    conn.close()
+
+    declared = VaultContext.local(declared_path).settings()
+    assert declared["local_timezone"] == "Europe/Berlin"
+    assert declared["unit_system"] == "metric"
+    assert declared["units"] == {
+        "distance": "km", "mass": "kg", "energy": "kJ",
+    }
+
+
 def test_a_typo_cannot_be_stored_as_a_timezone(tmp_path):
     """A stored typo would not fail here; it would mis-attribute a date later,
     somewhere with no connection to this call."""

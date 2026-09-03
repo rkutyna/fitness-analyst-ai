@@ -20,7 +20,8 @@ from __future__ import annotations
 import functools
 import inspect
 import sqlite3
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
@@ -220,17 +221,31 @@ def _bad_dates(**named: str | None) -> str | None:
     return None
 
 
-def _local_hhmm(utc_iso: str | None, seconds: bool = False) -> str | None:
-    """UTC ISO timestamp -> local wall clock 'HH:MM' (host tz; workouts don't
-    store their original offset — fine for a single-timezone pipeline).
-    seconds=True gives 'HH:MM:SS' (segment boundaries need the precision)."""
+def _as_timezone(local_timezone: str | tzinfo | None) -> tzinfo | None:
+    """Resolve a declared IANA zone once at a tool boundary."""
+    if local_timezone is None or isinstance(local_timezone, tzinfo):
+        return local_timezone
+    return ZoneInfo(local_timezone)
+
+
+def _local_hhmm(utc_iso: str | None,
+                local_timezone: str | tzinfo | None = None,
+                seconds: bool = False) -> str | None:
+    """UTC ISO timestamp -> local wall clock 'HH:MM'.
+
+    An undeclared vault passes None, preserving the historical host-timezone
+    behavior. A declared IANA zone or tzinfo makes the rendering per-vault.
+    seconds=True gives 'HH:MM:SS' (segment boundaries need the precision).
+    """
     if not utc_iso:
         return None
     try:
         dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return dt.astimezone().strftime("%H:%M:%S" if seconds else "%H:%M")
+    local_tz = _as_timezone(local_timezone)
+    rendered = dt.astimezone() if local_tz is None else dt.astimezone(local_tz)
+    return rendered.strftime("%H:%M:%S" if seconds else "%H:%M")
 
 
 # --------------------------------------------------------------------------- #
@@ -461,14 +476,18 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
 HR_ZONE_DEFAULT_THRESHOLDS = "135,150,155,170"
 
 
-def _local_window_utc(day: str, hhmm: str, label: str) -> str:
+def _local_window_utc(day: str, hhmm: str, label: str,
+                      local_timezone: str | tzinfo | None = None) -> str:
     """'HH:MM' on a local day -> the UTC ISO string records are stored with."""
     try:
         h, m = (int(p) for p in hhmm.strip().split(":", 1))
         naive = datetime.fromisoformat(day).replace(hour=h, minute=m)
     except (TypeError, ValueError):
         raise ValueError(f"{label}={hhmm!r} must be a local 'HH:MM' time") from None
-    return naive.astimezone().astimezone(timezone.utc).isoformat()
+    local_tz = _as_timezone(local_timezone)
+    aware = (naive.astimezone() if local_tz is None
+             else naive.replace(tzinfo=local_tz))
+    return aware.astimezone(timezone.utc).isoformat()
 
 
 def _utc_bound(ts: str) -> str:
@@ -509,15 +528,16 @@ def _hr_samples(conn, *, day: str | None = None,
 
 
 def _hr_zone_window(conn, source: str, label: str | None, start_utc: str,
-                    end_utc: str, thresholds, *, day: str | None = None) -> dict:
+                    end_utc: str, thresholds, *, day: str | None = None,
+                    local_timezone: tzinfo | None = None) -> dict:
     samples = (_hr_samples(conn, day=day) if source == "day"
                else _hr_samples(conn, start_utc=start_utc, end_utc=end_utc))
     end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
     z = mx.zone_minutes(samples, end_dt, thresholds)
     span = _elapsed_min(start_utc, end_utc)
     out = {"source": source, "label": label,
-           "start_time_local": _local_hhmm(start_utc, seconds=True),
-           "end_time_local": _local_hhmm(end_utc, seconds=True),
+           "start_time_local": _local_hhmm(start_utc, local_timezone, seconds=True),
+           "end_time_local": _local_hhmm(end_utc, local_timezone, seconds=True),
            "window_min": span, **z}
     if span and z["covered_min"] < 0.9 * span:
         out["note"] = (
@@ -563,19 +583,23 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
     if start_time and workout_type:
         return {"error": "pass either workout_type or start_time/end_time, not both"}
 
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
     conn = ctx.read_only()
     try:
         if start_time:
             try:
-                s_utc = _local_window_utc(day, start_time, "start_time")
-                e_utc = _local_window_utc(day, end_time, "end_time")
+                s_utc = _local_window_utc(day, start_time, "start_time",
+                                          local_timezone)
+                e_utc = _local_window_utc(day, end_time, "end_time",
+                                          local_timezone)
             except ValueError as e:
                 return {"error": str(e)}
             if s_utc >= e_utc:
                 return {"error": f"start_time={start_time!r} is not before "
                                  f"end_time={end_time!r}"}
-            windows = [_hr_zone_window(conn, "explicit", f"{start_time}-{end_time}",
-                                       s_utc, e_utc, edges)]
+            windows = [_hr_zone_window(
+                conn, "explicit", f"{start_time}-{end_time}", s_utc, e_utc,
+                edges, local_timezone=local_timezone)]
             return {"day": day, "thresholds": [mx.r(e, 0) for e in edges],
                     "count": len(windows), "windows": windows}
 
@@ -603,12 +627,14 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
                 "WHERE metric = 'heart_rate' AND local_date = ?", (day,)).fetchone()
             if row and row["a"]:
                 windows.append(_hr_zone_window(
-                    conn, "day", day, row["a"], row["b"], edges, day=day))
+                    conn, "day", day, row["a"], row["b"], edges, day=day,
+                    local_timezone=local_timezone))
         for w in wrows:
             if not w["end_utc"]:
                 continue
             windows.append(_hr_zone_window(
-                conn, "workout", w["workout_type"], w["start_utc"], w["end_utc"], edges))
+                conn, "workout", w["workout_type"], w["start_utc"],
+                w["end_utc"], edges, local_timezone=local_timezone))
     finally:
         conn.close()
 
@@ -644,13 +670,21 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     'truncated' says whether 'limit' cut the list short. Check truncated before
     counting sessions or totalling minutes: the returned rows are the most
     recent ones, not the range. 'workout_counts' is the full-range count by
-    workout type. `list_workouts` publishes full-range per-type counts as
+    workout type. Distance and energy use the vault's declared display units:
+    miles/kcal for imperial and kilometres/kJ for metric. `list_workouts` publishes
+    full-range per-type counts as
     `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path
     with `metric` omitted, and never count the possibly truncated `workouts`
     rows. Dates must be explicit YYYY-MM-DD — an 'error' comes back otherwise."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
     limit = max(1, min(int(limit), MAX_WORKOUTS))
+    settings = ctx.settings()
+    local_timezone = _as_timezone(settings["local_timezone"])
+    declared_unit_system = settings["unit_system"]
+    metric_units = declared_unit_system == "metric"
+    display_system = declared_unit_system or "imperial"
+    display_units = settings["units"] or V.UNIT_SYSTEMS["imperial"]
     conn = ctx.read_only()
     try:
         active = db.workout_mark_condition(conn, "w")
@@ -682,27 +716,46 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
         n_segments = _n_segments_by_workout(conn, [r["dedupe_key"] for r in rows])
     finally:
         conn.close()
-    out = [{"date": r["local_date"], "type": r["workout_type"],
-            # The ledger verifier uses this server-owned identity to keep a
-            # per-session claim attached to this exact workouts row. It is
-            # deliberately the database dedupe key, whose natural key omits
-            # source so cross-source sightings remain one physical session.
+    out = []
+    for r in rows:
+        # The ledger verifier uses this server-owned identity to keep a
+        # per-session claim attached to this exact workouts row. It is
+        # deliberately the database dedupe key, whose natural key omits
+        # source so cross-source sightings remain one physical session.
+        row = {
+            "date": r["local_date"], "type": r["workout_type"],
             "workout_key": r["dedupe_key"],
-            "duration_min": _r(r["duration_min"], 1), "energy_kcal": _r(r["energy_kcal"], 1),
-            "distance_mi": _r(r["distance_mi"], 2),
+            "duration_min": _r(r["duration_min"], 1),
+        }
+        if metric_units:
+            row["energy_kj"] = _r(
+                r["energy_kcal"] * V.UNIT_CONVERSION_FACTORS["energy_kcal_to_kj"], 1
+            ) if r["energy_kcal"] is not None else None
+            row["distance_km"] = _r(
+                r["distance_mi"] * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"], 2
+            ) if r["distance_mi"] is not None else None
+        else:
+            row["energy_kcal"] = _r(r["energy_kcal"], 1)
+            row["distance_mi"] = _r(r["distance_mi"], 2)
+        row.update({
             "avg_heart_rate": _r(r["avg_heart_rate"], 0),
             "max_heart_rate": _r(r["max_heart_rate"], 0),
-            "start_time_local": _local_hhmm(r["start_utc"]),
-            "end_time_local": _local_hhmm(r["end_utc"]),
+            "start_time_local": _local_hhmm(r["start_utc"], local_timezone),
+            "end_time_local": _local_hhmm(r["end_utc"], local_timezone),
             "has_route": bool(r["route_ref"]),
-            "n_segments": n_segments.get(r["dedupe_key"], 0)}
-           for r in rows]
+            "n_segments": n_segments.get(r["dedupe_key"], 0),
+        })
+        out.append(row)
     res = {"start": start, "end": end, "count": len(out),
            "total_in_range": total, "truncated": total > len(out),
            "excluded_count": excluded,
            "limit": limit, "workout_counts": [
                {"type": r["workout_type"], "count": r["n"]}
                for r in type_counts],
+           "units": {"system": display_system,
+                     "declared": declared_unit_system is not None,
+                     "distance": display_units["distance"],
+                     "energy": display_units["energy"]},
            "workouts": out}
     if res["truncated"]:
         res["note"] = (
@@ -715,7 +768,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
 MAX_SEGMENTS = 120
 
 
-def _render_split(conn, e, n: int) -> dict:
+def _render_split(conn, e, n: int, local_timezone: tzinfo | None = None) -> dict:
     """One split, with the heart rate measured over its own window."""
     hr = conn.execute(
         "SELECT AVG(value) a, MAX(value) m FROM records WHERE "
@@ -723,8 +776,8 @@ def _render_split(conn, e, n: int) -> dict:
         (e["start_utc"], e["end_utc"])).fetchone() if e["end_utc"] else None
     return {
         "n": n, "type": e["event_type"],
-        "start_local": _local_hhmm(e["start_utc"], seconds=True),
-        "end_local": _local_hhmm(e["end_utc"], seconds=True),
+        "start_local": _local_hhmm(e["start_utc"], local_timezone, seconds=True),
+        "end_local": _local_hhmm(e["end_utc"], local_timezone, seconds=True),
         "duration_min": _r(e["duration_min"], 2),
         "avg_heart_rate": _r(hr["a"], 0) if hr else None,
         "max_heart_rate": _r(hr["m"], 0) if hr else None,
@@ -772,6 +825,7 @@ def get_workout_segments(ctx: VaultContext, day: str, workout_type: str | None =
         date.fromisoformat(day)
     except ValueError:
         return {"error": "day must be YYYY-MM-DD"}
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
     conn = ctx.read_only()
     try:
         active = db.workout_mark_condition(conn, "w")
@@ -805,17 +859,19 @@ def get_workout_segments(ctx: VaultContext, day: str, workout_type: str | None =
                     splits.append(dict(e))
                 elif e["event_type"] in ("pause", "resume"):
                     pauses.append({"event": e["event_type"],
-                                   "at_local": _local_hhmm(e["start_utc"], seconds=True)})
+                                   "at_local": _local_hhmm(
+                                       e["start_utc"], local_timezone, seconds=True)})
 
             # One workout carries several rival partitions; report one of them.
             chains = mx.segment_chains(splits)
-            rendered = [[_render_split(conn, e, i) for i, e in enumerate(chain, 1)]
+            rendered = [[_render_split(conn, e, i, local_timezone)
+                         for i, e in enumerate(chain, 1)]
                         for chain in chains]
             primary = rendered[0] if rendered else []
             elapsed = _elapsed_min(w["start_utc"], w["end_utc"])
             entry = {
                 "type": w["workout_type"],
-                "start_time_local": _local_hhmm(w["start_utc"]),
+                "start_time_local": _local_hhmm(w["start_utc"], local_timezone),
                 "duration_min": _r(w["duration_min"], 1),
                 "elapsed_min": elapsed,
                 "n_segments": len(primary), "segments": primary,

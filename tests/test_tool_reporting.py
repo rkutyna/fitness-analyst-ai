@@ -12,7 +12,11 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from health_advisor import db as dbmod
 from health_advisor import metrics as M
+from health_advisor import mcp_server as S
+from health_advisor import vault as vaultmod
+from health_advisor.context import VaultContext
 from tests.conftest import seed_metric, seed_workout
 
 
@@ -144,6 +148,66 @@ def test_list_workouts_does_not_cry_truncation_when_complete(many_workouts, tool
     assert out["truncated"] is False
     assert out["total_in_range"] == 12
     assert out["workout_counts"] == [{"type": "running", "count": 12}]
+
+
+def _workout_vault(path, zone, system):
+    ctx = VaultContext.local(path, user_id=path.stem, writable=True)
+    conn = ctx.connect()
+    dbmod.init_db(conn)
+    seed_workout(conn, "running", "2026-08-01", 42.0, 3.21, energy_kcal=321.4)
+    vaultmod.set_local_timezone(conn, zone)
+    vaultmod.set_unit_system(conn, system)
+    conn.commit()
+    conn.close()
+    return ctx
+
+
+def test_list_workouts_uses_each_vault_timezone_and_unit_system(tmp_path):
+    berlin_tools = S.build_tools(
+        _workout_vault(tmp_path / "berlin.db", "Europe/Berlin", "imperial"))
+    tokyo_tools = S.build_tools(
+        _workout_vault(tmp_path / "tokyo.db", "Asia/Tokyo", "metric"))
+
+    berlin = berlin_tools["list_workouts"](
+        start="2026-08-01", end="2026-08-01")
+    tokyo = tokyo_tools["list_workouts"](
+        start="2026-08-01", end="2026-08-01")
+
+    berlin_row = berlin["workouts"][0]
+    tokyo_row = tokyo["workouts"][0]
+    assert berlin_row["distance_mi"] == 3.21
+    assert berlin_row["energy_kcal"] == 321.4
+    assert "distance_km" not in berlin_row
+    assert "energy_kj" not in berlin_row
+    assert berlin_row["start_time_local"] == "14:00"
+    assert tokyo_row["start_time_local"] == "21:00"
+    assert tokyo_row["distance_km"] == round(3.21 * 1.609344, 2)
+    assert tokyo_row["energy_kj"] == round(321.4 * 4.184, 1)
+    assert "distance_mi" not in tokyo_row
+    assert "energy_kcal" not in tokyo_row
+    assert berlin["units"] == {
+        "system": "imperial", "declared": True,
+        "distance": "mi", "energy": "kcal",
+    }
+    assert tokyo["units"] == {
+        "system": "metric", "declared": True,
+        "distance": "km", "energy": "kJ",
+    }
+
+
+def test_list_workouts_reports_imperial_fallback_when_undeclared(conn, tools):
+    seed_workout(conn, "running", "2026-08-01", 42.0, 3.21, energy_kcal=321.4)
+    out = tools.list_workouts(start="2026-08-01", end="2026-08-01")
+    assert out["units"] == {
+        "system": "imperial", "declared": False,
+        "distance": "mi", "energy": "kcal",
+    }
+
+
+def test_local_window_utc_uses_the_declared_zone():
+    assert S._local_window_utc(
+        "2026-08-01", "14:00", "start_time", "Europe/Berlin"
+    ) == "2026-08-01T12:00:00+00:00"
 
 
 # --------------------------------------------------------------------------- #

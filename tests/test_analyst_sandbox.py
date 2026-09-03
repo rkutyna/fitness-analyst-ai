@@ -878,7 +878,7 @@ def _toctou_vault_symlink_consistency(executor, tmp_root: Path) -> bool:
 
     def count_for(run_dir: Path) -> int | None:
         res = analyst_runner.run_analyst_code(
-            code, str(link_path), str(run_dir), sb.SeatbeltExecutor())
+            code, str(link_path), str(run_dir), executor)
         if not isinstance(res, analyst_envelope.Envelope) or not res.tables:
             return None
         return res.tables[0]["rows"][0][0]

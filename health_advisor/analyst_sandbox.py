@@ -78,6 +78,7 @@ import signal
 import shutil
 import socket
 import subprocess
+import urllib.parse
 import sys
 import tempfile
 import threading
@@ -281,7 +282,7 @@ def build_profile(
 # bind. The query-channel bootstrap in `analyst_runner` supplies the live
 # proxy instead.
 _RUNNER_TEMPLATE = """\
-conn = None
+{conn_setup}
 
 with open({code_path!r}, "r", encoding="utf-8") as _f:
     _src = _f.read()
@@ -294,8 +295,29 @@ exec(compile(_src, {code_path!r}, "exec"), _globals)
 """
 
 
-def _build_runner(*, code_path_real: str) -> str:
-    return _RUNNER_TEMPLATE.format(code_path=code_path_real)
+_NO_CONN_SETUP = "conn = None"
+_LEGACY_CONN_SETUP = """\
+import sqlite3 as _sqlite3
+
+try:
+    conn = _sqlite3.connect("file:{vault_uri}?mode=ro", uri=True)
+except Exception:
+    conn = None"""
+
+
+def _build_runner(*, code_path_real: str, vault_real: str | None = None) -> str:
+    """Render the plain-path bootstrap.
+
+    ``vault_real`` is None on Seatbelt, whose plain child has no vault (#24).
+    The legacy bwrap plain path still binds the vault read-only and opens it
+    here; removing both halves together, verified on Linux, is #37.
+    """
+    if vault_real is None:
+        conn_setup = _NO_CONN_SETUP
+    else:
+        conn_setup = _LEGACY_CONN_SETUP.format(
+            vault_uri=urllib.parse.quote(vault_real))
+    return _RUNNER_TEMPLATE.format(conn_setup=conn_setup, code_path=code_path_real)
 
 
 # --------------------------------------------------------------------------- #
@@ -880,7 +902,7 @@ class BwrapExecutor:
         # directly under $RUNDIR, never under work/.
         code_path = run_dir_real / "code.py"
         code_path.write_text(code, encoding="utf-8")
-        runner_src = _build_runner(code_path_real=str(code_path))
+        runner_src = _build_runner(code_path_real=str(code_path), vault_real=vault_real)
         runner_path = run_dir_real / "runner.py"
         runner_path.write_text(runner_src, encoding="utf-8")
 

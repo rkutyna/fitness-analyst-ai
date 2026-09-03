@@ -42,8 +42,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BACKEND = os.environ.get("HA_LLM_BACKEND", "codex")
 CODEX_MODEL = os.environ.get("HA_CODEX_MODEL", "gpt-5.6-luna")
-CODEX_BIN = (os.environ.get("HA_CODEX_BIN") or shutil.which("codex")
-             or os.path.expanduser("~/.hermes/node/bin/codex"))
+CODEX_BIN = os.environ.get("HA_CODEX_BIN") or shutil.which("codex")
 
 OLLAMA_URL = os.environ.get("HA_OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.environ.get("HA_LLM_MODEL", "qwen3.5:9b-q4_K_M")
@@ -284,6 +283,12 @@ def assert_backend_approved() -> None:
     if BACKEND not in APPROVED_BACKENDS:
         raise RuntimeError(
             f"LLM backend '{BACKEND}' is not approved under D15."
+        )
+    if BACKEND == "codex" and not CODEX_BIN:
+        raise RuntimeError(
+            "LLM backend 'codex' is not approved: no codex executable was "
+            "configured or found on PATH; set HA_CODEX_BIN or put codex on "
+            "PATH."
         )
     # The destination, not only the name of who is meant to be at it (#138).
     assert_endpoint_approved(BACKEND)

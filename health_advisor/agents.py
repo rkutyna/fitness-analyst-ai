@@ -300,12 +300,10 @@ def run_model(prompt: str, *, tools: str | None = None, ctx=None,
                options: dict | None = None) -> str:
     """The pipeline's single model entrypoint.
 
-    Renamed from ``run_hermes`` 2026-08-26 (#92). That name was the Telegram
-    gateway's, kept — as the old docstring said — only so monkeypatch-based
-    tests would keep working, while ``checkin.HERMES_BIN`` names a binary
-    genuinely called ``hermes``. Two unrelated "hermes" meant a grep for egress
-    returned both and the reader had to know which was which; anyone assuming
-    this one was the Telegram path audited the wrong thing.
+    Renamed 2026-08-26: the old name collided with the consuming layer's
+    messaging-gateway binary, so a grep for egress returned this function too
+    and a reader auditing the delivery path could audit the wrong thing. This
+    function never delivers anything; it only calls the model.
 
     tools=None -> tool-less
     narration/judge via llm.complete; tools set -> deep-dive researcher via

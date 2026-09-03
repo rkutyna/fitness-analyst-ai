@@ -30,7 +30,8 @@ def _restore_llm_module():
 
 def _llm(monkeypatch, **env):
     """Re-import llm with a patched environment — its config is read at import."""
-    for key in ("HA_LLM_BACKEND", "HA_OPENROUTER_PROVIDERS",
+    for key in ("HA_LLM_BACKEND", "HA_CODEX_BIN",
+                "HA_OPENROUTER_PROVIDERS",
                 "HA_OPENROUTER_REASONING", "HA_OPENROUTER_MODEL",
                 "HA_OPENROUTER_URL", "HA_OLLAMA_URL"):
         monkeypatch.delenv(key, raising=False)
@@ -58,7 +59,16 @@ def test_default_ollama_endpoint_passes(monkeypatch):
 
 def test_codex_is_unaffected(monkeypatch):
     """HA_CODEX_BIN is a separate axis, recorded on #138, not covered here."""
-    _llm(monkeypatch, HA_LLM_BACKEND="codex").assert_backend_approved()
+    _llm(monkeypatch, HA_LLM_BACKEND="codex",
+         HA_CODEX_BIN="codex-test").assert_backend_approved()
+
+
+def test_codex_without_binary_is_refused_at_approval(monkeypatch, tmp_path):
+    """No configured or discoverable binary reaches subprocess execution."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    llm = _llm(monkeypatch, HA_LLM_BACKEND="codex")
+    with pytest.raises(RuntimeError, match="HA_CODEX_BIN"):
+        llm.assert_backend_approved()
 
 
 @pytest.mark.parametrize("url,reason", [

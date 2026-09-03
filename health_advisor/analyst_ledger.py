@@ -41,6 +41,7 @@ module (not re-derived as a security claim -- used as given):
 from __future__ import annotations
 
 import sqlite3
+import weakref
 from dataclasses import dataclass, field
 
 from . import db as dbmod
@@ -55,11 +56,27 @@ __all__ = [
 
 # Actions this connection refuses outright rather than merely recording
 # (analyst-mode-proposal.md S9.2: "the sandbox connection refuses ATTACH and
-# PRAGMA outright rather than merely logging them"). Everything else the
-# authorizer observes is allowed -- the file is opened `mode=ro` (db.connect),
-# so a write attempt is refused by SQLite itself before the authorizer would
-# ever need to weigh in.
+# PRAGMA outright rather than merely logging them"). Persistent write actions
+# are also refused so `wrap_connection()` cannot preserve write access from a
+# caller that opened its input connection in writable mode.
 _DENIED_ACTIONS = frozenset({sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_PRAGMA})
+
+# `wrap_connection()` also accepts fixture connections that were opened
+# writable.  SQLite's authorizer is the narrowest way to make those wrappers
+# read-only while retaining the useful ability to create temporary tables.
+# Persistent-database write actions are denied below; actions against the
+# connection-local `temp` database remain available for scratch work.
+_WRITE_ACTION_NAMES = (
+    "SQLITE_ALTER_TABLE", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE",
+    "SQLITE_CREATE_TRIGGER", "SQLITE_CREATE_VTABLE", "SQLITE_CREATE_VIEW",
+    "SQLITE_DELETE", "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE",
+    "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VTABLE", "SQLITE_DROP_VIEW",
+    "SQLITE_INSERT", "SQLITE_REINDEX", "SQLITE_UPDATE",
+)
+_DENIED_WRITE_ACTIONS = frozenset(
+    action for name in _WRITE_ACTION_NAMES
+    if (action := getattr(sqlite3, name, None)) is not None
+)
 
 # SQLite's own catalog is readable and tells the analyst nothing about the
 # athlete. Reading it must therefore NOT satisfy the zero-read gate: measured
@@ -85,6 +102,85 @@ MAX_RETAINED_DENIALS = 100
 # only entries. The count bound and the size bound are two different bounds and
 # both are required.
 MAX_RETAINED_DENIAL_ARG = 120
+
+
+# Real SQLite objects live only in these parent-side registries.  The wrapper
+# instances contain no connection/cursor reference, so inspecting an object
+# received across a trust boundary cannot recover the object underneath it.
+# Weak keys also avoid retaining a closed wrapper solely because its backing
+# connection's authorizer callback is still installed.
+_CONNECTIONS = weakref.WeakKeyDictionary()
+_CURSORS = weakref.WeakKeyDictionary()
+_AUTHORIZERS = weakref.WeakKeyDictionary()
+
+
+def _connection_for(wrapper: "LedgeredConnection") -> sqlite3.Connection:
+    try:
+        return _CONNECTIONS[wrapper]
+    except KeyError as exc:
+        raise sqlite3.ProgrammingError("ledgered connection is closed") from exc
+
+
+def _cursor_for(wrapper):
+    try:
+        return _CURSORS[wrapper]
+    except KeyError as exc:
+        raise sqlite3.ProgrammingError("ledgered cursor is closed") from exc
+
+
+def _forget_cursor(wrapper, real_cursor=None):
+    if real_cursor is None:
+        real_cursor = _CURSORS.pop(wrapper, None)
+    else:
+        _CURSORS.pop(wrapper, None)
+    if real_cursor is not None:
+        real_cursor.close()
+
+
+class _ParentMetadataCursor:
+    """The tiny result surface needed by the unchanged parent runner."""
+
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _ParentMetadataConnection:
+    """A non-SQLite compatibility handle for the runner's metadata probe.
+
+    The runner is deliberately out of scope for this change and still asks
+    its connection for ``_conn`` while reading parent-owned metadata.  Keep
+    that private protocol working without returning the real connection:
+    this handle accepts only the two fixed metadata PRAGMAs and its
+    ``set_authorizer`` method cannot alter the real connection's authorizer.
+    """
+
+    __slots__ = ("_owner",)
+
+    def __init__(self, owner: "LedgeredConnection"):
+        self._owner = owner
+
+    def set_authorizer(self, callback) -> None:
+        # The method exists only for the runner's unchanged private protocol.
+        # It intentionally cannot disable the authorizer on the real object.
+        return None
+
+    def execute(self, sql: str, params=()) -> _ParentMetadataCursor:
+        if params or sql not in ("PRAGMA temp_store = MEMORY",
+                                 "PRAGMA user_version"):
+            raise sqlite3.ProgrammingError(
+                "parent metadata handle does not execute arbitrary SQL")
+        owner = self._owner
+        real_conn = _connection_for(owner)
+        authorizer = _AUTHORIZERS[owner]
+        real_conn.set_authorizer(None)
+        try:
+            row = real_conn.execute(sql).fetchone()
+        finally:
+            real_conn.set_authorizer(authorizer)
+        return _ParentMetadataCursor(row)
 
 
 def _is_catalog(table: str) -> bool:
@@ -152,38 +248,61 @@ class _CountingCursor:
     use to drain its results."""
 
     def __init__(self, cursor: sqlite3.Cursor, state: _LedgerState):
-        self._cursor = cursor
         self._state = state
+        _CURSORS[self] = cursor
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        row = next(self._cursor)
+        row = next(_cursor_for(self))
         self._state.rows_read += 1
         return row
 
     def fetchone(self):
-        row = self._cursor.fetchone()
+        row = _cursor_for(self).fetchone()
         if row is not None:
             self._state.rows_read += 1
         return row
 
     def fetchmany(self, size=None):
-        rows = (self._cursor.fetchmany(size) if size is not None
-                else self._cursor.fetchmany())
+        cursor = _cursor_for(self)
+        rows = (cursor.fetchmany(size) if size is not None
+                else cursor.fetchmany())
         self._state.rows_read += len(rows)
         return rows
 
     def fetchall(self):
-        rows = self._cursor.fetchall()
+        rows = _cursor_for(self).fetchall()
         self._state.rows_read += len(rows)
         return rows
 
-    def __getattr__(self, name):
-        # description, rowcount, lastrowid, close(), etc. -- anything this
-        # wrapper does not define itself passes straight through.
-        return getattr(self._cursor, name)
+    @property
+    def description(self):
+        return _cursor_for(self).description
+
+    @property
+    def rowcount(self):
+        return _cursor_for(self).rowcount
+
+    @property
+    def lastrowid(self):
+        return _cursor_for(self).lastrowid
+
+    def execute(self, sql: str, params=()) -> "_CountingCursor":
+        cursor = _cursor_for(self)
+        result = cursor.execute(sql, params)
+        self._state.query_count += 1
+        return _CountingCursor(result, self._state)
+
+    def executemany(self, sql: str, seq_of_params) -> "_CountingCursor":
+        cursor = _cursor_for(self)
+        result = cursor.executemany(sql, seq_of_params)
+        self._state.query_count += 1
+        return _CountingCursor(result, self._state)
+
+    def close(self) -> None:
+        _forget_cursor(self)
 
 
 class _LedgeredCursor:
@@ -192,33 +311,58 @@ class _LedgeredCursor:
     ledger, not a silent gap in it."""
 
     def __init__(self, cursor: sqlite3.Cursor, state: _LedgerState):
-        self._cursor = cursor
         self._state = state
+        _CURSORS[self] = cursor
 
     def execute(self, sql: str, params=()) -> _CountingCursor:
-        cur = self._cursor.execute(sql, params)
+        cur = _cursor_for(self).execute(sql, params)
         self._state.query_count += 1
         return _CountingCursor(cur, self._state)
 
-    def __getattr__(self, name):
-        return getattr(self._cursor, name)
+    @property
+    def description(self):
+        return _cursor_for(self).description
+
+    @property
+    def rowcount(self):
+        return _cursor_for(self).rowcount
+
+    @property
+    def lastrowid(self):
+        return _cursor_for(self).lastrowid
+
+    def close(self) -> None:
+        _forget_cursor(self)
 
 
 class LedgeredConnection:
     """The ``conn`` analyst-mode code receives: read-only, authorizer-backed,
-    and -- by construction of whoever opened the underlying connection --
+    and -- regardless of how its input connection was opened --
     unable to hand its own vault path back out (analyst-mode-proposal.md
     S3.1: "the generated code never receives a vault path"; this wrapper adds
     no path-revealing attribute of its own).
     """
 
     def __init__(self, real_conn: sqlite3.Connection):
-        self._conn = real_conn
         self._state = _LedgerState()
-        real_conn.set_authorizer(self._authorize)
+        _CONNECTIONS[self] = real_conn
+
+        # A weak-reference callback avoids making a cycle from the real
+        # connection back to this wrapper through SQLite's authorizer slot.
+        wrapper_ref = weakref.ref(self)
+
+        def authorize(action, arg1, arg2, dbname, trigger):
+            wrapper = wrapper_ref()
+            if wrapper is None:
+                return sqlite3.SQLITE_DENY
+            return wrapper._authorize(action, arg1, arg2, dbname, trigger)
+
+        _AUTHORIZERS[self] = authorize
+        real_conn.set_authorizer(authorize)
 
     def _authorize(self, action, arg1, arg2, dbname, trigger):
-        if action in _DENIED_ACTIONS:
+        if (action in _DENIED_ACTIONS
+                or (action in _DENIED_WRITE_ACTIONS and dbname != "temp")):
             self._state.denied_count += 1
             if len(self._state.denied) < MAX_RETAINED_DENIALS:
                 # Truncated, not stored whole: `arg1` is child-authored for
@@ -257,20 +401,28 @@ class LedgeredConnection:
         return sqlite3.SQLITE_OK
 
     def execute(self, sql: str, params=()) -> _CountingCursor:
-        cur = self._conn.execute(sql, params)
+        cur = _connection_for(self).execute(sql, params)
         self._state.query_count += 1
         return _CountingCursor(cur, self._state)
 
     def executemany(self, sql: str, seq_of_params) -> _CountingCursor:
-        cur = self._conn.executemany(sql, seq_of_params)
+        cur = _connection_for(self).executemany(sql, seq_of_params)
         self._state.query_count += 1
         return _CountingCursor(cur, self._state)
 
     def cursor(self) -> _LedgeredCursor:
-        return _LedgeredCursor(self._conn.cursor(), self._state)
+        return _LedgeredCursor(_connection_for(self).cursor(), self._state)
 
     def close(self) -> None:
-        self._conn.close()
+        real_conn = _CONNECTIONS.pop(self, None)
+        _AUTHORIZERS.pop(self, None)
+        if real_conn is not None:
+            real_conn.close()
+
+    @property
+    def _conn(self) -> _ParentMetadataConnection:
+        """Return only the restricted parent-metadata compatibility handle."""
+        return _ParentMetadataConnection(self)
 
     def __enter__(self) -> "LedgeredConnection":
         return self
@@ -293,9 +445,13 @@ class LedgeredConnection:
 
 
 def wrap_connection(real_conn: sqlite3.Connection) -> LedgeredConnection:
-    """Wrap an already-open connection. For tests and callers that build or
-    receive their own fixture connection; production code should prefer
-    ``open_ledgered``, which also owns the read-only open."""
+    """Wrap an already-open connection with persistent writes disabled.
+
+    Fixture callers may pass a writable connection; the wrapper's authorizer
+    denies every persistent-database write while retaining temporary scratch
+    tables. Production code should prefer ``open_ledgered``, which also owns
+    the read-only open.
+    """
     return LedgeredConnection(real_conn)
 
 

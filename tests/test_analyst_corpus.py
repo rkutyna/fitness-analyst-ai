@@ -666,6 +666,48 @@ def _validate_with(ledger: dict):
         ledger=ledger)
 
 
+def _numeric_spelling_payload(spellings: list[str]) -> bytes:
+    """Build JSON while preserving each numeric literal's source spelling."""
+    unit = json.dumps(sorted(analyst_envelope.ALLOWED_UNITS)[0])
+    first = spellings[:analyst_envelope.MAX_ROWS_PER_TABLE]
+    second = spellings[analyst_envelope.MAX_ROWS_PER_TABLE:]
+
+    def table(name, literals):
+        rows = ",".join(f"[{literal}]" for literal in literals)
+        return ("{\"name\":" + json.dumps(name) +
+                ",\"columns\":[\"value\"],\"units\":[" + unit +
+                "],\"rows\":[" + rows + "]}")
+
+    return ("{\"tables\":[" + table("spelling_one", first) + "," +
+            table("spelling_two", second) + "]}").encode("ascii")
+
+
+def test_numeric_token_cap_is_explicitly_on_distinct_values():
+    """Equivalent numeric spellings share one parsed grounding value.
+
+    The 201 spellings below are intentionally all ``0.1`` after JSON parsing;
+    the value cap therefore accepts them, while 201 distinct parsed values
+    still refuse at the same boundary.
+    """
+    ledger = {"query_count": 1, "rows_read": 201,
+              "tables_read": ["source"], "columns_read": []}
+    spellings = ["1e-" + ("0" * i) + "1" for i in range(201)]
+    accepted = analyst_envelope.validate(
+        _numeric_spelling_payload(spellings), run_id="r" * 32, question="",
+        code_sha256="a" * 64, vault_sha256="b" * 64, vault_version=1,
+        ledger=ledger)
+    assert isinstance(accepted, analyst_envelope.Envelope)
+    assert accepted.counts["numeric_tokens"] == 1
+
+    distinct = [str(i) for i in range(201)]
+    refused = analyst_envelope.validate(
+        _numeric_spelling_payload(distinct), run_id="r" * 32, question="",
+        code_sha256="a" * 64, vault_sha256="b" * 64, vault_version=1,
+        ledger=ledger)
+    assert isinstance(refused, analyst_envelope.Refusal)
+    assert refused.reason == "envelope exceeds distinct numeric-token cap: 201 > 200"
+
+
 def test_the_zero_read_gate_still_refuses_after_a_successful_cite(corpus):
     """`Done when` 9. The bypass, run.
 

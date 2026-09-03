@@ -1,9 +1,10 @@
 """End-to-end checks for the parent-owned analyst query boundary."""
 from __future__ import annotations
 
-import os
+import ast
 import fcntl
 import json
+import os
 import sqlite3
 import statistics
 import subprocess
@@ -408,3 +409,26 @@ def test_generated_template_has_no_vault_path_literal(vault_path):
     assert str(vault_path) not in source
     assert "sqlite3.connect" not in source
     assert "_conn" not in source
+
+
+def test_query_proxy_and_cursor_expose_no_sqlite_objects():
+    """Pin the child-side query boundary to fd/socket data objects only."""
+    tree = ast.parse(runner.RUNNER_TEMPLATE)
+    classes = {node.name: node for node in tree.body
+               if isinstance(node, ast.ClassDef)
+               and node.name in {"_QueryProxy", "_ProxyCursor"}}
+    namespace = {"_decode_value": lambda value: value}
+    for name in ("_ProxyCursor", "_QueryProxy"):
+        exec(compile(ast.Module(body=[classes[name]], type_ignores=[]),
+                     "<runner-template-test>", "exec"), namespace)
+
+    proxy = namespace["_QueryProxy"](4)
+    cursor = namespace["_ProxyCursor"]([], [["synthetic"]])
+    for value in (proxy, cursor):
+        assert not isinstance(value, sqlite3.Connection)
+        assert not isinstance(value, sqlite3.Cursor)
+        assert all(not isinstance(item, sqlite3.Connection)
+                   and not isinstance(item, sqlite3.Cursor)
+                   for item in vars(value).values())
+        for attr in ("connection", "_conn", "_cursor"):
+            assert not hasattr(value, attr)

@@ -266,6 +266,58 @@ def test_cursor_style_execute_is_also_counted(probe_db_path):
         conn.close()
 
 
+def test_wrapper_and_cursor_results_have_no_raw_sqlite_reach(probe_db_path):
+    """The wrapper can cross a boundary without carrying SQLite with it.
+
+    Before this guard, ``conn._conn`` and ``conn.cursor()._cursor`` exposed
+    the real objects, including the cursor returned by ``conn.execute``.
+    Check both the direct attributes and the instance dictionaries that hold
+    implementation state; the public execute/fetch surface must still work.
+    """
+    conn = led.open_ledgered(probe_db_path)
+    try:
+        ledger_cursor = conn.cursor()
+        counting_cursor = conn.execute("SELECT a FROM t LIMIT 1")
+        for value in (conn, ledger_cursor, counting_cursor):
+            assert not isinstance(value, sqlite3.Connection)
+            assert not isinstance(value, sqlite3.Cursor)
+            assert all(not isinstance(item, sqlite3.Connection)
+                       and not isinstance(item, sqlite3.Cursor)
+                       for item in vars(value).values())
+
+        # `_conn` is retained only as a non-SQLite compatibility handle for
+        # the unchanged parent metadata probe; it cannot disable the real
+        # authorizer or execute analyst SQL.
+        metadata_handle = conn._conn
+        assert not isinstance(metadata_handle, sqlite3.Connection)
+        metadata_handle.set_authorizer(None)
+        with pytest.raises(sqlite3.ProgrammingError, match="arbitrary SQL"):
+            metadata_handle.execute("SELECT a FROM t")
+
+        for attr in ("_cursor", "connection", "set_authorizer"):
+            assert not hasattr(conn, attr)
+            assert not hasattr(ledger_cursor, attr)
+            assert not hasattr(counting_cursor, attr)
+
+        assert counting_cursor.fetchone()[0] == 1
+        assert conn.ledger.rows_read == 1
+    finally:
+        conn.close()
+
+
+def test_wrap_connection_denies_writes_to_a_writable_connection():
+    """A caller choosing ``wrap_connection`` cannot retain write access."""
+    real_conn = sqlite3.connect(":memory:")
+    real_conn.execute("CREATE TABLE t (a INTEGER)")
+    wrapped = led.wrap_connection(real_conn)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            wrapped.execute("INSERT INTO t VALUES (1)")
+        assert wrapped.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+    finally:
+        wrapped.close()
+
+
 def test_open_ledgered_does_not_leak_the_vault_path(probe_db_path):
     """S3.1: 'the generated code never receives a vault path'. This wrapper
     should add no attribute that hands the path back out."""

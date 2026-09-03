@@ -70,6 +70,9 @@ __all__ = [
 MAX_ROWS_PER_TABLE = 200
 MAX_TABLES = 4
 MAX_CELLS = 2_000
+# This cap intentionally bounds distinct parsed values as they will be
+# rendered, not distinct lexical JSON spellings.  Equivalent spellings such
+# as `1e-1` and `1e-01` consume one grounding token.
 MAX_NUMERIC_TOKENS = 200
 MAX_ENVELOPE_BYTES = 65_536
 
@@ -245,10 +248,13 @@ def _reject_json_constant(name: str):
 
 
 def _token_key(value) -> str:
-    """A canonical dedup key for the distinct-numeric-token cap (S4.5/S1.4):
-    the model must not be the one sizing its own grounding pool. `3` (int)
-    and `3.0` (float) are kept distinct, since they would render as distinct
-    tokens in narration."""
+    """Key distinct parsed values for the numeric-token cap.
+
+    The cap is on values, not source spellings: equivalent JSON spellings
+    share a key. `3` (int) and `3.0` (float) remain distinct because they are
+    distinct values as rendered in narration. The model must not size its own
+    grounding pool.
+    """
     if isinstance(value, int):
         return f"i:{value}"
     return f"f:{value!r}"

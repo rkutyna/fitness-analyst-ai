@@ -9,7 +9,13 @@ The envelope is intentionally a small, versioned format rather than a
 filesystem trick.  Version 1 uses AES-256-GCM, a freshly generated 256-bit
 data key, and a provider-held 256-bit master key which wraps that data key.
 Plaintext is processed in bounded chunks; neither encryption nor decryption
-materialises the vault in memory.
+materialises the vault in memory.  In ``encrypt_vault``, each chunk nonce is
+generated independently with ``secrets.token_bytes(NONCE_SIZE)``.  NIST SP
+800-38D limits AES-GCM to 2**32 invocations per key with random 96-bit IVs;
+the envelope therefore permits at most 2**31 chunks plus one footer invocation
+per data key, a one-bit safety margin below that bound.  With the default 1 MiB
+chunk size, the enforced plaintext ceiling is 2**41 bytes (2 TiB), or
+2**31 chunks.
 """
 from __future__ import annotations
 
@@ -17,6 +23,7 @@ import argparse
 import base64
 import binascii
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -42,6 +49,9 @@ FORMAT_VERSION = 1
 CIPHER_NAME = "AES-256-GCM"
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 MAX_HEADER_SIZE = 1024 * 1024
+MAX_CHUNK_COUNT = 1 << 31
+MAX_PLAINTEXT_SIZE = MAX_CHUNK_COUNT * DEFAULT_CHUNK_SIZE
+MAX_GENERATION = (1 << 63) - 1
 NONCE_SIZE = 12
 KEY_SIZE = 32
 TAG_SIZE = 16
@@ -230,13 +240,24 @@ def _validate_header(header: Any) -> tuple[dict[str, Any], bytes, bytes, bytes]:
     if (not isinstance(chunk_size, int) or isinstance(chunk_size, bool)
             or chunk_size < 4096 or chunk_size > 16 * 1024 * 1024):
         raise VaultFormatError("header has an invalid chunk_size")
-    if (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+    if (not isinstance(size, int) or isinstance(size, bool)
+            or size < 0 or size > MAX_PLAINTEXT_SIZE):
         raise VaultFormatError("header has an invalid plaintext_size")
+    if (not isinstance(count, int) or isinstance(count, bool) or count < 0):
+        raise VaultFormatError("header has an invalid chunk_count")
+    if count > MAX_CHUNK_COUNT:
+        raise VaultFormatError("header has too many chunks")
     expected_count = (size + chunk_size - 1) // chunk_size if size else 0
     if count != expected_count:
         raise VaultFormatError("header chunk count does not match plaintext size")
-    if (not isinstance(count, int) or isinstance(count, bool) or count < 0):
-        raise VaultFormatError("header has an invalid chunk_count")
+    generation = header.get("generation")
+    if generation is not None and (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or generation > MAX_GENERATION
+    ):
+        raise VaultFormatError("header has an invalid generation")
     wrapped = _unb64(header.get("wrapped_data_key"), "wrapped_data_key")
     wrap_nonce = _unb64(header.get("wrap_nonce"), "wrap_nonce")
     footer_nonce = _unb64(header.get("footer_nonce"), "footer_nonce")
@@ -414,6 +435,7 @@ def _append_audit_event(*, event: dict[str, Any], source: Path) -> None:
                 raise AuditError(f"{operation} audit log must not be a symlink") from exc
             raise
         try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
             file_stat = os.fstat(fd)
             if not stat.S_ISREG(file_stat.st_mode):
                 raise AuditError(f"{operation} audit log must be a regular file")
@@ -426,6 +448,10 @@ def _append_audit_event(*, event: dict[str, Any], source: Path) -> None:
                 raise AuditError(f"{operation} audit log event was only partially written")
             os.fsync(fd)
         finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
             os.close(fd)
     except AuditError:
         raise
@@ -484,6 +510,24 @@ def _record_replace_status(
         )
 
 
+def _next_generation(destination: Path, vault_id: str) -> int:
+    """Return the next generation for a valid envelope at ``destination``."""
+    if not destination.is_file():
+        return 1
+    try:
+        previous = inspect_header(destination)
+    except (OSError, VaultCryptoError):
+        return 1
+    if previous.get("vault_id") != vault_id:
+        return 1
+    generation = previous.get("generation")
+    if generation is None:
+        return 1
+    if generation >= MAX_GENERATION:
+        raise VaultCryptoError("vault generation cannot be incremented further")
+    return generation + 1
+
+
 def encrypt_vault(
     src: str | os.PathLike[str],
     dst: str | os.PathLike[str],
@@ -492,8 +536,17 @@ def encrypt_vault(
     vault_id: str,
     actor: str,
     purpose: str,
+    generation: int | None = None,
 ) -> None:
-    """Stream-encrypt ``src`` into an atomically replaced envelope at ``dst``."""
+    """Stream-encrypt ``src`` into an atomically replaced envelope at ``dst``.
+
+    New envelopes carry a positive generation.  When ``generation`` is omitted,
+    replacing a valid current envelope at ``dst`` increments its generation;
+    otherwise generation 1 is used.  Callers storing versions under separate
+    object names must supply their own monotonically increasing generation.
+    Plaintext is limited to 2,199,023,255,552 bytes (2 TiB) and
+    2,147,483,648 chunks per data key.
+    """
     source = Path(src)
     destination = Path(dst)
     _check_paths(source, destination)
@@ -503,6 +556,22 @@ def encrypt_vault(
     _validate_identity(purpose, "purpose")
     plaintext_size = source.stat().st_size
     chunk_count = (plaintext_size + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE if plaintext_size else 0
+    if plaintext_size > MAX_PLAINTEXT_SIZE or chunk_count > MAX_CHUNK_COUNT:
+        raise VaultCryptoError(
+            f"source exceeds vault limits ({MAX_PLAINTEXT_SIZE} bytes or "
+            f"{MAX_CHUNK_COUNT} chunks)"
+        )
+    if generation is None:
+        generation = _next_generation(destination, vault_id)
+    elif (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or generation > MAX_GENERATION
+    ):
+        raise VaultCryptoError(
+            f"generation must be an integer from 1 to {MAX_GENERATION}"
+        )
     data_key = secrets.token_bytes(KEY_SIZE)
     master_key = _master_key(provider)
     wrap_nonce = secrets.token_bytes(NONCE_SIZE)
@@ -517,6 +586,7 @@ def encrypt_vault(
         "chunk_size": DEFAULT_CHUNK_SIZE,
         "plaintext_size": plaintext_size,
         "chunk_count": chunk_count,
+        "generation": generation,
         "vault_id": vault_id,
         "wrap_nonce": _b64(wrap_nonce),
         "wrapped_data_key": _b64(wrapped_data_key),
@@ -569,6 +639,87 @@ def encrypt_vault(
             staging.unlink(missing_ok=True)
 
 
+def _read_authenticated_body(
+    input_handle: Any,
+    header_bytes: bytes,
+    data_key: bytes,
+    footer_nonce: bytes,
+    chunk_size: int,
+    plaintext_size: int,
+    chunk_count: int,
+    *,
+    write_plaintext: Path | None = None,
+) -> None:
+    """Authenticate one complete body, optionally writing its plaintext.
+
+    The caller performs one pass without ``write_plaintext`` before creating a
+    named staging file.  A later pass may write only content whose complete
+    envelope was already authenticated.
+    """
+    output = write_plaintext.open("wb") if write_plaintext is not None else None
+    try:
+        chain = hashlib.sha256()
+        for expected_index in range(chunk_count):
+            record_prefix = _read_exact(input_handle, 8 + 4 + NONCE_SIZE, "chunk record")
+            index, ciphertext_size = struct.unpack(">QI", record_prefix[:12])
+            nonce = record_prefix[12:]
+            if index != expected_index:
+                # A dropped chunk puts the footer where a chunk record should
+                # be, and its magic then reads as an enormous index. Report
+                # that as truncation rather than as a reordering bug.
+                if record_prefix.startswith(FOOTER_MAGIC):
+                    raise TamperError(
+                        f"vault is missing chunks: the footer appears where "
+                        f"chunk {expected_index} of {chunk_count} should be"
+                    )
+                raise TamperError(
+                    f"vault chunks are out of order: expected {expected_index}, got {index}"
+                )
+            expected_plaintext_size = min(
+                chunk_size, plaintext_size - expected_index * chunk_size
+            )
+            if ciphertext_size != expected_plaintext_size + TAG_SIZE:
+                raise TamperError("vault chunk has an invalid ciphertext length")
+            ciphertext = _read_exact(input_handle, ciphertext_size, "chunk ciphertext")
+            try:
+                plaintext = AESGCM(data_key).decrypt(
+                    nonce, ciphertext, _chunk_aad(header_bytes, expected_index)
+                )
+            except InvalidTag as exc:
+                raise TamperError("vault ciphertext authentication failed") from exc
+            if output is not None:
+                output.write(plaintext)
+            chain.update(record_prefix)
+            chain.update(ciphertext)
+        if _read_exact(input_handle, len(FOOTER_MAGIC), "footer magic") != FOOTER_MAGIC:
+            raise TamperError("vault footer is missing or the body is truncated")
+        footer_size = struct.unpack(">I", _read_exact(input_handle, 4, "footer length"))[0]
+        if footer_size != 8 + 8 + hashlib.sha256().digest_size + TAG_SIZE:
+            raise TamperError("vault footer has an invalid length")
+        footer = _read_exact(input_handle, footer_size, "footer")
+        try:
+            footer_payload = AESGCM(data_key).decrypt(
+                footer_nonce, footer, _footer_aad(header_bytes)
+            )
+        except InvalidTag as exc:
+            raise TamperError("vault header or footer authentication failed") from exc
+        if len(footer_payload) != 8 + 8 + hashlib.sha256().digest_size:
+            raise TamperError("vault footer payload has an invalid length")
+        footer_count, footer_plaintext_size = struct.unpack(">QQ", footer_payload[:16])
+        if (footer_count != chunk_count
+                or footer_plaintext_size != plaintext_size
+                or footer_payload[16:] != chain.digest()):
+            raise TamperError("vault body is reordered, truncated, or otherwise tampered")
+        if input_handle.read(1):
+            raise TamperError("vault has trailing data after its authenticated footer")
+        if output is not None:
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        if output is not None:
+            output.close()
+
+
 def decrypt_vault(
     src: str | os.PathLike[str],
     dst: str | os.PathLike[str],
@@ -576,13 +727,31 @@ def decrypt_vault(
     provider: KeyProvider,
     actor: str,
     purpose: str,
+    expected_generation: int | None = None,
 ) -> None:
-    """Stream-decrypt an envelope into an atomically replaced plaintext file."""
+    """Stream-decrypt an envelope into an atomically replaced plaintext file.
+
+    The complete encrypted body and footer are authenticated before any named
+    plaintext staging file is created.  If ``expected_generation`` is supplied,
+    an envelope without a generation or with an older generation is refused.
+    Version-1 envelopes created before generation support remain readable when
+    no expected generation is supplied.  Plaintext is limited to
+    2,199,023,255,552 bytes (2 TiB) and 2,147,483,648 chunks per data key.
+    """
     source = Path(src)
     destination = Path(dst)
     _check_paths(source, destination)
     _validate_identity(actor, "actor")
     _validate_identity(purpose, "purpose")
+    if expected_generation is not None and (
+        not isinstance(expected_generation, int)
+        or isinstance(expected_generation, bool)
+        or expected_generation < 1
+        or expected_generation > MAX_GENERATION
+    ):
+        raise VaultCryptoError(
+            f"expected_generation must be an integer from 1 to {MAX_GENERATION}"
+        )
     staging: Path | None = None
     committed = False
     try:
@@ -593,6 +762,13 @@ def decrypt_vault(
             wrap_nonce = nonces[:NONCE_SIZE]
             footer_nonce = nonces[NONCE_SIZE:]
             vault_id = header["vault_id"]
+            generation = header.get("generation")
+            if expected_generation is not None and (
+                generation is None or generation < expected_generation
+            ):
+                raise TamperError(
+                    "vault envelope generation is older than the expected generation"
+                )
 
             # The audit is intentionally before provider access and before the
             # first plaintext chunk can be written.  A failed audit aborts the
@@ -610,68 +786,21 @@ def decrypt_vault(
                     "master key is wrong (or the wrapped data key is corrupt)"
                 ) from exc
 
-            staging = _staging_path(destination)
-            chain = hashlib.sha256()
             chunk_size = header["chunk_size"]
             plaintext_size = header["plaintext_size"]
             chunk_count = header["chunk_count"]
-            with staging.open("wb") as output:
-                for expected_index in range(chunk_count):
-                    record_prefix = _read_exact(input_handle, 8 + 4 + NONCE_SIZE, "chunk record")
-                    index, ciphertext_size = struct.unpack(">QI", record_prefix[:12])
-                    nonce = record_prefix[12:]
-                    if index != expected_index:
-                        # A dropped chunk puts the footer where a chunk record
-                        # should be, and its magic then reads as an enormous
-                        # index. Saying "expected 260, got 5206537530048402514"
-                        # sends a reader hunting for a reordering bug that is
-                        # really a truncation.
-                        if record_prefix.startswith(FOOTER_MAGIC):
-                            raise TamperError(
-                                f"vault is missing chunks: the footer appears where "
-                                f"chunk {expected_index} of {chunk_count} should be"
-                            )
-                        raise TamperError(
-                            f"vault chunks are out of order: expected {expected_index}, got {index}"
-                        )
-                    expected_plaintext_size = min(
-                        chunk_size, plaintext_size - expected_index * chunk_size
-                    )
-                    if ciphertext_size != expected_plaintext_size + TAG_SIZE:
-                        raise TamperError("vault chunk has an invalid ciphertext length")
-                    ciphertext = _read_exact(input_handle, ciphertext_size, "chunk ciphertext")
-                    try:
-                        plaintext = AESGCM(data_key).decrypt(
-                            nonce, ciphertext, _chunk_aad(header_bytes, expected_index)
-                        )
-                    except InvalidTag as exc:
-                        raise TamperError("vault ciphertext authentication failed") from exc
-                    output.write(plaintext)
-                    chain.update(record_prefix)
-                    chain.update(ciphertext)
-                if _read_exact(input_handle, len(FOOTER_MAGIC), "footer magic") != FOOTER_MAGIC:
-                    raise TamperError("vault footer is missing or the body is truncated")
-                footer_size = struct.unpack(">I", _read_exact(input_handle, 4, "footer length"))[0]
-                if footer_size != 8 + 8 + hashlib.sha256().digest_size + TAG_SIZE:
-                    raise TamperError("vault footer has an invalid length")
-                footer = _read_exact(input_handle, footer_size, "footer")
-                try:
-                    footer_payload = AESGCM(data_key).decrypt(
-                        footer_nonce, footer, _footer_aad(header_bytes)
-                    )
-                except InvalidTag as exc:
-                    raise TamperError("vault header or footer authentication failed") from exc
-                if len(footer_payload) != 8 + 8 + hashlib.sha256().digest_size:
-                    raise TamperError("vault footer payload has an invalid length")
-                footer_count, footer_plaintext_size = struct.unpack(">QQ", footer_payload[:16])
-                if (footer_count != chunk_count
-                        or footer_plaintext_size != plaintext_size
-                        or footer_payload[16:] != chain.digest()):
-                    raise TamperError("vault body is reordered, truncated, or otherwise tampered")
-                if input_handle.read(1):
-                    raise TamperError("vault has trailing data after its authenticated footer")
-                output.flush()
-                os.fsync(output.fileno())
+            body_offset = input_handle.tell()
+            _read_authenticated_body(
+                input_handle, header_bytes, data_key, footer_nonce,
+                chunk_size, plaintext_size, chunk_count,
+            )
+            input_handle.seek(body_offset)
+            staging = _staging_path(destination)
+            _read_authenticated_body(
+                input_handle, header_bytes, data_key, footer_nonce,
+                chunk_size, plaintext_size, chunk_count,
+                write_plaintext=staging,
+            )
             replace_status = _durable_replace(staging, destination)
             committed = True
             _record_replace_status(
@@ -705,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
     encrypt.add_argument("--vault-id", required=True)
     encrypt.add_argument("--actor", required=True)
     encrypt.add_argument("--purpose", required=True)
+    encrypt.add_argument("--generation", type=int)
     add_provider_options(encrypt)
 
     decrypt = subparsers.add_parser("decrypt", help="stream-decrypt an encrypted vault")
@@ -712,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
     decrypt.add_argument("dst")
     decrypt.add_argument("--actor", required=True)
     decrypt.add_argument("--purpose", required=True)
+    decrypt.add_argument("--expected-generation", type=int)
     add_provider_options(decrypt)
 
     inspect = subparsers.add_parser("inspect", help="print the public envelope header")
@@ -724,11 +855,13 @@ def main(argv: list[str] | None = None) -> int:
             encrypt_vault(
                 args.src, args.dst, provider=_provider_from_args(args),
                 vault_id=args.vault_id, actor=args.actor, purpose=args.purpose,
+                generation=args.generation,
             )
         else:
             decrypt_vault(
                 args.src, args.dst, provider=_provider_from_args(args),
                 actor=args.actor, purpose=args.purpose,
+                expected_generation=args.expected_generation,
             )
     except (OSError, VaultCryptoError) as exc:
         print(f"vault_crypt: {exc}", file=sys.stderr)

@@ -58,7 +58,18 @@ held by a pluggable key provider. Two providers ship — an environment variable
   you are comfortable with (an encrypted volume, a private directory), and be
   aware that a crash can leave it there.
 - Encryption and decryption are streamed in bounded chunks; the vault is never
-  materialized in memory.
+  materialized in memory. Each envelope is limited to 2,199,023,255,552 bytes
+  (2 TiB) and 2,147,483,648 chunks (2^31) per data key. Chunk nonces are
+  independently random 96-bit values; this keeps the chunks plus one footer
+  invocation below the NIST SP 800-38D 2^32-invocation AES-GCM limit. Decryption
+  authenticates the complete body and footer before it creates a named staging
+  file, then atomically installs the plaintext.
+- New envelopes carry a monotonically increasing `generation` when replacing
+  the same envelope path. Callers that store versions under separate object
+  names must provide increasing generations and pass `expected_generation` to
+  `decrypt_vault`; an older generation is refused. Version-1 envelopes created
+  before this field existed remain readable when no expected generation is
+  requested.
 - The master key is never written into the vault, and access is recorded to an
   audit log (`HEALTH_ADVISOR_VAULT_AUDIT_LOG`).
 - Encryption is **opt-in**. If you never configure a key provider, your vault is

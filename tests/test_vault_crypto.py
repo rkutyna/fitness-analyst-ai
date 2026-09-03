@@ -80,6 +80,170 @@ def test_round_trip_is_byte_identical_and_inspect_needs_no_key(tmp_path, monkeyp
     assert event["vault"] == "user-123"
 
 
+def test_older_envelope_is_refused_when_expected_generation_is_newer(tmp_path, monkeypatch):
+    """A valid older object cannot replace the generation the caller expects."""
+    _set_audit(monkeypatch, tmp_path)
+    vault_dir = tmp_path / "generation-vault"
+    vault_dir.mkdir()
+    source = vault_dir / "source.db"
+    encrypted = vault_dir / "current.enc"
+    older = vault_dir / "older.enc"
+    source.write_bytes(b"first version")
+    provider = FixedProvider(b"g" * 32)
+
+    crypto.encrypt_vault(
+        source, encrypted, provider=provider, vault_id="generation-vault",
+        actor="worker", purpose="generation-test",
+    )
+    older.write_bytes(encrypted.read_bytes())
+    assert crypto.inspect_header(older)["generation"] == 1
+
+    source.write_bytes(b"second version")
+    crypto.encrypt_vault(
+        source, encrypted, provider=provider, vault_id="generation-vault",
+        actor="worker", purpose="generation-test",
+    )
+    current_generation = crypto.inspect_header(encrypted)["generation"]
+    assert current_generation == 2
+
+    encrypted.write_bytes(older.read_bytes())
+    restored = vault_dir / "restored.db"
+    child = os.fork()
+    if child == 0:  # pragma: no cover - the child reports through its exit code
+        try:
+            crypto.decrypt_vault(
+                encrypted, restored, provider=provider, actor="worker",
+                purpose="generation-test", expected_generation=current_generation,
+            )
+        except crypto.TamperError:
+            os._exit(0)
+        except BaseException:
+            os._exit(2)
+        os._exit(1)
+
+    _, status = os.waitpid(child, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert not restored.exists()
+    assert crypto.find_staging_files(vault_dir) == []
+
+
+def test_hard_kill_during_verification_leaves_no_plaintext_staging(tmp_path, monkeypatch):
+    """The real process-kill boundary occurs before named staging exists."""
+    _set_audit(monkeypatch, tmp_path)
+    vault_dir = tmp_path / "crash-vault"
+    vault_dir.mkdir()
+    source = vault_dir / "source.db"
+    encrypted = vault_dir / "source.enc"
+    restored = vault_dir / "restored.db"
+    _write_source(source, 3 * crypto.DEFAULT_CHUNK_SIZE + 17)
+    provider = FixedProvider(b"h" * 32)
+    crypto.encrypt_vault(
+        source, encrypted, provider=provider, vault_id="crash-vault",
+        actor="worker", purpose="crash-test",
+    )
+
+    child = os.fork()
+    if child == 0:  # pragma: no cover - the child exits intentionally
+        real_decrypt = crypto.AESGCM.decrypt
+        calls = 0
+
+        def kill_after_two_chunks(cipher, nonce, ciphertext, associated_data):
+            nonlocal calls
+            calls += 1
+            plaintext = real_decrypt(cipher, nonce, ciphertext, associated_data)
+            # Call 1 unwraps the data key; calls 2 and 3 authenticate chunks.
+            if calls == 3:
+                os._exit(0)
+            return plaintext
+
+        crypto.AESGCM.decrypt = kill_after_two_chunks
+        try:
+            crypto.decrypt_vault(
+                encrypted, restored, provider=provider, actor="worker",
+                purpose="crash-test",
+            )
+        except BaseException:
+            os._exit(2)
+        os._exit(3)
+
+    _, status = os.waitpid(child, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert not restored.exists()
+    assert crypto.find_staging_files(vault_dir) == []
+
+
+def test_generation_is_optional_for_legacy_headers():
+    header = {
+        "format": "health-advisor-vault",
+        "version": crypto.FORMAT_VERSION,
+        "cipher": crypto.CIPHER_NAME,
+        "chunk_size": crypto.DEFAULT_CHUNK_SIZE,
+        "plaintext_size": 0,
+        "chunk_count": 0,
+        "vault_id": "legacy-vault",
+        "wrap_nonce": base64.urlsafe_b64encode(b"n" * crypto.NONCE_SIZE).decode(),
+        "wrapped_data_key": base64.urlsafe_b64encode(
+            b"w" * (crypto.KEY_SIZE + crypto.TAG_SIZE)
+        ).decode(),
+        "footer_nonce": base64.urlsafe_b64encode(b"f" * crypto.NONCE_SIZE).decode(),
+    }
+    validated, _, _, _ = crypto._validate_header(header)
+    assert "generation" not in validated
+
+
+def test_envelope_generated_before_generation_field_still_decrypts(tmp_path, monkeypatch):
+    """Pinned version-1 fixture: its authenticated header has no generation."""
+    legacy_envelope = base64.b64decode(
+        "SEFWTFRFTkMAAAExeyJjaHVua19jb3VudCI6MSwiY2h1bmtfc2l6ZSI6MTA0ODU3NiwiY2lwaGVyIjoiQUVTLTI1"
+        "Ni1HQ00iLCJmb290ZXJfbm9uY2UiOiJEQXdNREF3TURBd01EQXdNIiwiZm9ybWF0IjoiaGVhbHRoLWFkdmlzb3It"
+        "dmF1bHQiLCJwbGFpbnRleHRfc2l6ZSI6MTQsInZhdWx0X2lkIjoibGVnYWN5LWZpeHR1cmUiLCJ2ZXJzaW9uIjox"
+        "LCJ3cmFwX25vbmNlIjoiREF3TURBd01EQXdNREF3TSIsIndyYXBwZWRfZGF0YV9rZXkiOiJRbklITTBVeWJwQXdh"
+        "dXdCVjd2RXI2SWFhYXpDbDJMYVBweEoyeGZIdW0tcUJSdXppbnBaUFJ0WFpJUWxyQVVrIn0AAAAAAAAAAAAAAB4M"
+        "DAwMDAwMDAwMDAwDTS0fshdCmSndXWgEyYHD7/xVs3V12R9b6P9YqjFIQVZMVEZUUgAAAEBvKEp+0W5v/kClKR12"
+        "rFZtgr2UmlBTwqqSeclleH0XkKQY9QmfLI1dLtem+kMj1qECcXtotU97d9ibRDcBp92X"
+    )
+    _set_audit(monkeypatch, tmp_path)
+    vault_dir = tmp_path / "legacy-vault"
+    vault_dir.mkdir()
+    encrypted = vault_dir / "legacy.enc"
+    restored = vault_dir / "legacy.db"
+    encrypted.write_bytes(legacy_envelope)
+
+    crypto.decrypt_vault(
+        encrypted, restored, provider=FixedProvider(b"k" * 32),
+        actor="fixture", purpose="compatibility",
+    )
+    assert restored.read_bytes() == b"legacy-fixture"
+
+
+def test_plaintext_and_chunk_limits_are_enforced(tmp_path):
+    source = tmp_path / "oversized.db"
+    with source.open("wb") as handle:
+        handle.truncate(crypto.MAX_PLAINTEXT_SIZE + 1)
+    with pytest.raises(crypto.VaultCryptoError, match="exceeds vault limits"):
+        crypto.encrypt_vault(
+            source, tmp_path / "oversized.enc", provider=FixedProvider(b"l" * 32),
+            vault_id="limit-vault", actor="worker", purpose="limit-test",
+        )
+
+    header = {
+        "format": "health-advisor-vault",
+        "version": crypto.FORMAT_VERSION,
+        "cipher": crypto.CIPHER_NAME,
+        "chunk_size": 4096,
+        "plaintext_size": crypto.MAX_PLAINTEXT_SIZE,
+        "chunk_count": crypto.MAX_CHUNK_COUNT + 1,
+        "vault_id": "limit-vault",
+        "wrap_nonce": base64.urlsafe_b64encode(b"n" * crypto.NONCE_SIZE).decode(),
+        "wrapped_data_key": base64.urlsafe_b64encode(
+            b"w" * (crypto.KEY_SIZE + crypto.TAG_SIZE)
+        ).decode(),
+        "footer_nonce": base64.urlsafe_b64encode(b"f" * crypto.NONCE_SIZE).decode(),
+    }
+    with pytest.raises(crypto.VaultFormatError, match="too many chunks"):
+        crypto._validate_header(header)
+
+
 def test_round_trip_of_real_sqlite_file(tmp_path, monkeypatch):
     audit = _set_audit(monkeypatch, tmp_path)
     vault_dir = tmp_path / "sqlite-vault"

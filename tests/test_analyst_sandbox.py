@@ -462,6 +462,7 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
         *,
         limits: dict | None = None,
         host_artifact: Path | None = None,
+        parent_fd_path: Path | None = None,
     ) -> None:
         cases.append({
             "class": cls,
@@ -469,6 +470,7 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
             "code": code,
             "limits": limits or {},
             "host_artifact": host_artifact,
+            "parent_fd_path": parent_fd_path,
         })
 
     # (i) network -------------------------------------------------------- #
@@ -637,7 +639,7 @@ for name in os.listdir("/dev/fd"):
         pass
 if not found:
     print("BLOCKED no secret leak")
-""")
+""", parent_fd_path=secret_path)
     add("inherited_descriptors", "raw_vault_fd_write_bypassing_conn", """
 import os
 try:
@@ -655,32 +657,44 @@ except Exception as e:
 import os, time
 pid = os.fork()
 if pid == 0:
-    time.sleep(60)
+    time.sleep(4)
+    os.write(3, b"UNSAFE descendant survived deadline")
     os._exit(0)
 while True:
     pass
 """, limits={"wall_clock_s": 3.0})
-    add("forked_descendants", "descendant_holds_vault_conn_open", """
+    vault_conn_marker = (tmp_root / "corpus" / "forked_descendants"
+                         / "descendant_holds_vault_conn_open" / "work"
+                         / "post_timeout_marker.txt")
+    add("forked_descendants", "descendant_holds_vault_conn_open", f"""
 import os, time
 pid = os.fork()
 if pid == 0:
-    cur = conn.execute("SELECT COUNT(*) FROM daily_metrics")
-    cur.fetchone()
-    time.sleep(60)
+    if conn is not None:
+        cur = conn.execute("SELECT COUNT(*) FROM daily_metrics")
+        cur.fetchone()
+    time.sleep(4)
+    with open({str(vault_conn_marker)!r}, "w", encoding="utf-8") as marker:
+        marker.write("descendant survived deadline")
     os._exit(0)
 while True:
     pass
-""", limits={"wall_clock_s": 3.0})
-    add("forked_descendants", "three_plain_descendants", """
+""", limits={"wall_clock_s": 3.0}, host_artifact=vault_conn_marker)
+    plain_descendant_marker = (tmp_root / "corpus" / "forked_descendants"
+                               / "three_plain_descendants" / "work"
+                               / "post_timeout_marker.txt")
+    add("forked_descendants", "three_plain_descendants", f"""
 import os, time
 for _ in range(3):
     pid = os.fork()
     if pid == 0:
-        time.sleep(60)
+        time.sleep(4)
+        with open({str(plain_descendant_marker)!r}, "a", encoding="utf-8") as marker:
+            marker.write("descendant survived deadline\\n")
         os._exit(0)
 while True:
     pass
-""", limits={"wall_clock_s": 3.0})
+""", limits={"wall_clock_s": 3.0}, host_artifact=plain_descendant_marker)
 
     # (vi) path / TOCTOU ---------------------------------------------------- #
     # These three are asserted structurally below (they need filesystem
@@ -828,11 +842,23 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
             continue
         run_dir = tmp_path / "corpus" / cls / name
         host_artifact = case["host_artifact"]
+        parent_fd = None
         if host_artifact is not None:
             assert not os.path.exists(host_artifact), (
                 "host probe artifact already exists before the sandbox run"
             )
-        res = _run(executor, case["code"], vault_path, run_dir, **case["limits"])
+        if case["parent_fd_path"] is not None:
+            parent_fd = os.open(case["parent_fd_path"], os.O_RDONLY)
+            while parent_fd <= 4:
+                higher_fd = os.dup(parent_fd)
+                os.close(parent_fd)
+                parent_fd = higher_fd
+            os.set_inheritable(parent_fd, True)
+        try:
+            res = _run(executor, case["code"], vault_path, run_dir, **case["limits"])
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
         unsafe = _is_unsafe(res, host_artifact=host_artifact)
         attempted[cls] += 1
         if not unsafe:

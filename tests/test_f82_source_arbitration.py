@@ -169,6 +169,35 @@ def test_read_window_does_not_import_a_watch_winner_from_outside_the_window(conn
     assert sum(row["miles"] for row in rows) == pytest.approx(0.02)
 
 
+def test_arbitration_uses_roles_for_renamed_devices(conn):
+    """A generic watch/phone pair still selects the watch stream."""
+    conn.execute(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "duration_min, source, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("running", "2026-08-26T12:00:00+00:00",
+         "2026-08-26T13:00:00+00:00", "2026-08-26", 60.0,
+         "test", "renamed-device-workout"),
+    )
+    rows = []
+    for source, value in (("Demo Watch", 0.01), ("Demo Phone", 0.02)):
+        rows.append({
+            "metric": "distance_walking_running", "value": value, "unit": "mi",
+            "start_utc": "2026-08-26T12:00:00+00:00",
+            "end_utc": "2026-08-26T12:00:20+00:00",
+            "start_local": "2026-08-26 12:00:00", "local_date": "2026-08-26",
+            "source": source, "origin": "test",
+            "dedupe_key": f"renamed-device-{source}",
+        })
+    db.insert_records(conn, rows)
+
+    clause, args = db._workout_arbitration(conn, "distance_walking_running")
+    kept = conn.execute(
+        "SELECT source FROM records WHERE metric = ?" + clause,
+        ("distance_walking_running", *args),
+    ).fetchall()
+    assert [row[0] for row in kept] == ["Demo Watch"]
+
+
 @pytest.mark.parametrize("source", ["GymKit|Demo's Apple Watch", ""])
 def test_post_cutoff_opaque_source_labels_are_refused_loudly(conn, source):
     """Neither merged nor empty labels may silently enter device arbitration."""
@@ -207,10 +236,11 @@ def test_pre_cutoff_arbitration_leaves_fixture_rows_untouched(conn):
 def test_arbitration_is_bounded_and_survives_a_low_sqlite_variable_limit(conn):
     load_f82_multi_source(conn)
     clause, args = db._workout_arbitration(conn, "distance_walking_running")
-    # The generated arbitration predicate has one fixed cutoff bind, never one
-    # bind for each of the hundreds of loser rows in the fixture.
-    assert len(args) == 1
-    assert clause.count("?") == 1
+    # The generated arbitration predicate has one bind for each distinct raw
+    # post-cutoff label, never one bind for each of the loser rows.
+    assert set(args) == {"Demo Apple Watch", "Demo iPhone", "GymKit"}
+    assert len(args) == len(set(args)) == 3
+    assert clause.count("?") == 3
     old_limit = conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 16)
     try:
         rows = analysis.mx.impact_bucket_rows(

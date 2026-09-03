@@ -441,8 +441,9 @@ MIRROR_SOURCES = {"Sync Solver": "2019-01-16"}
 
 # HealthKit-direct ingestion began on this date. Unlike MIRROR_SOURCES, this
 # is not a whole-day source precedence rule: concurrent samples inside one
-# workout window need an activity-device winner. Labels are matched as complete
-# source strings; a pipe-joined label is deliberately not split.
+# workout window need an activity-device winner. Device roles are resolved from
+# the complete source label at query time; a pipe-joined label is deliberately
+# not split.
 # Deployment default carried over from the first deployment; making this a
 # per-vault setting is tracked in issue #6.
 WORKOUT_SOURCE_ARBITRATION_FROM = "2026-08-21"
@@ -469,17 +470,46 @@ def mirror_loses_from(source: str | None) -> str | None:
     return None
 
 
-def workout_source_role(source: str | None) -> str | None:
-    """Classify one complete workout source label, if it names a device."""
-    label = " ".join((source or "").split())
+WORKOUT_SOURCE_ROLES = frozenset({"watch", "iphone", "scale", "mirror", "gymkit"})
+
+
+def workout_source_role(source: str | None, *, product_type: str | None = None) -> str | None:
+    """Resolve a complete source label to its stable device role.
+
+    Source names are user-editable and localized, so role words are only a
+    fallback for exports that omit HealthKit's product type. A merged or empty
+    label has no single device identity and returns ``None``.
+    """
+    label = " ".join((source or "").replace("\xa0", " ").split())
     if "|" in label:
         return None
     if label == "GymKit":
         return "gymkit"
-    if label.endswith("Apple Watch"):
+
+    if is_mirror_source(label):
+        return "mirror"
+
+    product = " ".join((product_type or "").replace("\xa0", " ").split()).casefold()
+    compact_product = re.sub(r"[^\w]+", " ", product).strip()
+    if re.search(r"(?:^| )(?:watch|applewatch)(?: |$)", compact_product):
         return "watch"
-    if label.endswith("iPhone"):
+    if re.search(r"(?:^| )(?:iphone|phone|mobile)(?: |$)", compact_product):
         return "iphone"
+
+    words = re.sub(r"[^\w]+", " ", label.casefold()).split()
+    if any(word in words for word in (
+        "watch", "wrist", "reloj", "uhr", "montre", "relógio", "relogio",
+    )):
+        return "watch"
+    if any(word in words for word in (
+        "iphone", "phone", "mobile", "smartphone", "telefon", "teléfono",
+        "telefono", "téléphone",
+    )):
+        return "iphone"
+    if any(word in words for word in (
+        "scale", "balance", "waage", "báscula", "bascula", "balanza",
+    )):
+        return "scale"
     return None
 
 

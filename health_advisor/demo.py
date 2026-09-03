@@ -32,14 +32,10 @@ produces the *shapes* the engine keys off:
 
 DEVICE NAMES
 ------------
-``DEMO_WATCH`` / ``DEMO_PHONE`` end in "Apple Watch" and "iPhone" *on purpose*,
-and that suffix is load-bearing rather than decorative: cross-source distance
-arbitration in ``db._workout_arbitration`` matches ``LIKE '%Apple Watch'`` and
-``LIKE '%iPhone'``. A vault whose devices are called "Demo Watch" and "Demo
-Phone" would double-count every overlapping distance sample and would exercise
-none of that logic — the arbitration would silently never fire, which is the
-worst of the available outcomes. The names carry no personal identity, which is
-the actual requirement; the prefix is generic and the suffix is a device model.
+``DEMO_WATCH`` / ``DEMO_PHONE`` use generic, non-product names on purpose.
+Their roles are resolved at query time, so the demo exercises the same
+arbitration path as a renamed or localized device. The names carry no personal
+identity.
 
 DETERMINISM
 -----------
@@ -71,8 +67,8 @@ from . import vault as vaultmod
 # --------------------------------------------------------------------------- #
 # Invented identities. Nothing here refers to a real person or device.
 # --------------------------------------------------------------------------- #
-DEMO_WATCH = "Demo Apple Watch"
-DEMO_PHONE = "Demo iPhone"
+DEMO_WATCH = "Demo Watch"
+DEMO_PHONE = "Demo Phone"
 DEMO_SCALE = "Demo Scale"
 CHECKIN_SOURCE = "checkin"      # matches subjective.CHECKIN_ORIGIN
 

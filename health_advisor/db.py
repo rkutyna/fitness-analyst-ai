@@ -989,6 +989,70 @@ def _arbitration(
     return clause, params
 
 
+def _workout_source_labels(
+    conn: sqlite3.Connection, *, source_table: str, date: str | None,
+    arbitration_window: tuple[str, str] | None,
+    arbitration_window_kind: str,
+    scoped,
+) -> dict[str, list[str]]:
+    """Resolve the relevant raw source labels in the caller's window."""
+    from . import normalize as nz
+
+    source = _source_table(source_table)
+    scope, scope_args = scoped(source)
+    date_clause = ""
+    date_args: list[str] = []
+    if arbitration_window is None and date is not None:
+        date_clause = f" AND {source}.local_date = ?"
+        date_args.append(date)
+    rows = conn.execute(
+        f"SELECT DISTINCT source FROM {source} "
+        "WHERE metric = ? AND local_date >= ?"
+        f"{date_clause}{scope}",
+        ("distance_walking_running", nz.WORKOUT_SOURCE_ARBITRATION_FROM,
+         *date_args, *scope_args),
+    ).fetchall()
+    labels = {role: [] for role in ("watch", "iphone", "gymkit")}
+    for row in rows:
+        raw = row[0]
+        normalized = " ".join((raw or "").replace("\xa0", " ").split())
+        if not normalized or "|" in normalized:
+            raise ValueError(
+                "distance arbitration refuses post-cutoff source label "
+                f"{raw!r}: pipe-joined and empty labels have no device "
+                "identity")
+        role = nz.workout_source_role(raw)
+        if role in labels:
+            labels[role].append(raw)
+    for role in labels:
+        labels[role].sort(key=lambda value: (value is not None, value or ""))
+    return labels
+
+
+def _workout_role_ctes(
+    labels: dict[str, list[str]],
+    arbitration_window: tuple[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    """Build one-bind-per-label SQL sets shared by all arbitration predicates."""
+    ctes: list[str] = []
+    args: list[str] = []
+    for role in ("watch", "iphone", "gymkit"):
+        values = labels[role]
+        if values:
+            ctes.append(
+                f"{role}_sources(source) AS "
+                f"(VALUES {','.join('( ?)' for _ in values)})")
+            args.extend(values)
+        else:
+            ctes.append(f"{role}_sources(source) AS (SELECT NULL WHERE 0)")
+    if arbitration_window is not None:
+        ctes.append(
+            "arbitration_window(start_value, end_value) AS "
+            "(VALUES (?, ?))")
+        args.extend(arbitration_window)
+    return ", ".join(ctes), args
+
+
 def _workout_arbitration(
     conn: sqlite3.Connection, metric: str, *, date: str | None = None,
     source_table: str = "records",
@@ -997,25 +1061,11 @@ def _workout_arbitration(
 ) -> tuple[str, list]:
     """Filter lower-priority device samples in the requested read window.
 
-    This is deliberately a correlated ``NOT EXISTS`` rather than a list of
-    losing record ids. A live vault already has thousands of samples in these
-    windows, and binding one id per loser eventually exceeds SQLite's variable
-    limit. The whole-day iPhone-vs-Watch predicate is scoped to the caller's
-    read window when one is supplied, and the workout subquery is bounded to
-    that same window. The date-floor bind remains the only bind for callers
-    that rebuild a complete day.
-
-    Source labels use the same complete-label rule as
-    ``normalize.workout_source_role``: pipe-joined labels are not split. Inside
-    a workout window GymKit wins when present; otherwise Watch wins over iPhone.
-    For a complete-day/recompute call, Watch also wins over iPhone across the
-    post-cutoff day. Read-time callers pass their actual local-date or UTC
-    window, so movement outside the question cannot supply a winner.
-
-    Pipe-joined and empty source labels are not device identities. They are
-    explicitly refused in the post-cutoff arbitration scope rather than being
-    silently treated as a losing or winning device. Historical pipe-joined and
-    empty rows before the cutoff remain untouched by this rule.
+    Distinct post-cutoff source labels are classified in Python on every call.
+    Their raw spellings are then bound once in role-specific SQL sets. The
+    correlated filter remains a ``NOT EXISTS`` so it never binds one value per
+    losing sample and is valid on raw sqlite connections without custom
+    functions.
     """
     from . import normalize as nz
 
@@ -1039,19 +1089,7 @@ def _workout_arbitration(
             raise ValueError(f"arbitration_window must have {relation}")
     source = _source_table(source_table)
 
-    def normalized(column: str) -> str:
-        # The HealthKit export uses NBSP in device names and can leave a
-        # trailing ASCII space. SQLite's trim does not normalize NBSP.
-        return f"trim(replace(COALESCE({column}, ''), char(160), ' '))"
-
-    outer_source = normalized(f"{source}.source")
-    winner_source = normalized("winner.source")
-    gymkit = f"{winner_source} = 'GymKit'"
-    watch = f"{winner_source} NOT LIKE '%|%' AND {winner_source} LIKE '%Apple Watch'"
-    outer_watch = f"{outer_source} NOT LIKE '%|%' AND {outer_source} LIKE '%Apple Watch'"
-    outer_iphone = f"{outer_source} NOT LIKE '%|%' AND {outer_source} LIKE '%iPhone'"
-
-    def scoped(alias: str) -> tuple[str, list]:
+    def query_scoped(alias: str) -> tuple[str, list]:
         """Return the caller's read-window predicate for one SQL alias."""
         if arbitration_window is None:
             return "", []
@@ -1060,52 +1098,39 @@ def _workout_arbitration(
             return f" AND {alias}.local_date >= ? AND {alias}.local_date <= ?", [start, end]
         return f" AND {alias}.start_utc >= ? AND {alias}.start_utc < ?", [start, end]
 
-    # A pipe label is an already-merged historical stream, not evidence that
-    # either device won this arbitration. Empty labels have the same problem,
-    # with less provenance. In the post-cutover data these must be surfaced at
-    # the boundary: otherwise the LIKE predicates below fail open and the raw
-    # duplicate silently enters the jog dial.
-    validation_scope, validation_args = scoped(source)
-    validation_date = ""
-    validation_date_args: list[str] = []
-    if arbitration_window is None and date is not None:
-        validation_date = f" AND {source}.local_date = ?"
-        validation_date_args.append(date)
-    unknown = conn.execute(
-        f"SELECT {source}.source FROM {source} "
-        "WHERE metric = ? AND local_date >= ?"
-        f"{validation_date}{validation_scope} AND ("
-        f"{normalized(f'{source}.source')} = '' OR "
-        f"instr({normalized(f'{source}.source')}, '|') > 0) LIMIT 1",
-        ("distance_walking_running", nz.WORKOUT_SOURCE_ARBITRATION_FROM,
-         *validation_date_args, *validation_args),
-    ).fetchone()
-    if unknown is not None:
-        raise ValueError(
-            "distance arbitration refuses post-cutoff source label "
-            f"{unknown[0]!r}: pipe-joined and empty labels have no device "
-            "identity")
+    def scoped(alias: str) -> tuple[str, list]:
+        """Use the one shared caller-window bind set in the returned clause."""
+        if arbitration_window is None:
+            return "", []
+        if arbitration_window_kind == "local_date":
+            return (
+                f" AND {alias}.local_date >= "
+                "(SELECT start_value FROM arbitration_window)"
+                f" AND {alias}.local_date <= "
+                "(SELECT end_value FROM arbitration_window)", []
+            )
+        return (
+            f" AND {alias}.start_utc >= "
+            "(SELECT start_value FROM arbitration_window)"
+            f" AND {alias}.start_utc < "
+            "(SELECT end_value FROM arbitration_window)", []
+        )
 
-    # The post-boundary client writes one stream per device even outside a
-    # workout. Those rows still describe one movement, so Watch beats iPhone
-    # for the entire local day. GymKit priority is deliberately limited to the
-    # correlated workout-window predicate below. This deliberately uses a
-    # literal for the code-owned cutoff: the workout predicate already owns the
-    # sole bind returned by this function.
+    role_labels = _workout_source_labels(
+        conn, source_table=source_table, date=date,
+        arbitration_window=arbitration_window,
+        arbitration_window_kind=arbitration_window_kind,
+        scoped=query_scoped,
+    )
+    role_ctes, role_args = _workout_role_ctes(
+        role_labels, arbitration_window=arbitration_window)
+
+    def member(column: str, role: str) -> str:
+        return f"{column} IN (SELECT source FROM {role}_sources)"
+
     cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
-    day_watch = (
-        f"EXISTS (SELECT 1 FROM {source} AS day_winner "
-        "WHERE day_winner.metric = 'distance_walking_running' "
-        f"AND day_winner.local_date = {source}.local_date "
-        f"{scoped('day_winner')[0]} "
-        f"AND {normalized('day_winner.source')} NOT LIKE '%|%' "
-        f"AND {normalized('day_winner.source')} LIKE '%Apple Watch')"
-    )
-    whole_day_loser = (
-        f"{source}.local_date >= '{cutoff}' AND "
-        f"({outer_iphone} AND {day_watch})"
-    )
-
+    day_scope, day_scope_args = scoped("day_winner")
+    workout_scope, workout_scope_args = scoped("workout")
     winner_window = (
         "winner.metric = 'distance_walking_running' "
         "AND winner.start_utc >= workout.start_utc "
@@ -1113,29 +1138,33 @@ def _workout_arbitration(
     )
     has_gymkit = (
         f"EXISTS (SELECT 1 FROM {source} AS winner "
-        f"WHERE {winner_window} AND {gymkit})"
+        f"WHERE {winner_window} AND {member('winner.source', 'gymkit')})"
     )
     has_watch = (
         f"EXISTS (SELECT 1 FROM {source} AS winner "
-        f"WHERE {winner_window} AND "
-        f"{normalized('winner.source')} NOT LIKE '%|%' AND "
-        f"{normalized('winner.source')} LIKE '%Apple Watch')"
+        f"WHERE {winner_window} AND {member('winner.source', 'watch')})"
     )
-    workout_scope, workout_scope_args = scoped("workout")
     return (
-        " AND NOT (" + whole_day_loser + ")"
-        " AND NOT EXISTS ("
+        " AND NOT EXISTS (WITH " + role_ctes + " "
+        "SELECT 1 FROM (SELECT 1) AS arbitration WHERE ("
+        f"({source}.local_date >= '{cutoff}' "
+        f"AND {member(f'{source}.source', 'iphone')} "
+        f"AND EXISTS (SELECT 1 FROM {source} AS day_winner "
+        "WHERE day_winner.metric = 'distance_walking_running' "
+        f"AND day_winner.local_date = {source}.local_date "
+        f"{day_scope} AND {member('day_winner.source', 'watch')}))"
+        " OR EXISTS ("
         "SELECT 1 FROM workouts AS workout "
-        "WHERE workout.local_date >= ? "
+        f"WHERE workout.local_date >= '{cutoff}' "
         f"{workout_scope} "
         f"AND {source}.start_utc >= workout.start_utc "
         f"AND {source}.start_utc < workout.end_utc "
-        "AND ((" + outer_iphone + " AND (" + has_gymkit +
-        " OR (NOT " + has_gymkit + " AND " + has_watch + "))) "
-        "OR (" + outer_watch + " AND " + has_gymkit + "))"
-        ")",
-        [*scoped('day_winner')[1], nz.WORKOUT_SOURCE_ARBITRATION_FROM,
-         *workout_scope_args],
+        "AND (("
+        f"{member(f'{source}.source', 'iphone')} AND ({has_gymkit} OR {has_watch})"
+        ") OR ("
+        f"{member(f'{source}.source', 'watch')} AND {has_gymkit}"
+        ")))))",
+        [*role_args, *day_scope_args, *workout_scope_args],
     )
 
 
@@ -1172,31 +1201,32 @@ def arbitrated_pairs(
             ("distance_walking_running", *params),
         )}
     # Whole-day iPhone-vs-Watch arbitration has no workout row to correlate
-    # with (Aug 23 in the live fixture is the important case), so report its
-    # changed dates separately. Keep this predicate in sync with
-    # _workout_arbitration's complete-label rule rather than inferring dates
-    # from workout windows; GymKit is window-scoped only.
-    def normalized(column: str) -> str:
-        return f"trim(replace(COALESCE({column}, ''), char(160), ' '))"
-    cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
-    day_watch = (
-        f"EXISTS (SELECT 1 FROM {source_ref} AS day_winner "
-        "WHERE day_winner.metric = 'distance_walking_running' "
-        f"AND day_winner.local_date = {source_ref}.local_date "
-        f"AND {normalized('day_winner.source')} NOT LIKE '%|%' "
-        f"AND {normalized('day_winner.source')} LIKE '%Apple Watch')"
-    )
-    outer_source = normalized(f"{source_ref}.source")
-    day_loser = (
-        f"{source_ref}.local_date >= '{cutoff}' AND "
-        f"{outer_source} NOT LIKE '%|%' AND {outer_source} LIKE '%iPhone' AND "
-        f"{day_watch}"
-    )
-    pairs |= {("distance_walking_running", r[0]) for r in conn.execute(
-        f"SELECT DISTINCT local_date FROM {source_ref} "
-        "WHERE metric = ? AND " + day_loser,
-        ("distance_walking_running",),
-    )}
+    # with, so report its changed dates separately. Resolve the same scoped
+    # raw labels as _workout_arbitration; the CTE keeps every label bound once.
+    if clause:
+        def unscoped(alias: str) -> tuple[str, list]:
+            return "", []
+
+        role_labels = _workout_source_labels(
+            conn, source_table=source_table, date=None,
+            arbitration_window=None, arbitration_window_kind="local_date",
+            scoped=unscoped,
+        )
+        role_ctes, role_args = _workout_role_ctes(role_labels)
+        cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
+        day_loser = (
+            f"{source_ref}.local_date >= '{cutoff}' AND "
+            f"{source_ref}.source IN (SELECT source FROM iphone_sources) AND "
+            f"EXISTS (SELECT 1 FROM {source_ref} AS day_winner "
+            "WHERE day_winner.metric = 'distance_walking_running' "
+            f"AND day_winner.local_date = {source_ref}.local_date "
+            "AND day_winner.source IN (SELECT source FROM watch_sources))"
+        )
+        pairs |= {("distance_walking_running", r[0]) for r in conn.execute(
+            f"WITH {role_ctes} SELECT DISTINCT local_date FROM {source_ref} "
+            "WHERE metric = ? AND " + day_loser,
+            (*role_args, "distance_walking_running"),
+        )}
     return sorted(p for p in pairs if nz.agg_for(p[0]) == "sum")
 
 

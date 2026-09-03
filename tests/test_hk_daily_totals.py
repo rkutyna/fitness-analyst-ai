@@ -208,9 +208,9 @@ def test_state_is_constrained_to_the_two_legal_values(conn):
 
 # --- assertions 2-7a: the server wire and guards ---------------------------
 
-def test_settled_daily_total_post_is_rejected_without_evidence(
-        conn, vault, monkeypatch):
-    """2. A fresh batch cannot rewrite a settled day or leave a trace."""
+def test_settled_daily_total_post_is_rejected_with_evidence(
+        conn, vault, vault_path, monkeypatch, capsys):
+    """2. A fresh batch cannot rewrite a settled day or log its value."""
     dbmod.insert_daily_totals(conn, [_total(state="settled")], batch_id="seed")
     conn.commit()
 
@@ -220,6 +220,9 @@ def test_settled_daily_total_post_is_rejected_without_evidence(
 
     assert response.status_code == 409
     assert response.json()["detail"].startswith("daily total already settled")
+    trace = capsys.readouterr().err
+    assert "ingest-trace reject-409-settled" in trace
+    assert "9999" not in trace
     assert conn.execute(
         "SELECT value, state FROM hk_daily_totals WHERE metric = 'step_count' "
         "AND local_date = '2026-08-25'").fetchone()[:] == (10173.0, "settled")
@@ -227,6 +230,17 @@ def test_settled_daily_total_post_is_rejected_without_evidence(
     assert conn.execute(
         "SELECT COUNT(*) FROM commit_log WHERE key = 'healthkit:dev-1:settled-refusal'"
     ).fetchone()[0] == 0
+    fresh = dbmod.connect(vault_path, read_only=True)
+    try:
+        evidence = fresh.execute(
+            "SELECT source, kind, rows_seen, rows_added, detail FROM ingest_log"
+        ).fetchone()
+        assert tuple(evidence[:4]) == ("receiver", "reject", 0, 0)
+        assert "settled_guard" in evidence["detail"]
+        assert "settled-refusal" in evidence["detail"]
+        assert "9999" not in evidence["detail"]
+    finally:
+        fresh.close()
 
 
 def test_provisional_daily_total_post_accepts_update(conn, vault, monkeypatch):

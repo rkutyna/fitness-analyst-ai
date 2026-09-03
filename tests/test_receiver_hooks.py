@@ -66,3 +66,4 @@ def test_main_honours_an_explicit_app_factory(monkeypatch, tmp_path):
     ) == 0
     assert captured["ctx"] is context
     assert captured["app"] is not None
+    assert captured["run_kwargs"]["access_log"] is False

@@ -524,10 +524,10 @@ def test_workout_before_history_watermark_returns_409(vault, vault_path,
         conn.close()
 
 
-def test_healthkit_history_watermark_refuses_whole_batch_without_evidence(
-    vault, vault_path, monkeypatch
+def test_healthkit_history_watermark_refuses_whole_batch_with_evidence(
+    vault, vault_path, monkeypatch, capsys
 ):
-    """An imported-day replay cannot leave a partial tombstone or anchor."""
+    """An imported-day replay leaves only metadata evidence, never a mutation."""
     _set_history(vault, "2026-08-21")
     sample = _sample(
         "quantity", "hr-before-watermark", HEART,
@@ -556,15 +556,22 @@ def test_healthkit_history_watermark_refuses_whole_batch_without_evidence(
     # to name the two ways out.
     assert "set_history_imported_through()" in detail
     assert "cutover" in detail
+    trace = capsys.readouterr().err
+    assert "ingest-trace reject-409-history" in trace
+    assert "110.0" not in trace
     assert _counts(vault_path) == {
         "records": 0, "daily_metrics": 0, "hk_sync_state": 0,
         "hk_deletions": 0, "commit_log": 0,
     }
     conn = db.connect(vault_path, read_only=True)
     try:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM ingest_log"
-        ).fetchone()[0] == 0
+        evidence = conn.execute(
+            "SELECT source, kind, rows_seen, rows_added, detail FROM ingest_log"
+        ).fetchone()
+        assert tuple(evidence[:4]) == ("receiver", "reject", 0, 0)
+        assert "history_guard" in evidence["detail"]
+        assert "batch-before-watermark" in evidence["detail"]
+        assert "110.0" not in evidence["detail"]
         assert conn.execute(
             "SELECT COUNT(*) FROM commit_log "
             "WHERE key = 'healthkit:watch-a:batch-before-watermark'"
@@ -582,6 +589,18 @@ def test_healthkit_history_watermark_refuses_whole_batch_without_evidence(
         )
     assert response.status_code == 200, response.text
     assert response.json()["applied"] is True
+    trace = capsys.readouterr().err
+    assert "ingest-trace ingest-ok" in trace
+    assert "110.0" not in trace
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        details = [row["detail"] for row in conn.execute(
+            "SELECT detail FROM ingest_log ORDER BY id"
+        )]
+        assert len(details) == 2
+        assert all("110.0" not in detail for detail in details)
+    finally:
+        conn.close()
     assert _counts(vault_path) == {
         "records": 1, "daily_metrics": 2, "hk_sync_state": 1,
         "hk_deletions": 1, "commit_log": 1,

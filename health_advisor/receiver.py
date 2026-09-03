@@ -295,10 +295,9 @@ def _ask_freshness(ctx, as_of: str | None) -> dict:
 #
 # This exists because a 409 was undiagnosable on 2026-08-27: `--no-access-log`
 # keeps requests out of the journal, and the history-guard refusal deliberately
-# rolls back, so neither the journal nor the database could say which date was
-# refused. `_log_reject` cannot be used on that path — the ingest holds
-# BEGIN IMMEDIATE, so a second connection would block on the writer lock.
-# stderr has neither problem.
+# rolled back, so neither the journal nor the database could say which date was
+# refused. Guard refusals now write metadata to `ingest_log` after rolling back;
+# stderr remains useful for live visibility without enabling request logging.
 #
 # Deliberately METADATA ONLY: dates, counts, metric names, batch and device ids.
 # No sample values, ever — that restraint costs nothing and is why this is
@@ -320,7 +319,7 @@ def _batch_span(parsed) -> tuple[str | None, str | None, int]:
 
 
 def _log_reject(ctx, reason: str, nbytes: int) -> None:
-    """Best-effort operator evidence for a request refused before parsing."""
+    """Best-effort operator evidence for a refused request."""
     try:
         conn = ctx.connect()
         try:
@@ -329,8 +328,15 @@ def _log_reject(ctx, reason: str, nbytes: int) -> None:
                           f"{reason} bytes={nbytes}")
         finally:
             conn.close()
-    except Exception:                      # noqa: BLE001 - never mask the 413
+    except Exception:                      # noqa: BLE001 - never mask refusal
         pass
+
+
+def _refuse_guard(ctx, conn, *, detail: str, evidence: str, nbytes: int) -> None:
+    """Rollback a guard refusal before recording metadata on a fresh connection."""
+    conn.rollback()
+    _log_reject(ctx, evidence, nbytes)
+    raise HTTPException(status_code=409, detail=detail)
 
 
 async def _raw_body_for(ctx, request: Request) -> bytes:
@@ -437,9 +443,9 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             applied = False
             prior = dict(prior_row)
         else:
-            # Check before the first mutation. The rollback in the outer
-            # exception handler is intentional: BEGIN IMMEDIATE has acquired
-            # the writer lock, but this refusal leaves no database evidence.
+            # Check before the first mutation. The guard must release the
+            # BEGIN IMMEDIATE writer lock before _log_reject opens its fresh
+            # connection; its evidence belongs in ingest_log, never commit_log.
             history = vault.history_imported_through(conn)
             if history is not None:
                 record_offending = min(
@@ -468,8 +474,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                            batch_min=lo, batch_max=hi, records=n,
                            batch_id=parsed.get("batch_id"),
                            device=parsed.get("device_id"))
-                    raise HTTPException(
-                        status_code=409,
+                    _refuse_guard(
+                        ctx, conn,
                         detail=(
                             f"history imported through {history}; refusing "
                             f"HealthKit batch containing {kind} dated {offending}"
@@ -477,6 +483,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                             " cutover after the watermark or move the watermark"
                             " with vault.set_history_imported_through()"
                         ),
+                        evidence=(
+                            f"history_guard watermark={history} offending={offending} "
+                            f"kind={kind} batch_min={lo} batch_max={hi} records={n} "
+                            f"batch_id={parsed.get('batch_id')} "
+                            f"device={parsed.get('device_id')}"
+                        ),
+                        nbytes=len(raw),
                     )
 
             # This sibling guard is deliberately before every mutation. It is
@@ -492,14 +505,21 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 if prior is not None and prior["state"] == "settled":
                     _trace("reject-409-settled", metric=row["metric"],
                            day=row["local_date"], batch_id=parsed["batch_id"])
-                    raise HTTPException(
-                        status_code=409,
+                    _refuse_guard(
+                        ctx, conn,
                         detail=(
                             f"daily total already settled for {row['metric']} on "
                             f"{row['local_date']}; a settled consolidated total "
                             "is immutable (D19/#220) — this day is closed and the "
                             "client should advance past it, not retry"
                         ),
+                        evidence=(
+                            f"settled_guard metric={row['metric']} "
+                            f"day={row['local_date']} "
+                            f"batch_id={parsed['batch_id']} "
+                            f"device={parsed.get('device_id')}"
+                        ),
+                        nbytes=len(raw),
                     )
 
             # A tombstone is durable before the add filter is evaluated. A

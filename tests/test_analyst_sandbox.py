@@ -11,10 +11,16 @@ that is reported as a measured fact (see `test_attack_corpus_class_coverage`
 and its module-level `KNOWN_GAPS`), not hidden by narrowing the corpus —
 review finding 4's whole point was that a narrow corpus lies by omission.
 
-This suite is intentionally slow in one place:
-`test_wall_clock_default_timeout_kills_within_tolerance` runs the *default*
-60s wall clock for real, because A1's `Done when` 4 asks for the default to
-be measured, not a scaled-down stand-in.
+Issue #26: this file used to pay a real 60s sleep in the default run — the
+kill-mechanism test ran the *production default* (`DEFAULT_WALL_CLOCK_S`)
+end to end on `while True: pass`. The mechanism under test (the deadline
+check and `os.killpg` in `SeatbeltExecutor.run`/`BwrapExecutor.run`) does not
+branch on the configured value, so a short configured timeout
+(`RunLimits(wall_clock_s=2.0)`, see `test_wall_clock_configured_timeout_kills_within_tolerance`
+below) exercises the identical code path in a couple of seconds instead of a
+minute. `test_default_wall_clock_constant_is_60s` is the fast, separate guard
+against the production default silently drifting — the thing the old
+end-to-end test also happened to catch, without needing to sleep for it.
 """
 from __future__ import annotations
 
@@ -199,19 +205,40 @@ while True:
     assert lock_release_probe_s < 5.0
 
 
-def test_wall_clock_default_timeout_kills_within_tolerance(executor, vault_path, tmp_path):
-    """Done when 4: the *default* (60s) wall clock, measured for real, on
-    `while True: pass`. This is deliberately not scaled down."""
-    run_dir = tmp_path / "default_timeout"
+def test_default_wall_clock_constant_is_60s():
+    """Fast guard against `DEFAULT_WALL_CLOCK_S` silently drifting.
+
+    Issue #26: the timing test below no longer exercises the production
+    default end to end (that cost a real 60s sleep in every default run with
+    a vault present). The deadline/kill logic in `SeatbeltExecutor.run` and
+    `BwrapExecutor.run` does not branch on the configured value — `deadline =
+    start + limits.wall_clock_s` either way — so a short configured timeout
+    proves the mechanism just as well. What a short-timeout test *cannot*
+    catch is someone changing the shipped default itself; this assertion is
+    the whole cost of covering that, and it needs no executor, no vault, and
+    no sleep.
+    """
+    assert sb.DEFAULT_WALL_CLOCK_S == 60.0
+
+
+def test_wall_clock_configured_timeout_kills_within_tolerance(executor, vault_path, tmp_path):
+    """Done when 4 (A1): the kill mechanism, measured for real, on
+    `while True: pass` — against a short *configured* timeout rather than the
+    60s production default (issue #26). See `test_default_wall_clock_constant_is_60s`
+    for the default value itself."""
+    run_dir = tmp_path / "configured_timeout"
     code = "while True:\n    pass\n"
+    configured_s = 2.0
     t0 = time.monotonic()
-    res = _run(executor, code, vault_path, run_dir)  # default RunLimits(): 60.0s
+    res = _run(executor, code, vault_path, run_dir, wall_clock_s=configured_s)
     elapsed = time.monotonic() - t0
 
-    print(f"\n[Done-when 4] default-timeout kill_elapsed={elapsed:.2f}s")
+    print(f"\n[Done-when 4] configured-timeout({configured_s}s) kill_elapsed={elapsed:.2f}s")
     assert res.timed_out is True
     assert res.killed_group is True
-    assert 55.0 <= elapsed <= 65.0, f"expected 60s +/- 5s, measured {elapsed:.2f}s"
+    assert configured_s - 0.5 <= elapsed <= configured_s + 2.5, (
+        f"expected {configured_s}s (+2.5s/-0.5s), measured {elapsed:.2f}s"
+    )
     survivors = _pgrep_group_survivors(res.pgid)
     assert survivors == []
 

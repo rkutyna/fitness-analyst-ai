@@ -54,6 +54,17 @@ network. Tests marked `live` hit a local Ollama model and are skipped by default
 ./.venv/bin/python -m pytest -m live
 ```
 
+`tests/test_analyst_sandbox.py` skips entirely unless a vault is present at
+`data/health.db` or `HA_TEST_VAULT` points at one (build a synthetic one with
+`./.venv/bin/python -m health_advisor.demo --out data/demo.db --days 730`).
+Measured on macOS with a vault present: the default-addopts run of that one
+module (`pytest tests/test_analyst_sandbox.py -o addopts= -q`) takes **about
+31s** — down from about 88s before issue #26, when its wall-clock test ran the
+production 60s default timeout end to end on every default run instead of a
+short configured one (2s). The full suite with no vault present — the case CI's
+main `Run tests` step and a plain contributor pre-flight both hit — measures
+**about 70s**.
+
 CI runs the suite on both `ubuntu-latest` and `macos-latest`. That matrix is not
 decoration: the analyst sandbox has a different executor per OS (bubblewrap on
 Linux, seatbelt on macOS), so a change there is only half-tested on one runner.

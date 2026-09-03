@@ -123,15 +123,42 @@ def _run(
     return executor.run(code, vault, str(run_dir), limits=limits)
 
 
-def _is_unsafe(res: sb.RawResult) -> bool:
-    """Corpus convention: an attack that *succeeded* prints a line starting
-    with "UNSAFE" — to stdout or, if it made it that far, into the fd-3
-    payload. Anything else (a caught exception printing "BLOCKED...", or an
-    uncaught exception that killed the child with a nonzero exit code) is
-    blocked. This treats "the process died before it could misbehave" as a
-    pass, which matches how every probe in §2.3 itself was read."""
+def _is_unsafe(
+    res: sb.RawResult, *, host_artifact: Path | None = None
+) -> bool:
+    """Return whether a probe produced a host-visible escape.
+
+    Namespace-sensitive filesystem probes must provide the parent-chosen host
+    path they attempted to affect. Their child output is deliberately ignored:
+    bubblewrap can report a successful write to a namespace-local path that is
+    not an escape. Probes without a host artifact retain the original
+    stdout/fd-3 convention.
+    """
+    if host_artifact is not None:
+        return os.path.exists(host_artifact)
+
     haystack = res.stdout + res.fd3_bytes
     return b"UNSAFE" in haystack
+
+
+def test_parent_side_host_artifact_scoring_ignores_namespace_local_write(tmp_path):
+    artifact = tmp_path / "host_artifact.txt"
+    result = sb.RawResult(
+        fd3_bytes=b"",
+        fd3_oversized=False,
+        stdout=b"UNSAFE wrote a namespace-local file",
+        stderr=b"",
+        returncode=0,
+        timed_out=False,
+        killed_group=False,
+        duration_s=0.0,
+        pgid=0,
+        run_dir=tmp_path,
+    )
+
+    assert _is_unsafe(result, host_artifact=artifact) is False
+    artifact.write_text("x", encoding="utf-8")
+    assert _is_unsafe(result, host_artifact=artifact) is True
 
 
 # =========================================================================== #
@@ -412,11 +439,14 @@ KNOWN_GAPS = {
 
 def _corpus(tmp_root: Path, vault: str) -> list[dict]:
     """Build the attack corpus. Each entry is self-contained: the `code` is
-    everything the sandboxed process runs, and it is responsible for
+    everything the sandboxed process runs. Namespace-sensitive filesystem
+    entries also carry a parent-chosen `host_artifact`; those entries are
+    scored from the host after the run, because a successful write can remain
+    inside bubblewrap's namespace. All other entries are responsible for
     printing "UNSAFE ..." if (and only if) the attack succeeded. Everything
     else is scored as blocked (`_is_unsafe` above) — including an uncaught
     exception that simply kills the child, which is exactly how most of
-    these actually resolve in practice (see the module docstring)."""
+    these resolve in practice (see the module docstring)."""
 
     secret_path = tmp_root / "parent_secret.txt"
     secret_path.write_text("TOP-SECRET-VALUE")
@@ -425,8 +455,21 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
 
     cases: list[dict] = []
 
-    def add(cls: str, name: str, code: str, *, limits: dict | None = None) -> None:
-        cases.append({"class": cls, "name": name, "code": code, "limits": limits or {}})
+    def add(
+        cls: str,
+        name: str,
+        code: str,
+        *,
+        limits: dict | None = None,
+        host_artifact: Path | None = None,
+    ) -> None:
+        cases.append({
+            "class": cls,
+            "name": name,
+            "code": code,
+            "limits": limits or {},
+            "host_artifact": host_artifact,
+        })
 
     # (i) network -------------------------------------------------------- #
     add("network", "outbound_tcp_connect", """
@@ -481,22 +524,26 @@ try:
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """)
+    home_write_probe = Path(os.path.realpath(
+        Path(HOME_WRITE_PROBE).with_name(
+            f"pwned_by_sandbox_test_{tmp_root.name}.txt")))
     add("filesystem_write", "write_into_home", f"""
 try:
-    with open({HOME_WRITE_PROBE!r}, "w") as f:
+    with open({str(home_write_probe)!r}, "w") as f:
         f.write("x")
     print("UNSAFE wrote home file")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""")
-    add("filesystem_write", "write_into_tmp_outside_work", """
+""", host_artifact=home_write_probe)
+    tmp_write_probe = tmp_root / "pwned_by_sandbox_test.txt"
+    add("filesystem_write", "write_into_tmp_outside_work", f"""
 try:
-    with open("/tmp/pwned_by_sandbox_test.txt", "w") as f:
+    with open({str(tmp_write_probe)!r}, "w") as f:
         f.write("x")
     print("UNSAFE wrote /tmp file")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""")
+""", host_artifact=tmp_write_probe)
     add("filesystem_write", "overwrite_parent_owned_code_py", """
 try:
     with open("../code.py", "w") as f:
@@ -532,21 +579,23 @@ try:
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """)
-    add("vault_integrity", "attach_and_write", """
+    attach_probe = tmp_root / "probe_attach_evil.db"
+    add("vault_integrity", "attach_and_write", f"""
 try:
-    conn.execute("ATTACH DATABASE '/tmp/probe_attach_evil.db' AS evil")
+    conn.execute("ATTACH DATABASE {str(attach_probe)!r} AS evil")
     conn.execute("CREATE TABLE evil.x (a int)")
     print("UNSAFE attached and wrote")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""")
-    add("vault_integrity", "vacuum_into_exfil", """
+""", host_artifact=attach_probe)
+    vacuum_probe = tmp_root / "probe_vacuum_exfil.db"
+    add("vault_integrity", "vacuum_into_exfil", f"""
 try:
-    conn.execute("VACUUM INTO '/tmp/probe_vacuum_exfil.db'")
+    conn.execute("VACUUM INTO {str(vacuum_probe)!r}")
     print("UNSAFE vacuumed a copy out")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""")
+""", host_artifact=vacuum_probe)
 
     # (iv) inherited descriptors ------------------------------------------- #
     add("inherited_descriptors", "enumerate_and_read_beyond_known", """
@@ -778,13 +827,21 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
             # UNSAFE/BLOCKED marker) — still counted here for the table.
             continue
         run_dir = tmp_path / "corpus" / cls / name
+        host_artifact = case["host_artifact"]
+        if host_artifact is not None:
+            assert not os.path.exists(host_artifact), (
+                "host probe artifact already exists before the sandbox run"
+            )
         res = _run(executor, case["code"], vault_path, run_dir, **case["limits"])
-        unsafe = _is_unsafe(res)
+        unsafe = _is_unsafe(res, host_artifact=host_artifact)
         attempted[cls] += 1
         if not unsafe:
             blocked[cls] += 1
         else:
-            details.append(f"{cls}/{name}: NOT BLOCKED — stdout={res.stdout!r}")
+            if host_artifact is not None:
+                details.append(f"{cls}/{name}: NOT BLOCKED — host artifact exists")
+            else:
+                details.append(f"{cls}/{name}: NOT BLOCKED — stdout={res.stdout!r}")
 
     # TOCTOU class, scored structurally (see test_toctou_* below for the
     # actual mechanics; this reproduces the same checks so the one summary

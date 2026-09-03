@@ -50,10 +50,14 @@ ingest or aggregation. The short version:
 - Sleep is attributed **by session**, to the date the session ends.
 - Jog minutes are classified by **20-second cadence** inside a workout window.
   Nothing coarser than 20-second samples produces a single jog minute.
-- **`_workout_arbitration` matches device names as SQL literals**
-  (`LIKE '%Apple Watch'`, seven places). Devices named anything else get no
-  arbitration and silently double-count — issue #1, and the reason the demo
-  vault's devices are called `Demo Apple Watch` rather than `Demo Watch`.
+- **`_workout_arbitration` classifies device labels by role at query time**
+  (`normalize.workout_source_role`: product type first, then localised role
+  words such as watch/phone), then binds the raw labels into one SQL set per
+  role — no stored role column, by decision (#1: a stored column cost a 105 s
+  backfill and a full-table scan per call on a real vault). Pipe-joined and
+  empty post-cutoff labels are refused loudly; that refusal is a designed
+  answer, not a bug. A label the vocabulary cannot classify gets no
+  arbitration, so a new device family means a vocabulary change there.
 - **The sandbox attack corpus over-reports on Linux** — it scores a successful
   write as an escape, which is true under seatbelt and false under bubblewrap,
   where the child gets a namespace-local `/tmp`. Issue #3. Do not act on a

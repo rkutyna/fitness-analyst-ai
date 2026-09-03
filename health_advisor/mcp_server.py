@@ -170,6 +170,32 @@ def _n_segments_by_workout(conn, keys: list[str]) -> dict[str, int]:
     return {k: len(mx.segment_chains(v)[0]) for k, v in by_workout.items()}
 
 
+@tool
+def mark_workout_not_a_session(ctx: VaultContext, workout_key: str,
+                               reason: str = "", source: str = "user",
+                               marked_at: str | None = None) -> dict:
+    """Mark one stored workout as not a real session.
+
+    This is explicit user correction only: it never deletes or edits the
+    device-recorded workout. The stable ``workout_key`` comes from
+    ``list_workouts``; ``source`` and ``marked_at`` make the correction
+    attributable and durable. Repeating the call is idempotent.
+    """
+    conn = ctx.connect()
+    try:
+        db.init_db(conn)
+        mark = db.mark_workout_not_a_session(
+            conn, workout_key, source=source, reason=reason or None,
+            marked_at=marked_at,
+        )
+        conn.commit()
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+    return {"ok": True, **mark}
+
+
 def _bad_dates(**named: str | None) -> str | None:
     """Validate ISO date parameters, returning an error message or None.
 
@@ -553,13 +579,22 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
             return {"day": day, "thresholds": [mx.r(e, 0) for e in edges],
                     "count": len(windows), "windows": windows}
 
-        sql = ("SELECT workout_type, start_utc, end_utc FROM workouts "
-               "WHERE local_date = ?")
+        marked = db.workout_mark_condition(conn, "w", marked=True)
+        sql = ("SELECT w.workout_type, w.start_utc, w.end_utc FROM workouts AS w "
+               "WHERE w.local_date = ? AND "
+               f"{db.workout_mark_condition(conn, 'w')}")
         args: list = [day]
         if workout_type:
-            sql += " AND workout_type = ?"
+            sql += " AND w.workout_type = ?"
             args.append(workout_type)
         wrows = conn.execute(sql + " ORDER BY start_utc", args).fetchall()
+        excluded_args: list = [day]
+        excluded_sql = ("SELECT COUNT(*) FROM workouts AS w WHERE w.local_date = ? "
+                        f"AND {marked}")
+        if workout_type:
+            excluded_sql += " AND w.workout_type = ?"
+            excluded_args.append(workout_type)
+        excluded = conn.execute(excluded_sql, excluded_args).fetchone()[0]
 
         windows = []
         if workout_type is None:
@@ -578,7 +613,8 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
         conn.close()
 
     out = {"day": day, "thresholds": [mx.r(e, 0) for e in edges],
-           "count": len(windows), "windows": windows}
+           "count": len(windows), "excluded_count": excluded,
+           "windows": windows}
     if not windows:
         out["note"] = (
             f"no workout of type {workout_type!r} on {day}" if workout_type else
@@ -587,7 +623,8 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
 
 
 @tool
-def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None = None, limit: int = 50) -> dict:
+def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None = None,
+                  limit: int = 50) -> dict:
     """List workouts between start and end (YYYY-MM-DD; default = last 90 days),
     most recent first. Returns type, duration (min), energy (kcal), distance
     (mi), average/max heart rate (bpm), local start/end times (HH:MM), whether
@@ -601,7 +638,9 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     Naming a metric for a workout field is refused, and a per-session value
     must never be restated as a daily-metric series.
 
-    'total_in_range' is how many workouts the range actually holds and
+    'total_in_range' is how many unmarked workouts the range actually holds;
+    'excluded_count' reports marked rows in the same range so the exclusion is
+    visible.
     'truncated' says whether 'limit' cut the list short. Check truncated before
     counting sessions or totalling minutes: the returned rows are the most
     recent ones, not the range. 'workout_counts' is the full-range count by
@@ -614,23 +653,32 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     limit = max(1, min(int(limit), MAX_WORKOUTS))
     conn = ctx.read_only()
     try:
+        active = db.workout_mark_condition(conn, "w")
+        marked = db.workout_mark_condition(conn, "w", marked=True)
         if end is None:
-            row = conn.execute("SELECT MAX(local_date) FROM workouts").fetchone()
+            row = conn.execute(
+                "SELECT MAX(w.local_date) FROM workouts AS w"
+            ).fetchone()
             end = row[0] or date.today().isoformat()
         if start is None:
             start = (date.fromisoformat(end) - timedelta(days=89)).isoformat()
         rows = conn.execute(
-            "SELECT local_date, workout_type, duration_min, energy_kcal, distance_mi, "
-            "route_ref, avg_heart_rate, max_heart_rate, start_utc, end_utc, dedupe_key "
-            "FROM workouts WHERE local_date BETWEEN ? AND ? "
+            "SELECT w.local_date, w.workout_type, w.duration_min, w.energy_kcal, "
+            "w.distance_mi, w.route_ref, w.avg_heart_rate, w.max_heart_rate, "
+            "w.start_utc, w.end_utc, w.dedupe_key "
+            f"FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? AND {active} "
             "ORDER BY start_utc DESC LIMIT ?", (start, end, limit)).fetchall()
         total = conn.execute(
-            "SELECT COUNT(*) FROM workouts WHERE local_date BETWEEN ? AND ?",
+            f"SELECT COUNT(*) FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? "
+            f"AND {active}",
             (start, end)).fetchone()[0]
         type_counts = conn.execute(
-            "SELECT workout_type, COUNT(*) AS n FROM workouts "
-            "WHERE local_date BETWEEN ? AND ? GROUP BY workout_type "
-            "ORDER BY workout_type", (start, end)).fetchall()
+            f"SELECT w.workout_type, COUNT(*) AS n FROM workouts AS w "
+            f"WHERE w.local_date BETWEEN ? AND ? AND {active} "
+            "GROUP BY w.workout_type ORDER BY w.workout_type", (start, end)).fetchall()
+        excluded = conn.execute(
+            f"SELECT COUNT(*) FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? "
+            f"AND {marked}", (start, end)).fetchone()[0]
         n_segments = _n_segments_by_workout(conn, [r["dedupe_key"] for r in rows])
     finally:
         conn.close()
@@ -651,6 +699,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
            for r in rows]
     res = {"start": start, "end": end, "count": len(out),
            "total_in_range": total, "truncated": total > len(out),
+           "excluded_count": excluded,
            "limit": limit, "workout_counts": [
                {"type": r["workout_type"], "count": r["n"]}
                for r in type_counts],
@@ -725,13 +774,23 @@ def get_workout_segments(ctx: VaultContext, day: str, workout_type: str | None =
         return {"error": "day must be YYYY-MM-DD"}
     conn = ctx.read_only()
     try:
-        sql = ("SELECT workout_type, start_utc, end_utc, duration_min, dedupe_key "
-               "FROM workouts WHERE local_date = ?")
+        active = db.workout_mark_condition(conn, "w")
+        marked = db.workout_mark_condition(conn, "w", marked=True)
+        sql = ("SELECT w.workout_type, w.start_utc, w.end_utc, w.duration_min, "
+               "w.dedupe_key FROM workouts AS w WHERE w.local_date = ? "
+               f"AND {active}")
         args: list = [day]
         if workout_type:
-            sql += " AND workout_type = ?"
+            sql += " AND w.workout_type = ?"
             args.append(workout_type)
         wrows = conn.execute(sql + " ORDER BY start_utc", args).fetchall()
+        excluded_args: list = [day]
+        excluded_sql = ("SELECT COUNT(*) FROM workouts AS w WHERE w.local_date = ? "
+                        f"AND {marked}")
+        if workout_type:
+            excluded_sql += " AND w.workout_type = ?"
+            excluded_args.append(workout_type)
+        excluded = conn.execute(excluded_sql, excluded_args).fetchone()[0]
         workouts = []
         for w in wrows:
             evs = conn.execute(
@@ -786,9 +845,10 @@ def get_workout_segments(ctx: VaultContext, day: str, workout_type: str | None =
     finally:
         conn.close()
     if not workouts:
-        return {"day": day, "count": 0, "workouts": [],
+        return {"day": day, "count": 0, "excluded_count": excluded, "workouts": [],
                 "note": "no workouts on this day" + (f" of type {workout_type!r}" if workout_type else "")}
-    return {"day": day, "count": len(workouts), "workouts": workouts}
+    return {"day": day, "count": len(workouts), "excluded_count": excluded,
+            "workouts": workouts}
 
 
 # How far below the cadence cutoff still counts as "one bad week from dropping out".
@@ -1420,16 +1480,18 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
                 return {"error": "start must be on or before end"}
             return {"mode": "trend", **RF.banded_weekly(conn, start, end)}
 
+        active = db.workout_mark_condition(conn, "w")
         if workout_date:
             row = conn.execute(
-                "SELECT start_utc, end_utc, local_date FROM workouts "
-                "WHERE workout_type = 'running' AND local_date = ? "
-                "ORDER BY duration_min DESC LIMIT 1", (workout_date,)).fetchone()
+                "SELECT w.start_utc, w.end_utc, w.local_date FROM workouts AS w "
+                "WHERE w.workout_type = 'running' AND w.local_date = ? "
+                f"AND {active} ORDER BY w.duration_min DESC LIMIT 1",
+                (workout_date,)).fetchone()
         else:
             row = conn.execute(
-                "SELECT start_utc, end_utc, local_date FROM workouts "
-                "WHERE workout_type = 'running' ORDER BY start_utc DESC "
-                "LIMIT 1").fetchone()
+                "SELECT w.start_utc, w.end_utc, w.local_date FROM workouts AS w "
+                f"WHERE w.workout_type = 'running' AND {active} "
+                "ORDER BY w.start_utc DESC LIMIT 1").fetchone()
         if not row:
             return {"found": False,
                     "error": f"no running workout on {workout_date}"
@@ -2001,11 +2063,17 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         return {"error": err}
     conn = ctx.read_only()
     try:
+        active = db.workout_mark_condition(conn, "w")
+        marked = db.workout_mark_condition(conn, "w", marked=True)
         rows = conn.execute(
-            "SELECT id, workout_type, start_utc, end_utc, duration_min, "
-            "avg_heart_rate FROM workouts WHERE local_date = ? "
-            "AND workout_type IN ('running', 'walking', 'hiking') "
-            "ORDER BY start_utc", (day,)).fetchall()
+            "SELECT w.id, w.workout_type, w.start_utc, w.end_utc, w.duration_min, "
+            "w.avg_heart_rate FROM workouts AS w WHERE w.local_date = ? "
+            "AND w.workout_type IN ('running', 'walking', 'hiking') "
+            f"AND {active} ORDER BY w.start_utc", (day,)).fetchall()
+        excluded = conn.execute(
+            f"SELECT COUNT(*) FROM workouts AS w WHERE w.local_date = ? "
+            f"AND w.workout_type IN ('running', 'walking', 'hiking') AND {marked}",
+            (day,)).fetchone()[0]
         sessions = []
         for w in rows:
             block = A.longest_block(conn, w["start_utc"], w["end_utc"])
@@ -2028,13 +2096,14 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         conn.close()
     if not sessions:
         return {"day": day, "sessions": [], "longest_block_min": 0.0,
+                "excluded_count": excluded,
                 "qualified_block_min": None,
                 "note": "no session with measurable block structure on this day"}
     best = max(sessions, key=lambda s: s["longest_block_min"])
     qualified = [s["qualified_block_min"] for s in sessions
                  if s["qualified_block_min"] is not None]
     return {
-        "day": day, "sessions": sessions,
+        "day": day, "sessions": sessions, "excluded_count": excluded,
         # Across a multi-session day the dial is the LONGEST block, not the sum:
         # the question it answers is "how long can they run continuously".
         "longest_block_min": best["longest_block_min"],

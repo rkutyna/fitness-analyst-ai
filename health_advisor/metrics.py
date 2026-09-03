@@ -307,6 +307,7 @@ def impact_bucket_rows(conn, window_predicate: str,
     known_window = window_predicate in {
         "local_date BETWEEN ? AND ?", "start_utc >= ? AND start_utc < ?",
     }
+    workout_active_condition = dbmod.workout_mark_condition(conn, "w")
     if known_window:
         impact_window_cte = (
             "impact_window(start_value, end_value) AS (VALUES (?, ?)),"
@@ -317,7 +318,9 @@ def impact_bucket_rows(conn, window_predicate: str,
                          + timedelta(days=1)).isoformat()
         workout_candidates_cte = (
             "workout_candidates AS MATERIALIZED ("
-            "SELECT * FROM workouts WHERE local_date >= ? AND local_date <= ?),"
+            "SELECT w.* FROM workouts AS w "
+            "WHERE local_date >= ? AND local_date <= ? "
+            f"AND {workout_active_condition}),"
         )
         candidate_window_args = (candidate_start, candidate_end)
         if window_predicate == "local_date BETWEEN ? AND ?":
@@ -423,7 +426,8 @@ def impact_bucket_rows(conn, window_predicate: str,
                  s.cadence_spm AS cadence_spm,
                  CASE WHEN EXISTS (
                                      SELECT 1 FROM {workout_source} w
-                                       WHERE CAST(strftime('%s', w.start_utc) AS INTEGER)
+                                       WHERE {workout_active_condition}
+                                     AND CAST(strftime('%s', w.start_utc) AS INTEGER)
                                                <= b.bkt * {IMPACT_BUCKET_SECONDS}
                                      AND CAST(strftime('%s', w.end_utc) AS INTEGER)
                                        > b.bkt * {IMPACT_BUCKET_SECONDS}
@@ -432,7 +436,8 @@ def impact_bucket_rows(conn, window_predicate: str,
                             AND s.cadence_spm >= ?
                             AND EXISTS (
                                   SELECT 1 FROM {workout_source} w
-                                   WHERE CAST(strftime('%s', w.start_utc) AS INTEGER)
+                                   WHERE {workout_active_condition}
+                                     AND CAST(strftime('%s', w.start_utc) AS INTEGER)
                                            <= b.bkt * {IMPACT_BUCKET_SECONDS}
                                      AND CAST(strftime('%s', w.end_utc) AS INTEGER)
                                        > b.bkt * {IMPACT_BUCKET_SECONDS}

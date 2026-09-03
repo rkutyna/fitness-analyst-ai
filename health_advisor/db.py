@@ -421,6 +421,92 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def workout_session_marks_available(conn: sqlite3.Connection) -> bool:
+    """Whether this connection can see the additive mark table.
+
+    Read-only connections deliberately do not run migrations. Keeping this
+    probe lets a reader of an older vault continue to see its unmarked rows
+    until the next writable initialization creates the table.
+    """
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'workout_session_marks'"
+    ).fetchone() is not None
+
+
+def workout_mark_condition(conn: sqlite3.Connection, alias: str = "w",
+                           *, marked: bool = False) -> str:
+    """Return a SQL condition for marked or unmarked workout rows.
+
+    The alias is code-owned, never request input. A missing table means an
+    older read-only vault has no possible marks, so all rows are unmarked.
+    """
+    if not workout_session_marks_available(conn):
+        return "1 = 0" if marked else "1 = 1"
+    exists = (
+        "EXISTS (SELECT 1 FROM workout_session_marks AS m "
+        f"WHERE m.workout_key = {alias}.dedupe_key)"
+    )
+    return exists if marked else f"NOT {exists}"
+
+
+def mark_workout_not_a_session(
+    conn: sqlite3.Connection,
+    workout_key: str,
+    *,
+    source: str = "user",
+    reason: str | None = None,
+    marked_at: str | None = None,
+) -> dict:
+    """Append an attributed not-a-session mark without changing the workout.
+
+    The stable ``workout_key`` identifies the row across re-ingestion. Marking
+    the same row again is idempotent and preserves the first attribution.
+    """
+    if not isinstance(workout_key, str) or not workout_key.strip():
+        raise ValueError("workout_key must be a non-empty string")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source must be a non-empty string")
+    if reason is not None and not isinstance(reason, str):
+        raise ValueError("reason must be text")
+    if marked_at is None:
+        marked_at = utcnow_iso()
+    else:
+        try:
+            datetime.fromisoformat(marked_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            raise ValueError("marked_at must be an ISO-8601 timestamp") from None
+
+    workout = conn.execute(
+        "SELECT id, dedupe_key FROM workouts WHERE dedupe_key = ?",
+        (workout_key,),
+    ).fetchone()
+    if workout is None:
+        raise ValueError("workout_key does not identify a stored workout")
+    existing = conn.execute(
+        "SELECT workout_id, workout_key, mark, source, marked_at, reason "
+        "FROM workout_session_marks WHERE workout_key = ?",
+        (workout_key,),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO workout_session_marks "
+            "(workout_id, workout_key, mark, source, marked_at, reason) "
+            "VALUES (?, ?, 'not_a_session', ?, ?, ?)",
+            (workout["id"], workout["dedupe_key"], source.strip(), marked_at,
+             reason.strip() if reason else None),
+        )
+        existing = conn.execute(
+            "SELECT workout_id, workout_key, mark, source, marked_at, reason "
+            "FROM workout_session_marks WHERE workout_key = ?",
+            (workout_key,),
+        ).fetchone()
+        already_marked = False
+    else:
+        already_marked = True
+    return {**dict(existing), "already_marked": already_marked}
+
+
 # --------------------------------------------------------------------------- #
 # Dedupe keys (source-native identities -> idempotent INSERT OR IGNORE)
 # --------------------------------------------------------------------------- #

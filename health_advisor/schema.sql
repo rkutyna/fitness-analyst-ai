@@ -203,6 +203,43 @@ CREATE INDEX IF NOT EXISTS idx_workouts_type      ON workouts (workout_type, loc
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workouts_hk_uuid
     ON workouts (hk_uuid) WHERE hk_uuid IS NOT NULL;
 
+-- ---------------------------------------------------------------------------
+-- workout_session_marks: append-only user corrections to session identity.
+--
+-- A device-recorded workout is never rewritten or deleted when a user says it
+-- was not a real session. This edge keeps the correction and its provenance
+-- separate from the device row, while the stable workout key keeps it attached
+-- across re-ingestion.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS workout_session_marks (
+    id           INTEGER PRIMARY KEY,
+    workout_id   INTEGER NOT NULL UNIQUE
+        REFERENCES workouts(id) ON DELETE RESTRICT,
+    workout_key  TEXT NOT NULL UNIQUE
+        REFERENCES workouts(dedupe_key) ON DELETE RESTRICT,
+    mark         TEXT NOT NULL CHECK (mark = 'not_a_session'),
+    source       TEXT NOT NULL CHECK (length(trim(source)) > 0),
+    marked_at    TEXT NOT NULL,
+    reason       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workout_session_marks_key
+    ON workout_session_marks (workout_key);
+
+CREATE TRIGGER IF NOT EXISTS workout_session_marks_no_update
+BEFORE UPDATE ON workout_session_marks
+BEGIN
+    SELECT RAISE(ABORT,
+        'workout session marks are append-only; a device row is never rewritten');
+END;
+
+CREATE TRIGGER IF NOT EXISTS workout_session_marks_no_delete
+BEFORE DELETE ON workout_session_marks
+BEGIN
+    SELECT RAISE(ABORT,
+        'workout session marks are append-only; the correction is retained');
+END;
+
 -- HealthKit operational state is mutable per device and type. It does not
 -- belong in vault_meta, which describes the vault itself.
 CREATE TABLE IF NOT EXISTS hk_sync_state (

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date, timedelta
 
 import pytest
 
@@ -167,6 +168,45 @@ def test_read_window_does_not_import_a_watch_winner_from_outside_the_window(conn
 
     rows = metrics.bucket_series(conn, start, end)
     assert sum(row["miles"] for row in rows) == pytest.approx(0.02)
+
+
+def test_utc_arbitration_bounds_many_post_floor_workouts_by_local_date(conn):
+    """The UTC overlap remains exact, but the candidate scan uses its index."""
+    load_f82_multi_source(conn)
+    start = "2026-08-25T00:00:00+00:00"
+    end = "2026-09-01T00:00:00+00:00"
+    extra_workouts = []
+    for i in range(256):
+        day = date(2026, 9, 2) + timedelta(days=i)
+        extra_workouts.append((
+            "running", f"{day.isoformat()}T12:00:00+00:00",
+            f"{day.isoformat()}T13:00:00+00:00", day.isoformat(),
+            f"f82-scale-workout-{i}",
+        ))
+    conn.executemany(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "source, dedupe_key) VALUES (?, ?, ?, ?, 'test', ?)",
+        extra_workouts,
+    )
+    conn.commit()
+
+    clause, args = db._workout_arbitration(
+        conn, "distance_walking_running",
+        arbitration_window=(start, end), arbitration_window_kind="utc",
+    )
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM records "
+        "WHERE metric = ? AND start_utc >= ? AND start_utc < ?" + clause,
+        ("distance_walking_running", start, end, *args),
+    ).fetchall()
+    workout_steps = [row[3] for row in plan if "workout" in row[3]]
+
+    assert conn.execute("SELECT COUNT(*) FROM workouts").fetchone()[0] >= 250
+    assert any(
+        "idx_workouts_localdate" in detail
+        and "local_date>? AND local_date<?" in detail
+        for detail in workout_steps
+    ), workout_steps
 
 
 def test_arbitration_uses_roles_for_renamed_devices(conn):

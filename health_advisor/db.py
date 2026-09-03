@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -1101,6 +1101,22 @@ def _workout_arbitration(
     losing sample and is valid on raw sqlite connections without custom
     functions.
     """
+    query, params = _workout_arbitration_query(
+        conn, metric, date=date, source_table=source_table,
+        arbitration_window=arbitration_window,
+        arbitration_window_kind=arbitration_window_kind)
+    if not query:
+        return "", []
+    return " AND NOT EXISTS (" + query + ")", params
+
+
+def _workout_arbitration_query(
+    conn: sqlite3.Connection, metric: str, *, date: str | None = None,
+    source_table: str = "records",
+    arbitration_window: tuple[str, str] | None = None,
+    arbitration_window_kind: str = "utc",
+) -> tuple[str, list]:
+    """Build the shared loser subquery used by both arbitration directions."""
     from . import normalize as nz
 
     if metric != "distance_walking_running":
@@ -1150,6 +1166,28 @@ def _workout_arbitration(
             "(SELECT end_value FROM arbitration_window)", []
         )
 
+    def workout_scoped(alias: str) -> tuple[str, list]:
+        """Bound workout candidates with the indexed date column first.
+
+        UTC windows can straddle a source's local calendar date. One day on
+        either side is therefore only a candidate bound; the exact UTC range
+        below remains authoritative. The local-date bound is what prevents a
+        query for a short UTC window from walking every post-floor workout via
+        the unindexed start_utc predicate.
+        """
+        if arbitration_window is None or arbitration_window_kind == "local_date":
+            return scoped(alias)
+        start, end = arbitration_window
+        start_day = (datetime.fromisoformat(start.replace("Z", "+00:00")).date()
+                     - timedelta(days=1)).isoformat()
+        end_day = (datetime.fromisoformat(end.replace("Z", "+00:00")).date()
+                   + timedelta(days=1)).isoformat()
+        return (
+            f" AND {alias}.local_date >= ?"
+            f" AND {alias}.local_date <= ?"
+            + scoped(alias)[0], [start_day, end_day]
+        )
+
     role_labels = _workout_source_labels(
         conn, source_table=source_table, date=date,
         arbitration_window=arbitration_window,
@@ -1164,7 +1202,7 @@ def _workout_arbitration(
 
     cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
     day_scope, day_scope_args = scoped("day_winner")
-    workout_scope, workout_scope_args = scoped("workout")
+    workout_scope, workout_scope_args = workout_scoped("workout")
     winner_window = (
         "winner.metric = 'distance_walking_running' "
         "AND winner.start_utc >= workout.start_utc "
@@ -1178,17 +1216,16 @@ def _workout_arbitration(
         f"EXISTS (SELECT 1 FROM {source} AS winner "
         f"WHERE {winner_window} AND {member('winner.source', 'watch')})"
     )
-    return (
-        " AND NOT EXISTS (WITH " + role_ctes + " "
-        "SELECT 1 FROM (SELECT 1) AS arbitration WHERE ("
+    day_loser = (
         f"({source}.local_date >= '{cutoff}' "
         f"AND {member(f'{source}.source', 'iphone')} "
         f"AND EXISTS (SELECT 1 FROM {source} AS day_winner "
         "WHERE day_winner.metric = 'distance_walking_running' "
         f"AND day_winner.local_date = {source}.local_date "
         f"{day_scope} AND {member('day_winner.source', 'watch')}))"
-        " OR EXISTS ("
-        "SELECT 1 FROM workouts AS workout "
+    )
+    workout_loser = (
+        "EXISTS (SELECT 1 FROM workouts AS workout "
         f"WHERE workout.local_date >= '{cutoff}' "
         f"{workout_scope} "
         f"AND {source}.start_utc >= workout.start_utc "
@@ -1197,7 +1234,12 @@ def _workout_arbitration(
         f"{member(f'{source}.source', 'iphone')} AND ({has_gymkit} OR {has_watch})"
         ") OR ("
         f"{member(f'{source}.source', 'watch')} AND {has_gymkit}"
-        ")))))",
+        ")))"
+    )
+    return (
+        "WITH " + role_ctes + " "
+        "SELECT 1 FROM (SELECT 1) AS arbitration WHERE ("
+        f"{day_loser} OR {workout_loser})",
         [*role_args, *day_scope_args, *workout_scope_args],
     )
 
@@ -1224,20 +1266,19 @@ def arbitrated_pairs(
             f"SELECT DISTINCT local_date FROM {source_ref} WHERE metric = ? AND value > ?",
             (metric, ceiling),
         )}
-    clause, params = _workout_arbitration(
+    query, params = _workout_arbitration_query(
         conn, "distance_walking_running", source_table=source_table,
     )
-    if clause:
-        excluded_clause = clause.replace(" AND NOT EXISTS (", " AND EXISTS (", 1)
+    if query:
         pairs |= {("distance_walking_running", r["local_date"]) for r in conn.execute(
             f"SELECT DISTINCT local_date FROM {source_ref} "
-            "WHERE metric = ?" + excluded_clause,
+            "WHERE metric = ? AND EXISTS (" + query + ")",
             ("distance_walking_running", *params),
         )}
     # Whole-day iPhone-vs-Watch arbitration has no workout row to correlate
     # with, so report its changed dates separately. Resolve the same scoped
     # raw labels as _workout_arbitration; the CTE keeps every label bound once.
-    if clause:
+    if query:
         def unscoped(alias: str) -> tuple[str, list]:
             return "", []
 

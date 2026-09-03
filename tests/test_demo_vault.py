@@ -285,6 +285,20 @@ def test_impact_volume_finds_both_jogging_and_walking(tools, demo_db):
             assert 5.0 < w["jog_pace_min_per_mi"] < 16.0
 
 
+def test_demo_sensitivity_jog_minutes_values_are_unchanged(tools, demo_db, conn):
+    """#14: metadata must not alter the Python-computed sensitivity values."""
+    from health_advisor import mcp_server
+
+    _, report = demo_db
+    start, end = report["watch_from"], report["end_date"]
+    expected = mcp_server._jog_threshold_sensitivity(conn, start, end)["sensitivity"]
+    published = tools.get_impact_volume(start=start, end=end, by="week")
+    fields = ("cadence_min_steps_per_min", "jog_buckets", "jog_minutes", "live_cutoff")
+    assert [{field: row[field] for field in fields} for row in published[
+        "jog_threshold_sensitivity"]] == [
+        {field: row[field] for field in fields} for row in expected]
+
+
 def test_correlate_metrics_runs_and_reports_honestly(tools):
     out = tools.correlate_metrics(metric_x="sleep_asleep",
                                   metric_y="subjective_energy", period="all")

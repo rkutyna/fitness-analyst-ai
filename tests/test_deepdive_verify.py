@@ -188,6 +188,37 @@ def test_legacy_midpoint_variability_bridges_through_the_harness():
     assert verdict["ok"] is True, verdict
 
 
+def test_legacy_impact_sensitivity_jog_minutes_bridges_through_the_harness():
+    from tests.replay_ask_captures import _bridge_legacy_labels
+
+    ledger = _record({"jog_threshold_sensitivity": [{
+        "cadence_min_steps_per_min": 140.0,
+        "jog_buckets": 37,
+        "jog_minutes": 12.3,
+        "live_cutoff": True,
+    }]}, "get_impact_volume")
+    claim = _claim("jog_minutes", None, "jog_minutes", 12.3,
+                   "$.result.jog_threshold_sensitivity[0].jog_minutes")
+
+    assert DV.verify_coach_claims(
+        None, "Jogging was 12.3 minutes.", [claim], payload=ledger)["ok"] is False
+
+    for record in ledger:
+        _bridge_legacy_labels(record)
+    verdict = DV.verify_coach_claims(
+        None, "Jogging was 12.3 minutes.", [claim], payload=ledger)
+    assert verdict["ok"] is True, verdict
+
+    context_claim = _claim("jog_minutes", None, "cadence_min_steps_per_min", 140.0,
+                           "$.result.jog_threshold_sensitivity[0]."
+                           "cadence_min_steps_per_min")
+    refused = DV.verify_coach_claims(
+        None, "The cutoff was 140 steps per minute.", [context_claim],
+        payload=ledger)
+    assert refused["ok"] is False
+    assert refused["reason"] == "claim metric does not match ledger field"
+
+
 def test_metricless_workout_count_does_not_accept_a_surplus_metric_label():
     ledger = _record({"workout_counts": [{"type": "running", "count": 5}]})
     claim = _claim("running", None, "count", 5,

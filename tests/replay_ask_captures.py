@@ -26,7 +26,7 @@ _LEGACY_FACTOR_METRICS = {"hrv": "heart_rate_variability",
 
 
 def _bridge_legacy_labels(record: dict) -> None:
-    """Inject the ``field_metrics`` today's publishers declare (#158, #202)
+    """Inject the ``field_metrics`` today's publishers declare (#14, #158, #202)
     into ledger records captured before those publishers existed.
 
     This lives in the replay harness, NOT in the verifier: the runtime keeps
@@ -60,6 +60,11 @@ def _bridge_legacy_labels(record: dict) -> None:
         if isinstance(variability, dict):
             variability.setdefault("field_metrics", {}).setdefault(
                 "latest_sd_hours", "sleep_midpoint_sd_28d")
+    elif tool == "get_impact_volume":
+        for row in result.get("jog_threshold_sensitivity") or []:
+            if isinstance(row, dict):
+                row.setdefault("field_metrics", {}).setdefault(
+                    "jog_minutes", "jog_minutes")
 
 
 def _captures(root: Path):

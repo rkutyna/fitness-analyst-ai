@@ -388,6 +388,42 @@ def test_sensitivity_reports_jog_minutes_at_neighbouring_cutoffs(cliffdb, tools)
     assert at[150.0] == pytest.approx(0.0, abs=0.5)
 
 
+def test_sensitivity_jog_minutes_verifies_but_context_fields_do_not(cliffdb, tools):
+    """#14: sensitivity owns only the recomputed series value."""
+    from health_advisor import deepdive_verify as DV
+
+    result = tools.get_impact_volume("2026-06-01", "2026-06-07", by="week")
+    row = next(row for row in result["jog_threshold_sensitivity"]
+               if row["live_cutoff"])
+    ledger = [{"sequence": 1, "tool_name": "get_impact_volume",
+               "arguments": {}, "result": result, "result_elided": False}]
+
+    jog_claim = {
+        "metric": "jog_minutes", "period": None, "field": "jog_minutes",
+        "value": row["jog_minutes"],
+        "source": {"sequence": 1,
+                   "path": "$.result.jog_threshold_sensitivity[2].jog_minutes"},
+    }
+    accepted = DV.verify_coach_claims(
+        None, f"Jogging was {row['jog_minutes']} minutes.", [jog_claim],
+        payload=ledger)
+    assert accepted["ok"] is True, accepted
+
+    context_claim = {
+        **jog_claim,
+        "field": "cadence_min_steps_per_min",
+        "value": row["cadence_min_steps_per_min"],
+        "source": {"sequence": 1,
+                   "path": "$.result.jog_threshold_sensitivity[2]."
+                           "cadence_min_steps_per_min"},
+    }
+    refused = DV.verify_coach_claims(
+        None, f"The cutoff was {row['cadence_min_steps_per_min']} steps per minute.",
+        [context_claim], payload=ledger)
+    assert refused["ok"] is False
+    assert refused["reason"] == "claim metric does not match ledger field"
+
+
 def test_sensitivity_at_the_live_cutoff_equals_the_reported_minutes(cliffdb, tools):
     """If these ever disagree the sensitivity block is measuring something else
     than the classifier it claims to be probing."""

@@ -851,7 +851,10 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
 
     Uses the shared bucket set and varies only cadence. Workout scope and the
     implausible-pace floor remain fixed, so the live threshold row is exactly
-    the same classification as ``impact_volume``.
+    the same classification as ``impact_volume``. ``jog_minutes`` is the only
+    series value in each sensitivity row and is recomputed at that cadence
+    edge; ``cadence_min_steps_per_min``, ``jog_buckets``, and ``live_cutoff``
+    are context about the sensitivity calculation and remain unowned.
     """
     bucket_min = mx.IMPACT_BUCKET_SECONDS / 60.0
     live = mx.IMPACT_JOG_CADENCE_MIN
@@ -882,12 +885,26 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
     at_live = counts[edges.index(live)] if live in edges else 0
     if not at_live and not any(counts):
         return None
+
+    def sensitivity_row(edge: float, count: int) -> dict:
+        row = {
+            "cadence_min_steps_per_min": edge,
+            "jog_buckets": count,
+            "jog_minutes": _r(count * bucket_min, 1),
+            "live_cutoff": edge == live,
+            # jog_minutes is a series value at this cadence edge. The other
+            # three fields above describe the diagnostic cutoff and buckets;
+            # they are context, not separately owned metric values.
+            "field_metrics": {"jog_minutes": "jog_minutes"},
+        }
+        # Keep this unscoped table from stealing the ordinary period table's
+        # sole presentation leaf when fact_template pairs display metadata.
+        _add_presentation(row, "jog_minutes", None, row["jog_minutes"],
+                          field="jog_minutes")
+        return row
+
     return {
-        "sensitivity": [
-            {"cadence_min_steps_per_min": e, "jog_buckets": c,
-             "jog_minutes": _r(c * bucket_min, 1),
-             "live_cutoff": e == live}
-            for e, c in zip(edges, counts)],
+        "sensitivity": [sensitivity_row(e, c) for e, c in zip(edges, counts)],
         "near": {
             "within_steps_per_min": IMPACT_NEAR_THRESHOLD_STEPS_PER_MIN,
             "jog_buckets": at_live,

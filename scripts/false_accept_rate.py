@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the bag-of-numbers grounding gate against a deep-dive payload.
+"""Measure the bag-of-numbers grounding gate against MCP tool payloads.
 
 This is deliberately an instrument, not a copy of the gate.  Every probe is
 sent through :func:`health_advisor.agents.grounding_check`; this module only
@@ -11,7 +11,6 @@ defines the probe spaces and counts the returned verdicts.
 from __future__ import annotations
 
 import argparse
-import random
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,8 +24,6 @@ from health_advisor.numeric_tokens import NUM_RE  # noqa: E402
 
 INTEGER_PROBES = tuple(range(1, 201))
 DECIMAL_PROBES = tuple(index / 10 for index in range(1, 1001))
-CONTROL_SIZE = 15
-CONTROL_SEED = 91
 
 
 def numeric_occurrence_count(value: Any) -> int:
@@ -42,11 +39,16 @@ def numeric_occurrence_count(value: Any) -> int:
     return 0
 
 
-def scoreboard_payload(scoreboard: str) -> tuple[dict[str, list[float]], list[str]]:
-    """Turn scoreboard tokens into a numeric payload without deduplicating them."""
-    tokens = NUM_RE.findall(scoreboard)
-    values = [float(token.replace(",", "")) for token in tokens]
-    return {"scoreboard_numbers": values}, tokens
+def presentation_leaf_count(value: Any) -> int:
+    """Count the engine's presentation leaves without interpreting their text."""
+    if isinstance(value, dict):
+        is_leaf = (value.get("field") == "presentation"
+                   and isinstance(value.get("value"), str))
+        return int(is_leaf) + sum(presentation_leaf_count(item)
+                                  for item in value.values())
+    if isinstance(value, list):
+        return sum(presentation_leaf_count(item) for item in value)
+    return 0
 
 
 def _probe_text(token: str) -> str:
@@ -80,6 +82,7 @@ def measure_payload(payload: dict,
     decimal_accepted = _accepted_count(payload, decimals, decimals=1)
     return {
         "number_count": numeric_occurrence_count(payload),
+        "presentation_leaf_count": presentation_leaf_count(payload),
         "integers": {
             "accepted": integer_accepted,
             "total": len(integers),
@@ -92,31 +95,9 @@ def measure_payload(payload: dict,
         },
     }
 
-
-def control(payload: dict, scoreboard_tokens: list[str]) -> dict[str, Any]:
-    """Check a reproducible sample of figures copied from the scoreboard.
-
-    Read the result narrowly. Measured 2026-08-25, four of the fifteen sampled
-    tokens are date fragments — `2026`, `09`, `2026`, `10` — because NUM_RE
-    splits a rendered date into components. So this demonstrates "numbers
-    present in the payload are licensed", which is weaker than "real figures
-    verify". It is left as-is because the published 15/15 reproduces against it,
-    but the calendar numbers in the licence pool are themselves a false-accept
-    surface worth carrying into #39: a model writing "10" of anything is
-    licensed by a date.
-    """
-    if len(scoreboard_tokens) < CONTROL_SIZE:
-        raise ValueError("scoreboard has fewer than 15 numeric tokens")
-    sample = random.Random(CONTROL_SEED).sample(scoreboard_tokens, CONTROL_SIZE)
-    accepted = sum(
-        agents.grounding_check(_probe_text(token), payload)[0]
-        for token in sample
-    )
-    return {"accepted": accepted, "total": CONTROL_SIZE, "sample": sample}
-
-
 def _print_payload(name: str, result: dict[str, Any]) -> None:
     print(f"{name}: {result['number_count']} numbers")
+    print(f"  presentation leaves: {result['presentation_leaf_count']}")
     integers = result["integers"]
     print(f"  integers 1..200: {integers['accepted']}/{integers['total']} = "
           f"{integers['rate']:.1%}")
@@ -132,22 +113,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # The payload comes from an engine-native MCP tool over the supplied vault.
-    # The probe spaces, `measure_payload` and `control` remain independent of
-    # that source and are useful (and tested) on any payload.
+    # The probe spaces and `measure_payload` remain independent of that source
+    # and are useful (and tested) on any payload.
     ctx = VaultContext.local(args.db, user_id="demo")
     tools = mcp_server.build_tools(ctx)
-    result = tools["get_briefing"](scope="deep", day=args.as_of)
-    scoreboard = str(result)
+    control_payload = tools["get_briefing"](scope="deep", day=args.as_of)
+    presentation_payload = tools["get_sleep_regularity"](end=args.as_of)
+    if presentation_leaf_count(presentation_payload) == 0:
+        raise RuntimeError("get_sleep_regularity returned no presentation leaves")
 
-    whole = measure_payload(result)
-    rendered, scoreboard_tokens = scoreboard_payload(scoreboard)
-    scoreboard_result = measure_payload(rendered)
-    scoreboard_control = control(rendered, scoreboard_tokens)
-
-    _print_payload("whole result dict", whole)
-    _print_payload("rendered scoreboard", scoreboard_result)
-    print("control: scoreboard's own 15 sampled figures: "
-          f"{scoreboard_control['accepted']}/{scoreboard_control['total']} accepted")
+    print("N numbers = numeric leaves only; digits inside presentation strings "
+          "are not counted.")
+    for name, payload in (
+        ("control payload (get_briefing)", control_payload),
+        ("presentation payload (get_sleep_regularity)", presentation_payload),
+    ):
+        result = measure_payload(payload)
+        _print_payload(name, result)
     return 0
 
 

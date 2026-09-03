@@ -1,8 +1,9 @@
 """The false-accept harness measures the shipped grounding gate itself."""
 from __future__ import annotations
 
+from health_advisor import demo
 from health_advisor.numeric_tokens import NUM_RE
-from scripts.false_accept_rate import measure_payload, _probe_text
+from scripts.false_accept_rate import main, measure_payload, _probe_text
 
 
 def test_synthetic_payload_has_hand_computed_gate_results():
@@ -11,6 +12,7 @@ def test_synthetic_payload_has_hand_computed_gate_results():
         "first": 10,
         "nested": [{"second": 20.0}, {"third": 100}],
         "repeated": 10,
+        "presentation": {"field": "presentation", "value": "10 h 00 m"},
         "not_a_number": True,
     }
     integer_probes = (1, 10, 11, 100)
@@ -22,6 +24,7 @@ def test_synthetic_payload_has_hand_computed_gate_results():
     # Decimals: 9.9 reject, 10.0 accept, 10.1 reject, 99.5 accept because
     # |99.5 - 100| = 0.5 <= max(0.05, 100 * 0.005) -> 2/4.
     assert result["number_count"] == 4
+    assert result["presentation_leaf_count"] == 1
     assert result["integers"]["accepted"] == 2
     assert result["integers"]["total"] == 4
     assert result["one_decimal"]["accepted"] == 2
@@ -32,3 +35,24 @@ def test_synthetic_payload_has_hand_computed_gate_results():
     for token in ("10", "10.0", "99.5"):
         assert NUM_RE.findall(token) == [token]
         assert NUM_RE.findall(_probe_text(token)) == [token]
+
+
+def test_main_measures_real_demo_mcp_payloads(tmp_path, capsys):
+    """The entry point must exercise a real presentation-bearing tool result."""
+    db_path = tmp_path / "demo.db"
+    demo.build_demo_vault(db_path, days=60)
+
+    assert main(["--db", str(db_path), "--as-of", demo.DEFAULT_END_DATE]) == 0
+
+    output = capsys.readouterr().out
+    assert "N numbers = numeric leaves only" in output
+    assert "digits inside presentation strings are not counted" in output
+    assert "control payload (get_briefing)" in output
+    assert "presentation payload (get_sleep_regularity)" in output
+    assert "  presentation leaves: 0" in output
+    presentation_output = output.split(
+        "presentation payload (get_sleep_regularity)", 1)[1]
+    assert "  presentation leaves: 1" in presentation_output
+    assert "  presentation leaves: 0" not in presentation_output
+    assert "  integers 1..200:" in presentation_output
+    assert "  one-decimal 0.1..100.0:" in presentation_output

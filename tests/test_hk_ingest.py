@@ -134,6 +134,85 @@ def test_healthkit_ingest_aggregates_every_series_but_keeps_raw_allowlist(
         conn.close()
 
 
+def test_unknown_anchor_is_not_advanceable_and_writes_no_sync_state(
+    vault, vault_path, monkeypatch
+):
+    unknown = "HKQuantityTypeIdentifierNotYetSupported"
+    heart = _sample(
+        "quantity", "hr-known", HEART,
+        "2026-08-22T09:00:00-04:00", "2026-08-22T09:00:01-04:00",
+        145.0, "count/min",
+    )
+    unsupported = _sample(
+        "quantity", "unknown-type", unknown,
+        "2026-08-22T10:00:00-04:00", "2026-08-22T10:00:01-04:00",
+        1.0, "count",
+    )
+    anchors = [
+        {"type_identifier": HEART, "from": None, "to": "heart-token"},
+        {"type_identifier": unknown, "from": None, "to": "token-1"},
+    ]
+
+    with _client(vault, monkeypatch) as client:
+        response = client.post(
+            "/v1/ingest",
+            json=_payload(heart, unsupported, batch_id="unknown-anchor",
+                          anchors=anchors),
+            headers={"x-health-secret": "hk-secret"},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["anchor_results"] == [
+        {"index": 0, "type_identifier": HEART, "accepted": True},
+        {
+            "index": 1, "type_identifier": unknown, "accepted": False,
+            "reason": (
+                "unknown type_identifier 'HKQuantityTypeIdentifierNotYetSupported'; "
+                "anchor is not advanceable"
+            ),
+        },
+    ]
+
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hk_sync_state WHERE device_id = ? "
+            "AND type_identifier = ?", (DEVICE["id"], HEART)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hk_sync_state WHERE device_id = ? "
+            "AND type_identifier = ?", (DEVICE["id"], unknown)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_known_anchor_response_keeps_legacy_bytes(vault, monkeypatch):
+    payload = _payload(batch_id="legacy-response", anchors=[{
+        "type_identifier": HEART, "from": None, "to": "heart-token",
+    }])
+    with _client(vault, monkeypatch) as client:
+        response = client.post(
+            "/v1/ingest", json=payload,
+            headers={"x-health-secret": "hk-secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == (
+        b'{"ok":true,"applied":true,"batch_id":"legacy-response",'
+        b'"records_seen":0,"records_added":0,"workouts_seen":0,'
+        b'"workouts_added":0,"daily_totals_seen":0,"daily_totals_added":0,'
+        b'"workouts_rejected":0,"workouts_rejected_detail":[],"deleted":0,'
+        b'"tombstones_added":0,"daily_pairs_updated":0,"dates":[],'
+        b'"detail":"records_seen=0 records_added=0 workouts_seen=0 '
+        b'workouts_added=0 workouts_contained_rejected=0 deleted=0 tombstones=0 '
+        b'daily_totals_seen=0 daily_totals_added=0 daily_pairs=0 '
+        b'history_imported_through=- batch_sequence=1","unhandled":[],'
+        b'"derived":0,"derive_error":null}'
+    )
+
+
 def test_healthkit_three_batches_accumulate_non_allowlisted_raw(vault, vault_path,
                                                                 monkeypatch):
     """A day's aggregate must include every HealthKit delivery, not its tail."""

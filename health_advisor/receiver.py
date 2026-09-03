@@ -399,12 +399,15 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     # prior commit and be applied twice.
     key = lease.commit_key("healthkit", parsed["device_id"], parsed["batch_id"])
     if (prior := lease.already_applied(ctx, key)) is not None:
-        return JSONResponse({
+        response = {
             "ok": True, "applied": False, "reason": "already_applied",
             "batch_id": parsed["batch_id"], "records_seen": len(parsed["records"]),
             "workouts_seen": len(parsed["workouts"]), "workouts_added": 0,
             "unhandled": parsed["unhandled"][:20], **prior,
-        })
+        }
+        if parsed["rejected_anchors"]:
+            response["anchor_results"] = parsed["anchor_results"]
+        return JSONResponse(response)
 
     accepted: list[dict] = []
     affected: set[tuple[str, str]] = set()
@@ -671,13 +674,16 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         conn.close()
 
     if not applied:
-        return JSONResponse({
+        response = {
             "ok": True, "applied": False, "reason": "already_applied",
             "batch_id": parsed["batch_id"], "records_seen": len(parsed["records"]),
             "workouts_seen": len(parsed["workouts"]), "workouts_added": 0,
             "daily_totals_seen": len(parsed["daily_totals"]),
             "unhandled": parsed["unhandled"][:20], **prior,
-        })
+        }
+        if parsed["rejected_anchors"]:
+            response["anchor_results"] = parsed["anchor_results"]
+        return JSONResponse(response)
 
     # This helper deliberately runs after the data/anchor commit: it is
     # designed to swallow a derive failure and report it, while the HealthKit
@@ -735,7 +741,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
            unhandled=len(parsed["unhandled"]),
            date_min=_dates[0] if _dates else None,
            date_max=_dates[-1] if _dates else None)
-    return JSONResponse({
+    response = {
         "ok": True, "applied": True, "batch_id": parsed["batch_id"],
         "records_seen": len(parsed["records"]), "records_added": rec_added,
         "workouts_seen": len(parsed["workouts"]), "workouts_added": workouts_added,
@@ -750,7 +756,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         "detail": detail,
         "unhandled": parsed["unhandled"][:20], "derived": derived,
         "derive_error": derive_errors[0] if derive_errors else None,
-    })
+    }
+    if parsed["rejected_anchors"]:
+        response["anchor_results"] = parsed["anchor_results"]
+    return JSONResponse(response)
 
 
 def _require_ingest_secret(x_health_secret: str | None) -> None:

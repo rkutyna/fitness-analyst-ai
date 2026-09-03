@@ -2,7 +2,10 @@
 
 This module is deliberately a pure boundary: it validates and normalizes one
 already-decoded dictionary and does not open a database or apply anchors and
-tombstones.  The vocabulary and unit arithmetic belong to ``normalize``;
+tombstones.  Protocol versions other than the server's supported version are
+refused, and anchors for types outside the persistence vocabulary are returned
+as explicitly rejected status entries rather than as advanceable anchors.  The
+vocabulary and unit arithmetic belong to ``normalize``;
 ``db.record_key`` supplies the existing window/value-aware identity.
 """
 from __future__ import annotations
@@ -142,6 +145,16 @@ def _type_info(type_identifier: str, category_value: Any):
     if type_identifier in nz.HK_CATEGORY:
         return "category", [nz.HK_CATEGORY[type_identifier]["metric"]]
     return None, None
+
+
+def _anchor_type_supported(type_identifier: str) -> bool:
+    """Whether this server can persist samples for a HealthKit anchor type."""
+    return (
+        type_identifier in nz.HK_QUANTITY
+        or type_identifier == nz.HK_SLEEP_TYPE_IDENTIFIER
+        or type_identifier in nz.HK_CATEGORY
+        or type_identifier == _HK_WORKOUT_TYPE_IDENTIFIER
+    )
 
 
 def _unhandled(unhandled: list[str], index: int, reason: str) -> None:
@@ -465,7 +478,12 @@ def _parse_daily_total(total: dict, index: int, device_id: str,
 
 
 def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return canonical rows plus untouched anchors/deletions and envelope IDs."""
+    """Return canonical rows, advanceable anchors, and envelope IDs.
+
+    Unsupported protocol versions fail the whole payload. Unsupported anchor
+    types remain visible in ``anchor_results`` but are excluded from the
+    advanceable ``anchors`` collection.
+    """
     envelope = _mapping(payload, "payload")
     _reject_unknown(envelope, _TOP_FIELDS, "payload")
     required = ("protocol_version", "device", "app_version", "batch_id",
@@ -488,9 +506,12 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
             or envelope["batch_sequence"] < 0):
         raise PayloadError("payload.batch_sequence must be a non-negative integer")
 
-    anchors = _list(envelope["anchors"], "payload.anchors")
+    anchors_wire = _list(envelope["anchors"], "payload.anchors")
+    anchors: list[dict] = []
+    anchor_results: list[dict] = []
+    rejected_anchors: list[dict] = []
     unhandled: list[str] = []
-    for i, anchor in enumerate(anchors):
+    for i, anchor in enumerate(anchors_wire):
         anchor = _mapping(anchor, f"payload.anchors[{i}]")
         _reject_unknown(anchor, _ANCHOR_FIELDS, f"payload.anchors[{i}]")
         missing = _required(anchor, ("type_identifier", "from", "to"),
@@ -505,13 +526,28 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise PayloadError(f"payload.anchors[{i}].from must be a string or null")
         if not _text(anchor["to"]):
             raise PayloadError(f"payload.anchors[{i}].to must be a string")
-        if (anchor["type_identifier"] not in nz.HK_QUANTITY
-                and anchor["type_identifier"] != nz.HK_SLEEP_TYPE_IDENTIFIER
-                and anchor["type_identifier"] not in nz.HK_CATEGORY
-                and anchor["type_identifier"] != _HK_WORKOUT_TYPE_IDENTIFIER):
+        if not _anchor_type_supported(anchor["type_identifier"]):
+            reason = (
+                f"unknown type_identifier {anchor['type_identifier']!r}; "
+                "anchor is not advanceable"
+            )
             unhandled.append(
                 f"anchors[{i}]: unknown type_identifier {anchor['type_identifier']!r}"
             )
+            rejected_anchors.append(anchor)
+            anchor_results.append({
+                "index": i,
+                "type_identifier": anchor["type_identifier"],
+                "accepted": False,
+                "reason": reason,
+            })
+        else:
+            anchors.append(anchor)
+            anchor_results.append({
+                "index": i,
+                "type_identifier": anchor["type_identifier"],
+                "accepted": True,
+            })
 
     deletions = _list(envelope["deletions"], "payload.deletions")
     for i, deletion in enumerate(deletions):
@@ -573,6 +609,8 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "unhandled": unhandled,
         "deletions": deletions,
         "anchors": anchors,
+        "rejected_anchors": rejected_anchors,
+        "anchor_results": anchor_results,
         "batch_id": envelope["batch_id"],
         "batch_sequence": envelope["batch_sequence"],
         "device_id": device["id"],

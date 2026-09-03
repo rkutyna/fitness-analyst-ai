@@ -103,3 +103,21 @@ def test_a_good_payload_still_ingests(client, vault_path):
 
 def test_empty_payload_is_accepted_not_rejected(client):
     assert client.post("/v1/ingest", json=_base()).status_code == 200
+
+
+def test_unknown_protocol_version_is_refused_without_database_evidence(
+    client, vault_path
+):
+    response = client.post(
+        "/v1/ingest", json=_base(protocol_version=2),
+    )
+
+    assert response.status_code == 400
+    assert "unsupported protocol_version" in response.json()["detail"]
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM hk_sync_state").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM commit_log").fetchone()[0] == 0
+    finally:
+        conn.close()

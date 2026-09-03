@@ -159,6 +159,32 @@ def test_unknown_type_does_not_reject_batch():
     assert out["batch_id"] == "batch-1"
 
 
+def test_unknown_anchor_is_excluded_from_advanceable_anchors():
+    unknown = {
+        "type_identifier": "HKQuantityTypeIdentifierNotYetSupported",
+        "from": None,
+        "to": "token-1",
+    }
+    out = hk_parse.parse_payload(_payload(
+        anchors=[unknown],
+        samples=[_quantity(type_identifier=unknown["type_identifier"])],
+    ))
+
+    assert out["anchors"] == []
+    assert out["rejected_anchors"] == [unknown]
+    assert out["anchor_results"] == [{
+        "index": 0,
+        "type_identifier": unknown["type_identifier"],
+        "accepted": False,
+        "reason": (
+            "unknown type_identifier 'HKQuantityTypeIdentifierNotYetSupported'; "
+            "anchor is not advanceable"
+        ),
+    }]
+    assert any("anchors[0]: unknown type_identifier" in item
+               for item in out["unhandled"])
+
+
 def test_category_unit_may_be_omitted():
     sample = _sleep()
     sample.pop("unit")

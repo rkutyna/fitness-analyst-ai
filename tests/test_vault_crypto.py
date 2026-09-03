@@ -216,7 +216,13 @@ def test_envelope_generated_before_generation_field_still_decrypts(tmp_path, mon
     assert restored.read_bytes() == b"legacy-fixture"
 
 
-def test_plaintext_and_chunk_limits_are_enforced(tmp_path):
+def test_plaintext_and_chunk_limits_are_enforced(tmp_path, monkeypatch):
+    # The encrypt-side check reads the module constants at call time, so it is
+    # exercised against a lowered ceiling: a sparse file at the real 2 TiB
+    # limit is refused with EFBIG by some CI filesystems (ubuntu-latest /tmp).
+    # The header check below runs against the real constants and needs no file.
+    monkeypatch.setattr(crypto, "MAX_CHUNK_COUNT", 4)
+    monkeypatch.setattr(crypto, "MAX_PLAINTEXT_SIZE", 4 * crypto.DEFAULT_CHUNK_SIZE)
     source = tmp_path / "oversized.db"
     with source.open("wb") as handle:
         handle.truncate(crypto.MAX_PLAINTEXT_SIZE + 1)
@@ -226,6 +232,7 @@ def test_plaintext_and_chunk_limits_are_enforced(tmp_path):
             vault_id="limit-vault", actor="worker", purpose="limit-test",
         )
 
+    monkeypatch.undo()
     header = {
         "format": "health-advisor-vault",
         "version": crypto.FORMAT_VERSION,

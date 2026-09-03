@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import socket
 import statistics
 import subprocess
 import sys
@@ -915,26 +916,29 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
 
 def _toctou_preplanted_code_is_overwritten(executor, vault_path, run_dir: Path) -> bool:
     """§4.6: the profile is generated into parent-owned space and `run()`
-    always regenerates `code.py` fresh. Pre-plant a malicious file at the
-    exact path `run()` is about to write to, then confirm the ACTUALLY
-    EXECUTED code is the one just passed in, never the pre-planted one."""
+    refuses a pre-existing parent-owned `code.py`. Pre-plant a malicious file
+    at the exact path `run()` is about to write to, then confirm the write is
+    refused before the pre-planted file can be executed or changed."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "code.py").write_text("print('UNSAFE ran the preplanted file')")
-    res = _run(executor, "print('BLOCKED ran the real code')", vault_path, run_dir)
-    return b"BLOCKED" in res.stdout and b"UNSAFE" not in res.stdout
+    code_path = run_dir / "code.py"
+    code_path.write_text("print('UNSAFE ran the preplanted file')")
+    try:
+        _run(executor, "print('BLOCKED ran the real code')", vault_path, run_dir)
+    except (FileExistsError, sb.TransientUnitError):
+        return code_path.is_file() and "UNSAFE" in code_path.read_text()
+    return False
 
 
 def _toctou_preplanted_profile_is_overwritten(executor, vault_path, run_dir: Path) -> bool:
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "profile.sb").write_text("(version 1)\n(allow default)\n")  # would-be wide-open profile
-    res = _run(executor, "print('BLOCKED ran under the real profile')", vault_path, run_dir)
-    # If the preplanted wide-open profile had survived, network would work.
-    net_code_run_dir = run_dir  # same dir, second call would reuse a regenerated profile
-    ok_ran = b"BLOCKED" in res.stdout
-    # Confirm the actual profile.sb on disk is OUR generated one, not the stub.
-    profile_text = (run_dir / "profile.sb").read_text()
-    ok_regenerated = "deny network*" in profile_text and "allow default" not in profile_text
-    return ok_ran and ok_regenerated
+    profile_path = run_dir / "profile.sb"
+    profile_path.write_text("(version 1)\n(allow default)\n")  # would-be wide-open profile
+    try:
+        _run(executor, "print('BLOCKED ran under the real profile')", vault_path, run_dir)
+    except (FileExistsError, sb.TransientUnitError):
+        profile_text = profile_path.read_text()
+        return "allow default" in profile_text and "deny network*" not in profile_text
+    return False
 
 
 def _toctou_vault_symlink_consistency(executor, tmp_root: Path) -> bool:
@@ -1028,6 +1032,162 @@ def test_toctou_home_tmpdir_env_remap_has_no_effect(executor, vault_path, tmp_pa
 
 
 # --------------------------------------------------------------------------- #
+# Parent-owned artefacts — exclusive creation for every executor path
+# --------------------------------------------------------------------------- #
+
+
+def _plant_parent_artifact_symlink(run_dir: Path, artifact: str) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    target = run_dir.parent / f"{artifact}.target"
+    target.write_bytes(b"sentinel")
+    (run_dir / artifact).symlink_to(target)
+    return target
+
+
+@pytest.mark.parametrize("artifact", ["code.py", "runner.py", "profile.sb"])
+def test_seatbelt_run_rejects_preexisting_parent_artifact_symlinks(
+        tmp_path, monkeypatch, artifact):
+    executor = object.__new__(sb.SeatbeltExecutor)
+    executor._python = sys.executable
+    executor._real_home = str(tmp_path)
+    executor._pyenv_prefix = str(tmp_path)
+    executor._venv_dir = str(tmp_path)
+    executor._pkg_dir = None
+    run_dir = tmp_path / "seatbelt-run"
+    target = _plant_parent_artifact_symlink(run_dir, artifact)
+
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("Popen must not be reached")
+
+    monkeypatch.setattr(sb.subprocess, "Popen", unexpected_popen)
+    with pytest.raises(FileExistsError):
+        executor.run("pass", "unused-vault", str(run_dir))
+    assert (run_dir / artifact).is_symlink()
+    assert target.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("artifact", ["code.py", "runner.py"])
+def test_bwrap_query_run_rejects_preexisting_parent_artifact_symlinks(
+        tmp_path, monkeypatch, artifact):
+    executor = object.__new__(sb.BwrapExecutor)
+    run_dir = tmp_path / "bwrap-query-run"
+    target = _plant_parent_artifact_symlink(run_dir, artifact)
+
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("Popen must not be reached")
+
+    monkeypatch.setattr(sb.subprocess, "Popen", unexpected_popen)
+    with pytest.raises(FileExistsError):
+        executor.run_with_query_channel(
+            "pass", str(run_dir), -1, runner_source="pass",
+            limits=sb.RunLimits())
+    assert (run_dir / artifact).is_symlink()
+    assert target.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("artifact", ["code.py", "runner.py"])
+def test_bwrap_plain_run_rejects_preexisting_parent_artifact_symlinks(
+        tmp_path, monkeypatch, artifact):
+    executor = object.__new__(sb.BwrapExecutor)
+    run_dir = tmp_path / "bwrap-plain-run"
+    target = _plant_parent_artifact_symlink(run_dir, artifact)
+
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("Popen must not be reached")
+
+    monkeypatch.setattr(sb.subprocess, "Popen", unexpected_popen)
+    with pytest.raises(FileExistsError):
+        executor.run("pass", "unused-vault", str(run_dir))
+    assert (run_dir / artifact).is_symlink()
+    assert target.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("artifact", ["code.py", "runner.py"])
+def test_transient_query_run_rejects_preexisting_parent_artifact_symlinks(
+        tmp_path, monkeypatch, artifact):
+    executor = object.__new__(sb.TransientUnitExecutor)
+    run_dir = tmp_path / "transient-query-run"
+    work_dir = run_dir / "work"
+    work_dir.mkdir(parents=True)
+    target = _plant_parent_artifact_symlink(run_dir, artifact)
+    monkeypatch.setattr(
+        sb.TransientUnitExecutor,
+        "_prepare_transient_run_dir",
+        lambda self, ignored: (run_dir, work_dir),
+    )
+
+    query_parent, query_child = socket.socketpair()
+    real_socket = sb.socket.socket
+
+    class FakeQueryServer:
+        def bind(self, path):
+            Path(path).touch()
+
+        def listen(self, backlog):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    def socket_factory(*args, **kwargs):
+        if args[:2] == (socket.AF_UNIX, socket.SOCK_STREAM):
+            return FakeQueryServer()
+        return real_socket(*args, **kwargs)
+
+    monkeypatch.setattr(sb.socket, "socket", socket_factory)
+    monkeypatch.setattr(sb.shutil, "rmtree", lambda path, ignore_errors: None)
+
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("Popen must not be reached")
+
+    monkeypatch.setattr(sb.subprocess, "Popen", unexpected_popen)
+    try:
+        with pytest.raises(sb.TransientUnitError, match="File exists"):
+            executor.run_with_named_query_channel(
+                "pass", "ignored-run-dir", query_child.detach(),
+                runner_source="pass", limits=sb.RunLimits())
+    finally:
+        query_parent.close()
+    assert (run_dir / artifact).is_symlink()
+    assert target.read_bytes() == b"sentinel"
+
+
+def test_run_limits_canonicalize_fd3_and_wall_clock_limits():
+    ceiling = sb.DEFAULT_MAX_FD3_BYTES * 32
+    for value in (0, -1, 65_535, 65_536, 65_537, ceiling, ceiling + 1):
+        limits = sb.RunLimits(max_fd3_bytes=value)
+        assert limits.max_fd3_bytes == analyst_runner._fd3_limit(value)
+    assert sb.RunLimits(wall_clock_s=-1).wall_clock_s == 0.0
+
+
+def test_raw_executor_uses_canonical_fd3_cap(executor, vault_path, tmp_path):
+    ceiling = sb.DEFAULT_MAX_FD3_BYTES * 32
+    cases = [
+        (-1, 0),
+        (0, 0),
+        (65_535, 65_535),
+        (65_536, 65_536),
+        (65_537, 65_537),
+        (ceiling, ceiling),
+        (ceiling + 1, ceiling + 1),
+    ]
+    for index, (configured_limit, payload_size) in enumerate(cases):
+        result = executor.run(
+            f"import os\nos.write(3, b'x' * {payload_size})\n",
+            vault_path,
+            str(tmp_path / f"fd3-limit-{index}"),
+            limits=sb.RunLimits(max_fd3_bytes=configured_limit),
+        )
+        effective_limit = analyst_runner._fd3_limit(configured_limit)
+        assert isinstance(result.fd3_bytes, bytes)
+        assert result.fd3_oversized is (payload_size > effective_limit)
+        assert result.fd3_bytes == b"x" * min(payload_size, effective_limit)
+
+
+# --------------------------------------------------------------------------- #
 # (ix) fd-3 abuse — scored on the parent's refusal, per A1's own note
 # --------------------------------------------------------------------------- #
 
@@ -1079,6 +1239,71 @@ def test_fd3_abuse_write_after_close_does_not_hang_or_corrupt(executor, vault_pa
     )
     assert res.timed_out is False
     assert res.fd3_as_json() == {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Query-channel fd-3 validation — the parent must own the acceptance decision
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt query channel")
+def test_query_channel_emitted_oversize_is_parent_refusal(
+        executor, query_vault_path, tmp_path):
+    code = """
+columns = [f"value_{i}" for i in range(200)]
+units = ["count"] * 200
+rows = [[0] * 200 for _ in range(200)]
+emit("oversized", columns, units, rows)
+"""
+    result = analyst_runner.run_analyst_code(
+        code, query_vault_path, str(tmp_path / "query-oversized"), executor,
+        limits=analyst_runner.AnalystLimits(
+            max_fd3_bytes=sb.DEFAULT_MAX_FD3_BYTES),
+    )
+    assert isinstance(result, analyst_envelope.Refusal)
+    assert result.reason == (
+        f"analyst output exceeds {sb.DEFAULT_MAX_FD3_BYTES} bytes")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt query channel")
+def test_query_channel_runs_validate_for_emitted_invalid_unit(
+        executor, query_vault_path, tmp_path, monkeypatch):
+    calls = []
+    original_validate = analyst_envelope.validate
+
+    def spy_validate(raw, **kwargs):
+        calls.append(raw)
+        return original_validate(raw, **kwargs)
+
+    monkeypatch.setattr(analyst_envelope, "validate", spy_validate)
+    result = analyst_runner.run_analyst_code(
+        "emit('bad_unit', ['value'], ['not_a_catalog_unit'], [[0]])",
+        query_vault_path, str(tmp_path / "query-invalid-unit"), executor,
+    )
+    assert calls
+    assert isinstance(result, analyst_envelope.Refusal)
+    assert "unit 'not_a_catalog_unit' is not in" in result.reason
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt query channel")
+def test_query_channel_does_not_accept_raw_fd3_payload_alongside_emit(
+        executor, query_vault_path, tmp_path):
+    code = """
+import os
+os.write(3, b'{\"tables\":[]}')
+emit("legitimate", ["value"], ["count"], [[0]])
+"""
+    result = analyst_runner.run_analyst_code(
+        code, query_vault_path, str(tmp_path / "query-raw-fd3"), executor,
+    )
+    # Measured on the host (2026-09-03): under the query channel the payload
+    # descriptor is a parent-chosen high fd, not 3 -- fd 3 is closed in the
+    # child, so the raw write raises EBADF before emit() runs and the parent
+    # refuses with its own EXEC_FAILED reason. The raw bytes never reach the
+    # parent as a payload, which is the property this test pins.
+    assert isinstance(result, analyst_envelope.Refusal)
+    assert result.reason.startswith("EXEC_FAILED")
+    assert "Bad file descriptor" in result.reason
 
 
 # =========================================================================== #

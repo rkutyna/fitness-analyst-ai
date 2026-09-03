@@ -28,6 +28,7 @@ from typing import Any
 from . import analyst_envelope as envelope
 from . import analyst_ledger as ledger
 from . import analyst_sandbox as sandbox
+from .analyst_sandbox import _write_exclusive
 from . import normalize
 
 __all__ = [
@@ -413,30 +414,9 @@ def _hash_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _write_exclusive(path: Path, text: str) -> None:
-    """Create a parent-owned text artefact without following a symlink."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
-        stream = os.fdopen(fd, "w", encoding="utf-8")
-    except BaseException:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-        raise
-    try:
-        stream.write(text)
-    finally:
-        stream.close()
-
-
 def _fd3_limit(value: Any) -> int:
-    """Keep the requested cap inside the bytes the drain can retain."""
-    value = int(value)
-    return max(0, min(value, sandbox._FD3_DRAIN_CEILING))
+    """Return the canonical fd-3 cap owned by ``RunLimits``."""
+    return sandbox.RunLimits(max_fd3_bytes=value).max_fd3_bytes
 
 
 def _parent_metadata(conn) -> int:
@@ -461,7 +441,7 @@ def _limits_for_executor(limits: Any):
         max_fd3_bytes = getattr(limits, "max_fd3_bytes", sandbox.DEFAULT_MAX_FD3_BYTES)
     return sandbox.RunLimits(
         wall_clock_s=float(wall_clock_s),
-        max_fd3_bytes=_fd3_limit(max_fd3_bytes),
+        max_fd3_bytes=max_fd3_bytes,
     )
 
 

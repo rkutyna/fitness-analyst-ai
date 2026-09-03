@@ -119,10 +119,33 @@ FD_OUT = 3
 FD_QUERY = 4
 
 
+def _write_exclusive(path: Path, data: str | bytes) -> None:
+    """Create a parent-owned artefact without following a symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        payload = data.encode("utf-8") if isinstance(data, str) else data
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
 @dataclass(frozen=True)
 class RunLimits:
     wall_clock_s: float = DEFAULT_WALL_CLOCK_S
     max_fd3_bytes: int = DEFAULT_MAX_FD3_BYTES
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "wall_clock_s", max(0.0, float(self.wall_clock_s)))
+        object.__setattr__(
+            self,
+            "max_fd3_bytes",
+            max(0, min(int(self.max_fd3_bytes), _FD3_DRAIN_CEILING)),
+        )
 
 
 @dataclass
@@ -394,11 +417,11 @@ class SeatbeltExecutor:
         # generated runner all live directly under $RUNDIR, never under
         # work/, so the child's write grant (work/ only) cannot touch them.
         code_path = run_dir_real / "code.py"
-        code_path.write_text(code, encoding="utf-8")
+        _write_exclusive(code_path, code)
 
         runner_src = _build_runner(code_path_real=str(code_path))
         runner_path = run_dir_real / "runner.py"
-        runner_path.write_text(runner_src, encoding="utf-8")
+        _write_exclusive(runner_path, runner_src)
 
         profile_text = build_profile(
             real_home=self._real_home,
@@ -408,7 +431,7 @@ class SeatbeltExecutor:
             work_dir=str(work_dir_real),
         )
         profile_path = run_dir_real / "profile.sb"
-        profile_path.write_text(profile_text, encoding="utf-8")
+        _write_exclusive(profile_path, profile_text)
 
         argv = [
             self.SANDBOX_EXEC,
@@ -820,9 +843,9 @@ class BwrapExecutor:
         run_dir_real, work_dir_real = self._prepare_run_dir(run_dir)
 
         code_path = run_dir_real / "code.py"
-        code_path.write_text(code, encoding="utf-8")
+        _write_exclusive(code_path, code)
         runner_path = run_dir_real / "runner.py"
-        runner_path.write_bytes(runner_source.encode("utf-8"))
+        _write_exclusive(runner_path, runner_source)
 
         argv = self._build_query_argv(
             run_dir_real=run_dir_real,
@@ -901,10 +924,10 @@ class BwrapExecutor:
         # Parent-owned artifacts (§4.6): code.py and the generated runner live
         # directly under $RUNDIR, never under work/.
         code_path = run_dir_real / "code.py"
-        code_path.write_text(code, encoding="utf-8")
+        _write_exclusive(code_path, code)
         runner_src = _build_runner(code_path_real=str(code_path), vault_real=vault_real)
         runner_path = run_dir_real / "runner.py"
-        runner_path.write_text(runner_src, encoding="utf-8")
+        _write_exclusive(runner_path, runner_src)
 
         argv = self._build_argv(
             vault_real=vault_real,
@@ -1234,8 +1257,8 @@ class TransientUnitExecutor(BwrapExecutor):
             code_path = run_dir_real / "code.py"
             runner_path = run_dir_real / "runner.py"
             result_path = work_dir_real / "envelope.json"
-            code_path.write_text(code, encoding="utf-8")
-            runner_path.write_text(runner_source, encoding="utf-8")
+            _write_exclusive(code_path, code)
+            _write_exclusive(runner_path, runner_source)
             bwrap_argv = self._transient_query_argv(
                 run_dir=run_dir_real, work_dir=work_dir_real,
                 runner_path=runner_path, query_socket=query_socket,

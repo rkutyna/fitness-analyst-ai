@@ -207,6 +207,108 @@ def test_still_empty_narration_for_present_metric_falls_back(
     assert len(capture) <= 2
 
 
+def _available_jog_ledger():
+    return [{
+        "sequence": 1,
+        "tool_name": "get_impact_volume",
+        "arguments": {"start": "2026-08-17", "end": "2026-08-23",
+                       "by": "week"},
+        "result": {"metric": "jog_minutes",
+                    "period": "2026-08-17:2026-08-23",
+                    "jog_minutes": 12.5, "unit": "min"},
+    }]
+
+
+def test_denial_of_available_figure_is_refused_and_retry_gets_fact_keys(
+        monkeypatch, vault):
+    """A digit-free denial cannot pass over a ledger fact."""
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    ledger = _available_jog_ledger()
+    period = ledger[0]["result"]["period"]
+    key = fact_template.fact_key("jog_minutes", period, "jog_minutes")
+    denial = "I don't have a recorded value for your jog minutes this week."
+    responses = iter(["acknowledged", denial, denial])
+    calls = []
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        llm, "tool_loop",
+        lambda prompt, **kwargs: calls.append(prompt) or next(responses))
+
+    capture = []
+    result = chat.answer_question(
+        vault, "How many jog minutes did I do this week?",
+        as_of="2026-08-23", capture=capture)
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["cause"] == "denied_available_figure"
+    assert result["verification"]["reason"] == (
+        "narration denied an available figure")
+    assert capture[0]["verification"]["cause"] == "denied_available_figure"
+    assert capture[1]["verification"]["cause"] == "denied_available_figure"
+    assert "AVAILABLE FACT KEYS FOR THE ASKED METRIC" in calls[2]
+    assert key in calls[2]
+
+
+def test_denial_without_a_returned_value_remains_a_valid_empty_answer(
+        monkeypatch, vault):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    ledger = [{
+        **_available_jog_ledger()[0],
+        "result": {"metric": "jog_minutes",
+                    "period": "2026-08-17:2026-08-23",
+                    "jog_minutes": None, "unit": "min"},
+    }]
+    denial = "I don't have a recorded value for your jog minutes this week."
+    responses = iter(["acknowledged", denial])
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: next(responses))
+
+    result = chat.answer_question(
+        vault, "How many jog minutes did I do this week?",
+        as_of="2026-08-23")
+
+    assert result["mode"] == "narration"
+    assert result["verification"]["cause"] == "ok"
+
+
+@pytest.mark.parametrize("kind,text,expected", [
+    ("prose", "I don't have a recorded value for your jog minutes this week.", True),
+    ("prose", "You logged 12.5 jog minutes this week. This does not include walk breaks.", False),
+    ("prose", "12.5 jog minutes this week. Your plan does not include a fourth run.", False),
+    ("prose", "You logged 12.5 jog minutes this week.", False),
+    ("template", "You logged {KEY} this week; this does not include walk breaks.", False),
+])
+def test_denial_phrase_requires_no_asked_metric_figure(kind, text, expected):
+    """Denial vocabulary cannot override a figure carried by the answer."""
+    ledger = _available_jog_ledger()
+    period = ledger[0]["result"]["period"]
+    key = fact_template.fact_key("jog_minutes", period, "jog_minutes")
+    text = text.replace("{KEY}", "{" + key + "}")
+    facts = fact_template.build_fact_set(ledger)
+    question = "How many jog minutes did I do this week?"
+    if kind == "template":
+        carries_figure = chat._template_has_asked_metric_figure(
+            question, text, facts)
+    else:
+        carries_figure = chat._prose_has_asked_metric_figure(
+            "jog_minutes",
+            ([{"metric": "jog_minutes", "period": period,
+               "field": "jog_minutes", "value": 12.5,
+               "source": {"sequence": 1, "path": "$.result.jog_minutes"}}]
+             if "12.5" in text else []),
+            ({"verdict": {"numbers": [{"ok": True,
+                                         "metric": "jog_minutes",
+                                         "field": "jog_minutes"}]}}
+             if "12.5" in text else {}))
+    assert chat._denied_available_figure(
+        question, text, ledger,
+        answer_has_asked_metric_figure=carries_figure,
+        facts=facts) is expected
+
+
 def test_genuinely_empty_gather_allows_empty_narration_without_retry(
         monkeypatch, vault):
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")

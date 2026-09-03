@@ -315,6 +315,7 @@ ASK_CAUSES = (
     "gate_refused",
     "no_gather_needed",
     "judge_refused",
+    "denied_available_figure",
 )
 
 _BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
@@ -369,7 +370,8 @@ def _status_outcome_family(status: dict) -> str:
 
 def _ask_cause(verification: dict, *, ledger: list[dict],
                loop_outcomes: list[dict], judge_score: int | None = None,
-               no_gather_needed: bool = False) -> str:
+               no_gather_needed: bool = False,
+               denied_available_figure: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
 
     ``judge_score`` is ``None`` when no judge ran — the fact-template arm
@@ -386,6 +388,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "no_gather_needed"
     if not ledger:
         return "empty_gather"
+    if denied_available_figure:
+        return "denied_available_figure"
     if not verification.get("ok"):
         return "gate_refused"
     if judge_score is not None and judge_score < 70:
@@ -928,6 +932,20 @@ _EMPTY_NARRATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# These phrases are deliberately closed. A generic negation or a word such
+# as "missing" is too broad for this gate: ordinary coaching prose can contain
+# both without denying a published measurement.
+_AVAILABLE_FIGURE_DENIAL_RE = re.compile(
+    r"\b(?:"
+    r"no\s+(?:recorded\s+)?value(?:\s+(?:was\s+)?recorded)?|"
+    r"(?:does\s+not|doesn't)\s+include|"
+    r"(?:do\s+not|don't)\s+have\s+(?:a\s+)?(?:recorded\s+)?value"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_DENIED_AVAILABLE_FIGURE_REASON = "narration denied an available figure"
+
 _RESULT_METADATA_KEYS = frozenset({
     "note", "start", "end", "limit", "truncated", "unit", "metric",
     "period", "first_date", "last_date", "group", "agg", "n_days", "ok",
@@ -1028,9 +1046,172 @@ def _metric_mentions(text: str, metric: str) -> bool:
                          text, re.IGNORECASE) for alias in aliases)
 
 
+def _question_metric(question: str,
+                     facts: dict[str, dict] | None = None) -> str | None:
+    """Return a catalog metric explicitly named by the user's question."""
+    from . import fact_template, normalize
+
+    candidates = set(normalize.known_metrics())
+    for key in (facts or {}):
+        try:
+            parsed = fact_template.parse_fact_key(key)
+        except (ImportError, TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            candidates.add(parsed[0])
+    matches = [metric for metric in candidates
+               if _metric_mentions(question, metric)]
+    return max(matches, key=len) if matches else None
+
+
+def _window_bounds(value) -> tuple[str, str] | None:
+    """Extract explicit inclusive bounds from one Python-owned object."""
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("requested_range")
+    if isinstance(nested, dict):
+        value = nested
+    start, end = value.get("start"), value.get("end")
+    if isinstance(start, str) and isinstance(end, str):
+        return start, end
+    return None
+
+
+def _record_matches_asked_window(record: dict, resolved_window) -> bool:
+    """Require a ledger result or call argument to carry the asked window."""
+    if resolved_window is None:
+        return True
+    if isinstance(resolved_window, tuple):
+        # Multiple calendar phrases are intentionally not assigned to one
+        # metric; the normal tool scope remains authoritative in that case.
+        return False
+    expected = (resolved_window.start, resolved_window.end)
+    argument_bounds = _window_bounds(record.get("arguments"))
+    if argument_bounds is not None:
+        if argument_bounds == expected:
+            return True
+        # A tool may legitimately gather a larger Python-scoped range and
+        # publish the asked bucket inside ``result.periods``. Keep inspecting
+        # the result instead of treating the broader call as proof that the
+        # asked window is absent.
+    result = record.get("result")
+    if _window_bounds(result) == expected:
+        return True
+    if isinstance(result, dict):
+        for period in result.get("periods") or []:
+            if not isinstance(period, dict):
+                continue
+            if _window_bounds(period) == expected:
+                return True
+            if period.get("period_start") == expected[0]:
+                return True
+    return False
+
+
+def _ledger_has_asked_metric_value(ledger: list[dict], metric: str,
+                                   resolved_window=None) -> bool:
+    """Find a non-null asked metric leaf in a successful scoped result."""
+    from . import deepdive_verify
+
+    for record in ledger if isinstance(ledger, list) else []:
+        if (not isinstance(record, dict) or record.get("result_elided")
+                or not _record_matches_asked_window(record, resolved_window)):
+            continue
+        result = record.get("result")
+        if not isinstance(result, (dict, list)):
+            continue
+        if isinstance(result, dict) and (
+                result.get("ok") is False
+                or any(result.get(name) not in (None, "", False)
+                       for name in ("error", "_error", "_error_type")
+                       if name in result)):
+            continue
+        try:
+            entries = deepdive_verify._ledger_scopes(record)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        for entry in entries:
+            if (entry.get("kind") == "result"
+                    and entry.get("value") is not None
+                    and (entry.get("metric") == metric
+                         or (entry.get("metric") is None
+                             and entry.get("field") == metric))):
+                return True
+    return False
+
+
+def _template_has_asked_metric_figure(question: str, template: str,
+                                      facts: dict[str, dict]) -> bool:
+    """Whether a template resolves a placeholder for the asked metric."""
+    from . import fact_template
+
+    metric = _question_metric(question, facts)
+    if not metric:
+        return False
+    scan = fact_template.scan_template(template, facts)
+    for key in scan.get("placeholders", []):
+        try:
+            parsed = fact_template.parse_fact_key(key)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and parsed[0] == metric:
+            return True
+    return False
+
+
+def _prose_has_asked_metric_figure(metric: str | None, claims,
+                                   verification: dict) -> bool:
+    """Whether a verified prose claim carries a figure for ``metric``."""
+    if not metric or not isinstance(claims, list):
+        return False
+    numbers = (verification.get("verdict") or {}).get("numbers") or []
+    for claim, number in zip(claims, numbers):
+        if not isinstance(claim, dict) or not isinstance(number, dict):
+            continue
+        if not number.get("ok"):
+            continue
+        if (claim.get("metric") == metric or number.get("metric") == metric
+                or (claim.get("metric") is None
+                    and number.get("field") == metric)):
+            return True
+    return False
+
+
+def _denied_available_figure(question: str, text: str, ledger: list[dict],
+                             *, answer_has_asked_metric_figure: bool = False,
+                             facts: dict[str, dict] | None = None,
+                             resolved_window=None) -> bool:
+    """Whether a denial refuses a figure Python published for this question."""
+    if (not isinstance(text, str)
+            or not (_EMPTY_NARRATION_RE.search(text)
+                    or _AVAILABLE_FIGURE_DENIAL_RE.search(text))
+            or answer_has_asked_metric_figure):
+        return False
+    metric = _question_metric(question, facts)
+    return bool(metric and _ledger_has_asked_metric_value(
+        ledger, metric, resolved_window))
+
+
 def _empty_narration_is_grounded(ctx: VaultContext, text: str,
-                                 as_of: str | None) -> tuple[bool, str]:
-    """Validate a surviving no-data narration against current coverage."""
+                                 as_of: str | None, *,
+                                 question: str | None = None,
+                                 ledger: list[dict] | None = None,
+                                 facts: dict[str, dict] | None = None,
+                                 resolved_window=None,
+                                 answer_has_asked_metric_figure: bool = False
+                                 ) -> tuple[bool, str]:
+    """Validate no-data prose against returned facts and current coverage."""
+    if not (_EMPTY_NARRATION_RE.search(text)
+            or _AVAILABLE_FIGURE_DENIAL_RE.search(text)):
+        return True, ""
+    if question is not None and ledger is not None and _denied_available_figure(
+            question, text, ledger,
+            answer_has_asked_metric_figure=answer_has_asked_metric_figure,
+            facts=facts, resolved_window=resolved_window):
+        return False, _DENIED_AVAILABLE_FIGURE_REASON
+    # Keep the existing coverage protection in force. The ledger check above
+    # is additive: a missing value permits a genuine gap, but coverage still
+    # refuses an empty answer for a metric the vault can cover.
     if not _EMPTY_NARRATION_RE.search(text):
         return True, ""
     rows = _empty_narration_coverage(ctx, as_of)
@@ -1041,6 +1222,46 @@ def _empty_narration_is_grounded(ctx: VaultContext, text: str,
     if any(row.get("status") != "missing" for row in mentioned):
         return False, "empty narration names a metric whose coverage is not missing"
     return True, ""
+
+
+def _mark_denied_available_figure(verification: dict, *, question: str,
+                                  text: str, ledger: list[dict],
+                                  answer_has_asked_metric_figure: bool = False,
+                                  facts: dict[str, dict] | None = None,
+                                  resolved_window=None) -> bool:
+    """Apply the Python-owned refusal verdict without exposing internal flags."""
+    denied = _denied_available_figure(
+        question, text, ledger,
+        answer_has_asked_metric_figure=answer_has_asked_metric_figure,
+        facts=facts, resolved_window=resolved_window)
+    if denied:
+        verification.update({
+            "ok": False,
+            "grounded": False,
+            "reason": _DENIED_AVAILABLE_FIGURE_REASON,
+        })
+    return denied
+
+
+def _asked_metric_fact_prompt(question: str, facts: dict[str, dict]) -> str:
+    """List only closed fact keys for the metric named in the question."""
+    from . import fact_template
+
+    metric = _question_metric(question, facts)
+    keys = []
+    if metric:
+        for key in sorted(facts):
+            try:
+                parsed = fact_template.parse_fact_key(key)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and parsed[0] == metric:
+                keys.append(key)
+    if not keys:
+        return ("AVAILABLE FACT KEYS FOR THE ASKED METRIC: none were published; "
+                "do not invent a key or a figure.")
+    return ("AVAILABLE FACT KEYS FOR THE ASKED METRIC (copy one exactly; "
+            "Python published these values):\n- " + "\n- ".join(keys))
 
 
 def _unused_fact_prompt(facts: dict[str, dict], ledger: list[dict]) -> str:
@@ -1060,7 +1281,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           tool_schemas: list[dict], ledger_path: str,
                           *, capture: list | None = None,
                           analyst_query_fn=None,
-                          as_of: str | None = None) -> dict:
+                          as_of: str | None = None,
+                          resolved_window=None) -> dict:
     """Gather facts, then ask for a template with one bounded repair retry."""
     from . import fact_template, llm
 
@@ -1162,10 +1384,17 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     }
     interpolated = fact_template.interpolate_template(
         template, facts, advice_quantities=advice_quantities)
+    denied_available_figure = _mark_denied_available_figure(
+        verification, question=question, text=interpolated or template,
+        ledger=ledger,
+        answer_has_asked_metric_figure=_template_has_asked_metric_figure(
+            question, template, facts),
+        facts=facts, resolved_window=resolved_window)
     verification["cause"] = _ask_cause(
         verification, ledger=ledger, loop_outcomes=[gather_status, final_status],
         no_gather_needed=(not scan["placeholders"]
-                          and bool(scan["advice_quantities"])))
+                          and bool(scan["advice_quantities"])),
+        denied_available_figure=denied_available_figure)
     _record_attempt(capture, 1, template, None, verification, 0, ledger)
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
@@ -1193,6 +1422,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             "data; use at least one supported fact or explain the result "
             "without claiming that the gathered data is absent\n" +
             _unused_fact_prompt(facts, ledger))
+    if denied_available_figure:
+        refusal_detail += "\n\n" + _asked_metric_fact_prompt(question, facts)
     repair_prompt = (
         final_prompt + "\n\nYour previous template was refused by Python's "
         "grounding gate. Fix only this reported issue and return a new prose "
@@ -1235,20 +1466,35 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     }
     retry_interpolated = fact_template.interpolate_template(
         retry_template, facts, advice_quantities=retry_advice_quantities)
+    retry_denied_available_figure = _mark_denied_available_figure(
+        retry_verification, question=question,
+        text=retry_interpolated or retry_template, ledger=ledger,
+        answer_has_asked_metric_figure=_template_has_asked_metric_figure(
+            question, retry_template, facts),
+        facts=facts, resolved_window=resolved_window)
     retry_verification["cause"] = _ask_cause(
         retry_verification, ledger=ledger,
         loop_outcomes=[gather_status, retry_status],
         no_gather_needed=(not retry_scan["placeholders"]
-                          and bool(retry_scan["advice_quantities"])))
+                          and bool(retry_scan["advice_quantities"])),
+        denied_available_figure=retry_denied_available_figure)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]
             and not retry_scan["advice_quantities"]):
         grounded, reason = _empty_narration_is_grounded(
-            ctx, retry_interpolated, as_of)
+            ctx, retry_interpolated, as_of, question=question, ledger=ledger,
+            facts=facts, resolved_window=resolved_window,
+            answer_has_asked_metric_figure=_template_has_asked_metric_figure(
+                question, retry_template, facts))
         if not grounded:
             retry_verification.update({
                 "ok": False, "grounded": False, "reason": reason,
             })
+            retry_verification["cause"] = _ask_cause(
+                retry_verification, ledger=ledger,
+                loop_outcomes=[gather_status, retry_status],
+                denied_available_figure=(
+                    reason == _DENIED_AVAILABLE_FIGURE_REASON))
     _record_attempt(capture, 2, retry_template, None, retry_verification, 0,
                     ledger)
     if not retry_verification["ok"] or retry_interpolated is None:
@@ -1333,7 +1579,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             return _answer_fact_template(
                 ctx, question, prompt, tool_schemas, ledger_path,
                 capture=capture, analyst_query_fn=analyst_query_fn,
-                as_of=as_of)
+                as_of=as_of, resolved_window=resolved_window)
         # claim_instructions=None: ASK_CLAIM_INSTRUCTIONS is already in `prompt`,
         # and tool_loop's default would append the research block on top of it —
         # a second, contradicting schema (it permits a `$.arguments...` source
@@ -1363,9 +1609,15 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 if verification.get("ok") else 0
         finally:
             verify_conn.close()
+        denied_available_figure = _mark_denied_available_figure(
+            verification, question=question, text=prose.strip(), ledger=ledger,
+            answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
+                _question_metric(question), claims, verification),
+            resolved_window=resolved_window)
         verification["cause"] = _ask_cause(
             verification, ledger=ledger, loop_outcomes=[first_loop_status],
-            judge_score=score)
+            judge_score=score,
+            denied_available_figure=denied_available_figure)
         _record_attempt(capture, 1, prose.strip(), claims, verification, score,
                         ledger)
         first_attempt = {
@@ -1409,9 +1661,15 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 if verification.get("ok") else 0
         finally:
             verify_conn.close()
+        denied_available_figure = _mark_denied_available_figure(
+            verification, question=question, text=prose.strip(), ledger=ledger,
+            answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
+                _question_metric(question), claims, verification),
+            resolved_window=resolved_window)
         verification["cause"] = _ask_cause(
             verification, ledger=ledger, loop_outcomes=[retry_loop_status],
-            judge_score=score)
+            judge_score=score,
+            denied_available_figure=denied_available_figure)
         _record_attempt(capture, 2, prose.strip(), claims, verification, score,
                         ledger)
         retry_attempt = {

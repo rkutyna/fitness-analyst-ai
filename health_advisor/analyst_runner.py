@@ -28,6 +28,7 @@ from typing import Any
 from . import analyst_envelope as envelope
 from . import analyst_ledger as ledger
 from . import analyst_sandbox as sandbox
+from . import normalize
 
 __all__ = [
     "AnalystLimits",
@@ -469,6 +470,249 @@ def _decode_params(value):
     return result
 
 
+def _sql_tokens(sql: str) -> list[tuple[str, str]]:
+    """Tokenize only the SQL shapes needed by the parent-side shape check.
+
+    This is deliberately not a SQL parser. It does, however, keep comments and
+    quoted strings separate from identifiers so a value containing ``last``
+    cannot look like a selected column to the check.
+    """
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    parameter_index = 0
+    while index < len(sql):
+        char = sql[index]
+        if char.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            end = sql.find("\n", index + 2)
+            index = len(sql) if end < 0 else end + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = len(sql) if end < 0 else end + 2
+            continue
+        if char == "'":
+            end = index + 1
+            value: list[str] = []
+            while end < len(sql):
+                if sql[end] == "'":
+                    if end + 1 < len(sql) and sql[end + 1] == "'":
+                        value.append("'")
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                value.append(sql[end])
+                end += 1
+            tokens.append(("STRING", "".join(value)))
+            index = end
+            continue
+        if char in ('"', "`"):
+            quote = char
+            end = index + 1
+            value = []
+            while end < len(sql):
+                if sql[end] == quote:
+                    if end + 1 < len(sql) and sql[end + 1] == quote:
+                        value.append(quote)
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                value.append(sql[end])
+                end += 1
+            tokens.append(("IDENT", "".join(value).lower()))
+            index = end
+            continue
+        if char == "[":
+            end = sql.find("]", index + 1)
+            if end < 0:
+                end = len(sql)
+            tokens.append(("IDENT", sql[index + 1:end].lower()))
+            index = min(end + 1, len(sql))
+            continue
+        if char == "?":
+            end = index + 1
+            while end < len(sql) and sql[end].isdigit():
+                end += 1
+            tokens.append(("PARAM", str(parameter_index)))
+            parameter_index += 1
+            index = end
+            continue
+        if char in ":@$" and index + 1 < len(sql):
+            end = index + 1
+            if sql[end].isalpha() or sql[end] == "_":
+                end += 1
+                while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
+                    end += 1
+                tokens.append(("PARAM", str(parameter_index)))
+                parameter_index += 1
+                index = end
+                continue
+        if char.isalpha() or char == "_":
+            end = index + 1
+            while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
+                end += 1
+            tokens.append(("IDENT", sql[index:end].lower()))
+            index = end
+            continue
+        if char.isdigit():
+            end = index + 1
+            while end < len(sql) and (sql[end].isalnum() or sql[end] in "._+-"):
+                end += 1
+            tokens.append(("OTHER", sql[index:end]))
+            index = end
+            continue
+        tokens.append(("SYMBOL", char))
+        index += 1
+    return tokens
+
+
+def _sql_depths(tokens: list[tuple[str, str]]) -> list[int]:
+    depths: list[int] = []
+    depth = 0
+    for kind, value in tokens:
+        depths.append(depth)
+        if kind == "SYMBOL" and value == "(":
+            depth += 1
+        elif kind == "SYMBOL" and value == ")":
+            depth = max(depth - 1, 0)
+    return depths
+
+
+def _selected_last(projection: list[int], tokens: list[tuple[str, str]]) -> bool:
+    """Return whether a projection expression reads the ``last`` column."""
+    for position in projection:
+        kind, value = tokens[position]
+        if kind != "IDENT" or value != "last":
+            continue
+        previous = tokens[position - 1] if position else None
+        if previous == ("IDENT", "as"):
+            # ``SELECT 1 AS last`` names a computed expression; it does not
+            # read daily_metrics.last.
+            continue
+        if position + 1 == len(tokens) or tokens[position + 1] in {
+            ("SYMBOL", ","), ("IDENT", "from"),
+        }:
+            # An unqualified identifier at the end of an expression is still
+            # a column unless it is an implicit alias (``SELECT value last``).
+            if (previous and previous[0] in {"IDENT", "STRING", "OTHER"}
+                    and previous != ("IDENT", "select")):
+                continue
+        return True
+    return False
+
+
+def _parameter_or_literal(position: int, tokens: list[tuple[str, str]],
+                           params: list[Any]) -> str | None:
+    kind, value = tokens[position]
+    if kind == "STRING":
+        return value
+    if kind == "PARAM":
+        parameter_index = int(value)
+        if parameter_index < len(params) and isinstance(params[parameter_index], str):
+            return params[parameter_index]
+    return None
+
+
+def _metric_values(start: int, end: int, tokens: list[tuple[str, str]],
+                   params: list[Any]) -> set[str]:
+    """Extract exact metric equality/IN values from one SELECT scope."""
+    values: set[str] = set()
+    for position in range(start, end):
+        kind, value = tokens[position]
+        if kind != "IDENT" or value != "metric":
+            continue
+        if position + 2 < end and tokens[position + 1] == ("SYMBOL", "="):
+            literal = _parameter_or_literal(position + 2, tokens, params)
+            if literal is not None:
+                values.add(literal)
+            continue
+        if position + 3 < end and tokens[position + 1] == ("IDENT", "in"):
+            if tokens[position + 2] != ("SYMBOL", "("):
+                continue
+            cursor = position + 3
+            while cursor < end and tokens[cursor] != ("SYMBOL", ")"):
+                literal = _parameter_or_literal(cursor, tokens, params)
+                if literal is not None:
+                    values.add(literal)
+                cursor += 1
+            continue
+        if position >= start + 2 and tokens[position - 1] == ("SYMBOL", "="):
+            literal = _parameter_or_literal(position - 2, tokens, params)
+            if literal is not None:
+                values.add(literal)
+    return values
+
+
+def _daily_metrics_source(tokens: list[tuple[str, str]], depths: list[int],
+                          start: int, end: int, select_depth: int) -> bool:
+    """Whether a SELECT scope has a direct daily_metrics table source."""
+    for position in range(start, end):
+        kind, value = tokens[position]
+        if kind != "IDENT" or value != "daily_metrics" or depths[position] != select_depth:
+            continue
+        previous = position - 1
+        if previous >= start and tokens[previous] == ("SYMBOL", "."):
+            previous -= 2
+        if previous >= start and tokens[previous][0] == "IDENT":
+            if tokens[previous][1] in {"from", "join"}:
+                return True
+        if previous >= start and tokens[previous] == ("SYMBOL", ","):
+            return True
+    return False
+
+
+def _last_for_sum_shape_reason(sql: str, params: list[Any]) -> str | None:
+    """Return a parent-authored refusal for a last-for-sum query shape."""
+    tokens = _sql_tokens(sql)
+    if not tokens:
+        return None
+    depths = _sql_depths(tokens)
+    for select in range(len(tokens)):
+        if tokens[select] != ("IDENT", "select"):
+            continue
+        select_depth = depths[select]
+        from_position = None
+        for position in range(select + 1, len(tokens)):
+            if depths[position] == select_depth and tokens[position] == ("IDENT", "from"):
+                from_position = position
+                break
+        if from_position is None:
+            continue
+        scope_end = len(tokens)
+        for position in range(from_position + 1, len(tokens)):
+            if depths[position] < select_depth:
+                scope_end = position
+                break
+        projection = [
+            position for position in range(select + 1, from_position)
+            if depths[position] == select_depth
+        ]
+        if not _selected_last(projection, tokens):
+            continue
+        if not _daily_metrics_source(
+                tokens, depths, from_position, scope_end, select_depth):
+            continue
+        metrics = _metric_values(from_position + 1, scope_end, tokens, params)
+        sum_metrics = sorted(
+            metric for metric in metrics if normalize.agg_for(metric) == "sum")
+        if sum_metrics:
+            listed = ", ".join(repr(metric) for metric in sum_metrics)
+            return (
+                "analyst query refused: daily_metrics.last is invalid for "
+                f"sum-shaped metric(s) {listed}; select daily_metrics.sum"
+            )
+        if not metrics:
+            return (
+                "analyst query refused: daily_metrics.last has no metric "
+                "filter, and sum-shaped metrics require daily_metrics.sum"
+            )
+    return None
+
+
 def _service_query(sock: socket.socket, conn, max_rows: int,
                    pending: bytearray) -> tuple[bool, str | None]:
     try:
@@ -495,6 +739,11 @@ def _service_query(sock: socket.socket, conn, max_rows: int,
         params = _decode_params(request.get("params", []))
         if not isinstance(sql, str):
             raise TypeError("sql must be a string")
+        shape_reason = _last_for_sum_shape_reason(sql, params)
+        if shape_reason is not None:
+            _send_frame(sock, {"ok": False, "error_type": "AnalystQueryError",
+                                "error": shape_reason})
+            return True, shape_reason
         cursor = conn.execute(sql, params)
         rows = cursor.fetchmany(max_rows + 1)
         if len(rows) > max_rows:

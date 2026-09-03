@@ -26,6 +26,27 @@ def _build_vault(path: Path, rows: int = 4) -> None:
     conn.close()
 
 
+def _build_shape_vault(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE daily_metrics ("
+        "metric TEXT, date TEXT, count INTEGER, sum REAL, avg REAL, "
+        "min REAL, max REAL, last REAL, unit TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO daily_metrics "
+        "(metric, date, count, sum, avg, min, max, last, unit) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("step_count", "2026-01-01", 2, 30.0, 15.0, 10.0, 20.0, 20.0, "count"),
+            ("step_count", "2026-01-02", 2, 50.0, 25.0, 20.0, 30.0, 30.0, "count"),
+            ("jog_minutes", "2026-01-01", 1, 5.0, 5.0, 5.0, 5.0, 5.0, "min"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
 class LocalChannelExecutor:
     """Portable child-process executor with the production channel shape."""
 
@@ -111,6 +132,13 @@ def vault_path(tmp_path):
 @pytest.fixture
 def executor():
     return LocalChannelExecutor()
+
+
+@pytest.fixture
+def shape_vault(tmp_path):
+    path = tmp_path / "shape-vault.db"
+    _build_shape_vault(path)
+    return path
 
 
 def _run(code, vault_path, tmp_path, executor, **kwargs):
@@ -239,6 +267,44 @@ except Exception:
     assert isinstance(result, env.Refusal)
     assert result.reason == "query result exceeds row cap: 4 > 3"
     print(f"\n[runner] configured_row_cap=3 reason={result.reason}")
+
+
+def test_last_for_sum_metric_is_a_typed_parent_refusal(
+        shape_vault, tmp_path, executor):
+    result = _run(
+        """
+rows = conn.execute(
+    "SELECT date, last FROM daily_metrics "
+    "WHERE metric = 'step_count' ORDER BY date"
+).fetchall()
+total = sum(row[1] for row in rows if row[1] is not None)
+emit('total_steps_last_shaped', ['total_steps'], ['count'], [[total]])
+""",
+        shape_vault, tmp_path, executor,
+    )
+    assert isinstance(result, env.Refusal)
+    assert result.reason == (
+        "analyst query refused: daily_metrics.last is invalid for "
+        "sum-shaped metric(s) 'step_count'; select daily_metrics.sum"
+    )
+
+
+def test_last_for_last_metric_still_executes(shape_vault, tmp_path, executor):
+    result = _run(
+        """
+rows = conn.execute(
+    "SELECT date, last FROM daily_metrics "
+    "WHERE metric = 'jog_minutes' ORDER BY date"
+).fetchall()
+emit('jog_minutes', ['minutes'], ['min'], [[row[1]] for row in rows])
+""",
+        shape_vault, tmp_path, executor,
+    )
+    assert isinstance(result, env.Envelope)
+    assert result.ledger["query_count"] == 1
+    assert result.ledger["columns_read"] == [
+        "daily_metrics.date", "daily_metrics.last", "daily_metrics.metric",
+    ]
 
 
 def test_nonzero_child_stderr_is_carried_as_quoted_diagnostic(

@@ -8,8 +8,7 @@ This module is the **only substrate-aware seam** (§2.4):
 
     Analyst loop  ---> Executor (protocol)   .run(code, vault_path, run_dir, limits)
                    Seatbelt `.run()` accepts `vault_path` for protocol parity but
-                   gives that child no vault; bwrap's legacy plain path keeps its
-                   explicit read-only vault bind.
+                   gives that child no vault; bwrap's plain path does the same.
                    +-> SeatbeltExecutor   (this file, macOS)
                    +-> BwrapExecutor      (this file, Linux)
                    +-> FargateExecutor    (production, unbuilt)
@@ -28,8 +27,7 @@ What this module does implement, per A1's `Must implement` (§8):
   this worktree symlinks `.venv` and `data/health.db` into the main checkout,
   and an unresolved symlink in the profile silently denies (§2.3 failure 3).
 - A bubblewrap mount namespace on Linux with the same split run-directory,
-  minimal environment, read-only vault on the legacy plain path, query-channel,
-  and fd-3 result-channel contracts.
+  minimal environment, query-channel, and fd-3 result-channel contracts.
 - An absolute interpreter path, `python -I`, `cwd` inside the child-writable
   `work/` directory, and an `env -i`-style minimal environment — `PATH`,
   `TMPDIR`, `HOME` all pointed at `work/`. None of the parent's own
@@ -49,8 +47,7 @@ What this module does implement, per A1's `Must implement` (§8):
   ledgered `conn` proxy over fd 4; the user's/model's own code (`code.py`)
   receives that object as a bound global and never receives the vault path.
   (§3.1: "the generated code never receives a vault path".) The Seatbelt
-  plain `run()` path supplies no connection at all; the legacy bwrap plain
-  path retains its explicit read-only vault bind. The full **ledgered**
+  plain `run()` path supplies no connection at all. The full **ledgered**
   wrapper — the authorizer and refusal on zero reads — is A2's
   `analyst_ledger.py`.
 
@@ -78,7 +75,6 @@ import signal
 import shutil
 import socket
 import subprocess
-import urllib.parse
 import sys
 import tempfile
 import threading
@@ -300,12 +296,10 @@ def build_profile(
 # ledgered `conn` and the real `emit()`, is A2's deliverable). This is the
 # minimal bootstrap A1 needs to exercise the executor itself. The plain
 # `run()` path has no data channel: its protocol-level `vault_path` argument
-# is ignored by this bootstrap and `conn` is None. Seatbelt denies the vault
-# itself; the legacy bwrap plain path supplies a separate explicit read-only
-# bind. The query-channel bootstrap in `analyst_runner` supplies the live
-# proxy instead.
+# is ignored by this bootstrap and `conn` is None. The query-channel bootstrap
+# in `analyst_runner` supplies the live proxy instead.
 _RUNNER_TEMPLATE = """\
-{conn_setup}
+conn = None
 
 with open({code_path!r}, "r", encoding="utf-8") as _f:
     _src = _f.read()
@@ -318,29 +312,9 @@ exec(compile(_src, {code_path!r}, "exec"), _globals)
 """
 
 
-_NO_CONN_SETUP = "conn = None"
-_LEGACY_CONN_SETUP = """\
-import sqlite3 as _sqlite3
-
-try:
-    conn = _sqlite3.connect("file:{vault_uri}?mode=ro", uri=True)
-except Exception:
-    conn = None"""
-
-
-def _build_runner(*, code_path_real: str, vault_real: str | None = None) -> str:
-    """Render the plain-path bootstrap.
-
-    ``vault_real`` is None on Seatbelt, whose plain child has no vault (#24).
-    The legacy bwrap plain path still binds the vault read-only and opens it
-    here; removing both halves together, verified on Linux, is #37.
-    """
-    if vault_real is None:
-        conn_setup = _NO_CONN_SETUP
-    else:
-        conn_setup = _LEGACY_CONN_SETUP.format(
-            vault_uri=urllib.parse.quote(vault_real))
-    return _RUNNER_TEMPLATE.format(conn_setup=conn_setup, code_path=code_path_real)
+def _build_runner(*, code_path_real: str) -> str:
+    """Render the plain-path bootstrap with no data connection."""
+    return _RUNNER_TEMPLATE.format(code_path=code_path_real)
 
 
 # --------------------------------------------------------------------------- #
@@ -614,8 +588,8 @@ class SeatbeltExecutor:
 class BwrapExecutor:
     """Runs code under bubblewrap on Linux.
 
-    The mount namespace exposes only the runtime, package, vault, and run
-    directory paths needed by the runner.  The read-only run-directory bind is
+    The mount namespace exposes only the runtime, package, and run directory
+    paths needed by the runner.  The read-only run-directory bind is
     deliberately followed by the nested writable ``work`` bind: that ordering
     is what preserves the §4.6 split-run-directory contract.
     """
@@ -657,7 +631,6 @@ class BwrapExecutor:
     def _build_argv(
         self,
         *,
-        vault_real: str,
         run_dir_real: Path,
         work_dir_real: Path,
         runner_path: Path,
@@ -680,9 +653,6 @@ class BwrapExecutor:
         ):
             argv.extend(["--ro-bind", self._venv_dir, self._venv_dir])
         argv.extend([
-            # This is the legacy plain path. The production query path uses
-            # _build_query_argv(), which has no vault or repository bind.
-            "--ro-bind", vault_real, vault_real,
             "--ro-bind", str(run_dir_real), str(run_dir_real),
             "--bind", str(work_dir_real), str(work_dir_real),
             "--proc", "/proc",
@@ -919,18 +889,16 @@ class BwrapExecutor:
     ) -> RawResult:
         limits = limits or RunLimits()
         run_dir_real, work_dir_real = self._prepare_run_dir(run_dir)
-        vault_real = os.path.realpath(vault_path)
 
         # Parent-owned artifacts (§4.6): code.py and the generated runner live
         # directly under $RUNDIR, never under work/.
         code_path = run_dir_real / "code.py"
         _write_exclusive(code_path, code)
-        runner_src = _build_runner(code_path_real=str(code_path), vault_real=vault_real)
+        runner_src = _build_runner(code_path_real=str(code_path))
         runner_path = run_dir_real / "runner.py"
         _write_exclusive(runner_path, runner_src)
 
         argv = self._build_argv(
-            vault_real=vault_real,
             run_dir_real=run_dir_real,
             work_dir_real=work_dir_real,
             runner_path=runner_path,

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from health_advisor import analyst_sandbox as sb
+from health_advisor import analyst_envelope
 from health_advisor import analyst_runner
 from health_advisor import receiver
 
@@ -32,7 +33,7 @@ def _argv_executor(*, venv: str, pkg: str, pyenv: str) -> sb.BwrapExecutor:
     return executor
 
 
-def test_bwrap_argv_has_usr_loader_links_and_split_run_order():
+def test_bwrap_argv_has_usr_loader_links_and_no_vault_bind():
     executor = _argv_executor(
         venv="/repo/.venv",
         pkg="/repo",
@@ -41,7 +42,6 @@ def test_bwrap_argv_has_usr_loader_links_and_split_run_order():
     run_dir = Path("/tmp/runs/run with spaces")
     work_dir = run_dir / "work"
     argv = executor._build_argv(
-        vault_real="/tmp/vault with spaces.db",
         run_dir_real=run_dir,
         work_dir_real=work_dir,
         runner_path=run_dir / "runner.py",
@@ -56,7 +56,6 @@ def test_bwrap_argv_has_usr_loader_links_and_split_run_order():
         "--symlink", "usr/sbin", "/sbin",
         "--ro-bind", "/opt/python", "/opt/python",
         "--ro-bind", "/repo", "/repo",
-        "--ro-bind", "/tmp/vault with spaces.db", "/tmp/vault with spaces.db",
         "--ro-bind", str(run_dir), str(run_dir),
         "--bind", str(work_dir), str(work_dir),
         "--proc", "/proc",
@@ -65,10 +64,9 @@ def test_bwrap_argv_has_usr_loader_links_and_split_run_order():
         "--unshare-all", "--die-with-parent", "--new-session",
         "/opt/python/bin/python3.11", "-I", str(run_dir / "runner.py"),
     ]
-    ro_run = argv.index("--ro-bind", argv.index("/tmp/vault with spaces.db") + 1)
-    rw_work = argv.index("--bind")
-    assert ro_run < rw_work
-    assert argv[rw_work + 1:rw_work + 3] == [str(work_dir), str(work_dir)]
+    assert "/tmp/vault with spaces.db" not in argv
+    assert argv[argv.index("--bind") + 1:argv.index("--bind") + 3] == [
+        str(work_dir), str(work_dir)]
 
 
 def test_bwrap_argv_adds_a_separate_venv_bind_only_when_needed():
@@ -78,7 +76,6 @@ def test_bwrap_argv_adds_a_separate_venv_bind_only_when_needed():
         pyenv="/opt/python",
     )
     argv = executor._build_argv(
-        vault_real="/tmp/vault.db",
         run_dir_real=Path("/tmp/run"),
         work_dir_real=Path("/tmp/run/work"),
         runner_path=Path("/tmp/run/runner.py"),
@@ -175,7 +172,6 @@ def test_bwrap_run_passes_constructed_command_and_honors_run_limits(
     assert result.killed_group is True
     assert killed == [(4242, sb.signal.SIGKILL)]
     assert popen_call["argv"] == executor._build_argv(
-        vault_real=os.path.realpath(vault_path),
         run_dir_real=result.run_dir,
         work_dir_real=result.run_dir / "work",
         runner_path=result.run_dir / "runner.py",
@@ -184,6 +180,9 @@ def test_bwrap_run_passes_constructed_command_and_honors_run_limits(
     assert popen_call["kwargs"]["start_new_session"] is True
     assert popen_call["kwargs"]["cwd"] == str(result.run_dir / "work")
     assert popen_call["kwargs"]["env"]["TMPDIR"] == str(result.run_dir / "work")
+    runner_source = result.run_dir.joinpath("runner.py").read_text()
+    assert "conn = None" in runner_source
+    assert str(vault_path) not in runner_source
 
 
 def test_bwrap_query_argv_has_no_pkg_bind_and_runs_from_run_dir(tmp_path):
@@ -199,6 +198,25 @@ def test_bwrap_query_argv_has_no_pkg_bind_and_runs_from_run_dir(tmp_path):
         runner_path=run_dir / "runner.py",
     )
 
+    # Exact argv captured before issue #37; the production query namespace is
+    # deliberately unchanged by the plain-path fix.
+    assert argv == [
+        "/usr/bin/bwrap",
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/sbin", "/sbin",
+        "--ro-bind", "/opt/python", "/opt/python",
+        "--ro-bind", "/repo/.venv", "/repo/.venv",
+        "--ro-bind", str(run_dir), str(run_dir),
+        "--bind", str(work_dir), str(work_dir),
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--chdir", str(run_dir),
+        "--unshare-all", "--die-with-parent", "--new-session",
+        "/opt/python/bin/python3.11", "-I", str(run_dir / "runner.py"),
+    ]
     assert str(pkg_dir) not in argv
     assert ["--ro-bind", "/repo/.venv", "/repo/.venv"] == (
         argv[argv.index("--ro-bind", argv.index("/opt/python") + 1):
@@ -469,42 +487,42 @@ def test_bwrap_real_sandbox_smoke_enforces_grants_and_fd3(tmp_path):
     (run_dir / "parent.txt").rmdir()
     (run_dir / "parent.txt").write_text("parent", encoding="utf-8")
     code = f"""
-import json, os, socket, sqlite3
+import socket, sqlite3
 facts = {{}}
-facts["parent_read"] = open("../parent.txt").read()
+facts["parent_read"] = int(open({str(run_dir / 'parent.txt')!r}).read() == "parent")
 try:
-    open("../parent.txt", "w").write("changed")
-    facts["parent_write"] = "unsafe"
+    open({str(run_dir / 'parent.txt')!r}, "w").write("changed")
+    facts["parent_write"] = 0
 except Exception:
-    facts["parent_write"] = "blocked"
-open("work-child.txt", "w").write("allowed")
-facts["work_write"] = open("work-child.txt").read()
+    facts["parent_write"] = 1
+open({str(run_dir / 'work' / 'work-child.txt')!r}, "w").write("allowed")
+facts["work_write"] = int(open({str(run_dir / 'work' / 'work-child.txt')!r}).read() == "allowed")
 facts["vault_rows"] = conn.execute("SELECT COUNT(*) FROM probe").fetchone()[0]
 try:
     c = sqlite3.connect({str(vault_path)!r})
     c.execute("CREATE TABLE denied (value INTEGER)")
     c.commit()
-    facts["vault_write"] = "unsafe"
+    facts["vault_write"] = 0
 except Exception:
-    facts["vault_write"] = "blocked"
+    facts["vault_write"] = 1
 try:
     socket.gethostbyname("openrouter.ai")
-    facts["network"] = "unsafe"
+    facts["network"] = 0
 except Exception:
-    facts["network"] = "blocked"
-os.write(3, json.dumps(facts).encode())
+    facts["network"] = 1
+emit("sandbox", list(facts), ["count"] * len(facts), [list(facts.values())])
 """
-    result = sb.BwrapExecutor().run(code, str(vault_path), str(run_dir))
-    assert result.returncode == 0, result.stderr
-    assert result.fd3_oversized is False
-    assert result.fd3_as_json() == {
-        "parent_read": "parent",
-        "parent_write": "blocked",
-        "work_write": "allowed",
-        "vault_rows": 1,
-        "vault_write": "blocked",
-        "network": "blocked",
-    }
+    # The former plain run() body read conn directly.  The query-channel
+    # runner supplies the parent-owned proxy and validates its fd-3 envelope.
+    # Paths are absolute because the bwrap query child starts in run_dir
+    # (_build_query_argv --chdir), not in work/ as the plain path did; the
+    # binds sit at identical paths on both sides of the namespace.
+    result = analyst_runner.run_analyst_code(
+        code, str(vault_path), str(run_dir), sb.BwrapExecutor())
+    assert isinstance(result, analyst_envelope.Envelope)
+    assert result.tables[0]["name"] == "sandbox"
+    assert result.tables[0]["rows"] == ((1, 1, 1, 1, 1, 1),)
+    assert result.ledger["parent_observed"] is True
 
 
 @LINUX_BWRAP

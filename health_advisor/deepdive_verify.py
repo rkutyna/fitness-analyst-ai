@@ -371,12 +371,33 @@ def _structural_matches(prose: str, claims: list[dict], *, rule_r: bool = False)
     return matches
 
 
+def _scoped_grounding_claims(claims, payload) -> list[dict]:
+    """Keep only claims resolved in the payload's own metric/period/field scope.
+
+    A numeric set made from all claims has the same collision flaw as the old
+    briefing bag. When a non-ledger payload is available, each claim therefore
+    goes through ``resolve_payload_value`` independently. With no payload, the
+    caller has already supplied claims that were verified against SQL, so their
+    declared scopes are the available evidence. This helper never derives a
+    value and never merges unrelated claim identities.
+    """
+    if not isinstance(claims, list):
+        return []
+    candidates = [claim for claim in claims if isinstance(claim, dict)]
+    if payload is None or _is_ledger(payload):
+        return candidates
+    if not _payload_scopes(payload):
+        return []
+    return [claim for claim in candidates
+            if (resolve_payload_value(payload, claim) or {}).get("ok")]
+
+
 def _coach_grounding(prose: str, claims: list[dict], payload=None) -> tuple[bool, list[str]]:
     # Rule R runs exactly where the claim layer beneath it is exact: a ledger
-    # payload. The non-ledger payloads (coach brief, pipeline digest) keep the
-    # legacy tolerance until #61 routes them through the scoped resolver —
-    # their claim layer still allows ±0.5%, and demanding exact prose against
-    # a drifted claim would refuse prose stating the TRUE payload value.
+    # payload. Non-ledger payloads use the same scoped claim resolver, with the
+    # legacy tolerance because their published claim layer allows +/-0.5%;
+    # demanding exact prose against a drifted claim would refuse prose stating
+    # the true payload value.
     if _is_ledger(payload):
         cleaned = G.strip_dates_and_names(prose)
         remaining = [
@@ -402,16 +423,27 @@ def _coach_grounding(prose: str, claims: list[dict], payload=None) -> tuple[bool
                 remaining.remove(token)
         return not remaining, remaining
 
-    grounded, bad = G.grounding_check(prose, {"claims": claims})
-    remaining = list(bad)
-    for token in _presentation_matches(prose, claims):
+    # Do not turn the claims list into a bag of floats. The old call to
+    # G.grounding_check did exactly that and allowed a value from one claim to
+    # license prose for another claim. Resolve each claim in its own scope.
+    scoped_claims = _scoped_grounding_claims(claims, payload)
+    remaining = [token_match.group() for token_match in
+                 _NUM_RE.finditer(G.strip_dates_and_names(prose))
+                 if not any(
+                     _close(float(token_match.group().replace(",", "")),
+                            _as_float(claim.get("value")))
+                     for claim in scoped_claims
+                     if _as_float(claim.get("value")) is not None
+                 )]
+    for token in _presentation_matches(prose, scoped_claims):
         if token in remaining:
             remaining.remove(token)
     if not remaining:
         return True, []
     # Only remove tokens that are actually reconciled. In particular, an
     # unsigned token next to the opposite direction remains unsupported.
-    for token in _signed_percentage_matches(prose, claims, signed_values=True):
+    for token in _signed_percentage_matches(prose, scoped_claims,
+                                            signed_values=True):
         if token in remaining:
             remaining.remove(token)
     for token in _structural_matches(prose, _structural_claims(payload)):
@@ -1569,7 +1601,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
         payload = tool_results
     # Number-free compatibility prose does not need a claim record. Once prose
     # contains a number, every number must be represented by a scoped claim.
-    _, unsupported = G.grounding_check(prose, {})
+    unsupported = G._numeric_tokens(prose)
     degenerate = _is_degenerate_repeated_bullets(prose)
     if not unsupported and not degenerate:
         return {"ok": True, "grounded": True, "unsupported": [],

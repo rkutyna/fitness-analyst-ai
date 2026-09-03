@@ -2,7 +2,12 @@
 health_advisor.llm (direct Ollama /api/chat); the model is only ever a text
 transformer here — Python owns the truth. extract_json / grounding_check /
 render_fallback are the gates that make a wrong or empty model output safe.
-The numeric grounding pattern is shared with the other narration gates."""
+The numeric grounding pattern is shared with the other narration gates.
+
+``grounding_check`` is retained as a legacy, unscoped pre-filter for callers
+outside this package. Its result is not a grounding verdict: a nested briefing
+is a bag of values with no metric, period, field, unit, or provenance identity.
+Publishing paths must use ``deepdive_verify``'s scoped claim resolver instead."""
 from __future__ import annotations
 
 import json
@@ -430,19 +435,35 @@ def strip_dates_and_names(prose: str) -> str:
     return _SCALE_DENOM_RE.sub(lambda m: m.group("keep") + " ", cleaned)
 
 
+def _numeric_tokens(prose: str) -> list[str]:
+    """Return quantitative prose tokens after the shared date/name cleanup.
+
+    This is only a scanner. It deliberately does not license a value; callers
+    that publish prose must reconcile each token with a scoped Python verdict.
+    """
+    return _NUM_RE.findall(strip_dates_and_names(prose or ""))
+
+
 def grounding_check(prose: str, briefing: dict, rel_tol: float = 0.005,
                     abs_floor: float = 0.05):
-    """Every numeric token in `prose` must match a number in `briefing`. Tolerance
-    is RELATIVE (within rel_tol of the matched magnitude, with a tiny abs_floor for
-    rounding) so neighbours of small integers (e.g. a fabricated 99 vs a real 100)
-    are caught while legitimate rounding of large values still passes. ISO and
-    prose dates are stripped first — they are not quantitative claims. Returns
-    (ok: bool, unsupported: list[str])."""
+    """Coarsely pre-filter prose against an unscoped briefing bag.
+
+    Tolerance is RELATIVE (within rel_tol of the matched magnitude, with a tiny
+    abs_floor for rounding) so neighbours of small integers (e.g. a fabricated
+    99 vs a real 100) are caught while legitimate rounding of large values still
+    passes. ISO and prose dates are stripped first — they are not quantitative
+    claims. Returns ``(ok: bool, unsupported: list[str])``.
+
+    This function is not safe evidence for publication. A value such as a day
+    count can coincide with a percentage or a sleep delta because this legacy
+    interface has no field/metric/period/unit identity. Publishing callers must
+    use the scoped resolver in ``deepdive_verify``; this function is only a
+    pre-filter for unscoped external callers.
+    """
     allowed = _numbers_in(briefing)
     allowed_floats = {float(a) for a in allowed}
     bad = []
-    cleaned = strip_dates_and_names(prose)
-    for tok in _NUM_RE.findall(cleaned):
+    for tok in _numeric_tokens(prose):
         try:
             val = float(tok.replace(",", ""))
         except ValueError:

@@ -842,6 +842,44 @@ def test_capture_records_the_failed_draft_and_the_retry(monkeypatch, vault, conn
     assert capture[1]["judge_score"] == 100
 
 
+def test_unrun_judge_is_none_in_capture_and_response(monkeypatch, vault, conn):
+    verifications = iter([
+        _failed_verification(figures_verified=0, figures_total=1,
+                             reason="first gate failure"),
+        _failed_verification(figures_verified=0, figures_total=1,
+                             reason="retry gate failure"),
+    ])
+    drafts = iter([llm.ResearchResponse("first draft"),
+                   llm.ResearchResponse("retry draft")])
+    monkeypatch.setattr(chat, "_verify_ask_answer",
+                        lambda *args, **kwargs: next(verifications))
+    monkeypatch.setattr(chat, "_read_ledger",
+                        lambda path: [{"sequence": 1}])
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: next(drafts))
+    monkeypatch.setattr(chat, "_ask_judge",
+                        lambda *args, **kwargs: pytest.fail("judge must not run"))
+
+    capture = []
+    result = chat.answer_question(vault, "What happened?", capture=capture)
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["judge_score"] is None
+    assert [entry["judge_score"] for entry in capture] == [None, None]
+
+
+def test_ask_cause_keeps_a_real_zero_distinct_from_no_judge():
+    verification = {"ok": True}
+    loop_outcomes = []
+    assert chat._ask_cause(verification, ledger=[{"sequence": 1}],
+                           loop_outcomes=loop_outcomes,
+                           judge_score=None) == "ok"
+    assert chat._ask_cause(verification, ledger=[{"sequence": 1}],
+                           loop_outcomes=loop_outcomes,
+                           judge_score=0) == "judge_refused"
+
+
 def _failed_verification(*, figures_verified, figures_total, reason,
                          unsupported=None):
     return {

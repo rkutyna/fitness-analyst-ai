@@ -23,6 +23,32 @@ def _record(result, tool_name="test_tool"):
     }]
 
 
+def test_coach_grounding_does_not_cross_license_day_count_as_percentage():
+    payload = [{"metric": "jog_minutes", "period": "30d",
+                "field": "days", "value": 100}]
+    claim = _claim("jog_minutes", "30d", "delta_pct", 100,
+                   "$.result.delta_pct")
+
+    grounded, unsupported = DV._coach_grounding(
+        "Jogging increased 100%.", [claim], payload=payload)
+
+    assert grounded is False
+    assert unsupported == ["100"]
+
+
+def test_coach_grounding_does_not_cross_license_resting_hr_as_sleep_delta():
+    payload = [{"metric": "resting_heart_rate", "period": "30d",
+                "field": "resting_hr", "value": 52.0}]
+    claim = _claim("sleep_asleep", "30d", "delta_minutes", 52.0,
+                   "$.result.delta_minutes")
+
+    grounded, unsupported = DV._coach_grounding(
+        "You slept 52 minutes more.", [claim], payload=payload)
+
+    assert grounded is False
+    assert unsupported == ["52"]
+
+
 def test_points_value_is_owned_by_the_enclosing_result_metric():
     ledger = _record({
         "metric": "sleep_asleep",

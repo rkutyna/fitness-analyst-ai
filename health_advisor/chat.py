@@ -4,6 +4,13 @@ Conversation turns remain caller-owned, while ``answer_question`` accepts
 caller-supplied history and vault-scoped durable user facts as prompt context.
 Every operation receives its :class:`VaultContext` explicitly so a conversation
 can never fall back to an ambient database path.
+
+Partial verification is all-or-nothing by default: an answer with any failed
+figure falls back as a whole. With ``HA_ASK_SPAN_SUPPRESS=1``, only a minority
+failure may enter the salvage arm; Python removes failed figures, regenerates
+from the remaining verified claims, and publishes only after the rewrite passes
+the same gate. A failed rewrite still falls back, so no unverified sentence is
+published with a caveat.
 """
 from __future__ import annotations
 
@@ -398,7 +405,13 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
 
 
 def _ask_judge(question: str, prose: str, verification: dict) -> int:
-    """Run the briefing-style judge pass after, never instead of, the gate."""
+    """Run the briefing-style judge pass after, never instead of, the gate.
+
+    This function is called only when Python verification passed, and always
+    returns an integer because a malformed response still means the judge ran
+    and is treated as score zero. The caller uses ``None`` for the separate
+    state in which this function was not called.
+    """
     from . import agents, llm
 
     prompt = (
@@ -480,13 +493,16 @@ def _retry_feedback(verification: dict) -> str:
 
 
 def _record_attempt(capture: list | None, attempt: int, prose: str, claims,
-                    verification: dict, score: int, ledger: list[dict]) -> None:
+                    verification: dict, score: int | None,
+                    ledger: list[dict]) -> None:
     """Append one attempt's evidence to an out-of-band capture list.
 
     The record is copied rather than aliased so a reader of the capture can
     never reach — or mutate — the objects the caller returns. Nothing written
     here may be echoed into the return value: an unverified draft's prose is
     exactly what the response contract keeps away from a client surface.
+    ``score`` is ``None`` when the judge did not run, and an actual judge score
+    including zero remains an integer.
     """
     if capture is None:
         return
@@ -790,7 +806,7 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
             verify_conn.close()
         last_verification = verification
         _record_attempt(capture, 2 + attempts, regenerated, verified_claims,
-                        verification, 0, attempt["ledger"])
+                        verification, None, attempt["ledger"])
         if (verification.get("ok")
                 and not _contains_unverified_figure(regenerated, verification)
                 and not _contains_unverified_figure(
@@ -1376,6 +1392,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "tier1_path_bound": 0,
         "tier2_metric_recomputed": 0,
         "tool_calls": len(ledger),
+        "judge_score": None,
         "template_compliant": bool(scan["ok"]),
         # This arm changes the unit of measurement from prose attempts to
         # compliant templates; its narration rate is not comparable to legacy
@@ -1395,7 +1412,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         no_gather_needed=(not scan["placeholders"]
                           and bool(scan["advice_quantities"])),
         denied_available_figure=denied_available_figure)
-    _record_attempt(capture, 1, template, None, verification, 0, ledger)
+    _record_attempt(capture, 1, template, None, verification, None, ledger)
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
     # An advice-carrying answer is substance, not empty-handedness — without
@@ -1461,6 +1478,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "tier1_path_bound": 0,
         "tier2_metric_recomputed": 0,
         "tool_calls": len(ledger),
+        "judge_score": None,
         "template_compliant": bool(retry_scan["ok"]),
         "narration_counts_comparable": False,
     }
@@ -1495,7 +1513,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                 loop_outcomes=[gather_status, retry_status],
                 denied_available_figure=(
                     reason == _DENIED_AVAILABLE_FIGURE_REASON))
-    _record_attempt(capture, 2, retry_template, None, retry_verification, 0,
+    _record_attempt(capture, 2, retry_template, None, retry_verification, None,
                     ledger)
     if not retry_verification["ok"] or retry_interpolated is None:
         return {
@@ -1605,8 +1623,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         try:
             verification = _verify_ask_answer(
                 verify_conn, prose.strip(), claims, ledger, as_of=as_of)
-            score = _ask_judge(question, prose.strip(), verification) \
-                if verification.get("ok") else 0
+            score = (_ask_judge(question, prose.strip(), verification)
+                     if verification.get("ok") else None)
         finally:
             verify_conn.close()
         denied_available_figure = _mark_denied_available_figure(
@@ -1657,8 +1675,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         try:
             verification = _verify_ask_answer(
                 verify_conn, prose.strip(), claims, ledger, as_of=as_of)
-            score = _ask_judge(question, prose.strip(), verification) \
-                if verification.get("ok") else 0
+            score = (_ask_judge(question, prose.strip(), verification)
+                     if verification.get("ok") else None)
         finally:
             verify_conn.close()
         denied_available_figure = _mark_denied_available_figure(
@@ -1701,7 +1719,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 "text": suppressed_text,
                 "mode": "narration",
                 "tool_trace": selected["ledger"],
-                "verification": {**suppressed_verification, "cause": "ok",
+                "verification": {**suppressed_verification,
+                                  "judge_score": None, "cause": "ok",
                                   "retry": True},
             }
         fallback_verification = {

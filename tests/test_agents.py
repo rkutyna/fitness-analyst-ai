@@ -62,6 +62,12 @@ def test_grounding_check_flags_fabricated_number():
     assert not ok and "999" in bad
 
 
+def test_grounding_check_is_documented_as_a_prefilter_only():
+    doc = G.grounding_check.__doc__ or ""
+    assert "pre-filter" in doc
+    assert "not safe evidence for publication" in doc
+
+
 @pytest.mark.parametrize("prose", [
     "Your VO2max improved this week.",
     "Your VO2 improved this week.",

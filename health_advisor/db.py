@@ -52,6 +52,22 @@ VAULT_SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 30_000
 
 
+def workout_source_arbitration_cutoff(conn: sqlite3.Connection) -> str:
+    """Resolve the cutoff from vault metadata at the time of the query.
+
+    An unset setting keeps the migration value so existing data is unchanged
+    until its owner explicitly declares a setting. To arbitrate every date,
+    callers can store ``date.min.isoformat()`` as the setting.
+    """
+    from . import vault
+
+    configured = vault.workout_source_arbitration_from(conn)
+    if configured is not None:
+        return configured
+    # Legacy migration value for databases created before this setting existed.
+    return "2026-08-21"
+
+
 class _VaultConnection(sqlite3.Connection):
     """Connection type used to retain the requested open mode locally."""
 
@@ -1129,7 +1145,7 @@ def _workout_source_labels(
         f"SELECT DISTINCT source FROM {source} "
         "WHERE metric = ? AND local_date >= ?"
         f"{date_clause}{scope}",
-        ("distance_walking_running", nz.WORKOUT_SOURCE_ARBITRATION_FROM,
+        ("distance_walking_running", workout_source_arbitration_cutoff(conn),
          *date_args, *scope_args),
     ).fetchall()
     labels = {role: [] for role in ("watch", "iphone", "gymkit")}
@@ -1286,7 +1302,7 @@ def _workout_arbitration_query(
     def member(column: str, role: str) -> str:
         return f"{column} IN (SELECT source FROM {role}_sources)"
 
-    cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
+    cutoff = workout_source_arbitration_cutoff(conn).replace("'", "''")
     day_scope, day_scope_args = scoped("day_winner")
     workout_scope, workout_scope_args = workout_scoped("workout")
     winner_window = (
@@ -1374,7 +1390,7 @@ def arbitrated_pairs(
             scoped=unscoped,
         )
         role_ctes, role_args = _workout_role_ctes(role_labels)
-        cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
+        cutoff = workout_source_arbitration_cutoff(conn).replace("'", "''")
         day_loser = (
             f"{source_ref}.local_date >= '{cutoff}' AND "
             f"{source_ref}.source IN (SELECT source FROM iphone_sources) AND "

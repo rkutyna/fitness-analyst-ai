@@ -2032,15 +2032,16 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
     """How long the user ran CONTINUOUSLY, and whether it was easy enough to count.
 
     This is the dial the impact ramp progresses on: the longest continuous jog
-    block at a block-mean heart rate of 150 or below, that ceiling being a
-    configured value. Weekly jog minutes is a consequence of session
+    block at or below the vault-configured block-mean heart-rate ceiling.
+    Weekly jog minutes is a consequence of session
     shape, not a target — six two-minute reps and one twelve-minute rep are the
     same number of minutes and are not the same training.
 
     Returns per running session and for the day:
       longest_block_min      longest continuous block, bridge rule applied
-      qualified_block_min    the same block ONLY IF its mean HR <= 150, else
-                             null. Null means "nothing ran easy enough to count
+      qualified_block_min    the same block only if its mean HR is at or below
+                             the configured ceiling, else null. Null means
+                             "nothing ran easy enough to count
                              toward the ramp" — it does NOT mean they did not run.
       unbridged_min          the block without the bridge rule, for comparison
       avg_hr_longest_block   mean HR over the longest block. This is one of
@@ -2092,6 +2093,7 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 "avg_hr_session": hr["avg_hr_session"],
                 "reps": block["reps"],
             })
+        hr_ceiling = A.mx.block_qualify_hr_max(conn)
     finally:
         conn.close()
     if not sessions:
@@ -2108,7 +2110,7 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         # the question it answers is "how long can they run continuously".
         "longest_block_min": best["longest_block_min"],
         "qualified_block_min": max(qualified) if qualified else None,
-        "hr_ceiling_for_qualifying": A.mx.BLOCK_QUALIFY_HR_MAX,
+        "hr_ceiling_for_qualifying": hr_ceiling,
     }
 
 

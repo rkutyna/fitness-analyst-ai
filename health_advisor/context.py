@@ -189,8 +189,11 @@ class VaultContext:
         """This vault's declared settings (T-032), read from the vault itself.
 
         `{"local_timezone": str|None, "unit_system": str|None,
-          "units": dict|None}`. A value is None when the vault has not declared
-        it -- there is no default applied here and none anywhere else. One
+          "units": dict|None, "workout_source_arbitration_from": str|None,
+          "block_qualify_hr_max": float|None}`. A value is None when the vault
+        has not declared
+        it -- there is no default applied here. Computation callers resolve
+        their documented legacy or explicit setting. One
         process serves many vaults, so a module-level fallback would read as
         correct right up until the second vault declares something different,
         which is the failure T-003 exists to prevent.
@@ -200,14 +203,20 @@ class VaultContext:
         per-sample offset carried in the export.
         """
         blank: dict[str, object] = {
-            "local_timezone": None, "unit_system": None, "units": None}
+            "local_timezone": None, "unit_system": None, "units": None,
+            "workout_source_arbitration_from": None,
+            "block_qualify_hr_max": None,
+        }
         if not self.db_path.exists():
             return blank
         conn = _db.connect(self.db_path, read_only=True)
         try:
             return {"local_timezone": _vault.local_timezone(conn),
                     "unit_system": _vault.unit_system(conn),
-                    "units": _vault.units(conn)}
+                    "units": _vault.units(conn),
+                    "workout_source_arbitration_from":
+                        _vault.workout_source_arbitration_from(conn),
+                    "block_qualify_hr_max": _vault.block_qualify_hr_max(conn)}
         finally:
             conn.close()
 

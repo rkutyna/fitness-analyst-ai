@@ -626,7 +626,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             affected.update(
                 ("distance_walking_running", day)
                 for day in parsed["workout_dates"]
-                if day >= nz.WORKOUT_SOURCE_ARBITRATION_FROM
+                if day >= db.workout_source_arbitration_cutoff(conn)
             )
             for row in parsed["daily_totals"]:
                 affected.add((row["metric"], row["local_date"]))

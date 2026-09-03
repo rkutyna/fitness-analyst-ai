@@ -439,14 +439,11 @@ def agg_for(metric: str) -> str:
 # Apple Watch sample is 2019-01-16.
 MIRROR_SOURCES = {"Sync Solver": "2019-01-16"}
 
-# HealthKit-direct ingestion began on this date. Unlike MIRROR_SOURCES, this
-# is not a whole-day source precedence rule: concurrent samples inside one
+# HealthKit-direct ingestion has a per-vault start date. Unlike MIRROR_SOURCES,
+# this is not a whole-day source precedence rule: concurrent samples inside one
 # workout window need an activity-device winner. Device roles are resolved from
 # the complete source label at query time; a pipe-joined label is deliberately
-# not split.
-# Deployment default carried over from the first deployment; making this a
-# per-vault setting is tracked in issue #6.
-WORKOUT_SOURCE_ARBITRATION_FROM = "2026-08-21"
+# not split. The setting lives in vault_meta; callers resolve an unset value.
 
 # The largest value one honest sample of a metric carries. Above this the row
 # is a whole-day estimate wearing a sample's clothes: RENPHO's scale writes its

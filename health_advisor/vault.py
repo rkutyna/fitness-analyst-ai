@@ -11,6 +11,7 @@ deliberate re-derivation migration.
 from __future__ import annotations
 
 import gzip
+import math
 import os
 import sqlite3
 import tempfile
@@ -247,6 +248,82 @@ def set_unit_system(conn: sqlite3.Connection, name: str | None) -> None:
     conn.execute(
         "INSERT INTO vault_meta (key, value) VALUES ('unit_system', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (name,))
+
+
+def _vault_meta_value(conn: sqlite3.Connection, key: str) -> str | None:
+    """One vault_meta value, or None when unset OR when the table does not exist.
+
+    A vault written before vault_meta existed, or any vault opened read-only
+    before its first writable initialisation, has no vault_meta table at all.
+    Such a vault has no settings by construction, and the legacy defaults
+    apply; raising here would take every arbitration read down with it
+    (measured 2026-09-03 on the reference snapshot).
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM vault_meta WHERE key = ?", (key,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return None
+        raise
+    return row[0] if row else None
+
+
+def workout_source_arbitration_from(conn: sqlite3.Connection) -> str | None:
+    """The vault's declared workout-arbitration start date, or ``None``."""
+    row = _vault_meta_value(conn, "workout_source_arbitration_from")
+    return row
+
+
+def set_workout_source_arbitration_from(
+    conn: sqlite3.Connection, through: str | None,
+) -> None:
+    """Declare (or clear) the vault's workout-arbitration start date."""
+    if through is None:
+        conn.execute(
+            "DELETE FROM vault_meta WHERE key = 'workout_source_arbitration_from'"
+        )
+        return
+    try:
+        parsed = date.fromisoformat(through)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "workout_source_arbitration_from must be an ISO local date "
+            "(YYYY-MM-DD)"
+        ) from None
+    if parsed.isoformat() != through:
+        raise ValueError(
+            "workout_source_arbitration_from must be an ISO local date "
+            "(YYYY-MM-DD)"
+        )
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) VALUES "
+        "('workout_source_arbitration_from', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (through,))
+
+
+def block_qualify_hr_max(conn: sqlite3.Connection) -> float | None:
+    """The vault's declared qualifying-block HR ceiling, or ``None``."""
+    row = _vault_meta_value(conn, "block_qualify_hr_max")
+    return float(row) if row is not None else None
+
+
+def set_block_qualify_hr_max(
+    conn: sqlite3.Connection, ceiling: float | None,
+) -> None:
+    """Declare (or clear) the vault's qualifying-block HR ceiling."""
+    if ceiling is None:
+        conn.execute("DELETE FROM vault_meta WHERE key = 'block_qualify_hr_max'")
+        return
+    try:
+        ceiling = float(ceiling)
+    except (TypeError, ValueError):
+        raise ValueError("block_qualify_hr_max must be a finite number") from None
+    if not math.isfinite(ceiling) or ceiling <= 0 or ceiling >= 300:
+        raise ValueError("block_qualify_hr_max must be a finite bpm ceiling")
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('block_qualify_hr_max', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(ceiling),))
 
 
 def units(conn: sqlite3.Connection) -> dict[str, str] | None:
@@ -531,6 +608,22 @@ def _history_at(
         conn.close()
 
 
+def _tuning_settings_at(path: Path) -> dict[str, str]:
+    """Read the two analysis settings that a rebuild must carry forward."""
+    conn = db.connect(path, read_only=True)
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM vault_meta WHERE key IN "
+                "('workout_source_arbitration_from', 'block_qualify_hr_max')"
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+        return {row[0]: row[1] for row in rows}
+    finally:
+        conn.close()
+
+
 def _streamed_raw_series() -> frozenset[str]:
     """Allowlisted series copied sample-for-sample; the rest are bucketed."""
     return VAULT_RAW_SERIES - VAULT_BUCKET_SECONDS.keys()
@@ -807,6 +900,8 @@ def build_vault(
     ) = (
         _history_at(vault_path) if vault_path.exists()
         else (0, [], None, None, None, 0, [], [], {}))
+    existing_tuning = (_tuning_settings_at(vault_path)
+                       if vault_path.exists() else {})
     owner = owner or existing_owner
     vault_path.parent.mkdir(parents=True, exist_ok=True)
     fd, staging_name = tempfile.mkstemp(
@@ -925,6 +1020,12 @@ def build_vault(
             set_local_timezone(target, local_timezone)
         if unit_system is not None:
             set_unit_system(target, unit_system)
+        if existing_tuning.get("workout_source_arbitration_from") is not None:
+            set_workout_source_arbitration_from(
+                target, existing_tuning["workout_source_arbitration_from"])
+        if existing_tuning.get("block_qualify_hr_max") is not None:
+            set_block_qualify_hr_max(
+                target, float(existing_tuning["block_qualify_hr_max"]))
         if history is not None:
             target.execute(
                 "INSERT OR REPLACE INTO vault_meta (key, value) "

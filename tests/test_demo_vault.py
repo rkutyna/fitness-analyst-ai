@@ -7,8 +7,8 @@ are about shape and coherence, not about any particular invented number.
 
 Small windows on purpose: the generator is linear in `days`, and the properties
 under test do not need two years to hold. Every build here uses a window ending
-at demo.DEFAULT_END_DATE so it crosses normalize.WORKOUT_SOURCE_ARBITRATION_FROM
-and the two-device path is reachable.
+at demo.DEFAULT_END_DATE so it crosses the vault's arbitration setting and the
+two-device path is reachable.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import pytest
 from health_advisor import db as dbmod
 from health_advisor import demo, derive
 from health_advisor import normalize as nz
+from health_advisor import vault as vaultmod
 from health_advisor.context import VaultContext
 
 DAYS = 60
@@ -187,11 +188,11 @@ def test_no_real_device_or_person_names(conn):
 def test_two_devices_overlap_and_the_watch_wins(conn):
     """The reason a single-source demo vault would be worth little.
 
-    From normalize.WORKOUT_SOURCE_ARBITRATION_FROM both devices record the same
+    From the vault's arbitration setting both devices record the same
     movement. `db._workout_arbitration` must resolve that to the watch alone —
     if it did not, the stored daily sum would be roughly the sum of both.
     """
-    cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM
+    cutoff = vaultmod.workout_source_arbitration_from(conn)
     overlapping = [r["local_date"] for r in conn.execute(
         "SELECT local_date FROM records WHERE metric = 'distance_walking_running' "
         "AND local_date >= ? GROUP BY local_date "

@@ -242,11 +242,20 @@ BLOCK_BRIDGE_HR_MIN = 130.0    # bpm; same floor, and for the same reason
 # Decoupling on that same block was +1.38% on flat ground, which is the
 # evidence that 150 was the wrong bar rather than 150.5 being too hot.
 #
-# The literal stays a literal. Aliasing it to EASY_JOG_CEILING would still be
-# the coupling defect above; the two agreeing today is a decision, not a link.
-# Deployment default carried over from the first deployment; making this a
-# per-vault setting is tracked in issue #6.
-BLOCK_QUALIFY_HR_MAX = 155.0
+# The ceiling is a per-vault setting (vault_meta 'block_qualify_hr_max').
+# DEFAULT_BLOCK_QUALIFY_HR_MAX is the labelled legacy default an undeclared
+# vault resolves to, so figures do not move when a vault has never declared
+# one; it is a default, not a personal parameter, and consumers that only
+# need the default read this name rather than a per-vault value.
+DEFAULT_BLOCK_QUALIFY_HR_MAX = 155.0
+
+
+def block_qualify_hr_max(conn) -> float:
+    """Return the vault ceiling, or DEFAULT_BLOCK_QUALIFY_HR_MAX when undeclared."""
+    from . import vault
+
+    configured = vault.block_qualify_hr_max(conn)
+    return configured if configured is not None else DEFAULT_BLOCK_QUALIFY_HR_MAX
 
 # Bedtime plan bands from P7-1, adopted at the Week 7 review on 2026-08-16.
 # Values are hours since the previous day's noon: 23:00 is 11.0 and 00:30 is
@@ -274,8 +283,8 @@ def impact_bucket_rows(conn, window_predicate: str,
     ``bucket_series``. Post-boundary interval samples are distributed across
     every 20-second UTC bucket they overlap, in proportion to the overlap
     duration, whether or not they fall inside a workout window. This prevents
-    a 599-second HealthKit interval from becoming one fictitious fast bucket
-    while retaining its distance. Point samples and all pre-2026-08-21 rows
+    a long HealthKit interval from becoming one fictitious fast bucket while
+    retaining its distance. Point samples and rows before the vault's cutoff
     remain one bucket. The 12-hour span guard still rejects daily-total-style
     rows, and all of this is shared by both callers.
 
@@ -293,10 +302,10 @@ def impact_bucket_rows(conn, window_predicate: str,
     """
     bucket_min = IMPACT_BUCKET_SECONDS / 60.0
     implausible_mi_ceiling = bucket_min / IMPACT_IMPLAUSIBLE_PACE_MIN
-    from . import db as dbmod
     if arbitration_window is None:
         arbitration_window = window_args
-    workout_cutoff = nz.WORKOUT_SOURCE_ARBITRATION_FROM.replace("'", "''")
+    from . import db as dbmod
+    workout_cutoff = dbmod.workout_source_arbitration_cutoff(conn).replace("'", "''")
     # These are the two literal windows used by the production callers. Keep
     # their repeated record filters in one CTE so the workout lookup can use
     # the indexed local-date candidate bound without adding duplicate binds.

@@ -226,7 +226,8 @@ def _is_bridge_bucket(b: dict) -> bool:
             and (hr or 0.0) >= mx.BLOCK_BRIDGE_HR_MIN)
 
 
-def longest_block_from_buckets(buckets: list[dict], bridge: bool = True) -> dict:
+def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
+                               hr_ceiling: float | None = None) -> dict:
     """The block structure of one session, given its bucket series.
 
     Pure so it can be tested against captured buckets — a 68-minute run is 4,702
@@ -235,7 +236,8 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True) -> dict
     Returns:
       unbridged_min          longest chain of jog buckets, bridge rule NOT applied
       bridged_min            longest chain with the bridge rule applied
-      qualified_min          longest bridged block whose MEAN HR <= 150, else None.
+      qualified_min          longest bridged block whose mean HR is at or below
+                             the vault-configured ceiling, else None.
                              THIS is the dial P2-1 made governing.
       avg_hr_longest_block   mean HR over the longest bridged block
       reps                   every block, longest first
@@ -293,8 +295,10 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True) -> dict
                   key=lambda r: r["minutes"], reverse=True)
 
     best = reps[0] if reps else None
+    if hr_ceiling is None:
+        hr_ceiling = 155.0  # legacy default for direct pure-function callers
     qualified = [r for r in reps
-                 if r["mean_hr"] is not None and r["mean_hr"] <= mx.BLOCK_QUALIFY_HR_MAX]
+                 if r["mean_hr"] is not None and r["mean_hr"] <= hr_ceiling]
     return {
         "unbridged_min": mx.r(plain_len * bm, 1),
         "bridged_min": best["minutes"] if best else 0.0,
@@ -309,13 +313,15 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True) -> dict
 def longest_block(conn, start_utc: str, end_utc: str, bridge: bool = True) -> dict:
     """Block structure for one session window. See longest_block_from_buckets.
 
-    This is the number the Week 7 review (2026-08-16) adopted as the GOVERNING
-    dial for whether the athlete progresses — P2-1: longest continuous block at
-    HR <= 150. Until this existed it was computed nowhere and derived by hand at
+    This is the governing dial for whether the plan progresses: the longest
+    continuous block at or below the vault-configured HR ceiling. Until this
+    existed it was computed nowhere and derived by hand at
     the review, which is a governor in name only. F2-1 / W7-2.
     """
-    return longest_block_from_buckets(mx.bucket_series(conn, start_utc, end_utc),
-                                      bridge=bridge)
+    return longest_block_from_buckets(
+        mx.bucket_series(conn, start_utc, end_utc), bridge=bridge,
+        hr_ceiling=mx.block_qualify_hr_max(conn),
+    )
 
 
 NOISE_FLOOR_WINDOW_DAYS = 365

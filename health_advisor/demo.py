@@ -77,8 +77,8 @@ DEFAULT_SEED = 42
 # A FIXED anchor, not `today`. "Same seed, same content" has to survive the
 # calendar, and the analysis layer anchors its windows to the latest data date
 # anyway, so a fixed end costs nothing. It deliberately sits after
-# normalize.WORKOUT_SOURCE_ARBITRATION_FROM so the generated window crosses the
-# cutover and the two-device arbitration is actually reachable.
+# the generated window crosses its synthetic cutover and the two-device
+# arbitration is actually reachable.
 DEFAULT_END_DATE = "2026-08-31"
 DEMO_TIMEZONE = "UTC"           # local == UTC, so local_date needs no offset math
 
@@ -149,10 +149,12 @@ class _Generator:
     ``scan_correlations`` a real association to find instead of noise.
     """
 
-    def __init__(self, days: int, seed: int, end_date: str):
+    def __init__(self, days: int, seed: int, end_date: str,
+                 arbitration_from: str):
         self.days = days
         self.rng = random.Random(seed)
         self.end = date.fromisoformat(end_date)
+        self.arbitration_from = arbitration_from
         self.start = self.end - timedelta(days=days - 1)
         # Instrument era: a phone-only stretch, then a watch appears. Capped so
         # a ten-year vault does not spend three years without a heart rate.
@@ -470,7 +472,7 @@ class _Generator:
         workout windows. `first` is this day's first record index, so the scan
         stays linear over the day rather than over the whole vault.
         """
-        if d.isoformat() < nz.WORKOUT_SOURCE_ARBITRATION_FROM:
+        if d.isoformat() < self.arbitration_from:
             return
         mirrored = []
         for r in self.records[first:]:
@@ -724,7 +726,8 @@ def build_demo_vault(path: str | Path, *, days: int = DEFAULT_DAYS,
             if side.exists():
                 side.unlink()
 
-    gen = _Generator(days, seed, end_date)
+    arbitration_from = (date.fromisoformat(end_date) - timedelta(days=10)).isoformat()
+    gen = _Generator(days, seed, end_date, arbitration_from)
     gen.build()
 
     conn = db.connect(path)
@@ -732,6 +735,7 @@ def build_demo_vault(path: str | Path, *, days: int = DEFAULT_DAYS,
         db.init_db(conn)
         vaultmod.set_local_timezone(conn, DEMO_TIMEZONE)
         vaultmod.set_unit_system(conn, "imperial")
+        vaultmod.set_workout_source_arbitration_from(conn, arbitration_from)
         conn.executemany(
             "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",
             [("demo_vault", "1"), ("demo_seed", str(seed)),

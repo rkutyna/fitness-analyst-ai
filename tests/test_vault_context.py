@@ -308,8 +308,10 @@ def test_an_undeclared_vault_reads_none_and_is_not_defaulted(tmp_path):
     as correct until the second vault declares something different.
     """
     ctx = _vault_declaring(tmp_path, "carol")
-    assert ctx.settings() == {"local_timezone": None, "unit_system": None,
-                              "units": None}
+    assert ctx.settings() == {
+        "local_timezone": None, "unit_system": None, "units": None,
+        "workout_source_arbitration_from": None, "block_qualify_hr_max": None,
+    }
 
 
 def test_a_typo_cannot_be_stored_as_a_timezone(tmp_path):
@@ -344,5 +346,7 @@ def test_a_declaration_can_be_cleared(tmp_path):
     vaultmod.set_unit_system(conn, None)
     conn.commit()
     conn.close()
-    assert ctx.settings() == {"local_timezone": None, "unit_system": None,
-                              "units": None}
+    assert ctx.settings() == {
+        "local_timezone": None, "unit_system": None, "units": None,
+        "workout_source_arbitration_from": None, "block_qualify_hr_max": None,
+    }

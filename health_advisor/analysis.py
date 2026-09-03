@@ -13,6 +13,32 @@ from . import metrics as mx
 from . import vault
 from .metrics import WEAR_MIN_HOURS
 
+# Literature figures are data, not instructions for the model to calculate.
+# Keep the citation beside every published value so renderers can show it.
+LITERATURE_FIGURES = {
+    "heat_effect_bpm_per_c": {
+        "value": 1.0,
+        "unit": "bpm/°C",
+        "citation": {
+            "author": "K B Pandolf; E Cafarelli; B J Noble; K F Metz",
+            "year": 1975,
+            "venue": "Arch Phys Med Rehabil",
+            "pmid": "1200826",
+        },
+    },
+    "expected_training_effect_bpm": {
+        "min": 0.0,
+        "max": 3.0,
+        "unit": "bpm",
+        "citation": {
+            "author": "A K Reimers; G Knapp; C D Reimers",
+            "year": 2018,
+            "venue": "J Clin Med",
+            "doi": "10.3390/jcm7120503",
+        },
+    },
+}
+
 # --- tunable constants (kept here so tuning is one place) -------------------- #
 VITALS = ["resting_heart_rate", "heart_rate_variability", "sleep_asleep",
           "respiratory_rate", "blood_oxygen_saturation", "step_count",
@@ -315,9 +341,10 @@ def metric_noise_floor(conn, metric: str, as_of: str,
     The autocorrelation inflation matters: consecutive days are not independent
     observations, and ignoring it makes a weekly mean look more precise than it
     is. The per-vault computation gives a WEEKLY mean MDC against the expected
-    training effect; reporting resting HR weekly can therefore miss a small
-    effect, which is why the cadence moved to 4-week blocks where the effect
-    sits inside the floor.
+    0–3 bpm training effect reported by Reimers, Knapp & Reimers (2018, J Clin
+    Med, DOI 10.3390/jcm7120503). Reporting resting HR weekly can therefore
+    miss a small effect, which is why the cadence moved to 4-week blocks where
+    the effect sits inside the floor.
 
     Returns sd_day/rho/mdc95 = None when the window has too few consecutive
     pairs to estimate them. A noise floor guessed from six days is worse than
@@ -958,8 +985,11 @@ def movement_floor_days(conn, start: str, end: str) -> list[dict]:
 
 
 EARLY_WARNING_DAYS = 21
-EARLY_WARNING_RHR_PER_WEEK = 1.0   # bpm/week rising
-EARLY_WARNING_HRV_PER_WEEK = -1.0  # ms/week falling
+EARLY_WARNING_RHR_PER_WEEK_CONVENTION = 1.0   # bpm/week rising
+EARLY_WARNING_HRV_PER_WEEK_CONVENTION = -1.0  # ms/week falling
+EARLY_WARNING_THRESHOLD_BASIS = (
+    "operational convention; not a literature-derived fit"
+)
 
 
 def _slope_over(conn, metric, as_of, days):
@@ -969,12 +999,19 @@ def _slope_over(conn, metric, as_of, days):
 
 
 def trends(conn, as_of: str | None = None) -> dict:
+    """Three-week slopes and early-warning flags.
+
+    The per-week cutoffs are operational conventions, not fitted or
+    literature-derived thresholds; the basis is returned beside the flags.
+    """
     as_of = _as_of(conn, as_of)
     rhr_slope, rhr_n = _slope_over(conn, "resting_heart_rate", as_of, EARLY_WARNING_DAYS)
     hrv_slope, hrv_n = _slope_over(conn, "heart_rate_variability", as_of, EARLY_WARNING_DAYS)
 
-    rhr_rising = rhr_slope is not None and rhr_slope >= EARLY_WARNING_RHR_PER_WEEK
-    hrv_falling = hrv_slope is not None and hrv_slope <= EARLY_WARNING_HRV_PER_WEEK
+    rhr_rising = (rhr_slope is not None
+                  and rhr_slope >= EARLY_WARNING_RHR_PER_WEEK_CONVENTION)
+    hrv_falling = (hrv_slope is not None
+                   and hrv_slope <= EARLY_WARNING_HRV_PER_WEEK_CONVENTION)
     flag = bool(rhr_rising or hrv_falling) and rhr_n >= 10 and hrv_n >= 10
 
     return {
@@ -985,6 +1022,9 @@ def trends(conn, as_of: str | None = None) -> dict:
             "rhr_rising": rhr_rising,
             "hrv_falling": hrv_falling,
             "window_days": EARLY_WARNING_DAYS,
+            "rhr_threshold_per_week": EARLY_WARNING_RHR_PER_WEEK_CONVENTION,
+            "hrv_threshold_per_week": EARLY_WARNING_HRV_PER_WEEK_CONVENTION,
+            "threshold_basis": EARLY_WARNING_THRESHOLD_BASIS,
         },
     }
 

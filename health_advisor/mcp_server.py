@@ -98,6 +98,14 @@ BRIEFING_SCOPES = tuple(A.MOVER_TOPK)
 # helpers — delegates to metrics.py primitives
 # --------------------------------------------------------------------------- #
 _r = mx.r
+
+
+def _literature_figure(name: str) -> dict:
+    """Return a cited literature figure without sharing its citation mapping."""
+    figure = A.LITERATURE_FIGURES[name]
+    return {**figure, "citation": dict(figure["citation"])}
+
+
 _agg = mx.agg
 _value_col = mx.value_col
 _anchor_end = mx.anchor_end
@@ -1920,13 +1928,13 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
       mdc95     the smallest week-to-week change that is NOT noise, given this
                 metric's own day-to-day variability and autocorrelation.
 
-    **Do not report a change smaller than mdc95 as a change.** At the user's
-    measured values a weekly resting-HR mean has an mdc95 of about 4.7 bpm
-    against an expected training effect of 0-3 — so at weekly cadence that
-    metric cannot detect what it is being asked to detect, and the honest answer
-    is "no change is measurable at this cadence", not a number. Over 4-week
-    blocks the floor falls to about 2.3, which is why the plan compares blocks
-    rather than weeks.
+    **Do not report a change smaller than mdc95 as a change.** The per-vault
+    weekly resting-HR MDC is compared with the expected 0–3 bpm training effect
+    reported by Reimers, Knapp & Reimers (2018, J Clin Med, DOI
+    10.3390/jcm7120503). At weekly cadence that metric can miss a small effect,
+    so the honest answer is "no change is measurable at this cadence", not a
+    number. The returned `expected_training_effect_bpm` record carries this
+    citation beside the literature figure.
 
     mdc95 is null when there is too little history to estimate a floor. A null
     floor means you cannot say whether a delta is real, not that it is.
@@ -1952,7 +1960,9 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
         _add_presentation(row, metric, row.get("period"), row.get("mean"),
                           field="mean")
     return {"metric": metric, "start": start, "end": end,
-            "weeks": weeks, "count": len(weeks), "noise_floor": floor}
+            "weeks": weeks, "count": len(weeks), "noise_floor": floor,
+            "expected_training_effect_bpm": _literature_figure(
+                "expected_training_effect_bpm")}
 
 
 @tool
@@ -2132,8 +2142,12 @@ def get_benchmark_series(ctx: VaultContext) -> dict:
     This is the instrument to reach for because uncontrolled weekly wearable
     data cannot resolve training adaptation at this horizon: on measurement, 5
     of 7 tracked metrics could not detect change, and heat alone (~1 bpm/°C) is
-    larger than the training signal. A treadmill holds pace and grade fixed, so
-    HR at a fixed pace is finally comparable month to month.
+    larger than the training signal (Pandolf KB, Cafarelli E, Noble BJ & Metz
+    KF, 1975, Arch Phys Med Rehabil, PMID 1200826). A treadmill holds pace and
+    grade fixed, so HR at a fixed pace is finally comparable month to month.
+
+    The returned `heat_effect_bpm_per_c` record carries that citation beside
+    the literature figure.
 
     Compare stages ACROSS dates, never stages within one date — the four paces
     are four different efforts. Read `median_source` before comparing: a
@@ -2145,7 +2159,9 @@ def get_benchmark_series(ctx: VaultContext) -> dict:
     finally:
         conn.close()
     return {"stages": rows, "count": len(rows),
-            "dates": sorted({r["date"] for r in rows})}
+            "dates": sorted({r["date"] for r in rows}),
+            "heat_effect_bpm_per_c": _literature_figure(
+                "heat_effect_bpm_per_c")}
 
 
 @tool

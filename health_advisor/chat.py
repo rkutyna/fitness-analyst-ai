@@ -21,10 +21,12 @@ import sys
 import tempfile
 import uuid
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Mapping
 
 from . import db
 from . import facts as fact_store
+from . import vault
 from .context import VaultContext
 
 
@@ -97,6 +99,13 @@ _TURN_COLUMNS = ("answers_turn_id", "client_disconnected_at", "attachments_json"
 _AUDIT_COMMAND_RE = re.compile(
     r"^\s*run_audit\(\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\)\s*$"
 )
+
+
+def _today(conn) -> date:
+    """Return today's date in the vault's declared zone, or the host date."""
+    local_timezone = vault.local_timezone(conn)
+    return (datetime.now(ZoneInfo(local_timezone)).date()
+            if local_timezone else date.today())
 
 
 def _decode_turn_attachments(turn: dict[str, Any]) -> dict[str, Any]:
@@ -2113,7 +2122,7 @@ def run_audit(ctx: VaultContext, name: str, *, as_of: str | None = None,
         conn = ctx.read_only()
         try:
             row = conn.execute("SELECT MAX(date) FROM daily_metrics").fetchone()
-            as_of = row[0] if row and row[0] else date.today().isoformat()
+            as_of = row[0] if row and row[0] else _today(conn).isoformat()
         finally:
             conn.close()
     battery, attachment_builder = audit_registry[audit_name]

@@ -7,6 +7,7 @@ import math
 import sqlite3
 import statistics
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from . import db
 from . import metrics as mx
@@ -187,7 +188,14 @@ def _as_of(conn, as_of: str | None) -> str:
     if as_of:
         return as_of
     row = conn.execute("SELECT MAX(date) FROM daily_metrics").fetchone()
-    return row[0] if row and row[0] else date.today().isoformat()
+    return row[0] if row and row[0] else _today(conn).isoformat()
+
+
+def _today(conn) -> date:
+    """Return today's date in the vault's declared zone, or the host date."""
+    local_timezone = vault.local_timezone(conn)
+    return (datetime.now(ZoneInfo(local_timezone)).date()
+            if local_timezone else date.today())
 
 
 def _bucket_index(bucket_start_utc: str) -> int:

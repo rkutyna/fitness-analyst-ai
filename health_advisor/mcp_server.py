@@ -228,6 +228,12 @@ def _as_timezone(local_timezone: str | tzinfo | None) -> tzinfo | None:
     return ZoneInfo(local_timezone)
 
 
+def _today(local_timezone: str | tzinfo | None = None) -> date:
+    """Return today's date in a declared zone, or the host date if unset."""
+    local_tz = _as_timezone(local_timezone)
+    return datetime.now(local_tz).date() if local_tz is not None else date.today()
+
+
 def _local_hhmm(utc_iso: str | None,
                 local_timezone: str | tzinfo | None = None,
                 seconds: bool = False) -> str | None:
@@ -681,6 +687,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     limit = max(1, min(int(limit), MAX_WORKOUTS))
     settings = ctx.settings()
     local_timezone = _as_timezone(settings["local_timezone"])
+    today = _today(local_timezone).isoformat()
     declared_unit_system = settings["unit_system"]
     metric_units = declared_unit_system == "metric"
     display_system = declared_unit_system or "imperial"
@@ -693,7 +700,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             row = conn.execute(
                 "SELECT MAX(w.local_date) FROM workouts AS w"
             ).fetchone()
-            end = row[0] or date.today().isoformat()
+            end = row[0] or today
         if start is None:
             start = (date.fromisoformat(end) - timedelta(days=89)).isoformat()
         rows = conn.execute(
@@ -931,13 +938,14 @@ def _impact_period_keys(start: str, end: str, by: str) -> list[date]:
 
 
 def _impact_days_covered(key: date, by: str, start: str, end: str,
-                         *, as_of: str | None = None) -> int:
+                         *, as_of: str | None = None,
+                         local_timezone: tzinfo | None = None) -> int:
     """Days of this period that are inside the requested range AND have already
     happened. 5 of 7 on a Friday is why a mid-week week-over-week number reads
     as a collapse."""
     span = 1 if by == "day" else 7
     first = max(key, date.fromisoformat(start))
-    horizon = date.fromisoformat(as_of) if as_of else date.today()
+    horizon = date.fromisoformat(as_of) if as_of else _today(local_timezone)
     last = min(key + timedelta(days=span - 1), date.fromisoformat(end), horizon)
     return max(0, (last - first).days + 1)
 
@@ -1045,7 +1053,8 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
 
 
 def _impact_periods(rows: list[dict], start: str, end: str,
-                    by: str, *, as_of: str | None = None) -> list[dict]:
+                    by: str, *, as_of: str | None = None,
+                    local_timezone: tzinfo | None = None) -> list[dict]:
     """Return the gap-filled impact periods with their completeness labels.
 
     Both the ordinary impact tool and its block-comparison mode need exactly
@@ -1059,7 +1068,7 @@ def _impact_periods(rows: list[dict], start: str, end: str,
     # The query should already be bounded by this same horizon, but keep the
     # pure presentation helper defensive: a future period must never become a
     # published zero merely because a caller supplied an end beyond as_of.
-    horizon = date.fromisoformat(as_of) if as_of else date.today()
+    horizon = date.fromisoformat(as_of) if as_of else _today(local_timezone)
     start_date = date.fromisoformat(start)
     end_date = min(date.fromisoformat(end), horizon)
     if start_date > horizon:
@@ -1071,7 +1080,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
     for key in _impact_period_keys(start, end, by):
         iso = key.isoformat()
         bucket_end = min(key + timedelta(days=6), end_date).isoformat()
-        covered = _impact_days_covered(key, by, start, end, as_of=as_of)
+        covered = _impact_days_covered(
+            key, by, start, end, as_of=as_of, local_timezone=local_timezone)
         row = have.get(iso) or {
             "period_start": iso, "jog_minutes": 0.0, "jog_miles": 0.0,
             "jog_pace_min_per_mi": None, "walk_minutes": 0.0, "walk_miles": 0.0,
@@ -1092,7 +1102,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
 
 def _impact_block_comparison(periods: list[dict], start: str, end: str,
                              weeks_per_block: int, anchor: str,
-                             *, as_of: str | None = None) -> dict:
+                             *, as_of: str | None = None,
+                             local_timezone: tzinfo | None = None) -> dict:
     """Aggregate adjacent weekly jog-minute blocks from labelled tool rows."""
     anchor_aliases = {
         "last_complete_week": "last_complete_week",
@@ -1233,7 +1244,7 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
                 "range and no later than the session as_of date; a week is complete only "
                 "when days_covered is 7"
             ),
-            "as_of": as_of or date.today().isoformat(),
+            "as_of": as_of or _today(local_timezone).isoformat(),
             "end_default": False,
             "partial_trailing_week": {
                 "period_start": trailing["period_start"],
@@ -1303,6 +1314,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
             return {"error": f"{label} must be YYYY-MM-DD"}
     if start > end:
         return {"error": "start must be on or before end"}
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
     conn = ctx.read_only()
     try:
         as_of = A._as_of(conn, None)
@@ -1320,7 +1332,9 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
         # column over the complete sequence. The same labelled rows feed block
         # comparison. Do this while the read-only connection is open only
         # because the source rows are computed here; the helper itself is pure.
-        periods = _impact_periods(rows, start, effective_end, by, as_of=as_of)
+        periods = _impact_periods(
+            rows, start, effective_end, by, as_of=as_of,
+            local_timezone=local_timezone)
     except ValueError as e:
         return {"error": str(e)}
     finally:
@@ -1351,7 +1365,8 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
             out["block_comparison_error"] = "weeks_per_block must be a positive integer"
         else:
             comparison = _impact_block_comparison(
-                periods, start, end, weeks_per_block, anchor, as_of=as_of
+                periods, start, end, weeks_per_block, anchor, as_of=as_of,
+                local_timezone=local_timezone
             )
             if "error" in comparison:
                 out["block_comparison_error"] = comparison["error"]
@@ -1399,8 +1414,9 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
     the WAKE day. Dates are local YYYY-MM-DD; both default to all of history."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
     start = start or "2016-01-01"
-    end = end or date.today().isoformat()
+    end = end or _today(local_timezone).isoformat()
     if start > end:
         return {"error": "start must be on or before end"}
     conn = ctx.read_only()
@@ -1472,7 +1488,8 @@ def get_training_load_detail(ctx: VaultContext, start: str | None = None,
     Dates are local YYYY-MM-DD; both default to the last 90 days."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
-    end = end or date.today().isoformat()
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    end = end or _today(local_timezone).isoformat()
     start = start or (date.fromisoformat(end) - timedelta(days=90)).isoformat()
     if start > end:
         return {"error": "start must be on or before end"}
@@ -1819,14 +1836,16 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
     earlier: a check-in is a report of a day that happened."""
     if err := _bad_dates(day=day):
         return {"ok": False, "error": err}
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    today = _today(local_timezone).isoformat()
     # A check-in about a day that hasn't happened is not a correction anyone can
     # make. Left open, a mis-parsed "tomorrow" writes a future row that then
     # mirrors into daily_metrics and shifts every baseline that reads forward.
-    if day > date.today().isoformat():
+    if day > today:
         return {"ok": False,
                 "error": f"day={day!r} is in the future; a check-in reports a "
                          "day that has happened. Today is "
-                         f"{date.today().isoformat()}."}
+                         f"{today}."}
     conn = ctx.connect()
     try:
         db.init_db(conn)
@@ -2347,7 +2366,8 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
     """
     if err := _bad_dates(day=day):
         return {"ok": False, "error": err}
-    if day > date.today().isoformat():
+    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    if day > _today(local_timezone).isoformat():
         return {"ok": False, "error": f"day={day!r} is in the future"}
     conn = ctx.connect()
     try:

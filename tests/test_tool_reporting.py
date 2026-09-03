@@ -8,11 +8,13 @@ worth a test apiece.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from health_advisor import db as dbmod
+from health_advisor import analysis as analysismod
+from health_advisor import chat as chatmod
 from health_advisor import metrics as M
 from health_advisor import mcp_server as S
 from health_advisor import vault as vaultmod
@@ -202,6 +204,77 @@ def test_list_workouts_reports_imperial_fallback_when_undeclared(conn, tools):
         "system": "imperial", "declared": False,
         "distance": "mi", "energy": "kcal",
     }
+
+
+def _empty_vault(path, zone=None):
+    ctx = VaultContext.local(path, user_id=path.stem, writable=True)
+    conn = ctx.connect()
+    dbmod.init_db(conn)
+    if zone is not None:
+        vaultmod.set_local_timezone(conn, zone)
+        conn.commit()
+    conn.close()
+    return ctx
+
+
+def test_list_workouts_today_is_per_vault_and_undeclared_is_host_date(
+        tmp_path, monkeypatch):
+    """A single process must not share the calendar date between vaults."""
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = cls(2026, 8, 1, 2, tzinfo=timezone.utc)
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(S, "datetime", FrozenDateTime)
+    kiribati = S.build_tools(
+        _empty_vault(tmp_path / "kiribati.db", "Pacific/Kiritimati"))
+    pago = S.build_tools(
+        _empty_vault(tmp_path / "pago.db", "Pacific/Pago_Pago"))
+    undeclared = S.build_tools(_empty_vault(tmp_path / "undeclared.db"))
+
+    kiribati_out = kiribati["list_workouts"]()
+    pago_out = pago["list_workouts"]()
+    undeclared_out = undeclared["list_workouts"]()
+
+    assert (kiribati_out["start"], kiribati_out["end"]) == (
+        "2026-05-04", "2026-08-01")
+    assert (pago_out["start"], pago_out["end"]) == (
+        "2026-05-03", "2026-07-31")
+    host_today = date.today()
+    assert undeclared_out["end"] == host_today.isoformat()
+    assert undeclared_out["start"] == (host_today - timedelta(days=89)).isoformat()
+
+
+def test_analysis_and_chat_today_use_the_vault_zone(tmp_path, monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = cls(2026, 8, 1, 2, tzinfo=timezone.utc)
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr(analysismod, "datetime", FrozenDateTime)
+    monkeypatch.setattr(chatmod, "datetime", FrozenDateTime)
+    expected = {
+        "Pacific/Kiritimati": "2026-08-01",
+        "Pacific/Pago_Pago": "2026-07-31",
+    }
+    for zone, expected_today in expected.items():
+        ctx = _empty_vault(tmp_path / f"{zone.rsplit('/', 1)[-1]}.db", zone)
+        conn = ctx.read_only()
+        try:
+            assert analysismod._as_of(conn, None) == expected_today
+            assert chatmod._today(conn).isoformat() == expected_today
+        finally:
+            conn.close()
+
+    undeclared = _empty_vault(tmp_path / "analysis-undeclared.db")
+    conn = undeclared.read_only()
+    try:
+        assert analysismod._as_of(conn, None) == date.today().isoformat()
+        assert chatmod._today(conn).isoformat() == date.today().isoformat()
+    finally:
+        conn.close()
 
 
 def test_local_window_utc_uses_the_declared_zone():

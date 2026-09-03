@@ -11,6 +11,7 @@ script somebody writes cannot bypass it.
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 
 import pytest
@@ -70,6 +71,13 @@ def _post(client, *rows, batch_id="daily-batch", sequence=1):
         json=_daily_payload(*rows, batch_id=batch_id, sequence=sequence),
         headers={"x-health-secret": "hk-secret"},
     )
+
+
+def _insights_digest(conn):
+    """Digest the complete stored insight table, including its timestamps."""
+    rows = [tuple(row) for row in conn.execute(
+        "SELECT id, date, text, tags, created_at FROM insights ORDER BY id")]
+    return hashlib.sha256(repr(rows).encode("utf-8")).hexdigest()
 
 
 # --- assertion 1: a settled total is immutable, in the engine ---------------
@@ -289,6 +297,48 @@ def test_settle_transition_is_one_way(conn, vault, monkeypatch):
         "AND local_date = '2026-08-25'").fetchone()
     assert row["state"] == "settled"
     assert row["settled_at"] is not None
+
+
+def test_settling_a_changed_total_leaves_prior_insights_byte_identical(conn):
+    """A settle changes the total, never the already-written insight table.
+
+    Cost, measured 2026-09-03 on the demo vault: apply_consolidated_totals
+    over 2,190 hk_daily_totals rows took 3.7 ms in total (0.0017 ms per day);
+    one scoped (metric, day) pair took 1.2 ms. Journal mode DELETE.
+    """
+    day = "2026-08-25"
+    dbmod.write_insight(conn, day, "Synthetic daily summary.", tags="daily")
+    before = _insights_digest(conn)
+
+    dbmod.insert_daily_totals(
+        conn, [_total(value=9000.0, queried_at="2026-08-26T09:00:00")],
+        batch_id="provisional")
+    dbmod.apply_consolidated_totals(conn, pairs=[("step_count", day)])
+    dbmod.insert_daily_totals(
+        conn, [_total(value=10173.0, state="settled",
+                      queried_at="2026-08-28T09:00:00")],
+        batch_id="settled")
+    dbmod.apply_consolidated_totals(conn, pairs=[("step_count", day)])
+    conn.commit()
+
+    assert _insights_digest(conn) == before
+    assert conn.execute(
+        "SELECT state, value FROM hk_daily_totals").fetchone()[:] == \
+        ("settled", 10173.0)
+    revisions = conn.execute(
+        "SELECT from_value, to_value, from_state, to_state, lag_days "
+        "FROM hk_daily_total_revisions ORDER BY id").fetchall()
+    assert [tuple(row) for row in revisions] == [
+        (None, 9000.0, None, "provisional", 1),
+        (9000.0, 10173.0, "provisional", "settled", 3),
+    ]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        dbmod.insert_daily_totals(
+            conn, [_total(value=11111.0, state="settled",
+                          queried_at="2026-08-29T09:00:00")],
+            batch_id="after-settle")
+    assert _insights_digest(conn) == before
 
 
 def test_applied_settle_batch_retry_is_already_applied(conn, vault, monkeypatch):

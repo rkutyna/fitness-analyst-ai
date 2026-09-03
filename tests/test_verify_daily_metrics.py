@@ -224,11 +224,12 @@ def _run_source(source: str, path, *extra):
 
 
 def _add_total(conn, metric: str, day: str, value: float, *,
-               unit: str = TOTALS_UNIT, batch: str = "b1") -> None:
+               unit: str = TOTALS_UNIT, state: str = "provisional",
+               batch: str = "b1") -> None:
     """One consolidated total, written the way the receiver will write it."""
     db.insert_daily_totals(conn, [{
         "metric": metric, "local_date": day, "value": value, "unit": unit,
-        "interval": "day", "state": "provisional", "device_id": "dev-1",
+        "interval": "day", "state": state, "device_id": "dev-1",
         "queried_at": f"{day}T23:00:00+00:00",
     }], batch_id=batch)
 
@@ -247,6 +248,28 @@ def _consolidated(tmp_path, metric: str, *, records=(3.0, 7.0), total=42.0,
     db.apply_consolidated_totals(conn)
     conn.commit()
     return path, conn
+
+
+def test_changed_provisional_to_settled_total_is_not_a_verifier_discrepancy(
+        tmp_path):
+    """A changed Apple total remains clean when the cache follows the pull."""
+    path, conn = _database(tmp_path, "step_count", [3.0, 7.0], d3=False,
+                           name="changed-settle")
+    _add_total(conn, "step_count", DAY, 42.0, batch="provisional")
+    db.apply_consolidated_totals(conn)
+    _add_total(conn, "step_count", DAY, 84.0, state="settled",
+               batch="settled")
+    db.apply_consolidated_totals(conn)
+    assert conn.execute(
+        "SELECT sum, source_kind FROM daily_metrics WHERE metric = 'step_count' "
+        "AND date = ?", (DAY,)).fetchone()[:] == (84.0, "apple_consolidated")
+    conn.commit()
+    conn.close()
+
+    result = _run(path)
+    _assert_categories(result, legitimate=0, genuine=0, returncode=0)
+    assert "consolidated rows: 1 checked, 0 discrepancy(ies) (0 fatal)" \
+        in result.stdout
 
 
 def _multi_day(tmp_path, days, *, metric="step_count", total=42.0,

@@ -103,15 +103,18 @@ CODEX_REFUSAL_MESSAGE = (
 def assert_analyst_backend_approved() -> None:
     """Approve the backend before anything else. Raises on any refusal.
 
-    Calls the shared D15 gate first -- so an unapproved backend name, an
-    unapproved OpenRouter provider, or an unapproved endpoint host are all
-    refused exactly as they are everywhere else in the product -- and then
-    adds the one rule specific to this module: 'codex' is never acceptable
-    here, even though D15/D17 approve it for narration elsewhere.
+    The one rule specific to this module comes first: 'codex' is never
+    acceptable here, even though D15/D17 approve it for narration elsewhere.
+    It is checked before the shared gate because it holds regardless of the
+    host -- a machine with no codex executable must still hear this rule,
+    not the shared gate's missing-binary refusal (#33). Then the shared D15
+    gate runs, so an unapproved backend name, an unapproved OpenRouter
+    provider, or an unapproved endpoint host are all refused exactly as they
+    are everywhere else in the product.
     """
-    llm.assert_backend_approved()
     if llm.BACKEND == "codex":
         raise RuntimeError(CODEX_REFUSAL_MESSAGE)
+    llm.assert_backend_approved()
 
 
 # --------------------------------------------------------------------------- #

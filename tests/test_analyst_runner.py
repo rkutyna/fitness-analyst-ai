@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import fcntl
 import json
 import os
@@ -9,6 +10,7 @@ import sqlite3
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -432,3 +434,210 @@ def test_query_proxy_and_cursor_expose_no_sqlite_objects():
                    for item in vars(value).values())
         for attr in ("connection", "_conn", "_cursor"):
             assert not hasattr(value, attr)
+
+
+class _SeatbeltStub:
+    SANDBOX_EXEC = "sandbox-exec"
+
+    def __init__(self, run_root: Path):
+        self._run_root = run_root
+        self._python = sys.executable
+        self._real_home = str(run_root)
+        self._pyenv_prefix = str(run_root)
+        self._venv_dir = str(run_root)
+
+    def _prepare_run_dir(self, run_dir: str):
+        run = Path(run_dir)
+        run.mkdir(parents=True, exist_ok=True)
+        work = run / "work"
+        work.mkdir(exist_ok=True)
+        return run, work
+
+
+class _FakeProcess:
+    def __init__(self, stdout, stderr):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pid = 987654
+        self.returncode = 0
+        self.killed = False
+        self.wait_calls = 0
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        del timeout
+        self.wait_calls += 1
+        return self.returncode
+
+
+def _empty_stream():
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    return os.fdopen(read_fd, "rb")
+
+
+@pytest.mark.parametrize("failure", ["popen", "register", "poll"])
+def test_seatbelt_query_channel_failures_close_fds_and_reap_process(
+        tmp_path, monkeypatch, failure):
+    executor = _SeatbeltStub(tmp_path)
+    query_read, query_child = os.pipe()
+    high_fds = []
+    original_high_fd = runner._high_fd
+
+    def capture_high_fd(fd):
+        high = original_high_fd(fd)
+        high_fds.append(high)
+        return high
+
+    monkeypatch.setattr(runner, "_high_fd", capture_high_fd)
+    killed_groups = []
+    process = None
+
+    def fake_killpg(pid, sig):
+        killed_groups.append((pid, sig))
+        if process is not None and process.pid == pid:
+            process.killed = True
+
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg)
+
+    if failure == "popen":
+        def failing_popen(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("synthetic process start failure")
+
+        monkeypatch.setattr(runner.subprocess, "Popen", failing_popen)
+    else:
+        def fake_popen(*args, **kwargs):
+            del args, kwargs
+            nonlocal process
+            process = _FakeProcess(_empty_stream(), _empty_stream())
+            return process
+
+        monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+
+        class ExplodingSelector:
+            def __init__(self):
+                self.registered = []
+
+            def register(self, fileobj, events, data):
+                del events
+                if failure == "register" and self.registered:
+                    raise RuntimeError("synthetic selector registration failure")
+                self.registered.append((fileobj, data))
+
+            def get_map(self):
+                return self.registered
+
+            def select(self, timeout):
+                del timeout
+                raise RuntimeError("synthetic selector polling failure")
+
+            def close(self):
+                self.registered.clear()
+
+        monkeypatch.setattr(runner.selectors, "DefaultSelector", ExplodingSelector)
+
+    result = runner._run_seatbelt(
+        executor, "pass", str(tmp_path / "run"), query_child,
+        runner.AnalystLimits(wall_clock_s=1.0), "unused-vault",
+    )
+    os.close(query_read)
+
+    assert isinstance(result, sandbox.RawResult)
+    for fd in high_fds:
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(fd)
+        assert exc_info.value.errno == errno.EBADF
+    if failure == "popen":
+        assert process is None
+        assert not killed_groups
+    else:
+        assert process is not None
+        assert process.killed is True
+        assert process.wait_calls == 1
+        assert killed_groups == [(process.pid, runner.signal.SIGKILL)]
+
+
+@pytest.mark.parametrize("artifact", ["code.py", "runner.py", "profile.sb"])
+def test_seatbelt_artefacts_reject_preexisting_symlinks(
+        tmp_path, monkeypatch, artifact):
+    executor = _SeatbeltStub(tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    target = tmp_path / "target"
+    target.write_text("sentinel", encoding="utf-8")
+    (run_dir / artifact).symlink_to(target)
+    query_read, query_child = os.pipe()
+    popen_called = False
+
+    def unexpected_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("a symlinked parent artefact was executed")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", unexpected_popen)
+    try:
+        result = runner._run_seatbelt(
+            executor, "pass", str(run_dir), query_child,
+            runner.AnalystLimits(), "unused-vault",
+        )
+    except FileExistsError:
+        result = None
+    os.close(query_read)
+    assert result is None or isinstance(result, sandbox.RawResult)
+    assert popen_called is False
+    assert (run_dir / artifact).is_symlink()
+    assert target.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_seatbelt_fd3_limit_is_clamped_to_drain_ceiling(
+        tmp_path, monkeypatch):
+    ceiling = sandbox.DEFAULT_MAX_FD3_BYTES * 32
+    cases = [
+        (-1, b""),
+        (0, b""),
+        (65_535, b"x" * 65_535),
+        (65_536, b"x" * 65_536),
+        (65_537, b"x" * 65_537),
+        (ceiling, b"x" * ceiling),
+        (ceiling + 1, b"x" * (ceiling + 1)),
+    ]
+
+    for index, (configured_limit, payload) in enumerate(cases):
+        executor = _SeatbeltStub(tmp_path)
+        query_read, query_child = os.pipe()
+        writer_thread = None
+
+        def fake_popen(*args, **kwargs):
+            del args
+            nonlocal writer_thread
+            write_fd = os.dup(kwargs["pass_fds"][0]) if kwargs else None
+            # kwargs is intentionally read above; retain the assertion that
+            # the output channel is the first passed descriptor.
+            assert write_fd is not None
+
+            def write_payload(data=payload, fd=write_fd):
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                finally:
+                    os.close(fd)
+
+            writer_thread = threading.Thread(target=write_payload)
+            writer_thread.start()
+            return _FakeProcess(_empty_stream(), _empty_stream())
+
+        monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+        result = runner._run_seatbelt(
+            executor, "pass", str(tmp_path / f"run-{index}"), query_child,
+            {"max_fd3_bytes": configured_limit}, "unused-vault",
+        )
+        writer_thread.join(timeout=5)
+        os.close(query_read)
+
+        effective_limit = max(0, min(configured_limit, ceiling))
+        assert result.fd3_oversized is (len(payload) > effective_limit)
+        assert result.fd3_bytes == payload[:effective_limit]

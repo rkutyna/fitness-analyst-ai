@@ -413,6 +413,32 @@ def _hash_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _write_exclusive(path: Path, text: str) -> None:
+    """Create a parent-owned text artefact without following a symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        raise
+    try:
+        stream.write(text)
+    finally:
+        stream.close()
+
+
+def _fd3_limit(value: Any) -> int:
+    """Keep the requested cap inside the bytes the drain can retain."""
+    value = int(value)
+    return max(0, min(value, sandbox._FD3_DRAIN_CEILING))
+
+
 def _parent_metadata(conn) -> int:
     """Set parent-only SQLite metadata without making it an analyst query."""
     real = conn._conn
@@ -427,11 +453,15 @@ def _parent_metadata(conn) -> int:
 def _limits_for_executor(limits: Any):
     if limits is None:
         return sandbox.RunLimits()
-    if isinstance(limits, sandbox.RunLimits):
-        return limits
+    if isinstance(limits, dict):
+        wall_clock_s = limits.get("wall_clock_s", sandbox.DEFAULT_WALL_CLOCK_S)
+        max_fd3_bytes = limits.get("max_fd3_bytes", sandbox.DEFAULT_MAX_FD3_BYTES)
+    else:
+        wall_clock_s = getattr(limits, "wall_clock_s", sandbox.DEFAULT_WALL_CLOCK_S)
+        max_fd3_bytes = getattr(limits, "max_fd3_bytes", sandbox.DEFAULT_MAX_FD3_BYTES)
     return sandbox.RunLimits(
-        wall_clock_s=float(getattr(limits, "wall_clock_s", sandbox.DEFAULT_WALL_CLOCK_S)),
-        max_fd3_bytes=int(getattr(limits, "max_fd3_bytes", sandbox.DEFAULT_MAX_FD3_BYTES)),
+        wall_clock_s=float(wall_clock_s),
+        max_fd3_bytes=_fd3_limit(max_fd3_bytes),
     )
 
 
@@ -779,112 +809,112 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
     """Seatbelt invocation with fd 3 output and fd 4 query input/output."""
     del vault_path
     run_dir_real, work_dir_real = executor._prepare_run_dir(run_dir)
-    code_path = run_dir_real / "code.py"
-    code_path.write_text(code, encoding="utf-8")
-    runner_path = run_dir_real / "runner.py"
-    # Written below, once the real descriptor numbers are known -- see the
-    # comment on the Popen call.
-    profile_path = run_dir_real / "profile.sb"
-    profile_text = sandbox.build_profile(
-        real_home=executor._real_home,
-        pyenv_prefix=executor._pyenv_prefix,
-        venv_dir=executor._venv_dir,
-        pkg_dir=None,
-        work_dir=str(work_dir_real),
-    )
-    # The child must not be able to read the parent-owned profile back as an
-    # information channel.
-    quoted_profile = sandbox._scheme_quote(str(profile_path))
-    profile_text += f'\n(deny file-read-data (literal "{quoted_profile}"))\n'
-    profile_path.write_text(profile_text, encoding="utf-8")
-
-    argv = [executor.SANDBOX_EXEC, "-f", str(profile_path), executor._python,
-            "-I", str(runner_path)]
-    env = {"PATH": "/usr/bin:/bin", "TMPDIR": str(work_dir_real),
-           "HOME": str(work_dir_real), "ANALYST_QUERY_FD": str(FD_QUERY)}
-
-    out_r, out_w = os.pipe()
-    out_r = _high_fd(out_r)
-    out_w = _high_fd(out_w)
-    query_fd = _high_fd(query_fd)
-
-    # The child is told its descriptor numbers instead of having them dup2'd
-    # into fixed slots by a `preexec_fn`. `preexec_fn` is documented as unsafe
-    # in a process with threads, and `run_analyst_code` calls this from a worker
-    # thread so the parent can service queries while the child runs -- which is
-    # exactly how this failed the first time it met a real seatbelt executor:
-    # the child died with EBADF before exec, and the whole run came back as
-    # "analyst executor failed: OSError: [Errno 9] Bad file descriptor".
-    # `pass_fds` alone keeps the descriptors open across the close-fds sweep,
-    # and the template already parameterises both numbers.
-    runner_path.write_text(
-        _runner_source(str(code_path), query_fd=query_fd, out_fd=out_w),
-        encoding="utf-8")
-
+    run_limits = sandbox.RunLimits()
+    out_r = out_w = None
+    proc = None
+    sel = None
+    popen_attempted = False
     start = time.monotonic()
-    proc = subprocess.Popen(
-        argv, cwd=str(work_dir_real), env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        pass_fds=(out_w, query_fd),
-        start_new_session=True, close_fds=True,
-    )
-    os.close(out_w)
-    os.close(query_fd)
-
     fd3_buf = bytearray()
     stdout_buf = bytearray()
     stderr_buf = bytearray()
     fd3_oversized = False
-    sel = selectors.DefaultSelector()
-    sel.register(out_r, selectors.EVENT_READ, "fd3")
-    sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
-    sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
-    run_limits = _limits_for_executor(limits)
-    deadline = start + run_limits.wall_clock_s
     timed_out = False
-
-    while sel.get_map():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            break
-        for key, _ in sel.select(min(remaining, 0.25)):
-            fileobj = key.fileobj
-            fd = fileobj if isinstance(fileobj, int) else fileobj.fileno()
-            try:
-                chunk = os.read(fd, _CHUNK)
-            except OSError:
-                chunk = b""
-            if not chunk:
-                sel.unregister(fileobj)
-                try:
-                    if not isinstance(fileobj, int):
-                        fileobj.close()
-                except Exception:
-                    pass
-                continue
-            if key.data == "fd3":
-                if len(fd3_buf) < sandbox._FD3_DRAIN_CEILING:
-                    fd3_buf.extend(chunk)
-                    if len(fd3_buf) > run_limits.max_fd3_bytes:
-                        fd3_oversized = True
-                else:
-                    fd3_oversized = True
-            elif key.data == "stdout":
-                stdout_buf.extend(chunk)
-            else:
-                stderr_buf.extend(chunk)
-
     killed_group = False
-    if timed_out:
+
+    def _close(fileobj) -> None:
+        if fileobj is None:
+            return
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-            killed_group = True
-        except (ProcessLookupError, PermissionError):
+            if isinstance(fileobj, int):
+                os.close(fileobj)
+            else:
+                fileobj.close()
+        except BaseException:
             pass
-        grace_deadline = time.monotonic() + 5
-        while sel.get_map() and time.monotonic() < grace_deadline:
-            for key, _ in sel.select(0.25):
+
+    def _kill_and_reap(process) -> bool:
+        if process is None:
+            return False
+        killed = False
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            killed = True
+        except BaseException:
+            try:
+                process.kill()
+                killed = True
+            except BaseException:
+                pass
+        try:
+            process.wait(timeout=5)
+        except BaseException:
+            pass
+        return killed
+
+    try:
+        run_limits = _limits_for_executor(limits)
+        code_path = run_dir_real / "code.py"
+        _write_exclusive(code_path, code)
+        runner_path = run_dir_real / "runner.py"
+        # Written below, once the real descriptor numbers are known -- see
+        # the comment on the Popen call.
+        profile_path = run_dir_real / "profile.sb"
+        profile_text = sandbox.build_profile(
+            real_home=executor._real_home,
+            pyenv_prefix=executor._pyenv_prefix,
+            venv_dir=executor._venv_dir,
+            pkg_dir=None,
+            work_dir=str(work_dir_real),
+        )
+        # The child must not be able to read the parent-owned profile back as
+        # an information channel.
+        quoted_profile = sandbox._scheme_quote(str(profile_path))
+        profile_text += f'\n(deny file-read-data (literal "{quoted_profile}"))\n'
+        _write_exclusive(profile_path, profile_text)
+
+        argv = [executor.SANDBOX_EXEC, "-f", str(profile_path), executor._python,
+                "-I", str(runner_path)]
+        env = {"PATH": "/usr/bin:/bin", "TMPDIR": str(work_dir_real),
+               "HOME": str(work_dir_real), "ANALYST_QUERY_FD": str(FD_QUERY)}
+
+        out_r, out_w = os.pipe()
+        out_r = _high_fd(out_r)
+        out_w = _high_fd(out_w)
+        query_fd = _high_fd(query_fd)
+
+        # The child is told its descriptor numbers instead of having them
+        # dup2'd into fixed slots by a `preexec_fn`. `preexec_fn` is unsafe in
+        # a process with threads, and the template parameterises both numbers.
+        _write_exclusive(
+            runner_path,
+            _runner_source(str(code_path), query_fd=query_fd, out_fd=out_w),
+        )
+
+        popen_attempted = True
+        proc = subprocess.Popen(
+            argv, cwd=str(work_dir_real), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=(out_w, query_fd),
+            start_new_session=True, close_fds=True,
+        )
+        _close(out_w)
+        out_w = None
+        _close(query_fd)
+        query_fd = None
+
+        sel = selectors.DefaultSelector()
+        sel.register(out_r, selectors.EVENT_READ, "fd3")
+        sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
+        sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
+        deadline = start + run_limits.wall_clock_s
+
+        while sel.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in sel.select(min(remaining, 0.25)):
                 fileobj = key.fileobj
                 fd = fileobj if isinstance(fileobj, int) else fileobj.fileno()
                 try:
@@ -893,26 +923,70 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
                     chunk = b""
                 if not chunk:
                     sel.unregister(fileobj)
+                    _close(fileobj)
                     continue
                 if key.data == "fd3":
                     if len(fd3_buf) < sandbox._FD3_DRAIN_CEILING:
                         fd3_buf.extend(chunk)
+                        if len(fd3_buf) > run_limits.max_fd3_bytes:
+                            fd3_oversized = True
+                    else:
+                        fd3_oversized = True
                 elif key.data == "stdout":
                     stdout_buf.extend(chunk)
                 else:
                     stderr_buf.extend(chunk)
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    for fileobj in (out_r, proc.stdout, proc.stderr):
-        try:
-            if isinstance(fileobj, int):
-                os.close(fileobj)
-            else:
-                fileobj.close()
-        except Exception:
-            pass
+
+        if timed_out:
+            killed_group = _kill_and_reap(proc)
+            # The grace drain is best-effort. The process has already been
+            # reaped, and a selector failure here must not reopen the leak.
+            grace_deadline = time.monotonic() + 5
+            while sel.get_map() and time.monotonic() < grace_deadline:
+                for key, _ in sel.select(0.25):
+                    fileobj = key.fileobj
+                    fd = fileobj if isinstance(fileobj, int) else fileobj.fileno()
+                    try:
+                        chunk = os.read(fd, _CHUNK)
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        sel.unregister(fileobj)
+                        _close(fileobj)
+                        continue
+                    if key.data == "fd3":
+                        if len(fd3_buf) < sandbox._FD3_DRAIN_CEILING:
+                            fd3_buf.extend(chunk)
+                    elif key.data == "stdout":
+                        stdout_buf.extend(chunk)
+                    else:
+                        stderr_buf.extend(chunk)
+        else:
+            proc.wait(timeout=5)
+    except BaseException:
+        killed_group = _kill_and_reap(proc)
+        if not popen_attempted:
+            raise
+        returncode = getattr(proc, "returncode", None)
+        return sandbox.RawResult(
+            fd3_bytes=bytes(fd3_buf[:run_limits.max_fd3_bytes])
+            if fd3_oversized else bytes(fd3_buf),
+            fd3_oversized=fd3_oversized, stdout=bytes(stdout_buf),
+            stderr=bytes(stderr_buf), returncode=returncode,
+            timed_out=timed_out, killed_group=killed_group,
+            duration_s=time.monotonic() - start, pgid=getattr(proc, "pid", 0),
+            run_dir=run_dir_real,
+        )
+    finally:
+        if sel is not None:
+            _close(sel)
+        _close(out_r)
+        _close(out_w)
+        _close(query_fd)
+        if proc is not None:
+            _close(getattr(proc, "stdout", None))
+            _close(getattr(proc, "stderr", None))
+
     return sandbox.RawResult(
         fd3_bytes=(bytes(fd3_buf[:run_limits.max_fd3_bytes])
                    if fd3_oversized else bytes(fd3_buf)),

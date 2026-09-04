@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from . import db
 from . import metrics as mx
-from . import vault
+from . import vault as V
 from .metrics import WEAR_MIN_HOURS
 
 # Literature figures are data, not instructions for the model to calculate.
@@ -193,7 +193,7 @@ def _as_of(conn, as_of: str | None) -> str:
 
 def _today(conn) -> date:
     """Return today's date in the vault's declared zone, or the host date."""
-    local_timezone = vault.local_timezone(conn)
+    local_timezone = V.local_timezone(conn)
     return (datetime.now(ZoneInfo(local_timezone)).date()
             if local_timezone else date.today())
 
@@ -455,7 +455,8 @@ def session_hr_scopes(conn, start_utc: str, end_utc: str,
     return out
 
 
-def impact_volume(conn, start: str, end: str, by: str = "week") -> list[dict]:
+def impact_volume(conn, start: str, end: str, by: str = "week", *,
+                  metric_units: bool = False) -> list[dict]:
     """Minutes actually spent jogging vs walking between two local dates.
 
     Groups raw distance_walking_running samples into fixed time buckets and
@@ -497,8 +498,13 @@ def impact_volume(conn, start: str, end: str, by: str = "week") -> list[dict]:
 
     out: list[dict] = []
     prev_jog: float | None = None
+    distance_key = "jog_km" if metric_units else "jog_miles"
     for r in rows:
         jog_min = round((r["jog_buckets"] or 0) * bucket_min, 1)
+        jog_distance = round(
+            (r["jog_mi"] or 0.0)
+            * (V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+               if metric_units else 1.0), 2)
         source, note = "measured", None
         if by == "week":
             covered = [d for d in manual if _week_start(d) == r["period"]
@@ -513,7 +519,7 @@ def impact_volume(conn, start: str, end: str, by: str = "week") -> list[dict]:
         out.append({
             "period_start": r["period"],
             "jog_minutes": jog_min,
-            "jog_miles": round(r["jog_mi"] or 0.0, 2),
+            distance_key: jog_distance,
             "jog_pace_min_per_mi": (round((r["jog_buckets"] * bucket_min) / r["jog_mi"], 1)
                                     if r["jog_mi"] else None),
             "walk_minutes": round((r["walk_buckets"] or 0) * bucket_min, 1),
@@ -533,7 +539,7 @@ def impact_volume(conn, start: str, end: str, by: str = "week") -> list[dict]:
             out.append({
                 "period_start": day,
                 "jog_minutes": manual[day]["minutes"],
-                "jog_miles": None, "jog_pace_min_per_mi": None,
+                distance_key: None, "jog_pace_min_per_mi": None,
                 "walk_minutes": 0.0, "walk_miles": 0.0, "jog_change_pct": None,
                 "jog_minutes_source": "manual",
                 "manual_note": manual[day]["note"],
@@ -548,7 +554,7 @@ def impact_volume(conn, start: str, end: str, by: str = "week") -> list[dict]:
             out.append({
                 "period_start": wk,
                 "jog_minutes": manual[day]["minutes"],
-                "jog_miles": None, "jog_pace_min_per_mi": None,
+                distance_key: None, "jog_pace_min_per_mi": None,
                 "walk_minutes": 0.0, "walk_miles": 0.0, "jog_change_pct": None,
                 "jog_minutes_source": "partly_manual",
                 "manual_note": f"{day} {manual[day]['note']}",
@@ -1278,7 +1284,8 @@ def training_load(conn, as_of: str | None = None) -> dict:
     }
 
 
-def workout_focus(conn, as_of: str | None = None) -> dict | None:
+def workout_focus(conn, as_of: str | None = None, *,
+                  metric_units: bool = False) -> dict | None:
     """Most recent workout within the lookback window.
     Running-style workouts get pace; cycling gets speed so a bike ride can never
     be narrated as a running pace.
@@ -1307,22 +1314,31 @@ def workout_focus(conn, as_of: str | None = None) -> dict | None:
     jog_pace = None
     if not cycling:
         try:
-            rows = impact_volume(conn, day, day, by="day")
+            rows = impact_volume(conn, day, day, by="day", metric_units=metric_units)
             jog_pace = rows[0].get("jog_pace_min_per_mi") if rows else None
         except Exception:  # noqa: BLE001 — a briefing must not die for a label
             jog_pace = None
+    pace_key = "pace_min_per_km" if metric_units else "pace_min_per_mi"
+    speed_key = "speed_kph" if metric_units else "speed_mph"
+    pace = (None if cycling else dur / dist if dist and dur else None)
+    speed = (dist / (dur / 60) if cycling and dist and dur else None)
+    if metric_units:
+        factor = V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+        pace = mx.r(pace / factor, 1) if pace is not None else None
+        speed = mx.r(speed * factor, 1) if speed is not None else None
+    else:
+        pace = mx.r(pace, 1) if pace is not None else None
+        speed = mx.r(speed, 1) if speed is not None else None
     out = {
         "type": row["workout_type"],
         "date": day,
         "distance_mi": mx.r(dist, 1) if dist is not None else None,
         "duration_min": mx.r(dur, 1) if dur is not None else None,
         "energy_kcal": mx.r(row["energy_kcal"]) if row["energy_kcal"] is not None else None,
-        "pace_min_per_mi": (None if cycling else mx.r(dur / dist, 1)
-                            if dist and dur else None),
+        pace_key: pace,
         "pace_label": None if cycling else "blended",
         "jog_pace_min_per_mi": jog_pace,
-        "speed_mph": (mx.r(dist / (dur / 60), 1)
-                      if cycling and dist and dur else None),
+        speed_key: speed,
     }
     return out
 
@@ -1497,17 +1513,21 @@ def talking_points(parts: dict) -> list[dict]:
     stopped = [(m, c) for m, c in cov.items() if c["status"] in COVERAGE_STOPPED]
 
     wf = parts.get("workout_focus")
-    if wf and wf.get("distance_mi") and (wf.get("pace_min_per_mi")
-                                          or wf.get("speed_mph")):
+    pace_key = ("pace_min_per_mi" if wf and "pace_min_per_mi" in wf
+                else "pace_min_per_km")
+    speed_key = ("speed_mph" if wf and "speed_mph" in wf
+                 else "speed_kph")
+    if wf and wf.get("distance_mi") and (wf.get(pace_key) or wf.get(speed_key)):
         # Date-stamp the seed: the focus workout may be up to 2 days old, and an
         # undated seed reads as "today" to the narrator (observed fabrication:
         # a rest-day briefing praising the previous day's ride as today's).
         when = "today" if wf.get("date") == parts.get("as_of") \
             else f"on {wf.get('date')} (not today)"
-        if wf.get("speed_mph") is not None:
+        if wf.get(speed_key) is not None:
+            speed_unit = "mph" if speed_key == "speed_mph" else "kph"
             seed = (f"{wf['type']} workout {when}: {wf['distance_mi']} mi at "
-                    f"{wf['speed_mph']} mph")
-            numbers = [wf["distance_mi"], wf["speed_mph"]]
+                    f"{wf[speed_key]} {speed_unit}")
+            numbers = [wf["distance_mi"], wf[speed_key]]
         elif wf.get("jog_pace_min_per_mi") is not None:
             # Say the jog pace where the day has one: it is the number the ramp
             # and the "slow down" lever are both defined on. The blended figure
@@ -1517,9 +1537,10 @@ def talking_points(parts: dict) -> list[dict]:
                     f"(walk breaks excluded)")
             numbers = [wf["distance_mi"], wf["jog_pace_min_per_mi"]]
         else:
+            pace_unit = "min/mi" if pace_key == "pace_min_per_mi" else "min/km"
             seed = (f"{wf['type']} workout {when}: {wf['distance_mi']} mi at "
-                    f"blended pace {wf['pace_min_per_mi']} min/mi")
-            numbers = [wf["distance_mi"], wf["pace_min_per_mi"]]
+                    f"blended pace {wf[pace_key]} {pace_unit}")
+            numbers = [wf["distance_mi"], wf[pace_key]]
         tp.append({"topic": "workout", "seed": seed, "numbers": numbers})
 
     rd = parts["readiness"]
@@ -1578,11 +1599,12 @@ def talking_points(parts: dict) -> list[dict]:
     return tp
 
 
-def build_briefing(conn, scope: str = "daily", as_of: str | None = None) -> dict:
+def build_briefing(conn, scope: str = "daily", as_of: str | None = None, *,
+                   metric_units: bool = False) -> dict:
     as_of = _as_of(conn, as_of)
     rd = readiness(conn, as_of)
     tl = training_load(conn, as_of)
-    wf = workout_focus(conn, as_of)
+    wf = workout_focus(conn, as_of, metric_units=metric_units)
     parts = {
         "as_of": as_of,
         "scope": scope,
@@ -1668,7 +1690,7 @@ def instrument_eras_status(conn, metric: str, start: str, end: str) -> dict:
     """
     rows, provenance = _source_months(conn, metric, start, end)
     if rows is None:
-        return {**vault.raw_unavailable(metric,
+        return {**V.raw_unavailable(metric,
                                         needed_for="instrument era detection"),
                 "boundaries": [], "provenance": None}
 

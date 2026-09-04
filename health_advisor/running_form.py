@@ -24,12 +24,25 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 
 from . import metrics as mx
+from . import vault as V
 
 MIN_JOG_MINUTES = 10.0   # below this a half is too short to compare against
 MIN_HALF_BUCKETS = 5     # HR-bearing jog buckets needed in EACH half
 
 
-def _collapse_bucket_rows(buckets):
+def _pace_min_per_mi(bucket, metric_units: bool = False):
+    if metric_units and bucket.get("pace_min_per_km") is not None:
+        return bucket["pace_min_per_km"] * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+    return bucket.get("pace_min_per_mi")
+
+
+def _speed_mph(bucket, metric_units: bool = False):
+    if metric_units and bucket.get("speed_kph") is not None:
+        return bucket["speed_kph"] / V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+    return bucket.get("speed_mph")
+
+
+def _collapse_bucket_rows(buckets, metric_units: bool = False):
     """Collapse local-date splits of one UTC bucket before measuring it."""
     grouped = {}
     for bucket in buckets:
@@ -51,39 +64,47 @@ def _collapse_bucket_rows(buckets):
         is_walk = bool(not is_jog and pace is not None
                        and pace >= mx.IMPACT_IMPLAUSIBLE_PACE_MIN
                        and pace <= mx.IMPACT_WALK_PACE_MAX)
+        speed = (miles / (bucket_min / 60.0)) if miles > 0 else None
         out.append({"bucket_start_utc": start,
                     "local_date": rows[0].get("local_date"),
                     "miles": miles,
                     "hr": hr,
-                    "speed_mph": (miles / (bucket_min / 60.0)) if miles > 0 else None,
-                    "pace_min_per_mi": pace,
+                    **({
+                        "speed_kph": (speed * V.UNIT_CONVERSION_FACTORS[
+                            "distance_mi_to_km"] if speed is not None else None),
+                        "pace_min_per_km": (pace / V.UNIT_CONVERSION_FACTORS[
+                            "distance_mi_to_km"] if pace is not None else None),
+                    } if metric_units else {
+                        "speed_mph": speed,
+                        "pace_min_per_mi": pace,
+                    }),
                     "is_jog": is_jog,
                     "is_walk": is_walk})
     return out
 
 
-def _efficiency(buckets) -> float | None:
+def _efficiency(buckets, metric_units: bool = False) -> float | None:
     """Mean speed/HR over buckets that have both. None if none do."""
-    vals = [b["speed_mph"] / b["hr"]
+    vals = [_speed_mph(b, metric_units) / b["hr"]
             for b in buckets
-            if b.get("hr") and b.get("speed_mph")]
+            if b.get("hr") and _speed_mph(b, metric_units)]
     if not vals:
         return None
     return sum(vals) / len(vals)
 
 
-def efficiency_change_from_buckets(buckets) -> dict:
+def efficiency_change_from_buckets(buckets, metric_units: bool = False) -> dict:
     """Percentage change in speed/HR efficiency, first vs second half of
     cumulative jog time. Negative means efficiency fell across the session.
 
     Pure function over bucket_series rows so it can be tested without a DB.
     """
-    buckets = _collapse_bucket_rows(buckets)
+    buckets = _collapse_bucket_rows(buckets, metric_units)
     buckets_dropped_implausible = sum(
         1 for b in buckets
         if not b.get("is_jog") and not b.get("is_walk")
-        and b.get("pace_min_per_mi") is not None
-        and b["pace_min_per_mi"] < mx.IMPACT_IMPLAUSIBLE_PACE_MIN
+        and _pace_min_per_mi(b, metric_units) is not None
+        and _pace_min_per_mi(b, metric_units) < mx.IMPACT_IMPLAUSIBLE_PACE_MIN
     )
     jog = [b for b in buckets if b.get("is_jog")]
     jog_minutes = len(jog) * (mx.IMPACT_BUCKET_SECONDS / 60.0)
@@ -95,15 +116,15 @@ def efficiency_change_from_buckets(buckets) -> dict:
 
     mid = len(jog) // 2
     first, second = jog[:mid], jog[mid:]
-    n_first = sum(1 for b in first if b.get("hr") and b.get("speed_mph"))
-    n_second = sum(1 for b in second if b.get("hr") and b.get("speed_mph"))
+    n_first = sum(1 for b in first if b.get("hr") and _speed_mph(b, metric_units))
+    n_second = sum(1 for b in second if b.get("hr") and _speed_mph(b, metric_units))
     if n_first < MIN_HALF_BUCKETS or n_second < MIN_HALF_BUCKETS:
         return {"status": "insufficient_half_coverage",
                 "reason": f"{n_first} and {n_second} usable buckets in the two "
                           f"halves; need {MIN_HALF_BUCKETS} in each",
                 "jog_minutes": round(jog_minutes, 1)}
 
-    e1, e2 = _efficiency(first), _efficiency(second)
+    e1, e2 = _efficiency(first, metric_units), _efficiency(second, metric_units)
     return {
         "status": "ok",
         "change_pct": mx.r((e2 - e1) / e1 * 100.0),
@@ -116,12 +137,15 @@ def efficiency_change_from_buckets(buckets) -> dict:
     }
 
 
-def jog_efficiency_change(conn, start_utc: str, end_utc: str) -> dict:
+def jog_efficiency_change(conn, start_utc: str, end_utc: str, *,
+                          metric_units: bool = False) -> dict:
     """efficiency_change_from_buckets over one workout's window."""
-    return efficiency_change_from_buckets(mx.bucket_series(conn, start_utc, end_utc))
+    return efficiency_change_from_buckets(
+        mx.bucket_series(conn, start_utc, end_utc, metric_units=metric_units),
+        metric_units=metric_units)
 
 
-def walk_structure_from_buckets(buckets) -> dict:
+def walk_structure_from_buckets(buckets, metric_units: bool = False) -> dict:
     """Walk fraction and bout structure across the session, and how it is
     distributed early vs late.
 
@@ -135,7 +159,7 @@ def walk_structure_from_buckets(buckets) -> dict:
     bout of a minute, not three events. Halves split on cumulative jog time, the
     same as efficiency_change_from_buckets, so the two are directly comparable.
     """
-    buckets = _collapse_bucket_rows(buckets)
+    buckets = _collapse_bucket_rows(buckets, metric_units)
     moving = [b for b in buckets if b.get("is_jog") or b.get("is_walk")]
     jog = [b for b in moving if b.get("is_jog")]
     bucket_min = mx.IMPACT_BUCKET_SECONDS / 60.0
@@ -184,9 +208,12 @@ def walk_structure_from_buckets(buckets) -> dict:
     }
 
 
-def walk_structure(conn, start_utc: str, end_utc: str) -> dict:
+def walk_structure(conn, start_utc: str, end_utc: str, *,
+                   metric_units: bool = False) -> dict:
     """walk_structure_from_buckets over one workout's window."""
-    return walk_structure_from_buckets(mx.bucket_series(conn, start_utc, end_utc))
+    return walk_structure_from_buckets(
+        mx.bucket_series(conn, start_utc, end_utc, metric_units=metric_units),
+        metric_units=metric_units)
 
 
 # Where Week 5's third gear landed. PARTLY POST HOC: chosen from an observed
@@ -202,15 +229,16 @@ CAVEAT = ("Descriptive only: nothing here controls for terrain, grade, heat, "
           "The reference band was chosen from an observed training week.")
 
 
-def in_reference_band(buckets, band=REFERENCE_PACE_BAND) -> list[dict]:
+def in_reference_band(buckets, band=REFERENCE_PACE_BAND, *,
+                      metric_units: bool = False) -> list[dict]:
     """Jog buckets whose pace falls inside the reference band, and which carry
     both HR and speed."""
-    buckets = _collapse_bucket_rows(buckets)
+    buckets = _collapse_bucket_rows(buckets, metric_units)
     lo, hi = band
     return [b for b in buckets
-            if b.get("is_jog") and b.get("hr") and b.get("speed_mph")
-            and b.get("pace_min_per_mi") is not None
-            and lo <= b["pace_min_per_mi"] <= hi]
+            if b.get("is_jog") and b.get("hr") and _speed_mph(b, metric_units)
+            and _pace_min_per_mi(b, metric_units) is not None
+            and lo <= _pace_min_per_mi(b, metric_units) <= hi]
 
 
 def trend_from_weeks(weeks) -> dict:
@@ -234,7 +262,8 @@ def trend_from_weeks(weeks) -> dict:
     }
 
 
-def banded_weekly(conn, start: str, end: str) -> dict:
+def banded_weekly(conn, start: str, end: str, *,
+                  metric_units: bool = False) -> dict:
     """Weekly mean efficiency (speed/HR) and mean HR within the reference pace
     band, Monday-anchored, plus their slopes.
 
@@ -253,7 +282,10 @@ def banded_weekly(conn, start: str, end: str) -> dict:
     # which is impossible for a subset of the same day's buckets.
     by_week: dict[str, dict[tuple, dict]] = {}
     for w in runs:
-        band = in_reference_band(mx.bucket_series(conn, w["start_utc"], w["end_utc"]))
+        band = in_reference_band(
+            mx.bucket_series(conn, w["start_utc"], w["end_utc"],
+                             metric_units=metric_units),
+            metric_units=metric_units)
         if not band:
             continue
         d = date.fromisoformat(w["local_date"])
@@ -269,7 +301,8 @@ def banded_weekly(conn, start: str, end: str) -> dict:
             continue
         weeks.append({
             "week_start": key,
-            "efficiency": mx.r(sum(b["speed_mph"] / b["hr"] for b in bs) / len(bs), 4),
+            "efficiency": mx.r(sum(_speed_mph(b, metric_units) / b["hr"]
+                                    for b in bs) / len(bs), 4),
             "mean_hr": mx.r(sum(b["hr"] for b in bs) / len(bs)),
             "buckets": len(bs),
         })
@@ -311,7 +344,8 @@ def reference_from_changes(changes) -> dict:
 
 
 def personal_reference(conn, start: str, end: str,
-                       exclude_start_utc: str | None = None) -> dict:
+                       exclude_start_utc: str | None = None, *,
+                       metric_units: bool = False) -> dict:
     """reference_from_changes over every comparable run in a date range.
 
     `exclude_start_utc` leaves a session out, so a run can be compared against
@@ -331,7 +365,8 @@ def personal_reference(conn, start: str, end: str,
         # reference distribution the current run is judged against.
         if any(s <= w["start_utc"] and w["end_utc"] <= e for s, e in kept):
             continue
-        out = jog_efficiency_change(conn, w["start_utc"], w["end_utc"])
+        out = jog_efficiency_change(conn, w["start_utc"], w["end_utc"],
+                                    metric_units=metric_units)
         if out["status"] == "ok":
             changes.append(out["change_pct"])
             kept.append((w["start_utc"], w["end_utc"]))
@@ -361,8 +396,10 @@ def _running_power_buckets(conn, start_utc: str, end_utc: str) -> dict[tuple[str
 
 
 def _matched_power_for_run(conn, start_utc: str, end_utc: str,
-                           pace_band: tuple[float, float]) -> float | None:
-    buckets = mx.bucket_series(conn, start_utc, end_utc)
+                           pace_band: tuple[float, float], *,
+                           metric_units: bool = False) -> float | None:
+    buckets = mx.bucket_series(conn, start_utc, end_utc,
+                               metric_units=metric_units)
     powers = _running_power_buckets(conn, start_utc, end_utc)
     if not buckets:
         return None
@@ -383,8 +420,8 @@ def _matched_power_for_run(conn, start_utc: str, end_utc: str,
 
         if (bucket.get("is_jog")
                 and block_elapsed >= RUNNING_POWER_LAG_SECONDS
-                and bucket.get("pace_min_per_mi") is not None
-                and lo <= bucket["pace_min_per_mi"] <= hi):
+                and _pace_min_per_mi(bucket, metric_units) is not None
+                and lo <= _pace_min_per_mi(bucket, metric_units) <= hi):
             key = (bucket["local_date"], start // mx.IMPACT_BUCKET_SECONDS)
             if key in powers:
                 matched.append(powers[key])
@@ -394,7 +431,8 @@ def _matched_power_for_run(conn, start_utc: str, end_utc: str,
 
 
 def monthly_running_power(conn, month: str,
-                           pace_band: tuple[float, float] = REFERENCE_PACE_BAND) -> float | None:
+                           pace_band: tuple[float, float] = REFERENCE_PACE_BAND, *,
+                           metric_units: bool = False) -> float | None:
     """Mean matched-pace power for a month, or ``None`` with fewer than two runs.
 
     Only route-backed Apple Watch running workouts are outdoor evidence. Each
@@ -424,6 +462,7 @@ def monthly_running_power(conn, month: str,
             continue
         value = _matched_power_for_run(
             conn, run["start_utc"], run["end_utc"], pace_band,
+            metric_units=metric_units,
         )
         if value is not None:
             run_means.append(value)

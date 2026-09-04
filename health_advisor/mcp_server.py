@@ -1054,7 +1054,8 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
 
 def _impact_periods(rows: list[dict], start: str, end: str,
                     by: str, *, as_of: str | None = None,
-                    local_timezone: tzinfo | None = None) -> list[dict]:
+                    local_timezone: tzinfo | None = None,
+                    metric_units: bool = False) -> list[dict]:
     """Return the gap-filled impact periods with their completeness labels.
 
     Both the ordinary impact tool and its block-comparison mode need exactly
@@ -1076,6 +1077,7 @@ def _impact_periods(rows: list[dict], start: str, end: str,
     end = end_date.isoformat()
 
     have = {r["period_start"]: r for r in rows}
+    distance_key = "jog_km" if metric_units else "jog_miles"
     periods = []
     for key in _impact_period_keys(start, end, by):
         iso = key.isoformat()
@@ -1083,7 +1085,7 @@ def _impact_periods(rows: list[dict], start: str, end: str,
         covered = _impact_days_covered(
             key, by, start, end, as_of=as_of, local_timezone=local_timezone)
         row = have.get(iso) or {
-            "period_start": iso, "jog_minutes": 0.0, "jog_miles": 0.0,
+            "period_start": iso, "jog_minutes": 0.0, distance_key: 0.0,
             "jog_pace_min_per_mi": None, "walk_minutes": 0.0, "walk_miles": 0.0,
             "jog_change_pct": None,
         }
@@ -1314,7 +1316,10 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
             return {"error": f"{label} must be YYYY-MM-DD"}
     if start > end:
         return {"error": "start must be on or before end"}
-    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    settings = ctx.settings()
+    local_timezone = _as_timezone(settings["local_timezone"])
+    declared_unit_system = settings["unit_system"]
+    metric_units = declared_unit_system == "metric"
     conn = ctx.read_only()
     try:
         as_of = A._as_of(conn, None)
@@ -1326,7 +1331,8 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                     "reason": "window_after_as_of"}
 
         effective_end = min(date.fromisoformat(end), as_of_date).isoformat()
-        rows = A.impact_volume(conn, start, effective_end, by=by)
+        rows = A.impact_volume(conn, start, effective_end, by=by,
+                               metric_units=metric_units)
         sens = _jog_threshold_sensitivity(conn, start, effective_end)
         # Fill periods analysis had no rows for, then recompute the change
         # column over the complete sequence. The same labelled rows feed block
@@ -1334,7 +1340,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
         # because the source rows are computed here; the helper itself is pure.
         periods = _impact_periods(
             rows, start, effective_end, by, as_of=as_of,
-            local_timezone=local_timezone)
+            local_timezone=local_timezone, metric_units=metric_units)
     except ValueError as e:
         return {"error": str(e)}
     finally:
@@ -1546,12 +1552,16 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
     nothing for the most recent run. Dates are local YYYY-MM-DD."""
     if err := _bad_dates(workout_date=workout_date, start=start, end=end):
         return {"error": err}
+    settings = ctx.settings()
+    declared_unit_system = settings["unit_system"]
+    metric_units = declared_unit_system == "metric"
     conn = ctx.read_only()
     try:
         if start and end:
             if start > end:
                 return {"error": "start must be on or before end"}
-            return {"mode": "trend", **RF.banded_weekly(conn, start, end)}
+            return {"mode": "trend", **RF.banded_weekly(
+                conn, start, end, metric_units=metric_units)}
 
         active = db.workout_mark_condition(conn, "w")
         if workout_date:
@@ -1575,12 +1585,14 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
             "found": True,
             "date": row["local_date"],
             "efficiency_change": RF.jog_efficiency_change(
-                conn, row["start_utc"], row["end_utc"]),
+                conn, row["start_utc"], row["end_utc"],
+                metric_units=metric_units),
             "walk_structure": RF.walk_structure(
-                conn, row["start_utc"], row["end_utc"]),
+                conn, row["start_utc"], row["end_utc"],
+                metric_units=metric_units),
             "personal_reference": RF.personal_reference(
                 conn, "2026-01-01", row["local_date"],
-                exclude_start_utc=row["start_utc"]),
+                exclude_start_utc=row["start_utc"], metric_units=metric_units),
         }
     finally:
         conn.close()
@@ -1602,9 +1614,13 @@ def get_briefing(ctx: VaultContext, scope: str = "daily", day: str | None = None
     if scope not in BRIEFING_SCOPES:
         return {"error": f"scope={scope!r} is not a briefing scope; use "
                          f"{' or '.join(repr(s) for s in BRIEFING_SCOPES)}"}
+    settings = ctx.settings()
+    declared_unit_system = settings["unit_system"]
+    metric_units = declared_unit_system == "metric"
     conn = ctx.read_only()
     try:
-        return A.build_briefing(conn, scope=scope, as_of=day)
+        return A.build_briefing(conn, scope=scope, as_of=day,
+                                metric_units=metric_units)
     finally:
         conn.close()
 
@@ -2366,7 +2382,10 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
     """
     if err := _bad_dates(day=day):
         return {"ok": False, "error": err}
-    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    settings = ctx.settings()
+    local_timezone = _as_timezone(settings["local_timezone"])
+    declared_unit_system = settings["unit_system"]
+    metric_units = declared_unit_system == "metric"
     if day > _today(local_timezone).isoformat():
         return {"ok": False, "error": f"day={day!r} is in the future"}
     conn = ctx.connect()
@@ -2374,7 +2393,8 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
         db.init_db(conn)
         db.log_manual_jog(conn, day, jog_minutes=jog_minutes,
                           source_note=source_note, why=why)
-        rows = A.impact_volume(conn, day, day, by="day")
+        rows = A.impact_volume(conn, day, day, by="day",
+                               metric_units=metric_units)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     finally:

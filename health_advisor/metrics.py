@@ -474,7 +474,8 @@ def impact_bucket_rows(conn, window_predicate: str,
     return [dict(row) for row in rows]
 
 
-def bucket_series(conn, start_utc: str, end_utc: str) -> list[dict]:
+def bucket_series(conn, start_utc: str, end_utc: str, *,
+                  metric_units: bool = False) -> list[dict]:
     """Per-bucket view of the jog/walk classification, over a UTC window.
 
     Same rule as analysis.impact_volume — that function aggregates these
@@ -486,6 +487,9 @@ def bucket_series(conn, start_utc: str, end_utc: str) -> list[dict]:
     edge. `speed_mph` is carried explicitly so no caller has to invert pace —
     efficiency is speed/HR, and a ratio built on pace moves the wrong way.
     """
+    if metric_units:
+        from . import vault as V
+
     bucket_min = IMPACT_BUCKET_SECONDS / 60.0
     rows = impact_bucket_rows(
         conn, "start_utc >= ? AND start_utc < ?", (start_utc, end_utc),
@@ -508,8 +512,16 @@ def bucket_series(conn, start_utc: str, end_utc: str) -> list[dict]:
             "hr": hr,
             "cadence_spm": (float(row["cadence_spm"])
                             if row["cadence_spm"] is not None else None),
-            "speed_mph": (mi / (bucket_min / 60.0)) if mi > 0 else None,
-            "pace_min_per_mi": pace,
+            **({
+                "speed_kph": (mi / (bucket_min / 60.0))
+                             * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+                             if mi > 0 else None,
+                "pace_min_per_km": (pace / V.UNIT_CONVERSION_FACTORS[
+                    "distance_mi_to_km"] if pace is not None else None),
+            } if metric_units else {
+                "speed_mph": (mi / (bucket_min / 60.0)) if mi > 0 else None,
+                "pace_min_per_mi": pace,
+            }),
             "is_jog": is_jog,
             "is_walk": is_walk,
         })

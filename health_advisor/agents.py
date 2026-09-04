@@ -299,6 +299,399 @@ def substance_check(text: str) -> SubstanceResult:
                            tuple(signals), tuple(evidence))
 
 
+# ---------------------------------------------------------------------------
+# #16 — a stated DAY COUNT against the answer's OWN itemisation.
+#
+# Scope, decided on measured evidence 2026-09-04: build a check for the one
+# observed failure shape only — a day count overstated by one, contradicted by
+# the sentence's own itemisation. Explicitly ruled out, and NOT built here: a
+# word-number-to-digit tokenizer, and any widening of `numeric_tokens`. Over
+# 158 published narrations the exposure was 219 word-number hits adjacent to a
+# unit or metric noun; the harm was 2 arithmetically wrong against 119 correct.
+# Roughly 140 of those 219 were fixed comparison windows ("the last four
+# weeks"), which is ordinary coaching prose — a check that refuses them is
+# worse than the hole it closes. Every guard below exists to leave those alone.
+#
+# `_COUNT_WORDS` is a closed twelve-entry lookup used ONLY to read the integer
+# on the LEFT of this one comparison. It is not a tokenizer, nothing else
+# imports it, and `_numeric_tokens` / `strip_dates_and_names` are untouched:
+# word-numbers remain invisible to every grounding gate, exactly as decided.
+#
+# WHY IT LIVES HERE, beside `substance_check`, and not in `deepdive_verify`:
+# this is a SELF-CONSISTENCY check, not a grounding check. It never reads the
+# ledger, the payload or a claim, because it does not need one — the payload
+# cannot supply "three" either way, and the contradiction is entirely inside
+# the text. `deepdive_verify`'s scanners all reconcile prose against a scoped
+# Python verdict; this one reconciles prose against itself, which is the same
+# category as the other text-only deterministic gate in this module. It shares
+# `_PROSE_DATE_RE` / `_DATE_RE` rather than defining a second date pattern, so
+# the "one tokenizer definition, shared" invariant holds: there is no new
+# numeric pattern in this repo.
+#
+# IT FIRES ONLY WHEN BOTH HALVES ARE IN THE TEXT: a count of days, and an
+# enumeration of dated entries that the count phrase ITSELF introduces. The
+# introducer (a colon, an OPENING spaced dash, an opening paren, "namely") is what makes
+# the list exhaustive and therefore comparable. Without it, "you ran five days
+# this week; Mar 3 was the hardest" is a partial mention, not a contradiction,
+# and refusing it would cost far more than the two errors this closes.
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                "eleven": 11, "twelve": 12}
+
+# The count, then at most two adjective-ish words ("running", "easy"), then the
+# day noun. The leading guard is the tokenizer's own: a digit after a letter,
+# a dot or a hyphen belongs to something else ("68.3", "VO2max", "3-day").
+_DAY_COUNT_RE = re.compile(
+    r"(?<![\w.-])(?P<count>\d{1,2}|"
+    + "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
+    + r")\s+(?P<gap>(?:[A-Za-z][A-Za-z-]*\s+){0,2})(?P<noun>days?)(?![\w-])",
+    re.I)
+# Determiners that must never appear between the count and the noun: each one
+# turns the phrase into something other than "a count of the listed days".
+_GAP_STOP = frozenset({
+    "of", "the", "a", "an", "and", "or", "out", "to", "in", "on", "at", "for",
+    "by", "with", "your", "my", "our", "their", "his", "her", "its", "this",
+    "that", "these", "those", "is", "are", "was", "were", "has", "have", "had",
+    "been", "more", "less", "fewer", "than", "as", "per", "every", "each"})
+# A FIXED COMPARISON WINDOW, an approximation, or a bound — never a count of a
+# set the sentence is about to enumerate. This is the guard that protects the
+# ~140/219 measured idiom hits: "over the last four days", "about three days",
+# "at least two days". "other" is deliberately absent: "the other four days
+# (Mar 4, 5, 7, 9)" is a real published shape and IS an exhaustive itemisation.
+#
+# The `a full` / `an entire` group is the TOTALITY idiom, added 2026-09-04 on a
+# measured false positive over the private narration corpus: "the week of <date>
+# — a full 7 days — totaled <n> jogging minutes". "a full N days" states the
+# LENGTH of a window; it never counts a set the sentence is about to list.
+# `all` is already in the list above and already stands "all three days: Mar 3,
+# Mar 5" down, so this is that same class written with a determiner instead of
+# a bare quantifier — not a new kind of leniency. It stays a CLOSED lexical
+# list for exactly that reason: full/whole/entire/complete after a/an/the, and
+# nothing generic ("a good 7 days"). The moment this becomes a modifier
+# wildcard it starts eating the real hits.
+_WINDOW_LEAD_RE = re.compile(
+    r"\b(?:last|past|previous|prior|next|recent|coming|upcoming|first|final|"
+    r"preceding|following|another|any|all|about|around|approximately|roughly|"
+    r"nearly|almost|least|most|than|under|over|within|up\s+to|every|each|"
+    r"(?:an?|the)\s+(?:full|whole|entire|complete))"
+    r"\s+(?:the\s+)?$", re.I)
+# A PARTITIVE: "one of your three easy days" counts a subset out of the set,
+# so the enumeration that follows is not the count's own itemisation.
+_PARTITIVE_LEAD_RE = re.compile(
+    r"\b(?:\d{1,2}|" + "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
+    + r"|some|several|many|few|none|any|all|each|one)\s+(?:out\s+)?of\s+"
+    r"(?:(?:your|my|our|their|his|her|its|the|these|those)\s+)?$", re.I)
+# A count of PLANNED days is a count of intent, not of the entries beside it:
+# "two out of four planned days: Mar 3 and Mar 5" is a correct sentence in
+# which the mismatch IS the point. These words in the gap stand the check down.
+_PLANNED_GAP = frozenset({
+    "planned", "scheduled", "prescribed", "target", "targeted", "intended",
+    "remaining", "possible", "available", "potential", "upcoming", "key",
+    "recommended", "suggested", "optional", "ideal"})
+# The enumeration introducer. The optional lead is a TIGHT allowlist rather
+# than "up to N words", because a permissive bridge reads "three days later —
+# Mar 6 felt easier" as a count with a one-item itemisation and fires on
+# perfectly good prose.
+_ENUM_INTRO_RE = re.compile(
+    # No `\A`: this pattern is applied with `.match(prose, pos)`, which already
+    # anchors at pos, while `\A` would only ever match at offset 0.
+    r"(?:\s+(?:this|that|last|the)?\s*(?:week|month))?"
+    r"(?:\s+(?:in\s+total|total|altogether|overall|so\s+far))?"
+    r"\s*(?::|\s+[—–]\s+|\s+-\s+|\(|,\s+(?:namely|specifically)[,:]?\s)")
+# A spaced dash that CLOSES a dash-delimited aside is not an introducer. An
+# aside is bounded on BOTH sides, and what follows its closing dash belongs to
+# the sentence the aside interrupted — not to the count sitting inside it. This
+# is the structural half of the 2026-09-04 false positive: in "the week of
+# <date> — a full 7 days — totaled <n> jogging minutes, and ...", the trailing
+# dash was read as "this count introduces what follows" and the window length
+# was then compared against the remainder of the sentence.
+#
+# Parity inside the segment is what separates the two dashes, and it is exactly
+# right for the shape that matters: a genuine introduction ("four cycling days
+# — 30.0 minutes on Mar 3 and 47.5 minutes on Mar 6") has no unmatched dash
+# before the count, so it still fires. Only the dash form of the introducer is
+# affected; a colon or a parenthesis inside an aside still introduces normally,
+# because neither is half of a pair that the count is sitting between.
+#
+# HORIZONTAL whitespace only, and that is load-bearing rather than tidiness: a
+# markdown bullet ("\n- 30.0 minutes on Mar 3") is a spaced dash too, and with
+# `\s` on the left an ODD number of bullets earlier in the same segment flipped
+# the parity and stood a later, genuine dash-introduced hit down. An aside is
+# never opened by a dash that begins a line, so a leading newline disqualifies
+# the dash from the parity count and the bullets fall out.
+_SPACED_DASH_RE = re.compile(r"[^\S\n\r][—–][^\S\n\r]|[^\S\n\r]-[^\S\n\r]")
+# A segment ends at a sentence terminator or a blank line. The digit lookbehind
+# keeps "44.0" and "Mar 3." from ending it; the capitalised-abbreviation
+# lookbehinds keep "Aug." and "Sept." from ending it.
+_SEGMENT_END_RE = re.compile(
+    r"(?<!\d)(?<![A-Z][a-z]{2})(?<![A-Z][a-z]{3})[.!?](?=[\s\"'’”)\]]|$)"
+    r"|\n[ \t]*\n")
+# An itemisation that ADMITS it is partial is not comparable with the count.
+_PARTIAL_LIST_RE = re.compile(
+    r"\b(?:including|includ(?:es|ed|ing)|such\s+as|for\s+example|e\.?g\.?|"
+    r"among\s+(?:them|others|other)|others|notably|especially|mostly|chiefly|"
+    r"at\s+least|and\s+so\s+on|etc\.?|plus\s+others|and\s+more)\b|\.\.\.|…",
+    re.I)
+# A range denotes an unknown number of days, so the list cannot be counted.
+_RANGE_HINT_RE = re.compile(
+    r"\b(?:between|through|thru)\b"
+    r"|\d{4}-\d{2}-\d{2}\s*(?:to|through|[–—-])\s*\d{4}-\d{2}-\d{2}", re.I)
+_WEEKDAY_RE = re.compile(
+    r"\b(?:mon|tues?|wed(?:nes)?|thur?s?|fri|sat(?:ur)?|sun)(?:day)?\b\.?",
+    re.I)
+_ORDINAL_DAY_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.I)
+# A BARE CONTINUATION DAY that `_PROSE_DATE_RE` did not absorb. That pattern's
+# day-list tail (#187) is deliberately all-or-nothing: "Mar 3, 5 and 7 were
+# easy" ends in a word, so the tail matches nothing and only "Mar 3" is a date.
+# For the grounding gate that is the right fail-open — 5 and 7 keep being
+# graded. For THIS check it is the dangerous direction: two real days would go
+# uncounted and a correct sentence would be called a contradiction. So when the
+# run is present but unabsorbed, the check stands down instead of counting.
+# The day-shape guards are copied in intent from `_PROSE_DATE_RE`'s tail: 1..31,
+# and never the head of a decimal or a longer digit run, so "on Mar 3, 47.5
+# minutes on Mar 6" is not mistaken for a continuation and still gets checked.
+_CONT_DAY_RUN_RE = re.compile(
+    r"(?:\s*(?:,\s*(?:and\s+)?|and\s+|&\s*)"
+    r"(?:0?[1-9]|[12]\d|3[01])(?!\d)(?![.,/]\d))+")
+_RELATIVE_DAY_RE = re.compile(r"\b(?:today|yesterday|tonight)\b", re.I)
+# An itemisation does not have to label every entry: "three key days:
+# Tuesday's intervals, Thursday's tempo, and the long run" names three entries
+# and dates two, and it is perfectly correct prose. So the comparison is
+# against an UPPER BOUND — dated days plus undated entries that could be days —
+# and not against the dated days alone. An entry that only closes the list
+# ("and the rest of the week had no cycling recorded") is not a day and does
+# not raise the bound; that clause is exactly what makes the observed failure
+# self-refuting.
+_ITEM_SPLIT_RE = re.compile(r"[;,\n]|\band\b|\bplus\b|&", re.I)
+_CLOSING_CLAUSE_RE = re.compile(
+    r"\b(?:no|none|nothing|not|never|zero|nil|else|otherwise|rest\s+of|"
+    r"remainder|remaining|only|all)\b", re.I)
+
+
+@dataclass(frozen=True)
+class DayCountResult:
+    """Explain the deterministic day-count decision made for one answer.
+
+    ``ok`` is false only when the text states a day count and then itemises
+    FEWER entries under it than the count claims. ``findings`` carries one
+    dict per contradiction — ``stated``, ``itemised`` (distinct dated days),
+    ``undated`` (listed entries carrying no day label, which still count
+    against the claim), ``delta``, the matched ``span`` and the day ``labels``
+    — so a hit can be audited by hand without re-running the check. ``notes`` records why each near-miss was left
+    alone, which is what makes a refusal-cost sweep readable.
+
+    The object is truthy when ``ok`` is true, as ``SubstanceResult`` is.
+    """
+
+    ok: bool
+    reason: str
+    findings: tuple[dict, ...] = ()
+    evidence: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def as_dict(self) -> dict:
+        """Return a JSON/log-friendly representation."""
+        return {"ok": self.ok, "reason": self.reason,
+                "findings": [dict(f) for f in self.findings],
+                "evidence": list(self.evidence), "notes": list(self.notes)}
+
+
+def _day_labels(span: str) -> tuple[set, str | None]:
+    """Count the DISTINCT days a span itemises, or say why it cannot be counted.
+
+    Distinct, because two entries on one date are one day and the count on the
+    left of the comparison is a count of days. Every ambiguity returns a reason
+    instead of a number: an uncountable list must make the check stand down,
+    never fire. Overcounting is the safe direction (it only suppresses a hit);
+    undercounting invents a contradiction, which is the failure this whole
+    check is scoped to avoid.
+
+    Dates are recognised with the module's existing `_PROSE_DATE_RE` and
+    `_DATE_RE` — no second date pattern is defined for this check, so the
+    day-list tail (#187) and the half-eaten-year guards apply here unchanged.
+    """
+    if _RANGE_HINT_RE.search(span):
+        return set(), "the itemisation spans a range"
+    labels: set = set()
+    # LINE BY LINE, because `_PROSE_DATE_RE`'s range alternative accepts any
+    # whitespace around the dash — so a markdown list ("Mar 3\n- 20.0 minutes")
+    # reads as the range "Mar 3 - 20" and the whole itemisation would stand the
+    # check down. A range never spans a line break in prose, and every other
+    # pattern here is line-local anyway.
+    for line in span.splitlines() or [span]:
+        consumed: list[tuple[int, int]] = []
+        for match in _PROSE_DATE_RE.finditer(line):
+            chunk = match.group(0)
+            consumed.append(match.span())
+            if ":" in chunk:
+                continue                  # a clock time is not a day label
+            if re.search(r"\d\s*[–—-]\s*\d", chunk):
+                return set(), "the itemisation spans a range"
+            month = re.search(r"[A-Za-z]+", chunk)
+            days = [tok for tok in re.findall(r"\d+", chunk) if len(tok) <= 2]
+            if month is None or not days:
+                continue                  # "July 2026" is a month, not a day
+            if _CONT_DAY_RUN_RE.match(line, match.end()):
+                return set(), "an unterminated day list cannot be counted"
+            for day in days:
+                labels.add(("md", month.group(0)[:3].lower(), int(day)))
+        for match in _DATE_RE.finditer(line):
+            if any(start <= match.start() < end for start, end in consumed):
+                continue
+            if len(match.group(0)) == 7:
+                continue                  # a bare year-month is not a day
+            consumed.append(match.span())
+            labels.add(("iso", match.group(0)))
+        for pattern, kind in ((_WEEKDAY_RE, "wd"), (_ORDINAL_DAY_RE, "ord"),
+                              (_RELATIVE_DAY_RE, "rel")):
+            for match in pattern.finditer(line):
+                if any(start <= match.start() < end for start, end in consumed):
+                    continue
+                token = match.group(0).strip(".").lower()
+                labels.add((kind, token[:3] if kind != "ord" else token))
+    return labels, None
+
+
+def _closes_a_dash_aside(prose: str, pos: int) -> bool:
+    """True when the count at ``pos`` sits inside an unclosed dash aside.
+
+    Counted within the current sentence only, because an aside never spans a
+    sentence terminator and a stray dash in an earlier sentence must not flip
+    the parity of this one. An odd number of spaced dashes between the start of
+    the segment and the count means one of them opened an aside that is still
+    open, so the next spaced dash closes it rather than introducing a list.
+    """
+    start = 0
+    for match in _SEGMENT_END_RE.finditer(prose):
+        if match.end() > pos:
+            break
+        start = match.end()
+    return len(_SPACED_DASH_RE.findall(prose[start:pos])) % 2 == 1
+
+
+def _undated_entries(span: str) -> int:
+    """Count entries in an itemisation that carry no day label but could be one.
+
+    These raise the ceiling the stated count is compared against. An entry that
+    merely closes the list — "and the rest of the week had no cycling recorded",
+    "nothing else was logged" — is not a candidate day, and a bare year (the
+    tail of "Mar 3, 2031") is not an entry at all.
+    """
+    undated = 0
+    for item in _ITEM_SPLIT_RE.split(span):
+        entry = item.strip(" \t\r-*•·:.!?…()[]\"'")
+        if not entry or not any(char.isalnum() for char in entry):
+            continue
+        if re.fullmatch(r"\d{1,4}(?:st|nd|rd|th)?", entry, re.I):
+            continue    # a bare number: a year, or a continuation day already
+                        # counted as a label by the date scan above
+        if _day_labels(entry)[0]:
+            continue
+        if _CLOSING_CLAUSE_RE.search(entry):
+            continue
+        undated += 1
+    return undated
+
+
+def day_count_check(text: str) -> DayCountResult:
+    """Reject an answer whose stated day count contradicts its own itemisation.
+
+    The observed defect, twice, on otherwise correct figures: the answer says
+    it ran on three days, then itemises two of them and adds that the rest of
+    the week had none. Every quantity is right; only the day count is wrong,
+    and the sentence refutes it without any external reference. So this check
+    takes no ledger, no payload and no claim — call it on a bare answer string.
+
+    It fires only when a count of days is IMMEDIATELY followed by an
+    enumeration it introduces (colon, spaced dash, parenthesis, "namely") and
+    the enumeration cannot account for the count even generously: the stated
+    number is compared against distinct dated days PLUS undated entries in the
+    same list that could be days, so "three key days: Tuesday's intervals,
+    Thursday's tempo, and the long run" is left alone. It is
+    deliberately one-directional: a stated count LOWER than the itemisation is
+    not flagged, because a list may legitimately run past the window the count
+    describes, and only overstatement was observed.
+
+    Returns a ``DayCountResult``; ``ok`` is true when nothing contradicts,
+    including when no countable day claim is present at all.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return DayCountResult(True, "no stated day count to check")
+
+    # Scan the invisible-stripped view, as every other gate here does; the
+    # reported offsets are offsets into that view.
+    prose = strip_invisible(text)
+    findings: list[dict] = []
+    notes: list[str] = []
+
+    for match in _DAY_COUNT_RE.finditer(prose):
+        raw = match.group("count").lower()
+        stated = _COUNT_WORDS.get(raw, int(raw) if raw.isdigit() else 0)
+        if not 1 <= stated <= 31:
+            continue
+        gap = [word.lower() for word in match.group("gap").split()]
+        if any(word in _GAP_STOP for word in gap):
+            continue
+        if any(word in _PLANNED_GAP for word in gap):
+            notes.append(f"a planned or prospective count: {match.group(0)!r}")
+            continue
+        lead = prose[max(0, match.start() - 40):match.start()]
+        if _PARTITIVE_LEAD_RE.search(lead):
+            notes.append(f"partitive, not a count: {match.group(0)!r}")
+            continue
+        if _WINDOW_LEAD_RE.search(lead):
+            notes.append(f"comparison window or bound: {match.group(0)!r}")
+            continue
+        intro = _ENUM_INTRO_RE.match(prose, match.end())
+        if intro is None:
+            notes.append(f"no itemisation introduced: {match.group(0)!r}")
+            continue
+        # Ask the INTRODUCER what form it took, rather than re-matching the
+        # aside pattern over it: `_ENUM_INTRO_RE`'s dash alternatives accept a
+        # newline, which the parity pattern above deliberately does not.
+        if (intro.group(0).rstrip()[-1:] in "—–-"
+                and _closes_a_dash_aside(prose, match.start())):
+            notes.append(
+                f"a dash aside closes rather than introduces: "
+                f"{match.group(0)!r}")
+            continue
+        end = _SEGMENT_END_RE.search(prose, intro.end())
+        span = prose[intro.end():end.start() if end else len(prose)]
+        if _PARTIAL_LIST_RE.search(span):
+            notes.append(f"itemisation declares itself partial: {match.group(0)!r}")
+            continue
+        labels, why = _day_labels(span)
+        if why is not None:
+            notes.append(f"{why}: {match.group(0)!r}")
+            continue
+        itemised = len(labels)
+        if itemised == 0:
+            notes.append(f"nothing dated is itemised: {match.group(0)!r}")
+            continue
+        undated = _undated_entries(span)
+        if stated <= itemised + undated:
+            continue
+        findings.append({
+            "stated": stated, "itemised": itemised, "undated": undated,
+            "delta": stated - itemised - undated,
+            "span": prose[match.start():end.start() if end else len(prose)],
+            "start": match.start(), "end": end.start() if end else len(prose),
+            "labels": sorted(str(label) for label in labels),
+        })
+
+    if findings:
+        return DayCountResult(
+            False,
+            "a stated day count exceeds the days the same sentence itemises",
+            tuple(findings), tuple(f["span"] for f in findings), tuple(notes))
+    return DayCountResult(
+        True, "no stated day count contradicts its own itemisation",
+        notes=tuple(notes))
+
+
 def run_model(prompt: str, *, tools: str | None = None, ctx=None,
                max_turns: int | None = None,
                timeout: int | None = None, think: bool = False,

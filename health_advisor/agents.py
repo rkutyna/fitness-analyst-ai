@@ -388,6 +388,29 @@ _PLANNED_GAP = frozenset({
     "planned", "scheduled", "prescribed", "target", "targeted", "intended",
     "remaining", "possible", "available", "potential", "upcoming", "key",
     "recommended", "suggested", "optional", "ideal"})
+# The same PLANNED class, reached by framing instead of by an adjective in the
+# gap. `_PLANNED_GAP` catches "three planned days"; it cannot catch "Your plan
+# has three quality days: Tuesday and Friday", where the intent lives in the
+# verb phrase on the LEFT and the count phrase itself is bare. A prescription
+# that names two example days under a three-day plan is a shape the coaching
+# surface actively produces, and it is not a self-contradiction: the plan is
+# the subject, the dates are illustrations of it.
+#
+# CLOSED on both halves, exactly as the `a full` / `a whole` group above is: a
+# plan-ish subject noun, then one of an enumerated set of stative verbs. There
+# is no modifier wildcard and no bare "the plan ... three days" bridge — the
+# verb must sit immediately before the count, or "you changed the plan after
+# three easy days: Mar 3 and Mar 5" would be swallowed too.
+#
+# "block" is deliberately NOT a subject here. Every other noun in the list can
+# only name a prescription; a block is as often the training that was actually
+# done ("that block had three hard days: Mar 3 and Mar 5"), and exempting it
+# would hide a real self-contradiction rather than a prescription.
+_PLANNED_LEAD_RE = re.compile(
+    r"\b(?:plans?|programmes?|programs?|schedules?|templates?)\s+"
+    r"(?:has|have|had|includes?|included|contains?|contained|prescribes?|"
+    r"prescribed|sets?|specifies|specified|calls?\s+for|called\s+for|"
+    r"asks?\s+for|asked\s+for)\s+$", re.I)
 # The enumeration introducer. The optional lead is a TIGHT allowlist rather
 # than "up to N words", because a permissive bridge reads "three days later —
 # Mar 6 felt easier" as a count with a one-item itemisation and fires on
@@ -431,6 +454,40 @@ _PARTIAL_LIST_RE = re.compile(
     r"\b(?:including|includ(?:es|ed|ing)|such\s+as|for\s+example|e\.?g\.?|"
     r"among\s+(?:them|others|other)|others|notably|especially|mostly|chiefly|"
     r"at\s+least|and\s+so\s+on|etc\.?|plus\s+others|and\s+more)\b|\.\.\.|…",
+    re.I)
+# An itemisation whose CLOSING clause predicates the listed entries as a
+# distinguished subset of the counted set is not comparable with the count
+# either — and it says so on the right of the list rather than on the left.
+# `_PARTIAL_LIST_RE` reads the introducer's own hedges ("including", "such
+# as"); this reads the tail. "You trained on four days last week: Tuesday and
+# Friday were the hard ones" states four days and then names WHICH TWO were
+# hard. The count is correct; the colon introduces a qualified subset, not an
+# enumeration of all four.
+#
+# Three closed frames, and no modifier wildcard — the adjective slot is an
+# enumerated coaching vocabulary, added the way `a full` / `a whole` /
+# `an entire` / `a complete` joined the window leads:
+#   <list> was/were the <ADJ> one(s)     — anaphoric: "the hard ones"
+#   <list> was/were the <NOUN>           — nominalised: "the standouts"
+#   <list> stand(s)/stood out            — the selective verb
+#
+# ANCHORED AT THE END of the span, which is what makes it a *trailing*
+# qualifier rather than a keyword anywhere in the list. A mid-list aside
+# ("three running days: Mar 3, which was the hard one, and Mar 5") qualifies
+# ONE entry, not the list, and must keep being counted — an unanchored search
+# would stand that real contradiction down.
+_SUBSET_TAIL_RE = re.compile(
+    r"(?:"
+    r"\b(?:was|were)\s+the\s+(?:"
+    r"hard|hardest|tough|toughest|easy|easiest|big|biggest|long|longest|"
+    r"short|shortest|best|worst|strong|strongest|fast|fastest|slow|slowest|"
+    r"heavy|heaviest|light|lightest|key|quality|notable|good|solid|flat"
+    r")\s+ones?"
+    r"|\b(?:was|were)\s+the\s+(?:standouts?|highlights?|exceptions?|"
+    r"outliers?|hardest|easiest|biggest|longest|shortest|toughest|strongest|"
+    r"fastest|slowest|heaviest|lightest|best|worst)"
+    r"|\b(?:stands?|stood)\s+out"
+    r")\b[\s.,;:!?)\"'’”\]…]*$",
     re.I)
 # A range denotes an unknown number of days, so the list cannot be counted.
 _RANGE_HINT_RE = re.compile(
@@ -645,6 +702,10 @@ def day_count_check(text: str) -> DayCountResult:
         if _WINDOW_LEAD_RE.search(lead):
             notes.append(f"comparison window or bound: {match.group(0)!r}")
             continue
+        if _PLANNED_LEAD_RE.search(lead):
+            notes.append(
+                f"a plan or prescription states the count: {match.group(0)!r}")
+            continue
         intro = _ENUM_INTRO_RE.match(prose, match.end())
         if intro is None:
             notes.append(f"no itemisation introduced: {match.group(0)!r}")
@@ -662,6 +723,11 @@ def day_count_check(text: str) -> DayCountResult:
         span = prose[intro.end():end.start() if end else len(prose)]
         if _PARTIAL_LIST_RE.search(span):
             notes.append(f"itemisation declares itself partial: {match.group(0)!r}")
+            continue
+        if _SUBSET_TAIL_RE.search(span):
+            notes.append(
+                f"the itemisation closes as a qualified subset: "
+                f"{match.group(0)!r}")
             continue
         labels, why = _day_labels(span)
         if why is not None:

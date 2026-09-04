@@ -438,3 +438,125 @@ def test_the_check_needs_no_ledger_payload_or_claim():
 
     signature = inspect.signature(G.day_count_check)
     assert list(signature.parameters) == ["text"]
+
+
+# --------------------------------------------------------------------------
+# The two measured false positives of 2026-09-04, and the guards that close
+# them. Both are ORDINARY COACHING PROSE that the check refused: one states a
+# correct count and then names a qualified subset of it, the other states a
+# PLANNED count and names two example days under it.
+#
+# Each negative is paired with a near-twin positive that differs only in the
+# thing the guard reads. That pairing is the test: without it, either guard
+# could pass by switching the check off for the whole shape.
+#
+# Every month, day and figure here is invented; the real answers were one
+# person's health data in a private repo.
+# --------------------------------------------------------------------------
+
+def test_a_trailing_subset_qualifier_is_not_flagged():
+    """"were the hard ones" predicates the listed days as a distinguished
+    SUBSET of the four. The count is correct and the colon introduces a
+    selection, not an enumeration of all four days."""
+    result = G.day_count_check(
+        "You trained on four days last week: Tuesday and Friday were the "
+        "hard ones.")
+
+    assert result.ok, result.as_dict()
+    assert result.findings == ()
+    assert any("qualified subset" in note for note in result.notes), result.notes
+
+
+def test_the_same_sentence_without_the_qualifier_still_flags():
+    """The near twin of the fixture above, differing only by the trailing
+    qualifier. Drop "were the hard ones" and the list IS the itemisation of
+    the four, so the contradiction is real and must still be caught."""
+    result = G.day_count_check(
+        "You trained on four days last week: Tuesday and Friday.")
+
+    assert not result, result.as_dict()
+    assert (result.findings[0]["stated"], result.findings[0]["itemised"]) == (4, 2)
+    assert result.findings[0]["delta"] == 2
+
+
+def test_a_qualifier_that_does_not_close_the_list_still_flags():
+    """The exemption is a TRAILING qualifier, anchored at the end of the span.
+    Mid-list, "was the hard one" qualifies ONE entry rather than the list, so
+    an unanchored keyword search here would stand a real contradiction down."""
+    result = G.day_count_check(
+        "You trained on four days last week: Tuesday was the hard one and "
+        "Friday was steady.")
+
+    assert not result, result.as_dict()
+    assert result.findings[0]["stated"] == 4
+    assert result.findings[0]["itemised"] == 2
+
+
+@pytest.mark.parametrize("text", [
+    "Your plan has three quality days: Tuesday and Friday.",
+    "The plan calls for three quality days: Tuesday and Friday.",
+    "Your program includes three quality days: Tuesday and Friday.",
+    "The schedule prescribes three quality days: Tuesday and Friday.",
+    "You have three quality days scheduled: Tuesday and Friday.",
+])
+def test_a_plan_stating_the_count_is_not_flagged(text):
+    """A PLANNED count is a count of intent, and the dates under it are
+    examples of the prescription rather than its full itemisation.
+    `_PLANNED_GAP` reads an adjective between the count and the noun; these
+    shapes carry the intent in the verb phrase to the LEFT instead."""
+    result = G.day_count_check(text)
+
+    assert result.ok, result.as_dict()
+    assert result.findings == ()
+
+
+def test_the_same_count_reported_rather_than_planned_still_flags():
+    """The near twin of the fixtures above: identical count phrase, identical
+    itemisation, but reported rather than prescribed. The plan guard must not
+    have switched the check off for "three quality days" as a shape."""
+    result = G.day_count_check(
+        "You trained on three quality days: Tuesday and Friday.")
+
+    assert not result, result.as_dict()
+    assert (result.findings[0]["stated"], result.findings[0]["itemised"]) == (3, 2)
+    assert result.findings[0]["delta"] == 1
+
+
+def test_a_plan_word_that_is_not_a_plan_statement_still_flags():
+    """The plan guard is a closed subject+verb pair immediately before the
+    count, not "the word plan appears nearby"."""
+    result = G.day_count_check(
+        "You changed the plan after three easy days: Mar 3 and Mar 5.")
+
+    assert not result, result.as_dict()
+    assert result.findings[0]["delta"] == 1
+
+
+def test_both_ground_truth_positives_still_flag_by_exactly_one():
+    """The only real evidence this check works: the two published narrations
+    that overstated a day count by one and were refuted by their own
+    itemisation, reproduced in shape with invented figures. Any exemption
+    added to this check must leave both of them flagging."""
+    first = G.day_count_check(
+        "That came from three running days: 30.0 minutes on Mar 3, 20.0 "
+        "minutes on Mar 5, and nothing else was logged.")
+    second = G.day_count_check(
+        "That came from three running days: 30.0 minutes on Mar 3, 20.0 "
+        "minutes on Mar 5, and the rest of the week had no running recorded.")
+
+    for result in (first, second):
+        assert not result, result.as_dict()
+        finding = result.findings[0]
+        assert (finding["stated"], finding["itemised"], finding["undated"]) == (3, 2, 0)
+        assert finding["delta"] == 1
+
+
+def test_a_training_block_is_not_a_plan_statement():
+    """"block" is kept out of the plan-lead subjects on purpose: unlike plan /
+    programme / schedule / template it as often names the training that was
+    actually done, so exempting it would hide a real self-contradiction."""
+    result = G.day_count_check(
+        "That block had three hard days: Mar 3 and Mar 5.")
+
+    assert not result, result.as_dict()
+    assert result.findings[0]["delta"] == 1

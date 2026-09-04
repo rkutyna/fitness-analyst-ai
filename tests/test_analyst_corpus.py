@@ -30,6 +30,7 @@ import pytest
 
 from health_advisor import analyst_corpus as ac
 from health_advisor import analyst_envelope, analyst_ledger, analyst_runner
+from health_advisor.corpus_build import build_corpus, sha256_text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_CORPUS = REPO_ROOT / "data" / "corpus" / "corpus.db"
@@ -66,6 +67,35 @@ def corpus():
         conn.close()
 
 
+def _build_test_corpus(path: Path) -> Path:
+    text = "Integrity check passage for a built corpus. " * 40
+    build_corpus(
+        [{
+            "doc_id": "built-doc",
+            "title": "Built document",
+            "authors": "Author",
+            "year": 2020,
+            "doi": None,
+            "pmid": None,
+            "source_url": "https://example.org/built-doc",
+            "retrieved_at": "2026-08-30T09:00:00Z",
+            "source_sha256": "0" * 64,
+            "text_sha256": sha256_text(text),
+            "license": "CC-BY-4.0",
+            "license_url": "https://creativecommons.org/licenses/by/4.0/",
+            "redistributable": 1,
+            "approver": "reviewer",
+            "approved_at": "2026-08-30",
+            "notes": None,
+        }],
+        [text],
+        path,
+        corpus_version=1,
+        read_only=False,
+    )
+    return path
+
+
 @pytest.fixture()
 def orphan_corpus(tmp_path):
     """A copy of the real corpus carrying one chunk with no ``docs`` row.
@@ -87,7 +117,7 @@ def orphan_corpus(tmp_path):
     )
     writer.commit()
     writer.close()
-    conn = ac.open_corpus(path)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         yield conn
     finally:
@@ -914,6 +944,60 @@ def test_open_corpus_refuses_a_missing_file(tmp_path):
     with pytest.raises(ac.CiteRefusal) as caught:
         ac.open_corpus(tmp_path / "nope.db")
     assert caught.value.code == "no_such_corpus"
+
+
+def test_open_corpus_refuses_a_forged_orphan_in_a_copy(tmp_path):
+    built = _build_test_corpus(tmp_path / "built.db")
+    forged = tmp_path / "forged-copy.db"
+    shutil.copy(built, forged)
+    forged.chmod(0o644)
+    writer = sqlite3.connect(forged)
+    writer.execute(
+        "INSERT INTO chunks(doc_id, chunk_ix, body) VALUES (?, ?, ?)",
+        ("orphan-doc", 0, "A forged passage with no registry row."),
+    )
+    writer.commit()
+    writer.close()
+
+    raw = sqlite3.connect(f"file:{forged}?mode=ro", uri=True)
+    try:
+        assert raw.execute(
+            "SELECT doc_id FROM chunks WHERE chunks MATCH ?",
+            ('"forged"',)).fetchall() == [("orphan-doc",)]
+        assert ac.cite(raw, "forged orphan", state=ac.CiteState()) == []
+        with pytest.raises(ac.CiteRefusal) as named:
+            ac.cite(raw, "forged orphan", state=ac.CiteState(),
+                    doc_id="orphan-doc")
+        assert named.value.code == "orphan_doc"
+    finally:
+        raw.close()
+
+    with pytest.raises(ac.CiteRefusal) as caught:
+        ac.open_corpus(forged)
+    assert caught.value.code == "corpus_integrity"
+    assert caught.value.code != named.value.code
+    assert caught.value.code != "unknown_doc"
+    assert caught.value.reason != "does not resolve"
+
+
+def test_open_corpus_checks_once_per_open_not_per_citation(tmp_path, monkeypatch):
+    path = _build_test_corpus(tmp_path / "built.db")
+    calls = 0
+    original = ac._check_corpus_integrity
+
+    def counted_check(conn):
+        nonlocal calls
+        calls += 1
+        return original(conn)
+
+    monkeypatch.setattr(ac, "_check_corpus_integrity", counted_check)
+    conn = ac.open_corpus(path)
+    try:
+        ac.cite(conn, "integrity check", state=ac.CiteState())
+        ac.cite(conn, "built corpus", state=ac.CiteState())
+    finally:
+        conn.close()
+    assert calls == 1
 
 
 def test_temp_store_is_never_set():

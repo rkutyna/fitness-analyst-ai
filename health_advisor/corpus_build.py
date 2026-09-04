@@ -17,7 +17,8 @@ module exists to make both of them mechanical rather than procedural:
 2. **The registry cannot be bypassed.** `docs` is `NOT NULL` on approver,
    license and both checksums, and `validate_entry` refuses anything the
    constraint would otherwise have to tolerate. "Vetted" is a schema
-   constraint, not a policy (design §1.3, §4.2).
+   constraint for `docs`; `chunks` are enforced at build time and open time
+   (design §1.3, §4.2).
 
 This module is the library half of B1. The entry point is
 `scripts/corpus_ingest.py`, which is run by a human and — deliberately — has no
@@ -53,6 +54,7 @@ __all__ = [
     "BuildResult",
     "RegistryRefusal",
     "build_corpus",
+    "check_corpus_integrity",
     "chunk_text",
     "corpus_file_sha256",
     "extract_text",
@@ -63,8 +65,9 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------- #
-# Schema — design §1.3, verbatim. Do not reorder or relax a NOT NULL: the
-# constraints ARE the vetting policy.
+# Schema — design §1.3, verbatim. Do not reorder or relax a `docs` NOT NULL:
+# those constraints are the registry's vetting policy; `chunks` are checked by
+# the builder and by the parent when the corpus opens.
 # --------------------------------------------------------------------------- #
 
 CORPUS_SCHEMA = """
@@ -135,6 +138,7 @@ class BuildResult:
     builder_sha: str
     doc_count: int
     chunk_count: int
+    orphan_chunk_count: int
     excluded_non_redistributable: int
     excluded_doc_ids: tuple[str, ...]
     corpus_sha256: str
@@ -394,6 +398,22 @@ def builder_sha256() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+_ORPHAN_CHUNK_COUNT_SQL = (
+    "SELECT COUNT(*) FROM chunks WHERE doc_id NOT IN "
+    "(SELECT doc_id FROM docs)"
+)
+
+
+def check_corpus_integrity(conn: sqlite3.Connection) -> int:
+    """Return the number of indexed chunks without a vetted ``docs`` row.
+
+    This is deliberately a query over the opened corpus, not a check of the
+    builder's counters.  The builder runs it before publishing a file and the
+    parent runs it again when opening one.
+    """
+    return int(conn.execute(_ORPHAN_CHUNK_COUNT_SQL).fetchone()[0])
+
+
 # --------------------------------------------------------------------------- #
 # Build
 # --------------------------------------------------------------------------- #
@@ -471,6 +491,7 @@ def build_corpus(
             stale.unlink()
 
     chunk_count = 0
+    orphan_chunk_count = 0
     conn = sqlite3.connect(tmp_path)
     try:
         conn.executescript(CORPUS_SCHEMA)
@@ -504,6 +525,13 @@ def build_corpus(
         conn.commit()
         conn.execute("PRAGMA optimize")
         conn.commit()
+        orphan_chunk_count = check_corpus_integrity(conn)
+        if orphan_chunk_count:
+            raise RegistryRefusal(
+                "orphan_chunks",
+                f"integrity check found {orphan_chunk_count} chunk(s) without "
+                "a docs row",
+            )
     finally:
         conn.close()
 
@@ -518,6 +546,7 @@ def build_corpus(
         builder_sha=b_sha,
         doc_count=len(admitted),
         chunk_count=chunk_count,
+        orphan_chunk_count=orphan_chunk_count,
         excluded_non_redistributable=len(excluded_ids),
         excluded_doc_ids=tuple(excluded_ids),
         corpus_sha256=corpus_file_sha256(out_path),

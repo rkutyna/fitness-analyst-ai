@@ -20,6 +20,7 @@ from health_advisor.corpus_build import (
     BuildResult,
     RegistryRefusal,
     build_corpus,
+    check_corpus_integrity,
     chunk_boundaries,
     chunk_text,
     corpus_file_sha256,
@@ -173,6 +174,17 @@ def test_built_corpus_has_the_design_schema(tmp_path):
             "SELECT sql FROM sqlite_master WHERE name='chunks'").fetchone()[0]
         assert "fts5" in sql.lower()
         assert "porter unicode61" in sql
+    finally:
+        conn.close()
+
+
+def test_build_runs_and_exposes_the_corpus_integrity_check(tmp_path):
+    text = make_text("integrity", 3000)
+    result = build(tmp_path, [(entry("d1", text), text)])
+    assert result.orphan_chunk_count == 0
+    conn = sqlite3.connect(f"file:{result.path}?mode=ro", uri=True)
+    try:
+        assert check_corpus_integrity(conn) == 0
     finally:
         conn.close()
 

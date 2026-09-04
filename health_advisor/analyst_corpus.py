@@ -67,6 +67,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from health_advisor.corpus_build import check_corpus_integrity as _check_corpus_integrity
+
 __all__ = [
     "CHILD_CITE_SNIPPET",
     "CITE_CAPS",
@@ -505,7 +507,24 @@ def open_corpus(corpus_path: str | Path) -> sqlite3.Connection:
     if not path.exists():
         raise CiteRefusal("no_such_corpus",
                           f"no corpus file at {path.name!r}")
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    corpus_conn = None
+    try:
+        corpus_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        orphan_count = _check_corpus_integrity(corpus_conn)
+    except sqlite3.DatabaseError:
+        if corpus_conn is not None:
+            corpus_conn.close()
+        raise CiteRefusal(
+            "corpus_unreadable",
+            "the corpus could not be opened and checked",
+        ) from None
+    if orphan_count:
+        corpus_conn.close()
+        raise CiteRefusal(
+            "corpus_integrity",
+            f"integrity check found {orphan_count} chunk(s) without a docs row",
+        )
+    return corpus_conn
 
 
 def _guard_doc_id(corpus_conn: sqlite3.Connection, doc_id) -> str:

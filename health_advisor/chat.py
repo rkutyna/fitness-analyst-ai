@@ -332,6 +332,7 @@ ASK_CAUSES = (
     "no_gather_needed",
     "judge_refused",
     "denied_available_figure",
+    "contradicted_day_count",
 )
 
 _BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
@@ -387,13 +388,19 @@ def _status_outcome_family(status: dict) -> str:
 def _ask_cause(verification: dict, *, ledger: list[dict],
                loop_outcomes: list[dict], judge_score: int | None = None,
                no_gather_needed: bool = False,
-               denied_available_figure: bool = False) -> str:
+               denied_available_figure: bool = False,
+               contradicted_day_count: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
 
     ``judge_score`` is ``None`` when no judge ran — the fact-template arm
     never judges a kept answer — and only a score that did run and fell
     below the pass mark reads as ``judge_refused``. Measured live 2026-09-01:
     a defaulted 0 labelled every kept template answer as refused.
+
+    ``contradicted_day_count`` is checked after ``denied_available_figure``
+    and before the generic gate verdict: both are Python-owned refusals that
+    a bare ``gate_refused`` would make indistinguishable in the cause log,
+    and the denial gate keeps the precedence it already had.
     """
     families = [_status_outcome_family(status) for status in loop_outcomes]
     if "backend_unavailable" in families:
@@ -406,6 +413,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "empty_gather"
     if denied_available_figure:
         return "denied_available_figure"
+    if contradicted_day_count:
+        return "contradicted_day_count"
     if not verification.get("ok"):
         return "gate_refused"
     if judge_score is not None and judge_score < 70:
@@ -973,6 +982,12 @@ _AVAILABLE_FIGURE_DENIAL_RE = re.compile(
 
 _DENIED_AVAILABLE_FIGURE_REASON = "narration denied an available figure"
 
+# #16. The defect is self-contradiction, not a bad measurement: every figure in
+# the two observed failures was right and only the day count was wrong, refuted
+# by the itemisation in the same sentence. The reason names that, and carries
+# the finding's own numbers so a refusal is auditable from the cause log alone.
+_CONTRADICTED_DAY_COUNT_REASON = "narration contradicts its own day itemisation"
+
 _RESULT_METADATA_KEYS = frozenset({
     "note", "start", "end", "limit", "truncated", "unit", "metric",
     "period", "first_date", "last_date", "group", "agg", "n_days", "ok",
@@ -1270,6 +1285,56 @@ def _mark_denied_available_figure(verification: dict, *, question: str,
     return denied
 
 
+def _contradicted_day_count_reason(result) -> str:
+    """Render the finding so the refusal is actionable and auditable.
+
+    Same shape as ``_fact_template_refusal_detail``'s ``reason; detail``: this
+    string is what both retry-feedback builders quote back to the model, so the
+    repair turn is told which count and which itemisation disagreed rather than
+    being asked to guess.
+    """
+    finding = result.findings[0] if result.findings else {}
+    detail = (f"stated {finding.get('stated')}, itemised "
+              f"{finding.get('itemised')}")
+    undated = finding.get("undated")
+    if undated:
+        detail += f" (plus {undated} undated)"
+    span = finding.get("span")
+    if span:
+        detail += f"; offending span: {span!r}"
+    return f"{_CONTRADICTED_DAY_COUNT_REASON}; {detail}"
+
+
+def _mark_contradicted_day_count(verification: dict, *, text: str) -> bool:
+    """Withhold an answer whose stated day count its own itemisation refutes.
+
+    ``agents.day_count_check`` needs no ledger, no claim and no payload — the
+    contradiction is internal to the text — so this takes only the prose that
+    would publish. Python still owns every number: the check only refuses, and
+    never lets the model derive or restate one.
+
+    Deliberately a no-op once something else has already refused, so an answer
+    the template scan or the denial gate rejected keeps that first reason and
+    the retry keeps the repair detail it already had. That also makes the flag
+    returned here mean "this gate is the deciding one", which is what
+    ``_ask_cause`` needs for the cause to match the reason.
+    """
+    from . import agents
+
+    if not verification.get("ok"):
+        return False
+    result = agents.day_count_check(text)
+    if result.ok:
+        return False
+    verification.update({
+        "ok": False,
+        "grounded": False,
+        "reason": _contradicted_day_count_reason(result),
+        "day_count": result.as_dict(),
+    })
+    return True
+
+
 def _asked_metric_fact_prompt(question: str, facts: dict[str, dict]) -> str:
     """List only closed fact keys for the metric named in the question."""
     from . import fact_template
@@ -1418,11 +1483,17 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         answer_has_asked_metric_figure=_template_has_asked_metric_figure(
             question, template, facts),
         facts=facts, resolved_window=resolved_window)
+    # The interpolated text is what publishes, and it is where a stated day
+    # count meets the days it itemises; the raw template still carries the
+    # word-form counts, so check whichever string would reach the user.
+    contradicted_day_count = _mark_contradicted_day_count(
+        verification, text=interpolated or template)
     verification["cause"] = _ask_cause(
         verification, ledger=ledger, loop_outcomes=[gather_status, final_status],
         no_gather_needed=(not scan["placeholders"]
                           and bool(scan["advice_quantities"])),
-        denied_available_figure=denied_available_figure)
+        denied_available_figure=denied_available_figure,
+        contradicted_day_count=contradicted_day_count)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
@@ -1501,12 +1572,18 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         answer_has_asked_metric_figure=_template_has_asked_metric_figure(
             question, retry_template, facts),
         facts=facts, resolved_window=resolved_window)
+    # The retry publishes verbatim, and it was just asked to rewrite — which is
+    # exactly how an itemisation loses an entry the count still claims. Gating
+    # attempt 1 alone would make one failed attempt the way past this gate.
+    retry_contradicted_day_count = _mark_contradicted_day_count(
+        retry_verification, text=retry_interpolated or retry_template)
     retry_verification["cause"] = _ask_cause(
         retry_verification, ledger=ledger,
         loop_outcomes=[gather_status, retry_status],
         no_gather_needed=(not retry_scan["placeholders"]
                           and bool(retry_scan["advice_quantities"])),
-        denied_available_figure=retry_denied_available_figure)
+        denied_available_figure=retry_denied_available_figure,
+        contradicted_day_count=retry_contradicted_day_count)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]
             and not retry_scan["advice_quantities"]):
@@ -1645,10 +1722,13 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
                 _question_metric(question), claims, verification),
             resolved_window=resolved_window)
+        contradicted_day_count = _mark_contradicted_day_count(
+            verification, text=prose.strip())
         verification["cause"] = _ask_cause(
             verification, ledger=ledger, loop_outcomes=[first_loop_status],
             judge_score=score,
-            denied_available_figure=denied_available_figure)
+            denied_available_figure=denied_available_figure,
+            contradicted_day_count=contradicted_day_count)
         _record_attempt(capture, 1, prose.strip(), claims, verification, score,
                         ledger)
         first_attempt = {
@@ -1699,10 +1779,13 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
                 _question_metric(question), claims, verification),
             resolved_window=resolved_window)
+        contradicted_day_count = _mark_contradicted_day_count(
+            verification, text=prose.strip())
         verification["cause"] = _ask_cause(
             verification, ledger=ledger, loop_outcomes=[retry_loop_status],
             judge_score=score,
-            denied_available_figure=denied_available_figure)
+            denied_available_figure=denied_available_figure,
+            contradicted_day_count=contradicted_day_count)
         _record_attempt(capture, 2, prose.strip(), claims, verification, score,
                         ledger)
         retry_attempt = {

@@ -181,44 +181,33 @@ and it is confined at the OS level rather than by inspecting the code:
 model.** Its enforcement varies by operating system and version, and the project
 measures this rather than assuming it.
 
-`tests/test_analyst_sandbox.py` runs an attack corpus of 34+ attempts across
-nine classes and requires **100% blocking per class**, with any accepted
-exception named explicitly in a module-level `KNOWN_GAPS`. Measured results:
+`tests/test_analyst_sandbox.py` runs an attack corpus of 35 cases across nine
+classes. Every case declares whether it applies to Seatbelt, bubblewrap, or
+both; the roll-up reports applicable and blocked separately. The
+`preplanted_profile_sb_is_overwritten` case is Seatbelt-only because bubblewrap
+does not create a `profile.sb`. Applicable classes still require **100%
+blocking**, with any accepted exception named explicitly in a module-level
+`KNOWN_GAPS`. Measured results:
 
 | Platform | Result |
 |---|---|
-| macOS 26.x, arm64 | Attack corpus **fully blocked** (one documented gap: `/Users/Shared` is readable) |
-| GitHub `macos-latest` runner | **`DYLD_INSERT_LIBRARIES` injection is NOT blocked** |
-| Linux (bubblewrap), unprivileged host — Ubuntu 26.04, bwrap 0.11.1 | Confining correctly; corpus **over-reports** 4 classes (issue #3) |
+| macOS 26.x, arm64 | 35 applicable cases; attack corpus fully blocked except the documented `/Users/Shared` read gap |
+| GitHub `macos-latest` runner | The `binaries` class reports **NOT BLOCKED** because `DYLD_INSERT_LIBRARIES` injection is not blocked |
+| Linux (bubblewrap), unprivileged host — Ubuntu 26.04, bwrap 0.11.1 | 34 applicable cases; corpus scoring excludes the Seatbelt-only profile case |
 
-> ### Linux results from the attack corpus are **over-reported** — see issue #3
->
-> On the bubblewrap executor the corpus reports four classes "NOT BLOCKED"
-> (`write_into_home`, `write_into_tmp_outside_work`, `attach_and_write`,
-> `vacuum_into_exfil`). **Verified on an unprivileged Ubuntu 26.04 host: none of
-> them escape.** No probe file appears on the host filesystem or in the host
-> `$HOME`, and the vault is byte-unchanged with `PRAGMA integrity_check` clean.
->
-> The cause is a scoring assumption, not a hole. Each probe prints `UNSAFE` when
-> its own write *succeeds*, which is a correct escape test under seatbelt —
-> macOS denies by path, so a successful write really did escape. Under
-> bubblewrap the child gets a namespace-local `/tmp` and `$HOME`, so the write
-> succeeds harmlessly and vanishes with the namespace. The corpus cannot tell
-> "confined" from "escaped" on Linux.
->
-> It errs toward alarm rather than false comfort, which is the right direction
-> for a security test — but it makes the Linux numbers unusable as a signal
-> until each probe verifies from the parent that the artifact exists on the
-> host.
+On Linux, the separate
+`test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill` test is
+the documented process-group escape (#18). It is not hidden in the corpus
+roll-up: the 34 applicable corpus cases are scored independently, and this
+named test remains visible as the Linux gap.
 
 The macOS discrepancy is a real open question, not a test artifact: the same
 corpus passes on one macOS configuration and fails on another, which means the
 seatbelt profile is relying on a protection that is not universally present.
 
-The corpus assertion is deliberately left **strict and failing** where the gap
-exists, rather than absorbed into `KNOWN_GAPS` to produce a green tick — that
-would delete the finding instead of fixing it. The CI job that runs it is
-informational for the same reason.
+The corpus assertion remains strict and the CI job remains informational, so
+the `binaries` class on macOS and the named process-group test on Linux stay
+visible rather than being turned into green ticks.
 
 **What this means for you:** run the sandbox suite on your own platform before
 relying on the confinement, and do not expose analyst mode to untrusted input on

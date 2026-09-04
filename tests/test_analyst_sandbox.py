@@ -419,7 +419,7 @@ except Exception:
 
 
 # =========================================================================== #
-# Done when 1 — the attack corpus: 9 classes, each attempted -> blocked
+# Done when 1 — the attack corpus: 9 classes, each applicable -> blocked
 # =========================================================================== #
 
 # The one class, and the one sub-case, this profile — implemented exactly as
@@ -437,6 +437,16 @@ KNOWN_GAPS = {
     ("paths", "users_shared_dir_readable"),
 }
 
+EXECUTOR_SCOPES = {
+    "seatbelt-only": frozenset({"seatbelt"}),
+    "bwrap-only": frozenset({"bwrap"}),
+    "both": frozenset({"seatbelt", "bwrap"}),
+}
+KNOWN_GAP_EXECUTORS = {
+    ("paths", "users_shared_dir_readable"): frozenset({"seatbelt"}),
+}
+SEATBELT_ONLY = "seatbelt-only"
+
 
 def _corpus(tmp_root: Path, vault: str) -> list[dict]:
     """Build the attack corpus. Each entry is self-contained: the `code` is
@@ -444,10 +454,11 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
     entries also carry a parent-chosen `host_artifact`; those entries are
     scored from the host after the run, because a successful write can remain
     inside bubblewrap's namespace. All other entries are responsible for
-    printing "UNSAFE ..." if (and only if) the attack succeeded. Everything
-    else is scored as blocked (`_is_unsafe` above) — including an uncaught
-    exception that simply kills the child, which is exactly how most of
-    these resolve in practice (see the module docstring)."""
+    printing "UNSAFE ..." if (and only if) the attack succeeded. Every row
+    carries an `applies_to` scope, and only applicable rows enter the roll-up.
+    Everything else is scored as blocked (`_is_unsafe` above) — including an
+    uncaught exception that simply kills the child, which is exactly how most
+    of these resolve in practice (see the module docstring)."""
 
     secret_path = tmp_root / "parent_secret.txt"
     secret_path.write_text("TOP-SECRET-VALUE")
@@ -464,7 +475,10 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
         limits: dict | None = None,
         host_artifact: Path | None = None,
         parent_fd_path: Path | None = None,
+        applies_to: str = "both",
     ) -> None:
+        if applies_to not in EXECUTOR_SCOPES:
+            raise ValueError(f"unknown executor scope: {applies_to!r}")
         cases.append({
             "class": cls,
             "name": name,
@@ -472,6 +486,7 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
             "limits": limits or {},
             "host_artifact": host_artifact,
             "parent_fd_path": parent_fd_path,
+            "applies_to": applies_to,
         })
 
     # (i) network -------------------------------------------------------- #
@@ -704,7 +719,8 @@ while True:
     # verification lives in test_toctou_* and is folded into the same
     # counters by that test. See _record_toctou_result.
     add("toctou", "preplanted_code_py_is_overwritten", "print('marker: this file must not run')")
-    add("toctou", "preplanted_profile_sb_is_overwritten", "print('ok')")
+    add("toctou", "preplanted_profile_sb_is_overwritten", "print('ok')",
+        applies_to=SEATBELT_ONLY)
     add("toctou", "vault_symlink_resolved_consistently", "r = conn.execute('SELECT 1').fetchone(); print('BLOCKED', r)")
     add("toctou", "home_tmpdir_env_remap_has_no_effect", f"""
 import os
@@ -827,10 +843,38 @@ except OSError:
     return cases
 
 
+def _executor_kind(executor) -> str:
+    if isinstance(executor, sb.SeatbeltExecutor):
+        return "seatbelt"
+    if isinstance(executor, sb.BwrapExecutor):
+        return "bwrap"
+    raise TypeError(f"unsupported corpus executor: {type(executor).__name__}")
+
+
+def _case_applies(case: dict, executor) -> bool:
+    return _executor_kind(executor) in EXECUTOR_SCOPES[case["applies_to"]]
+
+
+def _known_gap_applies(cls: str, executor) -> bool:
+    return any(
+        gap[0] == cls
+        and _executor_kind(executor) in KNOWN_GAP_EXECUTORS.get(
+            gap, EXECUTOR_SCOPES["both"])
+        for gap in KNOWN_GAPS
+    )
+
+
+def _skip_if_not_applicable(executor, scope: str) -> None:
+    if _executor_kind(executor) not in EXECUTOR_SCOPES[scope]:
+        pytest.skip(f"corpus case is {scope}, not applicable to this executor")
+
+
 def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
     cases = _corpus(tmp_path, vault_path)
+    assert len(cases) == 35
+    assert all(case["applies_to"] in EXECUTOR_SCOPES for case in cases)
 
-    attempted: Counter[str] = Counter()
+    applicable: Counter[str] = Counter()
     blocked: Counter[str] = Counter()
     details: list[str] = []
 
@@ -840,6 +884,8 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
             # Scored by their own dedicated tests below (they need real
             # filesystem setup / different success criteria than a plain
             # UNSAFE/BLOCKED marker) — still counted here for the table.
+            continue
+        if not _case_applies(case, executor):
             continue
         run_dir = tmp_path / "corpus" / cls / name
         host_artifact = case["host_artifact"]
@@ -861,7 +907,7 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
             if parent_fd is not None:
                 os.close(parent_fd)
         unsafe = _is_unsafe(res, host_artifact=host_artifact)
-        attempted[cls] += 1
+        applicable[cls] += 1
         if not unsafe:
             blocked[cls] += 1
         else:
@@ -873,40 +919,57 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
     # TOCTOU class, scored structurally (see test_toctou_* below for the
     # actual mechanics; this reproduces the same checks so the one summary
     # table is complete and self-contained).
-    attempted["toctou"] += 4
-    blocked["toctou"] += _toctou_score(executor, vault_path, tmp_path)
+    toctou_cases = [
+        case for case in cases
+        if case["class"] == "toctou" and _case_applies(case, executor)
+    ]
+    applicable["toctou"] += len(toctou_cases)
+    blocked["toctou"] += _toctou_score(
+        executor, vault_path, tmp_path, toctou_cases)
 
     # fd3_abuse class, scored on the *parent's* refusal per the note above.
-    attempted["fd3_abuse"] += 3
-    blocked["fd3_abuse"] += _fd3_abuse_score(executor, vault_path, tmp_path)
+    fd3_cases = [
+        case for case in cases
+        if case["class"] == "fd3_abuse" and _case_applies(case, executor)
+    ]
+    applicable["fd3_abuse"] += len(fd3_cases)
+    if fd3_cases:
+        blocked["fd3_abuse"] += _fd3_abuse_score(
+            executor, vault_path, tmp_path)
 
     # binaries/paths/etc. already counted above via the loop.
 
-    total_attempted = sum(attempted.values())
+    total_applicable = sum(applicable.values())
     total_blocked = sum(blocked.values())
 
-    lines = ["", "class | attempted | blocked | rate"]
-    for cls in sorted(attempted):
-        a, b = attempted[cls], blocked[cls]
+    lines = ["", "class | applicable | blocked | rate"]
+    for cls in sorted(applicable):
+        a, b = applicable[cls], blocked[cls]
         lines.append(f"{cls:22s} | {a:9d} | {b:7d} | {b/a:.0%}")
-    lines.append(f"{'TOTAL':22s} | {total_attempted:9d} | {total_blocked:7d} | {total_blocked/total_attempted:.0%}")
+    lines.append(f"{'TOTAL':22s} | {total_applicable:9d} | {total_blocked:7d} | {total_blocked/total_applicable:.0%}")
     print("\n".join(lines))
     if details:
         print("NOT BLOCKED:\n" + "\n".join(details))
 
-    assert total_attempted >= 34, f"corpus has {total_attempted} attempts, need >= 34"
-    assert len(attempted) == 9, f"corpus spans {len(attempted)} classes, need 9"
+    assert len(cases) == 35, f"corpus has {len(cases)} cases, need 35"
+    expected_applicable = {"seatbelt": 35, "bwrap": 34}[_executor_kind(executor)]
+    assert total_applicable == expected_applicable, (
+        f"corpus has {total_applicable} applicable cases, "
+        f"need {expected_applicable}"
+    )
+    assert len(applicable) == 9, f"corpus spans {len(applicable)} classes, need 9"
 
-    for cls in attempted:
-        expected_full = not any(g[0] == cls for g in KNOWN_GAPS)
+    for cls in applicable:
+        expected_full = not _known_gap_applies(cls, executor)
         if expected_full:
-            assert blocked[cls] == attempted[cls], (
-                f"class {cls!r} is not 100% blocked ({blocked[cls]}/{attempted[cls]}) "
+            assert blocked[cls] == applicable[cls], (
+                f"class {cls!r} is not 100% blocked ({blocked[cls]}/{applicable[cls]}) "
                 "and is not in KNOWN_GAPS"
             )
-    # The one documented exception, asserted explicitly rather than silently
-    # excluded: users_shared_dir_readable is measured NOT blocked.
-    assert blocked["paths"] == attempted["paths"] - 1
+    # The one documented Seatbelt exception, asserted explicitly rather than
+    # silently excluded: users_shared_dir_readable is measured NOT blocked.
+    if _known_gap_applies("paths", executor):
+        assert blocked["paths"] == applicable["paths"] - 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1005,14 +1068,23 @@ except Exception as e:
     return not _is_unsafe(res)
 
 
-def _toctou_score(executor, vault_path, tmp_path: Path) -> int:
-    checks = [
-        _toctou_preplanted_code_is_overwritten(executor, vault_path, tmp_path / "toctou_score_1"),
-        _toctou_preplanted_profile_is_overwritten(executor, vault_path, tmp_path / "toctou_score_2"),
-        _toctou_vault_symlink_consistency(executor, tmp_path),
-        _toctou_home_tmpdir_remap_ignored(executor, vault_path, tmp_path / "toctou_score_4"),
-    ]
-    return sum(1 for c in checks if c)
+def _toctou_score(
+    executor, vault_path, tmp_path: Path, cases: list[dict]
+) -> int:
+    checks = {
+        "preplanted_code_py_is_overwritten":
+            lambda: _toctou_preplanted_code_is_overwritten(
+                executor, vault_path, tmp_path / "toctou_score_1"),
+        "preplanted_profile_sb_is_overwritten":
+            lambda: _toctou_preplanted_profile_is_overwritten(
+                executor, vault_path, tmp_path / "toctou_score_2"),
+        "vault_symlink_resolved_consistently":
+            lambda: _toctou_vault_symlink_consistency(executor, tmp_path),
+        "home_tmpdir_env_remap_has_no_effect":
+            lambda: _toctou_home_tmpdir_remap_ignored(
+                executor, vault_path, tmp_path / "toctou_score_4"),
+    }
+    return sum(1 for case in cases if checks[case["name"]]())
 
 
 def test_toctou_preplanted_code_py_is_overwritten(executor, vault_path, tmp_path):
@@ -1020,6 +1092,7 @@ def test_toctou_preplanted_code_py_is_overwritten(executor, vault_path, tmp_path
 
 
 def test_toctou_preplanted_profile_sb_is_overwritten(executor, vault_path, tmp_path):
+    _skip_if_not_applicable(executor, SEATBELT_ONLY)
     assert _toctou_preplanted_profile_is_overwritten(executor, vault_path, tmp_path / "run")
 
 

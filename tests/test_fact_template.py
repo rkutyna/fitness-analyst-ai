@@ -91,6 +91,16 @@ def test_fact_publishers_resolve_duplicate_values(publisher, case, expected):
     facts = publisher(ledgers[case])
     assert (key in facts) is expected
 
+    if case == "same_value_different_presentation":
+        # Which presentation wins is user-visible -- it is the string the model
+        # narrates -- so pin it rather than leaving it to candidate order.
+        # First-wins, by ledger order.
+        if publisher is fact_template.build_fact_set:
+            assert facts[key]["display"] == "50 m"
+            assert facts[key]["unit"] == "min"
+        else:
+            assert facts[key]["unit"] == "count/min"
+
 
 def test_weekly_mean_without_period_uses_week_start_as_fact_period():
     """The exact recovered key prevents a generic or invented period passing."""

@@ -409,6 +409,14 @@ def _publish_unambiguous(candidates: list[tuple[str, dict]]) -> dict[str, dict]:
     and all other record metadata are intentionally excluded from identity.
     Equality is evaluated on the owned values themselves, not on their
     surrounding records.
+
+    When the values agree but their presentations differ, the **first
+    candidate's** record is published -- first by ledger order. That choice is
+    user-visible: it decides which display string reaches the model, so two
+    tool calls returning one value in different units would otherwise make the
+    narrated string depend on call order. It is pinned by test rather than left
+    implicit, so a later reordering of candidates fails loudly instead of
+    quietly changing what a user reads.
     """
     grouped: dict[str, list[dict]] = {}
     for key, fact in candidates:

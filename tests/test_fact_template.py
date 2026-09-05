@@ -136,6 +136,14 @@ def test_publish_completeness_walk_handles_identical_and_conflicting_duplicates(
     assert key in published
     assert fact_template.publish_completeness(identical, published) == set()
 
+    # Positive direction, and it is not decoration.  Every other walk assertion
+    # in this test is `== set()`, which a walk that always returns nothing
+    # satisfies trivially -- so before this line the test could not distinguish
+    # a correct walk from a dead one.  Measured 2026-09-05 (#46 Done-when 4):
+    # stubbing `eligible_fact_keys` to return an empty set left this test GREEN
+    # while the sibling test went red.
+    assert fact_template.publish_completeness(identical, {}) == {key}
+
     conflicting = (_synthetic_eligibility_ledger(value=123.45)
                    + _synthetic_eligibility_ledger(value=234.56))
     withheld_conflict = fact_template.build_fact_set(conflicting)

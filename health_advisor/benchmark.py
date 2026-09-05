@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
+from . import vault as V
+
 
 STAGE_MINUTES = 4
 WARMUP_MINUTES = 8
@@ -128,11 +130,25 @@ def record(conn, *, date: str, stage: int, pace: str | float | int,
     conn.commit()
 
 
-def series(conn) -> list[dict]:
-    """Return completed benchmark stages in date/stage order."""
+def series(conn, *, metric_units: bool = False) -> list[dict]:
+    """Return completed benchmark stages in date/stage order.
+
+    Benchmark pace is stored as min/mi. A metric tool session receives the
+    same physical pace as min/km at this publication boundary.
+    """
     rows = conn.execute(
         "SELECT date, stage, pace_min_per_mi, median_hr_last_two_min, talk_test, "
         "temp_c, dew_point_c, notes, median_source "
         "FROM benchmark ORDER BY date, stage"
     ).fetchall()
-    return [dict(row) for row in rows]
+    out = []
+    for row in rows:
+        item = dict(row)
+        if metric_units:
+            pace = item.pop("pace_min_per_mi")
+            item["pace_min_per_km"] = (
+                pace * V.UNIT_CONVERSION_FACTORS[
+                    "pace_min_per_mi_to_min_per_km"]
+                if pace is not None else None)
+        out.append(item)
+    return out

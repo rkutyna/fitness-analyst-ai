@@ -498,13 +498,23 @@ def impact_volume(conn, start: str, end: str, by: str = "week", *,
 
     out: list[dict] = []
     prev_jog: float | None = None
+    display_system = "metric" if metric_units else None
     distance_key = "jog_km" if metric_units else "jog_miles"
+    pace_key = "jog_pace_min_per_km" if metric_units else "jog_pace_min_per_mi"
+    walk_key = "walk_km" if metric_units else "walk_miles"
     for r in rows:
         jog_min = round((r["jog_buckets"] or 0) * bucket_min, 1)
-        jog_distance = round(
-            (r["jog_mi"] or 0.0)
-            * (V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
-               if metric_units else 1.0), 2)
+        jog_distance, _ = V.convert_for_unit_system(
+            r["jog_mi"] or 0.0, "mi", display_system)
+        walk_distance, _ = V.convert_for_unit_system(
+            r["walk_mi"] or 0.0, "mi", display_system)
+        jog_distance = round(jog_distance, 2)
+        walk_distance = round(walk_distance, 2)
+        jog_pace = ((r["jog_buckets"] * bucket_min) / r["jog_mi"]
+                    if r["jog_mi"] else None)
+        jog_pace, _ = V.convert_for_unit_system(
+            jog_pace, "min/mi", display_system)
+        jog_pace = round(jog_pace, 1) if jog_pace is not None else None
         source, note = "measured", None
         if by == "week":
             covered = [d for d in manual if _week_start(d) == r["period"]
@@ -520,10 +530,9 @@ def impact_volume(conn, start: str, end: str, by: str = "week", *,
             "period_start": r["period"],
             "jog_minutes": jog_min,
             distance_key: jog_distance,
-            "jog_pace_min_per_mi": (round((r["jog_buckets"] * bucket_min) / r["jog_mi"], 1)
-                                    if r["jog_mi"] else None),
+            pace_key: jog_pace,
             "walk_minutes": round((r["walk_buckets"] or 0) * bucket_min, 1),
-            "walk_miles": round(r["walk_mi"] or 0.0, 2),
+            walk_key: walk_distance,
             "jog_change_pct": change,
             # Guard 2: every consumer that uses a manual value says so.
             "jog_minutes_source": source,
@@ -539,8 +548,8 @@ def impact_volume(conn, start: str, end: str, by: str = "week", *,
             out.append({
                 "period_start": day,
                 "jog_minutes": manual[day]["minutes"],
-                distance_key: None, "jog_pace_min_per_mi": None,
-                "walk_minutes": 0.0, "walk_miles": 0.0, "jog_change_pct": None,
+                distance_key: None, pace_key: None,
+                "walk_minutes": 0.0, walk_key: 0.0, "jog_change_pct": None,
                 "jog_minutes_source": "manual",
                 "manual_note": manual[day]["note"],
             })
@@ -554,8 +563,8 @@ def impact_volume(conn, start: str, end: str, by: str = "week", *,
             out.append({
                 "period_start": wk,
                 "jog_minutes": manual[day]["minutes"],
-                distance_key: None, "jog_pace_min_per_mi": None,
-                "walk_minutes": 0.0, "walk_miles": 0.0, "jog_change_pct": None,
+                distance_key: None, pace_key: None,
+                "walk_minutes": 0.0, walk_key: 0.0, "jog_change_pct": None,
                 "jog_minutes_source": "partly_manual",
                 "manual_note": f"{day} {manual[day]['note']}",
             })
@@ -1315,29 +1324,36 @@ def workout_focus(conn, as_of: str | None = None, *,
     if not cycling:
         try:
             rows = impact_volume(conn, day, day, by="day", metric_units=metric_units)
-            jog_pace = rows[0].get("jog_pace_min_per_mi") if rows else None
+            jog_pace = (rows[0].get(
+                "jog_pace_min_per_km" if metric_units else "jog_pace_min_per_mi")
+                if rows else None)
         except Exception:  # noqa: BLE001 — a briefing must not die for a label
             jog_pace = None
     pace_key = "pace_min_per_km" if metric_units else "pace_min_per_mi"
     speed_key = "speed_kph" if metric_units else "speed_mph"
     pace = (None if cycling else dur / dist if dist and dur else None)
     speed = (dist / (dur / 60) if cycling and dist and dur else None)
-    if metric_units:
-        factor = V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
-        pace = mx.r(pace / factor, 1) if pace is not None else None
-        speed = mx.r(speed * factor, 1) if speed is not None else None
-    else:
-        pace = mx.r(pace, 1) if pace is not None else None
-        speed = mx.r(speed, 1) if speed is not None else None
+    display_system = "metric" if metric_units else None
+    pace, _ = V.convert_for_unit_system(pace, "min/mi", display_system)
+    speed, _ = V.convert_for_unit_system(speed, "mi/hr", display_system)
+    pace = mx.r(pace, 1) if pace is not None else None
+    speed = mx.r(speed, 1) if speed is not None else None
+    distance_key = "distance_km" if metric_units else "distance_mi"
+    distance, _ = V.convert_for_unit_system(dist, "mi", display_system)
+    distance = mx.r(distance, 1) if distance is not None else None
+    energy_key = "energy_kj" if metric_units else "energy_kcal"
+    energy, _ = V.convert_for_unit_system(row["energy_kcal"], "kcal", display_system)
+    energy = mx.r(energy) if energy is not None else None
+    jog_pace_key = "jog_pace_min_per_km" if metric_units else "jog_pace_min_per_mi"
     out = {
         "type": row["workout_type"],
         "date": day,
-        "distance_mi": mx.r(dist, 1) if dist is not None else None,
+        distance_key: distance,
         "duration_min": mx.r(dur, 1) if dur is not None else None,
-        "energy_kcal": mx.r(row["energy_kcal"]) if row["energy_kcal"] is not None else None,
+        energy_key: energy,
         pace_key: pace,
         "pace_label": None if cycling else "blended",
-        "jog_pace_min_per_mi": jog_pace,
+        jog_pace_key: jog_pace,
         speed_key: speed,
     }
     return out
@@ -1473,7 +1489,8 @@ def suggestions(readiness_d: dict, load_d: dict,
     # When a distance workout is present, the specific next-day target below carries
     # the ramping-fast guidance instead, so skip this generic nudge to avoid repetition.
     if (load_d.get("acwr_band") == "ramping-fast"
-            and not (workout_d and workout_d.get("distance_mi"))):
+            and not (workout_d and (workout_d.get("distance_mi")
+                                    or workout_d.get("distance_km")))):
         out.append({"text": "You've ramped training load quickly — watch for niggles "
                             "and maybe slot in a lighter day.",
                     "because": f"ACWR {load_d.get('acwr')} (>1.5)"})
@@ -1517,7 +1534,11 @@ def talking_points(parts: dict) -> list[dict]:
                 else "pace_min_per_km")
     speed_key = ("speed_mph" if wf and "speed_mph" in wf
                  else "speed_kph")
-    if wf and wf.get("distance_mi") and (wf.get(pace_key) or wf.get(speed_key)):
+    distance_key = ("distance_mi" if wf and "distance_mi" in wf
+                    else "distance_km")
+    jog_pace_key = ("jog_pace_min_per_mi" if wf and "jog_pace_min_per_mi" in wf
+                    else "jog_pace_min_per_km")
+    if wf and wf.get(distance_key) and (wf.get(pace_key) or wf.get(speed_key)):
         # Date-stamp the seed: the focus workout may be up to 2 days old, and an
         # undated seed reads as "today" to the narrator (observed fabrication:
         # a rest-day briefing praising the previous day's ride as today's).
@@ -1525,22 +1546,26 @@ def talking_points(parts: dict) -> list[dict]:
             else f"on {wf.get('date')} (not today)"
         if wf.get(speed_key) is not None:
             speed_unit = "mph" if speed_key == "speed_mph" else "kph"
-            seed = (f"{wf['type']} workout {when}: {wf['distance_mi']} mi at "
+            distance_unit = "mi" if distance_key == "distance_mi" else "km"
+            seed = (f"{wf['type']} workout {when}: {wf[distance_key]} {distance_unit} at "
                     f"{wf[speed_key]} {speed_unit}")
-            numbers = [wf["distance_mi"], wf[speed_key]]
-        elif wf.get("jog_pace_min_per_mi") is not None:
+            numbers = [wf[distance_key], wf[speed_key]]
+        elif wf.get(jog_pace_key) is not None:
             # Say the jog pace where the day has one: it is the number the ramp
             # and the "slow down" lever are both defined on. The blended figure
             # stays available in the dict, it just isn't what gets narrated.
-            seed = (f"{wf['type']} workout {when}: {wf['distance_mi']} mi, "
-                    f"jog pace {wf['jog_pace_min_per_mi']} min/mi "
+            distance_unit = "mi" if distance_key == "distance_mi" else "km"
+            pace_unit = "min/mi" if jog_pace_key == "jog_pace_min_per_mi" else "min/km"
+            seed = (f"{wf['type']} workout {when}: {wf[distance_key]} {distance_unit}, "
+                    f"jog pace {wf[jog_pace_key]} {pace_unit} "
                     f"(walk breaks excluded)")
-            numbers = [wf["distance_mi"], wf["jog_pace_min_per_mi"]]
+            numbers = [wf[distance_key], wf[jog_pace_key]]
         else:
             pace_unit = "min/mi" if pace_key == "pace_min_per_mi" else "min/km"
-            seed = (f"{wf['type']} workout {when}: {wf['distance_mi']} mi at "
+            distance_unit = "mi" if distance_key == "distance_mi" else "km"
+            seed = (f"{wf['type']} workout {when}: {wf[distance_key]} {distance_unit} at "
                     f"blended pace {wf[pace_key]} {pace_unit}")
-            numbers = [wf["distance_mi"], wf[pace_key]]
+            numbers = [wf[distance_key], wf[pace_key]]
         tp.append({"topic": "workout", "seed": seed, "numbers": numbers})
 
     rd = parts["readiness"]

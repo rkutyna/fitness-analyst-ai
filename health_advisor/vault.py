@@ -201,7 +201,52 @@ UNIT_SYSTEMS: dict[str, dict[str, str]] = {
 UNIT_CONVERSION_FACTORS: dict[str, float] = {
     "distance_mi_to_km": 1.609344,
     "energy_kcal_to_kj": 4.184,
+    "pace_min_per_mi_to_min_per_km": 1.0 / 1.609344,
+    "speed_mi_per_hr_to_km_per_hr": 1.609344,
+    "mass_lb_to_kg": 0.45359237,
+    "temperature_degF_to_degC": 5.0 / 9.0,
+    "temperature_degF_to_degC_offset": -32.0,
+    "length_ft_to_m": 0.3048,
+    "length_in_to_cm": 2.54,
+    "speed_ft_per_s_to_m_per_s": 0.3048,
 }
+
+# Canonical imperial spellings that have a metric presentation twin. The
+# arithmetic remains in UNIT_CONVERSION_FACTORS; this index only names the
+# target label and the factor key, so consumers cannot grow their own factors.
+_METRIC_UNIT_TWINS: dict[str, tuple[str, str]] = {
+    "mi": ("km", "distance_mi_to_km"),
+    "kcal": ("kJ", "energy_kcal_to_kj"),
+    "lb": ("kg", "mass_lb_to_kg"),
+    "degF": ("degC", "temperature_degF_to_degC"),
+    "mi/hr": ("km/hr", "speed_mi_per_hr_to_km_per_hr"),
+    "min/mi": ("min/km", "pace_min_per_mi_to_min_per_km"),
+    "ft": ("m", "length_ft_to_m"),
+    "in": ("cm", "length_in_to_cm"),
+    "ft/s": ("m/s", "speed_ft_per_s_to_m_per_s"),
+}
+
+
+def convert_for_unit_system(value, unit: str | None,
+                            unit_system: str | None) -> tuple[object, str | None]:
+    """Convert one canonical value for the declared metric presentation.
+
+    ``None`` means the vault did not declare a system and deliberately selects
+    the legacy payload unchanged. Imperial is already the storage convention;
+    only a declared metric vault takes this path.
+    """
+    if unit_system != "metric" or unit not in _METRIC_UNIT_TWINS:
+        return value, unit
+    target, factor_key = _METRIC_UNIT_TWINS[unit]
+    if value is None:
+        return value, target
+    factor = UNIT_CONVERSION_FACTORS[factor_key]
+    if unit == "degF":
+        value = (float(value) + UNIT_CONVERSION_FACTORS[
+            "temperature_degF_to_degC_offset"]) * factor
+    else:
+        value = float(value) * factor
+    return value, target
 
 
 def local_timezone(conn: sqlite3.Connection) -> str | None:

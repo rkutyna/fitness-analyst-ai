@@ -263,6 +263,8 @@ def list_available_metrics(ctx: VaultContext) -> dict:
     (sum/mean/last), date span and number of days. Call this first to discover
     what can be queried."""
     conn = ctx.read_only()
+    settings = ctx.settings()
+    unit_system = settings["unit_system"]
     try:
         rows = conn.execute(
             "SELECT metric, MIN(date) f, MAX(date) l, COUNT(*) n, MAX(unit) u "
@@ -273,10 +275,12 @@ def list_available_metrics(ctx: VaultContext) -> dict:
     out = []
     for r in rows:
         cat = nz.CATALOG.get(r["metric"], {})
+        unit = cat.get("unit", r["u"])
+        _, unit = V.convert_for_unit_system(None, unit, unit_system)
         out.append({
             "metric": r["metric"],
             "group": cat.get("group", "other"),
-            "unit": cat.get("unit", r["u"]),
+            "unit": unit,
             "agg": cat.get("agg", "mean"),
             "first_date": r["f"], "last_date": r["l"], "n_days": r["n"],
         })
@@ -295,6 +299,7 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
     Dates must be explicit YYYY-MM-DD — an 'error' comes back otherwise."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
+    unit_system = ctx.settings()["unit_system"]
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
@@ -303,6 +308,9 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
         if start is None:
             start = (date.fromisoformat(anchor) - timedelta(days=89)).isoformat()
         dates, vals, unit = _series(conn, metric, start, anchor)
+        vals = [V.convert_for_unit_system(v, unit, unit_system)[0]
+                for v in vals]
+        _, unit = V.convert_for_unit_system(None, unit, unit_system)
     finally:
         conn.close()
     downsampled = False
@@ -335,6 +343,7 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     mean/median/min/max, recent-vs-baseline change, and a linear trend per week.
     Anchored to the metric's most recent data. A period the server can't parse
     comes back as an 'error' — it is never silently replaced with a default."""
+    unit_system = ctx.settings()["unit_system"]
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
@@ -349,6 +358,9 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
         except ValueError as e:
             return {"error": str(e)}
         dates, vals, unit = _series(conn, metric, start_iso, end_iso)
+        vals = [V.convert_for_unit_system(v, unit, unit_system)[0]
+                for v in vals]
+        _, unit = V.convert_for_unit_system(None, unit, unit_system)
     finally:
         conn.close()
     if not vals:
@@ -381,6 +393,7 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     An unparseable window is an 'error', never a default. If either window has
     no data the deltas come back null with a 'note' — an empty window is not a
     change of the other window's whole size."""
+    unit_system = ctx.settings()["unit_system"]
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
@@ -393,6 +406,9 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
             return {"error": str(e)}
         da, va, unit = _series(conn, metric, a0, a1)
         db_, vb, _ = _series(conn, metric, b0, b1)
+        va = [V.convert_for_unit_system(v, unit, unit_system)[0] for v in va]
+        vb = [V.convert_for_unit_system(v, unit, unit_system)[0] for v in vb]
+        _, unit = V.convert_for_unit_system(None, unit, unit_system)
     finally:
         conn.close()
     sa, sb = _stats(da, va), _stats(db_, vb)
@@ -425,6 +441,7 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
     an HR cap use get_hr_zones, which scopes to the workout itself."""
     if err := _bad_dates(day=day):
         return {"error": err}
+    unit_system = ctx.settings()["unit_system"]
     try:
         bucket_hours = int(bucket_hours)
     except (TypeError, ValueError):
@@ -472,10 +489,15 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
     if not rows:
         return {"metric": metric, "day": day, "bucket_hours": bucket_hours,
                 "note": "no data for this day", "buckets": []}
-    buckets = [{"hour": r["h"], "value": _r(r["v"]), "n": r["n"]} for r in rows]
+    buckets = []
+    for r in rows:
+        value, _ = V.convert_for_unit_system(r["v"], unit, unit_system)
+        buckets.append({"hour": r["h"], "value": _r(value), "n": r["n"]})
     for bucket in buckets:
         _add_presentation(bucket, metric, day, bucket["value"], field="value")
-    return {"metric": metric, "day": day, "unit": unit or nz.canonical_unit(metric, None),
+    unit = unit or nz.canonical_unit(metric, None)
+    _, unit = V.convert_for_unit_system(None, unit, unit_system)
+    return {"metric": metric, "day": day, "unit": unit,
             "agg": _agg(metric), "bucket_hours": bucket_hours, "buckets": buckets}
 
 
@@ -1081,6 +1103,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
 
     have = {r["period_start"]: r for r in rows}
     distance_key = "jog_km" if metric_units else "jog_miles"
+    pace_key = "jog_pace_min_per_km" if metric_units else "jog_pace_min_per_mi"
+    walk_key = "walk_km" if metric_units else "walk_miles"
     periods = []
     for key in _impact_period_keys(start, end, by):
         iso = key.isoformat()
@@ -1089,7 +1113,7 @@ def _impact_periods(rows: list[dict], start: str, end: str,
             key, by, start, end, as_of=as_of, local_timezone=local_timezone)
         row = have.get(iso) or {
             "period_start": iso, "jog_minutes": 0.0, distance_key: 0.0,
-            "jog_pace_min_per_mi": None, "walk_minutes": 0.0, "walk_miles": 0.0,
+            pace_key: None, "walk_minutes": 0.0, walk_key: 0.0,
             "jog_change_pct": None,
         }
         periods.append({**row, "no_data": iso not in have,
@@ -1639,6 +1663,7 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
     sum over the window and the timestamp is its earliest sample — calling it
     "the latest reading" would be a claim about an instant that never happened.
     """
+    unit_system = ctx.settings()["unit_system"]
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
@@ -1663,10 +1688,16 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
             else None
     finally:
         conn.close()
+    day_value, day_unit = (V.convert_for_unit_system(
+        dm["v"], dm["unit"] or nz.canonical_unit(metric, None), unit_system)
+        if dm else (None, None))
+    raw_value, raw_unit = (V.convert_for_unit_system(
+        raw["value"], raw["unit"] or nz.canonical_unit(metric, None), unit_system)
+        if raw else (None, None))
     out = {
         "metric": metric, "agg": _agg(metric),
-        "latest_day": {"date": dm["date"], "value": _r(dm["v"]), "unit": dm["unit"]} if dm else None,
-        "latest_sample": {"value": _r(raw["value"]), "unit": raw["unit"],
+        "latest_day": {"date": dm["date"], "value": _r(day_value), "unit": day_unit} if dm else None,
+        "latest_sample": {"value": _r(raw_value), "unit": raw_unit,
                           "local_time": raw["start_local"],
                           "resolution_seconds": V.raw_resolution_seconds(metric)}
         if raw else None,
@@ -2285,6 +2316,7 @@ def record_benchmark(ctx: VaultContext, date: str, stage: int, pace: str,
     """
     if err := _bad_dates(date=date):
         return {"ok": False, "error": err}
+    metric_units = ctx.settings()["unit_system"] == "metric"
     conn = ctx.connect()
     try:
         db.init_db(conn)
@@ -2294,7 +2326,8 @@ def record_benchmark(ctx: VaultContext, date: str, stage: int, pace: str,
                          dew_point_c=dew_point_c, notes=notes or None,
                          stage_start_utc=stage_start_utc or None,
                          stage_end_utc=stage_end_utc or None)
-        rows = [r for r in benchmark.series(conn) if r["date"] == date]
+        rows = [r for r in benchmark.series(conn, metric_units=metric_units)
+                if r["date"] == date]
     finally:
         conn.close()
     return {"ok": True, "date": date, "stages": rows}
@@ -2318,9 +2351,10 @@ def get_benchmark_series(ctx: VaultContext) -> dict:
     are four different efforts. Read `median_source` before comparing: a
     "records:protocol" median came from an inferred window.
     """
+    metric_units = ctx.settings()["unit_system"] == "metric"
     conn = ctx.read_only()
     try:
-        rows = benchmark.series(conn)
+        rows = benchmark.series(conn, metric_units=metric_units)
     finally:
         conn.close()
     return {"stages": rows, "count": len(rows),

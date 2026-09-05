@@ -309,6 +309,26 @@ def test_denial_phrase_requires_no_asked_metric_figure(kind, text, expected):
         facts=facts) is expected
 
 
+@pytest.mark.parametrize("text,empty_expected,denial_expected", [
+    ("I don't have your jog minutes for this week.", False, True),
+    ("I don't have a recorded figure for your jog minutes this week.",
+     False, True),
+    ("I don't have any jog minute data for this week, so I can't provide "
+     "that figure.", True, False),
+    ("Jog minute data is unavailable for this week, so I cannot provide "
+     "that figure.", True, False),
+    ("I don't have a record of your jog minutes for this week, so I can't "
+     "provide that figure.", True, False),
+    ("I don't have a recorded value for the jog minutes metric family for "
+     "this week.", False, True),
+])
+def test_measured_denial_wordings_keep_the_regex_split(
+        text, empty_expected, denial_expected):
+    """Measured denial prose stays on its intended closed-list gate."""
+    assert bool(chat._EMPTY_NARRATION_RE.search(text)) is empty_expected
+    assert bool(chat._AVAILABLE_FIGURE_DENIAL_RE.search(text)) is denial_expected
+
+
 def test_genuinely_empty_gather_allows_empty_narration_without_retry(
         monkeypatch, vault):
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
@@ -1078,6 +1098,47 @@ def test_span_suppression_rewrites_from_only_verified_claims(
     assert reverify_args[2][0] == result["text"]
     assert reverify_args[2][1] == [verified_claim]
     assert reverify_args[2][2] == [{"sequence": 1}]
+
+
+def test_span_suppression_withholds_a_denial_of_an_available_figure(
+        monkeypatch, vault, conn):
+    """Suppression cannot publish a digit-free denial as a successful answer."""
+    verified_claim = {"metric": "jog_minutes", "period": "recent",
+                      "field": "mean", "value": 50.1}
+    attempt = {
+        "prose": "The draft had one unsupported claim.",
+        "claims": [verified_claim, {"metric": "jog_minutes", "value": 26}],
+        "verification": _partial_failure(),
+        "ledger": _available_jog_ledger(),
+    }
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "1")
+    monkeypatch.setattr(chat, "_verify_ask_answer",
+                        lambda *args, **kwargs: {
+                            "ok": True, "grounded": True,
+                            "unsupported": [], "reason": "",
+                            "verdict": {"numbers": []},
+                            "figures_verified": 0, "figures_total": 0,
+                        })
+    monkeypatch.setattr(llm, "complete", lambda *args, **kwargs:
+                        "I don't have your jog minutes for this week.")
+    derived_causes = []
+    real_ask_cause = chat._ask_cause
+    def derive_cause(*args, **kwargs):
+        cause = real_ask_cause(*args, **kwargs)
+        derived_causes.append(cause)
+        return "computed-" + cause
+    monkeypatch.setattr(chat, "_ask_cause", derive_cause)
+
+    verification, text, attempts, failures = chat._try_span_suppression(
+        vault, "How many jog minutes did I do this week?", attempt,
+        as_of="2026-08-23")
+
+    assert text is None
+    assert verification["ok"] is False
+    assert verification["cause"] == "computed-denied_available_figure"
+    assert derived_causes == [
+        "denied_available_figure", "denied_available_figure"]
+    assert attempts == failures == 2
 
 
 def test_span_suppression_failure_twice_refuses_whole_answer(

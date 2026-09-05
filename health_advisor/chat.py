@@ -784,6 +784,7 @@ def _contains_unverified_figure(text: str, verification: dict) -> bool:
 
 def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
                           *, as_of: str | None = None,
+                          resolved_window=None,
                           capture: list | None = None) -> tuple[dict | None,
                                                                   str | None,
                                                                   int, int]:
@@ -825,6 +826,29 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
         finally:
             verify_conn.close()
         last_verification = verification
+        denied_available_figure = _mark_denied_available_figure(
+            verification, question=question, text=regenerated,
+            ledger=attempt["ledger"],
+            answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
+                _question_metric(question), verified_claims, verification),
+            resolved_window=resolved_window)
+        if verification.get("ok"):
+            grounded, reason = _empty_narration_is_grounded(
+                ctx, regenerated, as_of, question=question,
+                ledger=attempt["ledger"], resolved_window=resolved_window,
+                answer_has_asked_metric_figure=(
+                    _prose_has_asked_metric_figure(
+                        _question_metric(question), verified_claims,
+                        verification)))
+            if not grounded:
+                verification.update({
+                    "ok": False, "grounded": False, "reason": reason,
+                })
+                denied_available_figure = (
+                    reason == _DENIED_AVAILABLE_FIGURE_REASON)
+        verification["cause"] = _ask_cause(
+            verification, ledger=attempt["ledger"], loop_outcomes=[],
+            denied_available_figure=denied_available_figure)
         _record_attempt(capture, 2 + attempts, regenerated, verified_claims,
                         verification, None, attempt["ledger"])
         if (verification.get("ok")
@@ -973,9 +997,11 @@ _EMPTY_NARRATION_RE = re.compile(
 # both without denying a published measurement.
 _AVAILABLE_FIGURE_DENIAL_RE = re.compile(
     r"\b(?:"
-    r"no\s+(?:recorded\s+)?value(?:\s+(?:was\s+)?recorded)?|"
+    r"no\s+(?:recorded\s+)?(?:value|figure)(?:\s+(?:was\s+)?recorded)?|"
     r"(?:does\s+not|doesn't)\s+include|"
-    r"(?:do\s+not|don't)\s+have\s+(?:a\s+)?(?:recorded\s+)?value"
+    r"(?:do\s+not|don't)\s+have\s+(?:a\s+)?(?:recorded\s+)?(?:value|figure)|"
+    r"(?:do\s+not|don't)\s+have\s+your\s+"
+    r"[A-Za-z][A-Za-z-]*(?:\s+[A-Za-z][A-Za-z-]*)*"
     r")\b",
     re.IGNORECASE,
 )
@@ -1810,6 +1836,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         suppressed_verification, suppressed_text, suppression_attempts, \
             suppression_failures = \
             _try_span_suppression(ctx, question, selected, as_of=as_of,
+                                  resolved_window=resolved_window,
                                   capture=capture)
         if (suppressed_verification
                 and suppressed_verification.get("span_suppressed")):
@@ -1818,7 +1845,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 "mode": "narration",
                 "tool_trace": selected["ledger"],
                 "verification": {**suppressed_verification,
-                                  "judge_score": None, "cause": "ok",
+                                  "judge_score": None,
                                   "retry": True},
             }
         fallback_verification = {

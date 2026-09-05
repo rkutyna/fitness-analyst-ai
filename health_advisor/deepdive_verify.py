@@ -845,10 +845,10 @@ def _entry_claim_refusal(entry: dict, claim: dict) -> dict | None:
     actual_raw = _claimable_value(entry["value"])
     if claimed_raw is None or actual_raw is None:
         return {"ok": False, "reason": "ledger field has no claimable value",
-                "actual": entry["value"]}
+                "actual": entry["value"], "path": entry["path"]}
     if claimed_raw != actual_raw:
         return {"ok": False, "reason": "claim value does not match ledger field",
-                "actual": entry["value"]}
+                "actual": entry["value"], "path": entry["path"]}
     return None
 
 

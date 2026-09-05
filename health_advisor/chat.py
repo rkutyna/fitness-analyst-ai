@@ -491,6 +491,17 @@ def _retry_feedback(verification: dict) -> str:
             or "claim verification failed"
         subject = "Your claim" if value is None else f"Your claim of {value}"
         sentence = f"{subject} failed: {failure}."
+        if failure == "claim value does not match ledger field":
+            cited_path = number.get("path")
+            if cited_path:
+                sentence += (f" The cited path {cited_path} holds "
+                             f"{number.get('actual')!r}, not the claimed "
+                             "value.")
+        elif failure == "ledger field has no claimable value":
+            cited_path = number.get("path")
+            if cited_path:
+                sentence += (f" The cited path {cited_path} has no claimable "
+                             "value.")
         actual_field = number.get("actual_field")
         if actual_field:
             sentence += f" The field at that path is {str(actual_field)!r}."

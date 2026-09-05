@@ -543,8 +543,18 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
     weekly mean leaves may use their enclosing ``week_start``.
     Arguments, context fields, elided results, and metricless workout rows are
     excluded because they cannot round-trip through the natural identity tuple.
-    Duplicate identities are removed from the published set rather than
-    allowing a key to choose between two ledger entries.
+    Duplicate identities publish when their owned values **agree**, and are
+    withheld only when they disagree (#42). A key never chooses between two
+    different values -- but two calls returning the same value, which a retry
+    routinely produces, no longer silence it. Where the values agree and their
+    presentations differ, the first candidate by ledger order is published;
+    ``_publish_unambiguous`` states why that choice is user-visible and pins it.
+
+    This sentence used to state the pre-#42 rule -- that duplicates were simply
+    removed -- two lines above code doing the opposite (#45). It was not an
+    ordinary stale comment: health_advisor#272's diagnosis turned on an empty
+    fact set, and a reader auditing that path was told here that the emptying
+    was deliberate policy.
     """
     if not isinstance(ledger, list):
         return {}

@@ -45,6 +45,8 @@ from datetime import date, timedelta
 
 from . import correlate as C
 from . import agents as G
+from .claim_contract import (is_metricless_metric as _is_metricless_metric,
+                             metricless_claim_instruction_sentence)
 from . import metrics as mx
 from .numeric_tokens import NUM_RE as _NUM_RE
 
@@ -74,7 +76,7 @@ def _metric_owns_field(metric, field) -> bool:
     for the existing claim vocabulary; they are not blanket inheritance of all
     sibling context fields.
     """
-    return bool(metric) and (
+    return not _is_metricless_metric(metric) and (
         field == metric or field in _INHERITED_SERIES_FIELDS)
 # Fields that only exist as correlation output; they need the metric PAIR, so
 # they resolve against every pair involving the cited metric over the window.
@@ -179,7 +181,8 @@ def workout_count_claim_metadata_sentence() -> str:
     return ("`list_workouts` publishes full-range per-type counts as "
             "`workout_counts: [{type, count}]`; cite the `count` leaf at its "
             "exact path with `metric` omitted, and never count the possibly "
-            "truncated `workouts` rows.")
+            "truncated `workouts` rows. "
+            + metricless_claim_instruction_sentence())
 
 
 _DECREASE_WORD_RE = re.compile(
@@ -326,7 +329,7 @@ def _structural_claims(payload) -> list[dict]:
         for entry in _ledger_scopes(record):
             if (entry.get("kind") != "result"
                     or entry.get("field") != "weeks_per_block"
-                    or not entry.get("metric")):
+                    or _is_metricless_metric(entry.get("metric"))):
                 continue
             key = (record.get("sequence"), entry.get("path"))
             if key in seen:
@@ -581,7 +584,8 @@ def _payload_scopes(payload) -> list[dict]:
             if not isinstance(field_metrics, dict):
                 field_metrics = {}
             field = node.get("field")
-            if metric and period is not None and field and "value" in node:
+            if (not _is_metricless_metric(metric) and period is not None
+                    and field and "value" in node):
                 value = _claimable_value(node.get("value"))
                 if value is not None:
                     out.append({"metric": metric, "period": period,
@@ -589,7 +593,7 @@ def _payload_scopes(payload) -> list[dict]:
                                 "source": "payload", "tier": "metric"})
             # Block aggregates are published as named fields alongside their
             # period. Do not flatten arbitrary numeric keys (e.g. days).
-            if metric and period is not None:
+            if not _is_metricless_metric(metric) and period is not None:
                 for name in ("mean", "total", "mean_delta", "total_delta",
                              "total_delta_pct"):
                     if (name in node and _metric_owns_field(metric, name)
@@ -621,7 +625,7 @@ def _payload_scopes(payload) -> list[dict]:
                 if (key in field_metrics and period is not None
                         and isinstance(child, (int, float))
                         and not isinstance(child, bool)
-                        and field_metrics[key]):
+                        and not _is_metricless_metric(field_metrics[key])):
                     out.append({"metric": str(field_metrics[key]),
                                 "period": period, "field": str(key),
                                 "value": float(child),
@@ -676,7 +680,9 @@ def _ledger_scopes(record: dict) -> list[dict]:
                 # keep this exception scoped to that exact result shape.
                 child_points_metric = (
                     node.get("metric") if root == "result"
-                    and key == "points" and node.get("metric") else None)
+                    and key == "points"
+                    and not _is_metricless_metric(node.get("metric"))
+                    else None)
                 walk(child, path + (key,), child_metric, period,
                      workout_key, field, child_metric_owned, root,
                      child_points_metric or points_metric)
@@ -711,7 +717,8 @@ def _ledger_scopes(record: dict) -> list[dict]:
                     "kind": root,
                     # A context leaf beside a metric result is distinct from
                     # a metricless result shape such as workout counts.
-                    "context": (bool(inherited_metric) and not metric_owned
+                    "context": (not _is_metricless_metric(inherited_metric)
+                                and not metric_owned
                                 and field in _SURPLUS_LABEL_CONTEXT_FIELDS)})
 
     for root in ("result", "arguments"):
@@ -781,8 +788,8 @@ def _is_surplus_context_metric(entry: dict, claim: dict) -> bool:
     for result leaves that sit under an enclosing metric result; it does not
     apply to metricless result shapes such as workout counts.
     """
-    return (claim.get("metric") is not None
-            and entry.get("metric") is None
+    return (not _is_metricless_metric(claim.get("metric"))
+            and _is_metricless_metric(entry.get("metric"))
             and entry.get("context") is True)
 
 
@@ -802,15 +809,23 @@ def _entry_claim_refusal(entry: dict, claim: dict) -> dict | None:
         return {"ok": False, "reason": "claim field does not match ledger path",
                 "actual_field": entry["field"]}
     metric = claim.get("metric")
+    metricless = _is_metricless_metric(metric)
     # list_workouts has no metric-series owner. Its row carries the server's
     # stable workout identity instead, so a metric-bearing claim is still
     # refused there; a workout field is never relabelled as a daily-metric
     # series. Metric-less result claims are handled by the general exact-path
     # rule below.
     workout_scoped = _entry_is_workout_scoped(entry)
-    if ((workout_scoped and metric is not None) or (
-            metric is not None and entry["metric"] != metric
-            and not _is_surplus_context_metric(entry, claim))):
+    # Blankness buys no leniency, but it buys no extra strictness either:
+    # absent, null and blank-after-strip are ONE state. Treating an explicit
+    # "" as stricter than an omitted key is the very absence-versus-emptiness
+    # split this check was fixed to remove, and it disagrees with the model
+    # contract shipped alongside it, which forbids null and "" identically.
+    # A claim asserting a WRONG metric is still refused on every entry kind.
+    if (not metricless and
+            (workout_scoped or
+             (entry["metric"] != metric
+              and not _is_surplus_context_metric(entry, claim)))):
         return {"ok": False, "reason": "claim metric does not match ledger field",
                 "actual_metric": entry["metric"]}
     if entry["period"] is not None and claim.get("period") is not None:
@@ -847,7 +862,7 @@ def _bind_entry(entry: dict, claim: dict) -> dict:
     # performs the SQL cross-check. Keep this explicit so the two assurances
     # cannot collapse into one boolean.
     resolved["tier"] = (
-        "path" if claim.get("metric") is None
+        "path" if _is_metricless_metric(claim.get("metric"))
         or _is_surplus_context_metric(entry, claim) else "metric")
     if _entry_is_workout_scoped(entry):
         resolved["scope"] = "workout"
@@ -1029,7 +1044,7 @@ def resolve_payload_value(payload, claim: dict) -> dict | None:
     metric = claim.get("metric")
     field = str(claim.get("field") or "").strip()
     period = claim.get("period")
-    if not metric or not field or period is None:
+    if _is_metricless_metric(metric) or not field or period is None:
         return None
     matches = [entry for entry in _payload_scopes(payload)
                if entry["metric"] == metric and entry["field"] == field
@@ -1266,7 +1281,7 @@ def _sql_scoped_value(conn, claim: dict, as_of: str | None = None) -> dict:
         actual, window, reason = _sql_impact_value(conn, claim)
         return {"actual": actual, "window": window, "scope": "impact_volume",
                 "reason": reason or ""}
-    if not metric or not mx.metric_exists(conn, metric):
+    if _is_metricless_metric(metric) or not mx.metric_exists(conn, metric):
         return {"actual": None, "reason": f"unknown metric {metric!r}"}
     window = resolve_window(conn, metric, claim.get("period"), as_of)
     if window is None:
@@ -1338,7 +1353,8 @@ def _verify_derivation(conn, num: dict, as_of: str | None, payload) -> dict:
             "field": str(num.get("field") or "") or None,
             "claimed": _as_float(num.get("value")), "ok": False,
             "exact": True, "derived": True}
-    if not num.get("metric") or num.get("period") is None or not num.get("field"):
+    if (_is_metricless_metric(num.get("metric"))
+            or num.get("period") is None or not num.get("field")):
         return {**base, "reason":
                 "derived claim must name metric, period, and field"}
     if not operation or not isinstance(operands, list):
@@ -1447,7 +1463,7 @@ def verify_number(conn, num: dict, as_of: str | None = None,
     # Metric omission is general only for an exact, unambiguous result path in
     # a ledger. Non-ledger payloads still require a metric, and the ledger
     # resolver itself retains all source/path refusals.
-    if metric is None and not _is_ledger(payload):
+    if _is_metricless_metric(metric) and not _is_ledger(payload):
         return {**base, "reason": "no metric named — unverifiable"}
     if payload_hit and not payload_hit.get("ok", False):
         return {**base, **payload_hit}

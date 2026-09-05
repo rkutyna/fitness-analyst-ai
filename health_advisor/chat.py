@@ -1188,7 +1188,8 @@ def _ledger_has_asked_metric_value(ledger: list[dict], metric: str,
             if (entry.get("kind") == "result"
                     and entry.get("value") is not None
                     and (entry.get("metric") == metric
-                         or (entry.get("metric") is None
+                         or (_DV_VOCAB._is_metricless_metric(
+                             entry.get("metric"))
                              and entry.get("field") == metric))):
                 return True
     return False
@@ -1200,7 +1201,7 @@ def _template_has_asked_metric_figure(question: str, template: str,
     from . import fact_template
 
     metric = _question_metric(question, facts)
-    if not metric:
+    if _DV_VOCAB._is_metricless_metric(metric):
         return False
     scan = fact_template.scan_template(template, facts)
     for key in scan.get("placeholders", []):
@@ -1216,7 +1217,7 @@ def _template_has_asked_metric_figure(question: str, template: str,
 def _prose_has_asked_metric_figure(metric: str | None, claims,
                                    verification: dict) -> bool:
     """Whether a verified prose claim carries a figure for ``metric``."""
-    if not metric or not isinstance(claims, list):
+    if _DV_VOCAB._is_metricless_metric(metric) or not isinstance(claims, list):
         return False
     numbers = (verification.get("verdict") or {}).get("numbers") or []
     for claim, number in zip(claims, numbers):
@@ -1225,7 +1226,7 @@ def _prose_has_asked_metric_figure(metric: str | None, claims,
         if not number.get("ok"):
             continue
         if (claim.get("metric") == metric or number.get("metric") == metric
-                or (claim.get("metric") is None
+                or (_DV_VOCAB._is_metricless_metric(claim.get("metric"))
                     and number.get("field") == metric)):
             return True
     return False

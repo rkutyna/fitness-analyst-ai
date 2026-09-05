@@ -14,6 +14,7 @@ import re
 from datetime import date, timedelta
 from urllib.parse import quote, unquote
 
+from . import claim_contract as _CLAIM_CONTRACT
 from . import deepdive_verify as _verify
 from . import normalize
 
@@ -178,7 +179,7 @@ def _add_period_label_facts(facts: dict[str, dict]) -> None:
     for fact in list(facts.values()):
         metric = fact.get("metric")
         period = fact.get("period")
-        if metric is None or period is None:
+        if _CLAIM_CONTRACT.is_metricless_metric(metric) or period is None:
             continue
         identity = (str(metric), _period_identity(period))
         if identity in seen:
@@ -455,7 +456,7 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
                          if entry.get("field") == "presentation"]
         units = _unit_by_path(record)
         for entry in entries:
-            if (not entry.get("metric")
+            if (_CLAIM_CONTRACT.is_metricless_metric(entry.get("metric"))
                     or entry.get("field") == "presentation"
                     or entry.get("value") is None):
                 continue

@@ -681,7 +681,10 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     full-range per-type counts as
     `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path
     with `metric` omitted, and never count the possibly truncated `workouts`
-    rows. Dates must be explicit YYYY-MM-DD — an 'error' comes back otherwise."""
+    rows. For a metric-less claim, omit the `metric` key entirely; do not send
+    `metric: null`, `metric: ""`, or whitespace as a substitute for
+    omission. Dates must be explicit YYYY-MM-DD — an 'error' comes back
+    otherwise."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
     limit = max(1, min(int(limit), MAX_WORKOUTS))

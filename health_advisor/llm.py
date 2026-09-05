@@ -38,6 +38,8 @@ from pathlib import Path
 import httpx
 import urllib.parse
 
+from . import claim_contract as _CLAIM_CONTRACT
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BACKEND = os.environ.get("HA_LLM_BACKEND", "codex")
@@ -1079,7 +1081,8 @@ _RESEARCH_CLAIM_INSTRUCTIONS = (
     "`list_workouts` publishes full-range per-type counts as "
     "`workout_counts: [{type, count}]`; cite the `count` leaf at its exact "
     "path with `metric` omitted, and never count the possibly truncated "
-    "`workouts` rows."
+    "`workouts` rows. "
+    + _CLAIM_CONTRACT.metricless_claim_instruction_sentence()
 )
 
 
@@ -1451,7 +1454,7 @@ def _ledger_index_value(value) -> str:
 def _ledger_index_leaf(entry: dict) -> str:
     """One citable leaf: what it is, what it says, and how to cite it."""
     parts = []
-    if entry.get("metric"):
+    if not _CLAIM_CONTRACT.is_metricless_metric(entry.get("metric")):
         parts.append(f"metric={entry['metric']}")
     if entry.get("period"):
         parts.append(f"period={entry['period']}")

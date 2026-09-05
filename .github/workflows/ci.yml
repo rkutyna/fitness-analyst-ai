@@ -71,9 +71,13 @@ jobs:
       # INFORMATIONAL, and deliberately not a gate. The sandbox attack corpus
       # enforces 100% blocking per class, and enforcement is OS-dependent:
       # DYLD_INSERT_LIBRARIES injection is blocked on macOS 26.x arm64 and NOT
-      # blocked on the macos-latest runner. The assertion stays strict so the
-      # gap stays visible -- adding it to KNOWN_GAPS to get a green tick would
-      # be deleting the finding rather than fixing it. See SECURITY.md.
+      # blocked on the macos-latest runner (#2). Recorded precisely as a
+      # Seatbelt-only KNOWN_GAPS entry rather than a blanket exemption --
+      # see tests/test_analyst_sandbox.py and SECURITY.md -- because the
+      # deficit is host-dependent and this step's continue-on-error already
+      # keeps it from gating unrelated work either way. The corpus's other
+      # eight classes, and the Linux (bubblewrap) executor, stay strictly
+      # enforced.
       - name: Sandbox attack corpus (informational — see SECURITY.md)
         continue-on-error: true
         env:

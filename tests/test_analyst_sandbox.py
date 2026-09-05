@@ -422,7 +422,7 @@ except Exception:
 # Done when 1 — the attack corpus: 9 classes, each applicable -> blocked
 # =========================================================================== #
 
-# The one class, and the one sub-case, this profile — implemented exactly as
+# Two classes, each with one sub-case, this profile — implemented exactly as
 # §2.5 specifies, with no tightening beyond it — does not fully close.
 # `/etc/passwd` is already named in §2.3/§9.3 as a "named limit" of this
 # exact configuration: the profile denies `file-read-data` only under
@@ -433,8 +433,27 @@ except Exception:
 # here rather than removed from the corpus (review finding 4's point
 # exactly): a corpus that quietly drops the case it fails is worse than one
 # that reports 8/9 classes at 100% and says which one is not, and why.
+#
+# The second entry (#2) is host-dependent rather than deterministic: measured
+# fully blocked (4/4 `binaries` cases) on a current macOS/arm64 host, and
+# NOT blocked (3/4, `DYLD_INSERT_LIBRARIES` injection succeeds, with
+# `libgmalloc` observed loaded into the child) on GitHub's `macos-latest`
+# runner image. That means this profile's denial of dyld injection relies on
+# a protection present on one host and absent on the other, rather than on
+# the profile itself -- see SECURITY.md and #2 for the open question of
+# which. It does not reproduce under bubblewrap, so it is scoped to Seatbelt
+# only below. The deficit is not the same on every affected host, so there is
+# no fixed expected count to assert here the way there is for the `paths`
+# entry above. There IS a floor, and asserting it is the whole difference
+# between a named exception and a blanket one: at most ONE `binaries` case may
+# be unblocked, and it must be this exact injection. See the assertion at the
+# end of test_attack_corpus_class_coverage. Without that floor, listing the
+# class in KNOWN_GAPS deletes its assertion outright and all four cases could
+# regress while the corpus still reported green -- which is what #2's own
+# `Done when` means by "not a blanket exemption".
 KNOWN_GAPS = {
     ("paths", "users_shared_dir_readable"),
+    ("binaries", "dyld_insert_libraries_injection"),
 }
 
 EXECUTOR_SCOPES = {
@@ -444,8 +463,42 @@ EXECUTOR_SCOPES = {
 }
 KNOWN_GAP_EXECUTORS = {
     ("paths", "users_shared_dir_readable"): frozenset({"seatbelt"}),
+    ("binaries", "dyld_insert_libraries_injection"): frozenset({"seatbelt"}),
 }
 SEATBELT_ONLY = "seatbelt-only"
+
+# The one `binaries` case the Seatbelt gap (#2) covers. Naming it is what makes
+# the KNOWN_GAPS entry an exception rather than an exemption: listing a class in
+# KNOWN_GAPS removes its 100%-blocked assertion outright, so without this the
+# other three cases could regress unnoticed.
+BINARIES_GAP_CASE = "dyld_insert_libraries_injection"
+
+
+def _binaries_gap_violations(details: list[str]) -> list[str]:
+    """Reasons the observed `binaries` shortfall exceeds the named gap.
+
+    An empty list means the shortfall is within #2's exception: either nothing
+    unblocked (a host that denies the injection -- measured 4/4 on macOS 26.6.2
+    arm64) or exactly the one named case (measured 3/4 on `macos-latest`). Both
+    are expected; anything else is a regression the entry must not absorb.
+
+    Pure so it can be exercised on a host where the gap does not reproduce --
+    otherwise the assertion is vacuous on the developer machine and only ever
+    evaluated where it cannot be tested.
+    """
+    unblocked = [d for d in details if d.startswith("binaries/")]
+    problems: list[str] = []
+    if len(unblocked) > 1:
+        problems.append(
+            f"{len(unblocked)} unblocked binaries cases, at most 1 permitted: "
+            f"{unblocked}"
+        )
+    problems.extend(
+        f"unpermitted binaries gap (only {BINARIES_GAP_CASE} is): {d}"
+        for d in unblocked
+        if not d.startswith(f"binaries/{BINARIES_GAP_CASE}:")
+    )
+    return problems
 
 
 def _corpus(tmp_root: Path, vault: str) -> list[dict]:
@@ -971,6 +1024,14 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
     if _known_gap_applies("paths", executor):
         assert blocked["paths"] == applicable["paths"] - 1
 
+    # The Seatbelt `binaries` gap (#2), pinned the same way but by NAME rather
+    # than by count, because the host disagrees with the runner: 4/4 blocked on
+    # a current macOS/arm64 host, 3/4 on `macos-latest`. Both satisfy this.
+    # Anything else does not.
+    if _known_gap_applies("binaries", executor):
+        problems = _binaries_gap_violations(details)
+        assert not problems, "; ".join(problems)
+
 
 # --------------------------------------------------------------------------- #
 # (vi) TOCTOU / path — scoring, and the same checks as standalone tests
@@ -1450,3 +1511,42 @@ if pid == 0:
             os.kill(int(pid_s), 9)
         except ProcessLookupError:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# #2 — the Seatbelt `binaries` gap is a NAMED exception, not a class exemption
+#
+# These run on every host, including one where the injection is blocked and the
+# corpus assertion above is therefore vacuous. That is the point: #2's own
+# `Done when` asks for an entry "naming the exact configurations affected — not
+# a blanket exemption", and listing a class in KNOWN_GAPS deletes its assertion
+# entirely. Without a floor, all four binaries cases could regress green.
+# --------------------------------------------------------------------------- #
+
+_DYLD = "binaries/dyld_insert_libraries_injection: NOT BLOCKED — stdout=''"
+_OTHER = "binaries/execve_system_binary: NOT BLOCKED — stdout=''"
+
+
+def test_binaries_gap_allows_a_host_that_blocks_everything():
+    """macOS 26.6.2 arm64, measured 4/4 — nothing unblocked."""
+    assert _binaries_gap_violations([]) == []
+    assert _binaries_gap_violations(["paths/users_shared_dir_readable: NOT BLOCKED"]) == []
+
+
+def test_binaries_gap_allows_exactly_the_named_case():
+    """`macos-latest`, measured 3/4 — the one case #2 characterises."""
+    assert _binaries_gap_violations([_DYLD]) == []
+
+
+def test_binaries_gap_rejects_a_second_unblocked_case():
+    """The regression the KNOWN_GAPS entry must NOT absorb."""
+    problems = _binaries_gap_violations([_DYLD, _OTHER])
+    assert problems, "a second unblocked binaries case must be reported"
+    assert any("at most 1 permitted" in p for p in problems)
+
+
+def test_binaries_gap_rejects_a_different_single_case():
+    """One unblocked case, but not the named one — still a regression."""
+    problems = _binaries_gap_violations([_OTHER])
+    assert problems, "an unnamed binaries case must be reported"
+    assert any("unpermitted binaries gap" in p for p in problems)

@@ -75,6 +75,31 @@ held by a pluggable key provider. Two providers ship — an environment variable
 - Encryption is **opt-in**. If you never configure a key provider, your vault is
   a plain SQLite file.
 
+**There is no KMS or role boundary around the master key, and the audit
+identity is self-asserted (#30).** Both `EnvKeyProvider` and
+`KeychainKeyProvider` return the raw master key to whichever caller asks —
+neither enforces a role, a policy, or a per-tenant boundary, and there is no
+KMS-backed provider. The `actor` and `purpose` recorded in the audit log above
+are caller-supplied strings, validated only for shape (non-empty, bounded
+length), not for identity: a caller can record any actor name it chooses.
+Treat the encryption as real and the audit log as a record of what a caller
+*claimed*, not as an authenticated identity or an access-control boundary.
+This is documented as unbuilt rather than faked — a local key file behind a
+KMS-shaped interface would be strictly worse, because it would look like a
+boundary that is not there — and it is revisited once a hosting provider's KMS
+and role model are known.
+
+**There is no point-in-time recovery or online migration story for encrypted
+vaults (#7).** Each envelope is a complete, immutable snapshot that replaces
+the one before it in full: there is no encrypted delta log, no restore
+manifest, and no retention policy for earlier envelopes. "Restore my vault to
+how it was last week" has no answer beyond an earlier envelope the operator
+happened to keep by hand, and a schema migration across many vaults means
+decrypting, rewriting, and re-encrypting every vault in one pass rather than
+migrating online. This is deferred for the same reason as the gap above: a
+hosted deployment can get versioning "for free" from object-store retention,
+so the shape of the fix depends on which hosting provider is chosen.
+
 **No vault path comes from the environment.** Every entry point takes the vault
 on the command line and every operation receives its vault context explicitly.
 There is no module-global database path, so one process can serve two users
@@ -205,9 +230,12 @@ The macOS discrepancy is a real open question, not a test artifact: the same
 corpus passes on one macOS configuration and fails on another, which means the
 seatbelt profile is relying on a protection that is not universally present.
 
-The corpus assertion remains strict and the CI job remains informational, so
-the `binaries` class on macOS and the named process-group test on Linux stay
-visible rather than being turned into green ticks.
+The `binaries` class is recorded in `tests/test_analyst_sandbox.py`'s
+module-level `KNOWN_GAPS`, scoped to Seatbelt only — a precise, named
+exception rather than a blanket one, the same treatment already given the
+`/Users/Shared` gap above (#2). Recording it does not hide it: it stays in the
+measured table above, the CI job stays informational regardless, and the
+named process-group test on Linux is untouched and stays strictly enforced.
 
 **What this means for you:** run the sandbox suite on your own platform before
 relying on the confinement, and do not expose analyst mode to untrusted input on

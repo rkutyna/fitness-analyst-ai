@@ -16,6 +16,30 @@ the envelope therefore permits at most 2**31 chunks plus one footer invocation
 per data key, a one-bit safety margin below that bound.  With the default 1 MiB
 chunk size, the enforced plaintext ceiling is 2**41 bytes (2 TiB), or
 2**31 chunks.
+
+This module implements the cipher only, and delivers exactly that: encryption
+at rest, with a per-vault data key wrapped by a provider-held master key.  It
+is not a key-management or access-control system.  Both ``KeyProvider``
+implementations return the raw master key to whichever caller asks, there is
+no role boundary or policy around who may unwrap a vault, and the ``actor``
+and ``purpose`` recorded in the mandatory unwrap audit are caller-supplied
+strings, validated for shape and not for identity -- the audit log records
+what a caller claimed, not an authenticated identity.  That gap is documented
+rather than papered over: a key-file provider dressed in a KMS-shaped
+interface would be strictly worse, because it would look like a boundary that
+is not there.  It is revisited once a hosting provider's KMS and role model
+are known (#30).
+
+Envelopes are also complete, immutable snapshots -- each one replaces the
+last in full.  There is no encrypted delta log, no restore manifest, and no
+retention policy for earlier envelopes, so there is no point-in-time recovery
+and no online, resumable migration path across a fleet of vaults; a schema
+change means decrypting, rewriting, and re-encrypting every vault in one
+pass.  Also deferred rather than half-built, until a hosting deployment's
+retention story is decided (#7).
+
+See SECURITY.md for both gaps stated as part of the vault's data-handling
+posture.
 """
 from __future__ import annotations
 

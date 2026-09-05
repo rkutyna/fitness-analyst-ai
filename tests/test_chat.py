@@ -309,24 +309,50 @@ def test_denial_phrase_requires_no_asked_metric_figure(kind, text, expected):
         facts=facts) is expected
 
 
-@pytest.mark.parametrize("text,empty_expected,denial_expected", [
-    ("I don't have your jog minutes for this week.", False, True),
-    ("I don't have a recorded figure for your jog minutes this week.",
-     False, True),
-    ("I don't have any jog minute data for this week, so I can't provide "
-     "that figure.", True, False),
-    ("Jog minute data is unavailable for this week, so I cannot provide "
-     "that figure.", True, False),
-    ("I don't have a record of your jog minutes for this week, so I can't "
-     "provide that figure.", True, False),
-    ("I don't have a recorded value for the jog minutes metric family for "
-     "this week.", False, True),
+@pytest.mark.parametrize("text", [
+    "The jog minutes metric is unavailable for this week.",
+    "I can't report jog minutes for this week because the jog minutes metric "
+    "family has no available data in the current fact set.",
+    "I don't have a supported figure for jog minutes this week; so I can't "
+    "provide a number.",
+    "Jog minute data is unavailable for this week.",
+    "The requested metric cannot be reported in this period.",
 ])
-def test_measured_denial_wordings_keep_the_regex_split(
-        text, empty_expected, denial_expected):
-    """Measured denial prose stays on its intended closed-list gate."""
-    assert bool(chat._EMPTY_NARRATION_RE.search(text)) is empty_expected
-    assert bool(chat._AVAILABLE_FIGURE_DENIAL_RE.search(text)) is denial_expected
+def test_available_metric_denial_is_structural_not_lexical(
+        monkeypatch, text):
+    """Any wording is refused when the two Python-owned facts are present."""
+    class ForbiddenRegex:
+        def search(self, value):
+            raise AssertionError("denial gate consulted lexical prose")
+
+    monkeypatch.setattr(chat, "_EMPTY_NARRATION_RE", ForbiddenRegex())
+    ledger = _available_jog_ledger()
+    assert chat._denied_available_figure(
+        "How many jog minutes did I do this week?", text, ledger) is True
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n", None])
+def test_an_absent_answer_is_not_a_denial(text):
+    """A transport failure returns no answer; it does not deny one.
+
+    Measured 2026-09-05 on a 72-sample live run under the deployed
+    configuration: the run produced no denial prose at all, yet reported four
+    -- one per empty model response. An answer that does not exist trivially
+    carries no figure for the asked metric, so the structural gate fired on
+    every transport failure and stamped it "narration denied an available
+    figure". The published verdict was unaffected (an empty answer is refused
+    either way, and _ask_cause rendered transport_failed), but `reason` is the
+    channel denial rates are measured from, so the mislabel corrupts the
+    evidence this gate exists to produce.
+
+    What would make this pass while the code is wrong: reinstating a phrase
+    list would also spare empty text. That is why the sibling test above
+    asserts the gate never consults a regex, and why this one asserts only the
+    emptiness boundary.
+    """
+    assert chat._denied_available_figure(
+        "How many jog minutes did I do this week?", text,
+        _available_jog_ledger()) is False
 
 
 def test_genuinely_empty_gather_allows_empty_narration_without_retry(

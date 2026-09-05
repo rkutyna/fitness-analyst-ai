@@ -992,20 +992,6 @@ _EMPTY_NARRATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# These phrases are deliberately closed. A generic negation or a word such
-# as "missing" is too broad for this gate: ordinary coaching prose can contain
-# both without denying a published measurement.
-_AVAILABLE_FIGURE_DENIAL_RE = re.compile(
-    r"\b(?:"
-    r"no\s+(?:recorded\s+)?(?:value|figure)(?:\s+(?:was\s+)?recorded)?|"
-    r"(?:does\s+not|doesn't)\s+include|"
-    r"(?:do\s+not|don't)\s+have\s+(?:a\s+)?(?:recorded\s+)?(?:value|figure)|"
-    r"(?:do\s+not|don't)\s+have\s+your\s+"
-    r"[A-Za-z][A-Za-z-]*(?:\s+[A-Za-z][A-Za-z-]*)*"
-    r")\b",
-    re.IGNORECASE,
-)
-
 _DENIED_AVAILABLE_FIGURE_REASON = "narration denied an available figure"
 
 # #16. The defect is self-contradiction, not a bad measurement: every figure in
@@ -1249,11 +1235,27 @@ def _denied_available_figure(question: str, text: str, ledger: list[dict],
                              *, answer_has_asked_metric_figure: bool = False,
                              facts: dict[str, dict] | None = None,
                              resolved_window=None) -> bool:
-    """Whether a denial refuses a figure Python published for this question."""
-    if (not isinstance(text, str)
-            or not (_EMPTY_NARRATION_RE.search(text)
-                    or _AVAILABLE_FIGURE_DENIAL_RE.search(text))
-            or answer_has_asked_metric_figure):
+    """Whether the answer omitted a figure Python published for this question.
+
+    Structural, not lexical: the asked metric comes from the question, its
+    value comes from the scoped ledger, and the answer figure bit comes from
+    Python's claim/template verification. ``text`` is read for one thing only
+    -- whether an answer exists at all -- and never for what it says.
+
+    An ABSENT answer is not a denial. A transport failure returns "", which
+    trivially carries no figure for the asked metric, so without this guard
+    every empty model response is recorded as ``reason`` "narration denied an
+    available figure". Measured 2026-09-05: a 72-sample live run produced no
+    denial prose at all, yet reported four, one per transport failure. The
+    user-visible verdict was right either way -- an empty answer is refused
+    regardless, and ``_ask_cause`` reported ``transport_failed`` -- but the
+    reason is the channel denial rates are measured from, so a mislabel here
+    corrupts the evidence this gate exists to produce. Emptiness is
+    ``_ask_cause``'s verdict to render, not this gate's.
+    """
+    if answer_has_asked_metric_figure:
+        return False
+    if not isinstance(text, str) or not text.strip():
         return False
     metric = _question_metric(question, facts)
     return bool(metric and _ledger_has_asked_metric_value(
@@ -1269,18 +1271,16 @@ def _empty_narration_is_grounded(ctx: VaultContext, text: str,
                                  answer_has_asked_metric_figure: bool = False
                                  ) -> tuple[bool, str]:
     """Validate no-data prose against returned facts and current coverage."""
-    if not (_EMPTY_NARRATION_RE.search(text)
-            or _AVAILABLE_FIGURE_DENIAL_RE.search(text)):
-        return True, ""
     if question is not None and ledger is not None and _denied_available_figure(
             question, text, ledger,
             answer_has_asked_metric_figure=answer_has_asked_metric_figure,
             facts=facts, resolved_window=resolved_window):
         return False, _DENIED_AVAILABLE_FIGURE_REASON
-    # Keep the existing coverage protection in force. The ledger check above
-    # is additive: a missing value permits a genuine gap, but coverage still
-    # refuses an empty answer for a metric the vault can cover.
-    if not _EMPTY_NARRATION_RE.search(text):
+    # This lexical check is only the separate coverage protection: a missing
+    # value permits a genuine gap, but explicit no-data prose still has to name
+    # a metric family whose vault coverage is actually missing. It is not part
+    # of the available-figure denial decision above.
+    if not isinstance(text, str) or not _EMPTY_NARRATION_RE.search(text):
         return True, ""
     rows = _empty_narration_coverage(ctx, as_of)
     mentioned = [row for row in rows

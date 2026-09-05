@@ -26,6 +26,10 @@ JUDGE_PASS = 70
 # Sampling profile re-exported for judge call sites (temp 0 for determinism).
 JUDGE_OPTS = llm.JUDGE_OPTS
 
+# Caller-stated bound for the scheduled briefing chain; run_model forwards it
+# to llm.complete rather than letting the reasoning setting choose it.
+TIMEOUT_BRIEFING = llm.TIMEOUT_BRIEFING
+
 # Keep the historical module-level name for callers and tests; the tokenizer
 # itself is owned by the shared numeric tokenizer.
 # Full ISO dates AND bare year-months. The year-month alternative matters: the
@@ -774,7 +778,9 @@ def run_model(prompt: str, *, tools: str | None = None, ctx=None,
     llm.tool_loop. Always returns a string ("" on any model error).
     When tools is set the call delegates to tool_loop, which manages its own
     turn budget and timeouts; `timeout` and `options` apply only to the
-    tool-less (complete) path."""
+    tool-less (complete) path. A caller with a wall-clock deadline should pass
+    its bound explicitly through `timeout`; an omitted bound retains llm's
+    existing reasoning-keyed default."""
     if tools:
         if ctx is None:
             raise ValueError("the researcher path needs a VaultContext: "

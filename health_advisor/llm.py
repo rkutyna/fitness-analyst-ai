@@ -352,6 +352,23 @@ TIMEOUT_TOOL_TURN = 2400  # per researcher turn (think-ON, tools). The weekly de
                           # prompt (~39k tokens ≈ 30 min at this box's ~22 tok/s) + thinking
 DEADLINE_TOOL_LOOP = 900  # overall wall-clock for one researcher task
 
+# The scheduled briefing chain can make four tool-less calls (generate, judge,
+# regenerate, judge) under systemd's 900 s start limit. Keep the existing
+# 180-second per-call ceiling, while deriving the caller-stated bound from the
+# chain shape and a 120-second scheduling/serialization reserve:
+# 4 calls × 180 s + 120 s overhead = 840 s < 900 s. If the chain length
+# changes, this expression changes the bound instead of leaving a guessed
+# timeout behind. The min also preserves TIMEOUT_BRIEF's established single-
+# call ceiling for other callers.
+BRIEFING_SYSTEMD_TIMEOUT = 900
+BRIEFING_CHAIN_CALLS = 4
+BRIEFING_OVERHEAD = 120
+TIMEOUT_BRIEFING = min(
+    TIMEOUT_BRIEF,
+    (BRIEFING_SYSTEMD_TIMEOUT - BRIEFING_OVERHEAD - 1)
+    // BRIEFING_CHAIN_CALLS,
+)
+
 # The ASK path is interactive and must not inherit the researcher's bounds.
 # Measured 2026-08-28 on together/deepseek-v4-flash-0731: a whole question
 # averages 38 s across ~7 tool turns, so ~5 s per turn. TIMEOUT_TOOL_TURN is

@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from health_advisor import llm
+from health_advisor import agents, llm
 
 
 @pytest.fixture
@@ -71,6 +71,72 @@ def test_openrouter_reasoning_controls_timeout_even_when_think_is_true(
     monkeypatch.setattr(llm, "OPENROUTER_REASONING", "on")
     llm.complete("prompt", think=False)
     assert timeouts == [llm.TIMEOUT_BRIEF, llm.TIMEOUT_THINK]
+
+
+@pytest.mark.parametrize("mode, expected", [
+    ("off", llm.TIMEOUT_BRIEF),
+    ("low", llm.TIMEOUT_THINK),
+    ("on", llm.TIMEOUT_THINK),
+])
+def test_default_timeout_still_follows_reasoning_mode(
+        openrouter, monkeypatch, mode, expected):
+    """An omitted timeout retains the pre-existing OpenRouter selection."""
+    timeouts = []
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, *args, **kwargs):
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "answer"}}],
+                "provider": "CoreWeave"},
+                request=httpx.Request("POST", "https://example.test"))
+
+    monkeypatch.setattr(llm, "_client",
+                        lambda timeout: (timeouts.append(timeout) or Client()))
+    monkeypatch.setattr(llm, "OPENROUTER_REASONING", mode)
+
+    assert llm.complete("prompt") == "answer"
+    assert timeouts == [expected]
+
+
+def test_briefing_timeout_is_derived_from_the_chain_budget():
+    assert llm.BRIEFING_CHAIN_CALLS == 4
+    assert llm.BRIEFING_OVERHEAD == 120
+    assert llm.TIMEOUT_BRIEFING == 180
+    assert (llm.BRIEFING_CHAIN_CALLS * llm.TIMEOUT_BRIEFING
+            + llm.BRIEFING_OVERHEAD < llm.BRIEFING_SYSTEMD_TIMEOUT)
+
+
+def test_run_model_caller_timeout_is_independent_of_openrouter_reasoning(
+        openrouter, monkeypatch):
+    """A caller deadline, unlike the default, owns the transport timeout."""
+    timeouts = []
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, *args, **kwargs):
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "answer"}}],
+                "provider": "CoreWeave"},
+                request=httpx.Request("POST", "https://example.test"))
+
+    monkeypatch.setattr(llm, "_client",
+                        lambda timeout: (timeouts.append(timeout) or Client()))
+    for mode in ("off", "low", "on"):
+        monkeypatch.setattr(llm, "OPENROUTER_REASONING", mode)
+        assert agents.run_model("prompt", timeout=llm.TIMEOUT_BRIEFING) == "answer"
+
+    assert timeouts == [llm.TIMEOUT_BRIEFING] * 3
 
 
 def test_complete_strips_think_block(openrouter):

@@ -81,12 +81,12 @@ SUBSCORE_K = 1.25
 # Making this per-vault is tracked in issue #6.
 SUBSCORE_K_RESCALED_ON = "2026-07-31"
 READINESS_SMOOTH_DAYS = 3
-GREEN, RED = 67, 34
+STRONG_THRESHOLD, RECOVER_THRESHOLD = 67, 34
 BAND_HYSTERESIS = 3
 READINESS_HYSTERESIS_DAYS = 7
 # How old the newest reading may be and still describe "today". The 05:00 brief
 # runs before the phone syncs, so yesterday's value is normal; anything older is
-# a watch that stopped, and a score built on it is a stale green light.
+# a watch that stopped, and a score built on it is a stale readiness label.
 READINESS_MAX_AGE_DAYS = 1
 
 ACWR_LOAD_METRICS = ["hr_load_proxy", "active_energy", "apple_exercise_time"]
@@ -707,17 +707,19 @@ _READINESS_COMPONENT_METRICS = {
 
 
 def _sticky_band(score: float, prev: str | None) -> str:
-    """Band for `score`, given yesterday's band. Crossing a boundary takes
+    """Readiness state for `score`, given yesterday's state. Crossing a boundary takes
     BAND_HYSTERESIS points more than staying put, so a label survives the noise
     that is left after smoothing instead of being renegotiated every morning."""
     h = 0 if prev is None else BAND_HYSTERESIS
-    green_edge = GREEN - h if prev == "green" else GREEN + h
-    red_edge = RED + h if prev == "red" else RED - h
-    if score >= green_edge:
-        return "green"
-    if score < red_edge:
-        return "red"
-    return "amber"
+    strong_edge = (STRONG_THRESHOLD - h if prev == "strong"
+                   else STRONG_THRESHOLD + h)
+    recover_edge = (RECOVER_THRESHOLD + h if prev == "recover"
+                    else RECOVER_THRESHOLD - h)
+    if score >= strong_edge:
+        return "strong"
+    if score < recover_edge:
+        return "recover"
+    return "steady"
 
 
 def _readiness_subscores(conn, as_of: str):
@@ -875,8 +877,8 @@ def readiness(conn, as_of: str | None = None) -> dict:
 # --- readiness becomes weekly, plus a two-day alert (P8-4, W7-4) -----------
 #
 # The daily 0-100 composite was retired at the Week 7 review. 53 scored days
-# produced 40 amber, 13 green and red NEVER — red would have needed a 3-day mean
-# resting HR of 77 against a 60 baseline — and both reachable bands license the
+# produced 40 steady, 13 strong and recover NEVER — recover would have needed a
+# 3-day mean resting HR of 77 against a 60 baseline — and both reachable states license the
 # same session. A number that cannot reach a third of its range, and whose two
 # reachable values imply the same action, is not informing a decision.
 #
@@ -902,7 +904,7 @@ def readiness_alert(conn, as_of: str | None = None) -> dict | None:
     """The one thing worth interrupting a day for, or None.
 
     None is the expected answer and is not a failure: an alert that fires most
-    days is the amber-every-morning composite this replaced.
+    days is the steady-every-morning composite this replaced.
     """
     as_of = _as_of(conn, as_of)
     days = [(date.fromisoformat(as_of) - timedelta(days=i)).isoformat()
@@ -1475,12 +1477,12 @@ def suggestions(readiness_d: dict, load_d: dict,
         out.append({"text": "Recovery metrics are still building a baseline — a few "
                             "more days of wear and these get meaningful.",
                     "because": "fewer than 14 baseline days available"})
-    elif band == "red":
+    elif band == "recover":
         f = readiness_d.get("factors", [])
         why = "; ".join(f"{x['component']} {x.get('pct')}%" for x in f[:2])
         out.append({"text": "Consider an easy or rest day; your body looks "
-                            "under-recovered.", "because": why or "readiness in red band"})
-    elif band == "green" and load_d.get("acwr") is not None and load_d["acwr"] < 0.9:
+                            "under-recovered.", "because": why or "readiness in recover state"})
+    elif band == "strong" and load_d.get("acwr") is not None and load_d["acwr"] < 0.9:
         out.append({"text": "You're fresh and recent volume is modest — a good day "
                             "to push if you want.",
                     "because": f"readiness {readiness_d.get('score')}, "
@@ -1504,11 +1506,11 @@ def suggestions(readiness_d: dict, load_d: dict,
             why += f"; ACWR {acwr} ({acwr_band})"
         # The written plan (docs/fitness/week-NN.md) owns progression — ≤10%/week,
         # deload cadence, rest days. The coach never prescribes distance; it only
-        # says how to *approach* tomorrow's planned session. A red recovery read or
+        # says how to *approach* tomorrow's planned session. A recover readiness read or
         # a fast ramp argue for backing off; anything else defers to the plan as
         # written. (An earlier version computed ±10% distance targets here, which
         # contradicted rest days and the plan's growth cap.)
-        if acwr_band == "ramping-fast" or readiness_d.get("band") == "red":
+        if acwr_band == "ramping-fast" or readiness_d.get("band") == "recover":
             out.append({"text": "Keep tomorrow easy — trim the planned session or "
                                 "take the rest day, not another hard push.",
                         "because": why})

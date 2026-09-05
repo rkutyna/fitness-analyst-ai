@@ -2244,7 +2244,7 @@ def get_weekly_readiness(ctx: VaultContext, as_of: str = "") -> dict:
     """Readiness as a WEEK, plus continuity — the two numbers that survived review.
 
     The daily 0-100 composite was retired. Over 53 scored days it
-    produced 40 amber, 13 green and red NEVER; red would have needed a 3-day
+    produced 40 steady, 13 strong and recover NEVER; recover would have needed a 3-day
     mean resting HR of 77 against a 60 baseline, and both reachable bands
     licensed the same session. A number that cannot reach a third of its range,
     whose two attainable values imply the same action, was not informing a
@@ -2258,7 +2258,7 @@ def get_weekly_readiness(ctx: VaultContext, as_of: str = "") -> dict:
       trend          week-over-week sentence, or null. REFUSES to compare across
                      2026-07-31, when SUBSCORE_K was halved:
                      the two sides are different instruments, and all four
-                     mornings the brief said "red" recompute as amber.
+                     mornings the brief said "recover" recompute as steady.
       alert          the one thing worth interrupting a day for, or null. Fires
                      only when a component has been across its threshold on TWO
                      CONSECUTIVE days. Null is the expected answer.

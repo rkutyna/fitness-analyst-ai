@@ -33,7 +33,7 @@ def test_readiness_red_when_rhr_up_hrv_down(conn):
                 [450] * 27 + [300] * 3)     # short sleep
     rd = A.readiness(conn, as_of="2026-05-30")
     assert rd["status"] == "ok"
-    assert rd["band"] == "red"
+    assert rd["band"] == "recover"
     assert rd["score"] < 34
 
 
@@ -42,7 +42,7 @@ def test_readiness_green_when_recovered(conn):
     seed_metric(conn, "heart_rate_variability", "2026-05-01", [60] * 27 + [80] * 3)
     seed_metric(conn, "sleep_asleep", "2026-05-01", [450] * 30)
     rd = A.readiness(conn, as_of="2026-05-30")
-    assert rd["band"] == "green"
+    assert rd["band"] == "strong"
 
 
 def test_missing_rhr_holds_the_prior_readiness_band(conn):
@@ -53,7 +53,7 @@ def test_missing_rhr_holds_the_prior_readiness_band(conn):
     rd = A.readiness(conn, as_of="2026-06-30")
 
     assert rd["status"] == "partial"
-    assert rd["band"] == "amber"
+    assert rd["band"] == "steady"
     assert "rhr" in rd["note"]
     assert "absent" in rd["note"]
 
@@ -66,7 +66,7 @@ def test_missing_hrv_holds_the_prior_readiness_band(conn):
     rd = A.readiness(conn, as_of="2026-06-30")
 
     assert rd["status"] == "partial"
-    assert rd["band"] == "amber"
+    assert rd["band"] == "steady"
     assert "hrv" in rd["note"]
     assert "absent" in rd["note"]
 
@@ -90,8 +90,8 @@ def test_the_rescale_date_is_recorded_where_the_code_can_see_it():
 def test_one_noisy_day_cannot_swing_readiness_across_the_scale(conn):
     # Measured HRV daily CV is 17.1% and SUBSCORE_K = 2.5 saturated at ±20%, so
     # the HRV subscore — 40% of the composite — was effectively binary. One low
-    # night moved the score 20 points; the live series swung green→amber→red→
-    # green on consecutive days.
+    # night moved the score 20 points; the live series swung strong→steady→recover→
+    # strong on consecutive days.
     seed_metric(conn, "resting_heart_rate", "2026-05-01", [55] * 30)
     seed_metric(conn, "heart_rate_variability", "2026-05-01", [60] * 29 + [35])
     seed_metric(conn, "sleep_asleep", "2026-05-01", [450] * 30)
@@ -112,18 +112,27 @@ def test_band_holds_through_an_oscillating_series(conn):
     assert len(set(bands)) == 1, bands
 
 
-def test_band_is_sticky_at_the_boundary_but_still_moves():
-    assert A._sticky_band(68, "amber") == "amber"     # 1 point over: noise
-    assert A._sticky_band(72, "amber") == "green"     # clear of it: real
-    assert A._sticky_band(65, "green") == "green"     # 2 points under: stays
-    assert A._sticky_band(60, "green") == "amber"
-    assert A._sticky_band(36, "red") == "red"
-    assert A._sticky_band(40, "red") == "amber"
-    assert A._sticky_band(75, None) == "green"        # no history: plain bands
-    assert A._sticky_band(20, None) == "red"
+def test_emitted_readiness_states_are_exactly_the_public_set():
+    emitted = {
+        A._sticky_band(score, prev)
+        for score in range(101)
+        for prev in (None, "recover", "steady", "strong")
+    }
+    assert emitted == {"recover", "steady", "strong"}
 
 
-# --- staleness (audit P2-2): a dead watch must not read green forever -------- #
+def test_hysteresis_sequence_stays_only_when_previous_state_matches():
+    scores = [70, 65, 63, 30, 36, 38]
+    states = []
+    previous = None
+    for score in scores:
+        previous = A._sticky_band(score, previous)
+        states.append(previous)
+
+    assert states == ["strong", "strong", "steady", "recover", "recover", "steady"]
+
+
+# --- staleness (audit P2-2): a dead watch must not read strong forever ------- #
 
 def _seed_recovery(conn, start="2026-05-01", days=30):
     seed_metric(conn, "resting_heart_rate", start, [55] * days)
@@ -133,7 +142,7 @@ def _seed_recovery(conn, start="2026-05-01", days=30):
 
 def test_readiness_is_stale_when_the_watch_stopped_reporting(conn):
     # 30 good days ending 2026-05-30, then nothing. Ten days later the same
-    # green score was still being reported as today's.
+    # strong score was still being reported as today's.
     _seed_recovery(conn)
     rd = A.readiness(conn, as_of="2026-06-09")
     assert rd["status"] == "stale"

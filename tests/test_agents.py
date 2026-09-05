@@ -119,7 +119,7 @@ def test_grounding_check_generated_unsupported_numbers_stay_rejected():
 
 def test_render_fallback_uses_talking_points():
     b = {"as_of": "2026-05-30",
-         "talking_points": [{"seed": "recovery readiness 72/100 (green)"},
+         "talking_points": [{"seed": "recovery readiness 72/100 (strong)"},
                             {"seed": "training load ACWR 1.1 (sweet-spot)"}],
          "suggestions": [{"text": "Good day to push."}]}
     text = G.render_fallback(b)

@@ -595,6 +595,110 @@ BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
+-- plan_statement_log: typed, append-only plan statements.
+--
+-- This is the source of truth for plan rules. Values stay typed: statement,
+-- scope, provenance and the rule's interval are represented as structured
+-- data, never rendered prose. A Week is rebuilt from these rows; it is not
+-- reconciled with the cache below.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS plan_statement_log (
+    sequence              INTEGER PRIMARY KEY AUTOINCREMENT,
+    statement_id          TEXT NOT NULL UNIQUE,
+    kind                  TEXT NOT NULL CHECK (kind IN
+        ('session', 'constraint', 'conditional', 'anchor', 'stance')),
+    scope_json             TEXT NOT NULL,
+    statement_kind         TEXT NOT NULL CHECK (statement_kind IN
+        ('stated', 'withdrawal')),
+    statement_json         TEXT NOT NULL,
+    provenance_kind        TEXT NOT NULL CHECK (provenance_kind IN
+        ('conversation_turn', 'parsed')),
+    conversation_turn_id   TEXT
+        REFERENCES conversation_turns(id) ON DELETE RESTRICT,
+    parsed_file            TEXT,
+    parsed_line            INTEGER,
+    effective_start        TEXT NOT NULL,
+    effective_end          TEXT,
+    include_start          INTEGER NOT NULL CHECK (include_start IN (0, 1)),
+    include_end            INTEGER NOT NULL CHECK (include_end IN (0, 1)),
+    enforced_from          TEXT,
+    acceptance_date        TEXT,
+    payload_json           TEXT NOT NULL,
+    recorded_at            TEXT NOT NULL,
+    CHECK (
+        (provenance_kind = 'conversation_turn'
+         AND conversation_turn_id IS NOT NULL
+         AND parsed_file IS NULL AND parsed_line IS NULL)
+        OR
+        (provenance_kind = 'parsed'
+         AND conversation_turn_id IS NULL
+         AND parsed_file IS NOT NULL AND parsed_line IS NOT NULL)
+    ),
+    CHECK (parsed_line IS NULL OR parsed_line > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_statement_log_effective
+    ON plan_statement_log (effective_start, effective_end, sequence);
+CREATE INDEX IF NOT EXISTS idx_plan_statement_log_scope
+    ON plan_statement_log (scope_json, sequence);
+
+CREATE TRIGGER IF NOT EXISTS plan_statement_log_no_update
+BEFORE UPDATE ON plan_statement_log
+BEGIN
+    SELECT RAISE(ABORT,
+        'plan statement log is append-only; insert a superseding statement');
+END;
+
+CREATE TRIGGER IF NOT EXISTS plan_statement_log_no_delete
+BEFORE DELETE ON plan_statement_log
+BEGIN
+    SELECT RAISE(ABORT,
+        'plan statement log is append-only; retain the log');
+END;
+
+-- plan_week_log: one immutable metadata declaration per Week.
+--
+-- Policy and Week provenance are facts about the Week, not attributes of the
+-- last rule appended to it. Keeping them here avoids duplicating policy on
+-- every statement and makes a projection fail closed when its declaration is
+-- absent rather than silently inventing metadata.
+CREATE TABLE IF NOT EXISTS plan_week_log (
+    week_start             TEXT PRIMARY KEY,
+    grading_policy_json    TEXT NOT NULL,
+    provenance_kind        TEXT NOT NULL CHECK (provenance_kind IN
+        ('conversation_turn', 'parsed')),
+    conversation_turn_id   TEXT
+        REFERENCES conversation_turns(id) ON DELETE RESTRICT,
+    parsed_file            TEXT,
+    parsed_line            INTEGER,
+    recorded_at            TEXT NOT NULL,
+    CHECK (
+        (provenance_kind = 'conversation_turn'
+         AND conversation_turn_id IS NOT NULL
+         AND parsed_file IS NULL AND parsed_line IS NULL)
+        OR
+        (provenance_kind = 'parsed'
+         AND conversation_turn_id IS NULL
+         AND parsed_file IS NOT NULL AND parsed_line IS NOT NULL)
+    ),
+    CHECK (parsed_line IS NULL OR parsed_line > 0)
+);
+
+CREATE TRIGGER IF NOT EXISTS plan_week_log_no_update
+BEFORE UPDATE ON plan_week_log
+BEGIN
+    SELECT RAISE(ABORT,
+        'plan Week metadata is append-only; a week declaration cannot be updated');
+END;
+
+CREATE TRIGGER IF NOT EXISTS plan_week_log_no_delete
+BEFORE DELETE ON plan_week_log
+BEGIN
+    SELECT RAISE(ABORT,
+        'plan Week metadata is append-only; retain the declaration');
+END;
+
+-- ---------------------------------------------------------------------------
 -- plan_projections: rebuildable typed plan envelopes, separate from the log.
 --
 -- The payload contains the complete Week projection, including its schema
@@ -626,6 +730,13 @@ CREATE INDEX IF NOT EXISTS idx_plan_projections_week
 CREATE INDEX IF NOT EXISTS idx_plan_projections_conversation
     ON plan_projections (conversation_turn_id)
     WHERE conversation_turn_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS plan_projections_no_update
+BEFORE UPDATE ON plan_projections
+BEGIN
+    SELECT RAISE(ABORT,
+        'plan projections are rebuild-only; insert a new projection');
+END;
 
 -- ---------------------------------------------------------------------------
 -- Review workflow (M4, #106): durable checkpoints over the conversational

@@ -353,6 +353,42 @@ def provenance_from_dict(data: Mapping[str, Any]) -> Provenance:
     raise ValueError(f"unknown provenance type: {kind!r}")
 
 
+def grading_policy_to_dict(policy: GradingPolicy) -> dict[str, Any]:
+    """Return the complete, JSON-shaped representation of a grading policy."""
+    if not isinstance(policy, GradingPolicy):
+        raise TypeError("grading policy must be a GradingPolicy")
+    return {
+        "version": policy.version,
+        "effective_date": (_iso(policy.effective_date)
+                           if policy.effective_date else None),
+        "over_volume_factor": policy.over_volume_factor,
+        "under_volume_factor": policy.under_volume_factor,
+        "jog_credit_factor": policy.jog_credit_factor,
+        "block_credit_factor": policy.block_credit_factor,
+        "qualify_min_minutes": policy.qualify_min_minutes,
+        "qualify_min_avg_hr": policy.qualify_min_avg_hr,
+        "qualify_min_kcal": policy.qualify_min_kcal,
+        "non_endurance_types": sorted(policy.non_endurance_types),
+    }
+
+
+def grading_policy_from_dict(data: Mapping[str, Any]) -> GradingPolicy:
+    """Construct a grading policy from its complete serialized form."""
+    return GradingPolicy(
+        version=data["version"],
+        effective_date=(_date(data["effective_date"])
+                        if data.get("effective_date") else None),
+        over_volume_factor=data["over_volume_factor"],
+        under_volume_factor=data["under_volume_factor"],
+        jog_credit_factor=data["jog_credit_factor"],
+        block_credit_factor=data["block_credit_factor"],
+        qualify_min_minutes=data["qualify_min_minutes"],
+        qualify_min_avg_hr=data["qualify_min_avg_hr"],
+        qualify_min_kcal=data["qualify_min_kcal"],
+        non_endurance_types=frozenset(data["non_endurance_types"]),
+    )
+
+
 def validate_enforced_from(enforced_from: date | None, acceptance_date: date | None) -> None:
     """Enforce the no-retroactive-enforcement invariant when dated evidence exists."""
     if enforced_from is not None and acceptance_date is not None and enforced_from < acceptance_date:
@@ -461,25 +497,12 @@ class Week:
         return self.grading_policy
 
     def to_dict(self) -> dict[str, Any]:
-        policy = self.grading_policy
         return {
             "schema_version": PLAN_MODEL_SCHEMA_VERSION,
             "week_start": _iso(self.week_start),
             "rules": [rule.to_dict() for rule in self.rules],
             "provenance": provenance_to_dict(self.provenance),
-            "grading_policy": {
-                "version": policy.version,
-                "effective_date": (_iso(policy.effective_date)
-                                   if policy.effective_date else None),
-                "over_volume_factor": policy.over_volume_factor,
-                "under_volume_factor": policy.under_volume_factor,
-                "jog_credit_factor": policy.jog_credit_factor,
-                "block_credit_factor": policy.block_credit_factor,
-                "qualify_min_minutes": policy.qualify_min_minutes,
-                "qualify_min_avg_hr": policy.qualify_min_avg_hr,
-                "qualify_min_kcal": policy.qualify_min_kcal,
-                "non_endurance_types": sorted(policy.non_endurance_types),
-            },
+            "grading_policy": grading_policy_to_dict(self.grading_policy),
         }
 
     def to_json(self) -> str:
@@ -489,20 +512,7 @@ class Week:
     def from_dict(cls, data: Mapping[str, Any]) -> "Week":
         if data.get("schema_version") != PLAN_MODEL_SCHEMA_VERSION:
             raise ValueError(f"unsupported plan model schema version: {data.get('schema_version')!r}")
-        policy_data = data["grading_policy"]
-        policy = GradingPolicy(
-            version=policy_data["version"],
-            effective_date=(_date(policy_data["effective_date"])
-                            if policy_data.get("effective_date") else None),
-            over_volume_factor=policy_data["over_volume_factor"],
-            under_volume_factor=policy_data["under_volume_factor"],
-            jog_credit_factor=policy_data["jog_credit_factor"],
-            block_credit_factor=policy_data["block_credit_factor"],
-            qualify_min_minutes=policy_data["qualify_min_minutes"],
-            qualify_min_avg_hr=policy_data["qualify_min_avg_hr"],
-            qualify_min_kcal=policy_data["qualify_min_kcal"],
-            non_endurance_types=frozenset(policy_data["non_endurance_types"]),
-        )
+        policy = grading_policy_from_dict(data["grading_policy"])
         return cls(
             week_start=_date(data["week_start"]),
             rules=tuple(Rule.from_dict(item) for item in data["rules"]),
@@ -526,5 +536,6 @@ __all__ = [
     "Statement", "statement_to_dict", "statement_from_dict", "stated", "withdrawal",
     "ConversationTurnProvenance", "ConversationTurn", "ParsedProvenance", "Parsed",
     "Provenance", "provenance_to_dict", "provenance_from_dict",
+    "grading_policy_to_dict", "grading_policy_from_dict",
     "validate_enforced_from", "Rule", "Week", "serialize_absence",
 ]

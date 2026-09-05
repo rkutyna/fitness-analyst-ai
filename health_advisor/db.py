@@ -600,7 +600,10 @@ def save_week_projection(
     *,
     projection_id: str | None = None,
 ) -> str:
-    """Persist one rebuildable Week envelope as a projection row.
+    """Append one rebuildable Week envelope as a projection row.
+
+    A repeated projection id is ignored; changing a rebuild gets a new id.
+    Projection rows are never updated in place.
 
     The import is local so the DB layer remains usable by the existing plan
     parser without creating an import cycle.  A parsed projection is a
@@ -627,7 +630,7 @@ def save_week_projection(
 
     conn.execute(
         """
-        INSERT OR REPLACE INTO plan_projections
+        INSERT OR IGNORE INTO plan_projections
             (projection_id, week_start, payload_json, schema_version,
              conversation_turn_id, parsed_file, parsed_line, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)

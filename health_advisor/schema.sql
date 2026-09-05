@@ -656,6 +656,25 @@ BEGIN
         'plan statement log is append-only; retain the log');
 END;
 
+-- ---------------------------------------------------------------------------
+-- approval_tokens: opaque, single-use approvals owned by this vault.
+--
+-- The client decides what the values mean and which values are eligible for
+-- minting. The engine only stores them and atomically consumes one alongside
+-- a plan statement append (see plan_log.append_rule_spending_token).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS approval_tokens (
+    token_id       TEXT PRIMARY KEY,
+    statement_hash TEXT NOT NULL,
+    turn_id        TEXT NOT NULL,
+    flow           TEXT NOT NULL,
+    minted_at      TEXT NOT NULL,
+    spent_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_tokens_audit
+    ON approval_tokens (statement_hash, turn_id, minted_at);
+
 -- plan_week_log: one immutable metadata declaration per Week.
 --
 -- Policy and Week provenance are facts about the Week, not attributes of the

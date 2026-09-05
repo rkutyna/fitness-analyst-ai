@@ -12,6 +12,7 @@ from datetime import date, timedelta
 from typing import Any, Mapping
 
 from . import db
+from . import approval_store
 from . import plan_model
 from .context import VaultContext
 
@@ -124,6 +125,60 @@ def append_rule(
         db.init_db(conn)
         _insert_rule(conn, rule, statement_id)
         conn.commit()
+    finally:
+        conn.close()
+    return statement_id
+
+
+def append_rule_spending_token(
+    ctx: VaultContext,
+    rule: plan_model.Rule,
+    token_id: str,
+    *,
+    statement_id: str | None = None,
+) -> str:
+    """Spend one token and append one rule in the same SQLite transaction.
+
+    The conditional UPDATE is the single-use gate. It intentionally does not
+    read the token first: competing writers serialize at ``BEGIN IMMEDIATE``
+    and only the writer that changes an unspent row may insert the rule.
+    """
+    if not isinstance(ctx, VaultContext):
+        raise TypeError("append_rule_spending_token requires a VaultContext")
+    if not isinstance(rule, plan_model.Rule):
+        raise TypeError("rule must be a plan_model.Rule")
+    if not isinstance(token_id, str) or not token_id:
+        raise ValueError("token_id must be a non-empty string")
+    rule.validate()
+    statement_id = statement_id or uuid.uuid4().hex
+    if not statement_id:
+        raise ValueError("statement_id must be non-empty")
+
+    conn = ctx.connect()
+    try:
+        # init_db commits its schema work before this operation begins. The
+        # spend and the rule insert below therefore share exactly this one
+        # connection and transaction.
+        db.init_db(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        changed = conn.execute(
+            """
+            UPDATE approval_tokens
+            SET spent_at = ?
+            WHERE token_id = ? AND spent_at IS NULL
+            """,
+            (db.utcnow_iso(), token_id),
+        ).rowcount
+        if changed != 1:
+            raise approval_store.TokenSpendRefused(
+                "token was already spent or was never issued"
+            )
+        _insert_rule(conn, rule, statement_id)
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
     return statement_id

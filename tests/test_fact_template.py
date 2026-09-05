@@ -10,14 +10,15 @@ from health_advisor.context import VaultContext
 from tests.conftest import PROD_DB_PATH
 
 
-def _ledger(*, value=50.1, period="2026-08-17", display="50 m"):
+def _ledger(*, value=50.1, period="2026-08-17", display="50 m",
+            unit="min"):
     return [{
         "sequence": 1,
         "tool_name": "synthetic_metric",
         "arguments": {},
         "result": {
             "metric": "jog_minutes",
-            "unit": "min",
+            "unit": unit,
             "period": period,
             "mean": value,
             "presentation": {
@@ -26,6 +27,78 @@ def _ledger(*, value=50.1, period="2026-08-17", display="50 m"):
             },
         },
     }]
+
+
+def _weekly_ledger():
+    return [{
+        "sequence": 1,
+        "tool_name": "get_weekly_series",
+        "arguments": {},
+        "result": {
+            "metric": "jog_minutes",
+            "weeks": [{"week_start": "2026-08-17", "mean": 50.1,
+                       "unit": "min"}],
+        },
+    }]
+
+
+@pytest.mark.parametrize("publisher", [
+    fact_template.build_fact_set,
+    fact_template.build_attachment_facts,
+], ids=["build_fact_set", "build_attachment_facts"])
+@pytest.mark.parametrize("case,expected", [
+    ("single", True),
+    ("identical", True),
+    ("conflicting", False),
+    ("same_value_different_presentation", True),
+], ids=["single", "identical", "conflicting", "same-value-different-presentation"])
+def test_fact_publishers_resolve_duplicate_values(publisher, case, expected):
+    """Duplicate identity is safe when its owned values resolve uniquely.
+
+    A wrong implementation that always publishes would fail the conflicting
+    row; one that always drops duplicates would fail the identical and
+    same-value-different-presentation rows. The single row catches accidental
+    rejection of ordinary, non-duplicate facts. The row-4 case is deliberately
+    explicit: passing by dropping the key would make a broken record-comparison
+    guard look correct, so this asserts that the key is actually published.
+    """
+    if publisher is fact_template.build_fact_set:
+        ledgers = {
+            "single": _ledger(),
+            "identical": _ledger() + _ledger(),
+            "conflicting": _ledger() + _ledger(value=50.2),
+            "same_value_different_presentation": (
+                _ledger(display="50 m", unit="min")
+                + _ledger(display="50.1 minutes", unit="minutes")),
+        }
+        key = fact_template.fact_key("jog_minutes", "2026-08-17", "mean")
+    else:
+        ledgers = {
+            "single": _attachment_ledger([["same-day", 63]]),
+            "identical": (_attachment_ledger([["same-day", 63]])
+                          + _attachment_ledger([["same-day", 63]])),
+            "conflicting": (_attachment_ledger([["same-day", 63]])
+                            + _attachment_ledger([["same-day", 64]])),
+            "same_value_different_presentation": (
+                _attachment_ledger([["same-day", 63]],
+                                    units=["date", "count/min"])
+                + _attachment_ledger([["same-day", 63]],
+                                     units=["date", "beats/min"])),
+        }
+        key = fact_template.attachment_fact_key(
+            "resting_rate", "rate", "same-day")
+
+    facts = publisher(ledgers[case])
+    assert (key in facts) is expected
+
+
+def test_weekly_mean_without_period_uses_week_start_as_fact_period():
+    """The exact recovered key prevents a generic or invented period passing."""
+    facts = fact_template.build_fact_set(_weekly_ledger())
+    key = fact_template.fact_key("jog_minutes", "2026-08-17", "mean")
+
+    assert key in facts
+    assert facts[key]["value"] == 50.1
 
 
 def test_fact_key_round_trips_the_natural_identity_tuple():

@@ -384,10 +384,49 @@ def _presentation_for(raw: dict, presentations: list[dict]) -> dict | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _weekly_period_for_entry(record: dict, entry: dict) -> str | None:
+    """Recover a weekly mean's period from its enclosing ``week_start``."""
+    if entry.get("field") != "mean":
+        return None
+    week_start = entry.get("week_start")
+    if _period_date(week_start) is not None:
+        return week_start
+    path = _path_parts(entry.get("path", ""))
+    node = record.get("result")
+    try:
+        for part in path[:-1]:
+            node = node[part]
+    except (KeyError, IndexError, TypeError):
+        return None
+    week_start = node.get("week_start") if isinstance(node, dict) else None
+    return week_start if _period_date(week_start) is not None else None
+
+
+def _publish_unambiguous(candidates: list[tuple[str, dict]]) -> dict[str, dict]:
+    """Collapse duplicate keys when, and only when, their values agree.
+
+    ``value`` is the fact's owned measurement. Presentation, units, source,
+    and all other record metadata are intentionally excluded from identity.
+    Equality is evaluated on the owned values themselves, not on their
+    surrounding records.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for key, fact in candidates:
+        grouped.setdefault(key, []).append(fact)
+
+    published: dict[str, dict] = {}
+    for key, facts in grouped.items():
+        value = facts[0].get("value")
+        if all(fact.get("value") == value for fact in facts[1:]):
+            published[key] = facts[0]
+    return published
+
+
 def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
     """Build the closed fact set from result leaves in this call's ledger.
 
-    Only metric-owned result leaves with an explicit period participate.
+    Only metric-owned result leaves with an explicit period participate;
+    weekly mean leaves may use their enclosing ``week_start``.
     Arguments, context fields, elided results, and metricless workout rows are
     excluded because they cannot round-trip through the natural identity tuple.
     Duplicate identities are removed from the published set rather than
@@ -416,6 +455,8 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
             period = (entry["period"] if entry["period"] is not None
                       else (presentation or {}).get("period"))
             if period is None:
+                period = _weekly_period_for_entry(record, entry)
+            if period is None:
                 continue
             entry = {**entry, "period": period,
                      "_presentation": presentation}
@@ -427,16 +468,9 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
                                        "path": entry.get("path")},
                                presentations, units))
 
-    counts: dict[str, int] = {}
-    for entry, _, _, _ in candidates:
-        key = fact_key(entry["metric"], entry["period"], entry["field"])
-        counts[key] = counts.get(key, 0) + 1
-
-    facts: dict[str, dict] = {}
+    resolved_candidates: list[tuple[str, dict]] = []
     for entry, source, presentations, units in candidates:
         key = fact_key(entry["metric"], entry["period"], entry["field"])
-        if counts[key] != 1:
-            continue
         presentation = entry.get("_presentation")
         if presentation is None:
             presentation = _presentation_for(entry, presentations)
@@ -444,16 +478,17 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
             display = str(entry["value"])
         else:
             display = presentation["value"]
-        facts[key] = {
-            "key": key,
-            "metric": entry["metric"],
-            "period": copy.deepcopy(entry["period"]),
-            "field": entry["field"],
-            "value": entry["value"],
-            "unit": _unit_for(entry, units),
-            "display": display,
-            "source": source,
-        }
+        resolved_candidates.append((key, {
+                "key": key,
+                "metric": entry["metric"],
+                "period": copy.deepcopy(entry["period"]),
+                "field": entry["field"],
+                "value": entry["value"],
+                "unit": _unit_for(entry, units),
+                "display": display,
+                "source": source,
+            }))
+    facts = _publish_unambiguous(resolved_candidates)
     _add_period_label_facts(facts)
     return facts
 
@@ -592,10 +627,7 @@ def build_attachment_facts(ledger: list[dict]) -> dict[str, dict]:
                         "source": trend_source,
                     }))
 
-    counts: dict[str, int] = {}
-    for key, _ in candidates:
-        counts[key] = counts.get(key, 0) + 1
-    return {key: fact for key, fact in candidates if counts[key] == 1}
+    return _publish_unambiguous(candidates)
 
 
 def render_fact_set(facts: dict[str, dict]) -> str:

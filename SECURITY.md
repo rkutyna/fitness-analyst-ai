@@ -195,8 +195,23 @@ and it is confined at the OS level rather than by inspecting the code:
 - Results arrive only on file descriptor 3, never as a file the child could
   rewrite after the parent reads it. Every path written into the sandbox profile
   is `realpath`-resolved first, because an unresolved symlink silently denies.
-- CPU, wall-clock, and output-size limits are enforced, with a process-group kill
-  on timeout.
+- Wall-clock and output-size limits are enforced, with a process-group
+  kill on timeout. On Linux, bubblewrap's `--unshare-all` includes a PID
+  namespace, so killing the namespace init also terminates forked descendants,
+  including one that calls `setsid()`. On macOS, a forked `setsid()` descendant
+  can still escape the tracked process group before the deadline; this remains
+  a named macOS-only `KNOWN_GAPS` entry and is asserted by
+  `test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill`.
+- Read confinement is deliberately broad in the current Seatbelt profile:
+  **everything outside `$HOME` is readable**, including paths such as
+  `/etc/passwd` and `/Users/Shared`. The profile denies reads under `$HOME`
+  selectively, but does not provide an allow-list for all host paths. This is
+  an accepted limitation of the current design, not a claim of general read
+  isolation.
+- Resource exhaustion remains unbounded: fork bombs can create an unbounded
+  number of processes, sandboxed code has no memory limit, and there is no CPU
+  quota. Wall-clock and output limits do not bound process count or memory
+  consumption.
 - The bytes off fd 3 are treated as untrusted and validated into either a typed
   result envelope or a typed refusal. Nothing in between is accepted.
 
@@ -221,21 +236,30 @@ blocking**, with any accepted exception named explicitly in a module-level
 | Linux (bubblewrap), unprivileged host — Ubuntu 26.04, bwrap 0.11.1 | 34 applicable cases; corpus scoring excludes the Seatbelt-only profile case |
 
 On Linux, the separate
-`test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill` test is
-the documented process-group escape (#18). It is not hidden in the corpus
-roll-up: the 34 applicable corpus cases are scored independently, and this
-named test remains visible as the Linux gap.
+`test_bwrap_kills_forked_setsid_descendant_at_deadline` test drives the real
+`BwrapExecutor` and reports the measured survivor count. The reference Linux
+run reports **0 survivors**: the production PID namespace kills the forked
+`setsid()` descendant when its namespace init is killed. If the host cannot
+create the PID namespace, the test skips rather than treating that environment
+as either reference platform; this includes privileged container CI where the
+namespace behavior can differ.
+
+On macOS, the separate
+`test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill` test
+asserts the escape and remains the documented process-group gap (#18). It is
+scoped to Seatbelt/macOS only; the Linux inverse is strictly enforced.
 
 The macOS discrepancy is a real open question, not a test artifact: the same
 corpus passes on one macOS configuration and fails on another, which means the
 seatbelt profile is relying on a protection that is not universally present.
 
-The `binaries` class is recorded in `tests/test_analyst_sandbox.py`'s
-module-level `KNOWN_GAPS`, scoped to Seatbelt only — a precise, named
-exception rather than a blanket one, the same treatment already given the
-`/Users/Shared` gap above (#2). Recording it does not hide it: it stays in the
-measured table above, the CI job stays informational regardless, and the
-named process-group test on Linux is untouched and stays strictly enforced.
+The `binaries` class and the `/Users/Shared` read case are recorded in
+`tests/test_analyst_sandbox.py`'s module-level `KNOWN_GAPS`, scoped to Seatbelt
+only — precise, named exceptions rather than blanket exemptions. The macOS
+`setsid()` liveness gap is recorded there separately and has the same
+Seatbelt-only scope. Recording any of these does not hide them: the relevant
+tests remain visible, and the Linux process-group inverse stays strictly
+enforced.
 
 **What this means for you:** run the sandbox suite on your own platform before
 relying on the confinement, and do not expose analyst mode to untrusted input on

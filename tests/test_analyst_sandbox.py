@@ -454,6 +454,7 @@ except Exception:
 KNOWN_GAPS = {
     ("paths", "users_shared_dir_readable"),
     ("binaries", "dyld_insert_libraries_injection"),
+    ("process", "forked_setsid_descendant_escapes_process_group_kill"),
 }
 
 EXECUTOR_SCOPES = {
@@ -464,6 +465,8 @@ EXECUTOR_SCOPES = {
 KNOWN_GAP_EXECUTORS = {
     ("paths", "users_shared_dir_readable"): frozenset({"seatbelt"}),
     ("binaries", "dyld_insert_libraries_injection"): frozenset({"seatbelt"}),
+    ("process", "forked_setsid_descendant_escapes_process_group_kill"):
+        frozenset({"seatbelt"}),
 }
 SEATBELT_ONLY = "seatbelt-only"
 
@@ -472,6 +475,12 @@ SEATBELT_ONLY = "seatbelt-only"
 # KNOWN_GAPS removes its 100%-blocked assertion outright, so without this the
 # other three cases could regress unnoticed.
 BINARIES_GAP_CASE = "dyld_insert_libraries_injection"
+SETSID_GAP = ("process", "forked_setsid_descendant_escapes_process_group_kill")
+
+
+def test_setsid_known_gap_is_seatbelt_only():
+    assert SETSID_GAP in KNOWN_GAPS
+    assert KNOWN_GAP_EXECUTORS[SETSID_GAP] == frozenset({"seatbelt"})
 
 
 def _binaries_gap_violations(details: list[str]) -> list[str]:
@@ -1458,18 +1467,19 @@ def test_normal_vault_read_still_works(query_vault_path, tmp_path):
 
 
 # =========================================================================== #
-# KNOWN GAP, found during this work and NOT in the scored corpus above: a
-# forked descendant that calls os.setsid() before the timeout fires leaves
-# the original process group entirely, and os.killpg on the group this
+# KNOWN GAP, found during this work and NOT in the scored corpus above: on
+# macOS, a forked descendant that calls os.setsid() before the timeout fires
+# leaves the original process group entirely, and os.killpg on the group this
 # executor tracks can no longer reach it. This is a stronger version of
 # review finding 6 than §3.5 defends against: `setsid` is not filesystem or
 # network activity, so nothing in the seatbelt profile constrains it, and
-# `process-fork` is (deliberately) allowed. Reported here as a real,
-# unblocked escape rather than narrowed out of the suite — see this
-# session's report for the full write-up.
+# `process-fork` is (deliberately) allowed. Linux bubblewrap runs the child in
+# its own PID namespace, where killing the namespace init also kills this
+# descendant; the inverse is tested in tests/test_bwrap_executor.py.
 # =========================================================================== #
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="setsid process-group gap is macOS-only")
 def test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill(executor, vault_path, tmp_path):
     run_dir = tmp_path / "setsid_escape"
     marker = run_dir / "work" / "marker.txt"

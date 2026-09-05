@@ -373,6 +373,44 @@ LINUX_BWRAP = pytest.mark.skipif(
 )
 
 
+def _linux_pids_using_run_dir(run_dir: Path) -> list[int]:
+    """Return live host PIDs whose command line belongs to this sandbox run."""
+    if sys.platform != "linux":
+        return []
+    needle = os.fsencode(str(run_dir))
+    pids: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+            command_line = (entry / "cmdline").read_bytes()
+            state = next(
+                line for line in (entry / "status").read_text().splitlines()
+                if line.startswith("State:")
+            )
+        except (OSError, StopIteration, ValueError):
+            continue
+        state_fields = state.split()
+        if (needle in command_line and len(state_fields) > 1
+                and state_fields[1] != "Z"):
+            pids.append(pid)
+    return pids
+
+
+def _pid_namespace_unavailable(result) -> bool:
+    """Recognize bwrap's inability to create namespaces, not other failures."""
+    stderr = result.stderr.decode("utf-8", errors="replace").lower()
+    return (
+        not result.timed_out
+        and result.returncode not in (None, 0)
+        and "namespace" in stderr
+        and any(token in stderr for token in (
+            "operation not permitted", "permission denied", "not allowed",
+        ))
+    )
+
+
 @LINUX_BWRAP
 def test_bwrap_query_channel_fd4_probe_and_production_pkg_isolation(tmp_path):
     pkg_dir = tmp_path / "production-repo"
@@ -542,7 +580,7 @@ emit("sandbox", list(facts), ["count"] * len(facts), [list(facts.values())])
 
 
 @LINUX_BWRAP
-def test_bwrap_closes_the_setsid_escape_KNOWN_GAP_on_seatbelt(tmp_path):
+def test_bwrap_kills_forked_setsid_descendant_at_deadline(tmp_path):
     vault_path = tmp_path / "vault.db"
     vault_path.write_bytes(b"")
     run_dir = tmp_path / "setsid_escape"
@@ -569,19 +607,25 @@ time.sleep(30)
     result = sb.BwrapExecutor().run(
         code, str(vault_path), str(run_dir), sb.RunLimits(wall_clock_s=2.0)
     )
+    if _pid_namespace_unavailable(result):
+        pytest.skip("bubblewrap could not create the PID namespace on this host")
     assert result.timed_out is True
+    assert result.killed_group is True
     assert marker.exists(), "expected the child to write before the timeout"
     lines_after_run = marker.read_text().splitlines()
     time.sleep(1)
     assert marker.read_text().splitlines() == lines_after_run
-    survivors = subprocess.run(
-        ["pgrep", "-f", str(run_dir)], capture_output=True, text=True
-    ).stdout.strip()
+    survivors = _linux_pids_using_run_dir(run_dir)
+    survivor_count = len(survivors)
+    print(f"\n[setsid PID namespace] survivor_count={survivor_count}")
     try:
-        assert not survivors, "the PID namespace must not leave a setsid survivor"
+        assert survivor_count == 0, (
+            f"PID namespace left {survivor_count} live sandbox process(es): "
+            f"{survivors}"
+        )
     finally:
-        for pid_s in survivors.splitlines():
+        for pid in survivors:
             try:
-                os.kill(int(pid_s), 9)
+                os.kill(pid, 9)
             except ProcessLookupError:
                 pass

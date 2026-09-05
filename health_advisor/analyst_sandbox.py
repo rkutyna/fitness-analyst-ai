@@ -40,9 +40,11 @@ What this module does implement, per A1's `Must implement` (§8):
   the child could rewrite, per review finding 5.
 - **Process-group kill on timeout**: the child is spawned with
   `start_new_session=True` (its own session/process group), and a timeout
-  kills the whole group with `os.killpg`, because a forked grandchild
-  otherwise survives the direct child's death and can go on holding a SQLite
-  lock (review finding 6, §3.5).
+  kills the whole group with `os.killpg`. On Linux, bubblewrap additionally
+  creates a PID namespace (`--unshare-all` includes `--unshare-pid`), so killing
+  the namespace init takes every descendant with it. macOS Seatbelt has a
+  named gap: a forked descendant that calls `os.setsid()` can leave the group
+  before the deadline and outlive the kill (review finding 6, §3.5).
 - On the query-channel path, the parent-authored runner supplies the live
   ledgered `conn` proxy over fd 4; the user's/model's own code (`code.py`)
   receives that object as a bound global and never receives the vault path.
@@ -51,18 +53,17 @@ What this module does implement, per A1's `Must implement` (§8):
   wrapper — the authorizer and refusal on zero reads — is A2's
   `analyst_ledger.py`.
 
-KNOWN, UNBLOCKED GAP (found during this work, not defended against here): a
-forked descendant that calls `os.setsid()` before the wall-clock deadline
-fires leaves the process group `os.killpg` targets — permanently. Nothing in
-the seatbelt profile constrains `setsid` (it is a plain POSIX syscall, not
-filesystem or network activity), and `process-fork` is allowed by design.
-Measured directly: such a descendant keeps running, and keeps writing,
-several seconds after `run()` has already returned with `killed_group=True`
-for everything that *was* still in the tracked group. See
+KNOWN, UNBLOCKED GAP on macOS (found during this work, not defended against
+here): a forked descendant that calls `os.setsid()` before the wall-clock
+deadline fires leaves the process group `os.killpg` targets — permanently.
+Nothing in the seatbelt profile constrains `setsid` (it is a plain POSIX
+syscall, not filesystem or network activity), and `process-fork` is allowed by
+design. Measured directly: such a descendant keeps running, and keeps writing,
+several seconds after `run()` has already returned with `killed_group=True` for
+everything that *was* still in the tracked group. See
 `tests/test_analyst_sandbox.py::test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill`
-for the reproduction. Closing this needs tracking real descendant PIDs
-(e.g. via `EVFILT_PROC`/`kqueue`) rather than trusting one process-group id
-across the whole run — out of scope for A1, and not attempted here.
+for the macOS reproduction. Linux's PID namespace closes this gap; the
+inverse is tested in `tests/test_bwrap_executor.py`.
 """
 from __future__ import annotations
 

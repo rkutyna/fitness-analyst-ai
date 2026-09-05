@@ -132,7 +132,27 @@ jobs:
 
           # Pronouns refer to one specific vault owner; issue #6 requires the
           # engine package to use vault-neutral language.
-          pronouns=$(grep -rniE "\b(he|his|him)\b" health_advisor --include='*.py' || true)
+          #
+          # EXEMPTION: a few lines enumerate English determiners as DATA -- a
+          # stopword set and a regex alternation that parse the USER'S OWN
+          # words, where the third-person masculine possessive sits between
+          # "their" and "her" and refers to nobody at all. Those lines carry an
+          # explicit marker. The marker is deliberately NOT a free escape
+          # hatch: the count is pinned, so adding a new one fails this check
+          # until someone edits this workflow on purpose. Rewriting a lexicon
+          # to dodge the grep -- splitting the literal, reordering the set --
+          # is the wrong fix and this exemption exists so nobody reaches for it.
+          MARKER='vault-neutral-lexicon'
+          EXPECTED_LEXICON_LINES=2
+          marked=$(grep -rn "$MARKER" health_advisor --include='*.py' | wc -l | tr -d ' ')
+          if [ "$marked" -ne "$EXPECTED_LEXICON_LINES" ]; then
+            echo "::error::expected $EXPECTED_LEXICON_LINES '$MARKER' line(s), found $marked"
+            grep -rn "$MARKER" health_advisor --include='*.py' || true
+            exit 1
+          fi
+
+          pronouns=$(grep -rniE "\b(he|his|him)\b" health_advisor --include='*.py' \
+                     | grep -v "$MARKER" || true)
           if [ -n "$pronouns" ]; then
             echo "::error::found pronouns referring to one vault owner"
             printf '%s\n' "$pronouns"

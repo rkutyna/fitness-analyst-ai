@@ -354,7 +354,7 @@ _DAY_COUNT_RE = re.compile(
 # turns the phrase into something other than "a count of the listed days".
 _GAP_STOP = frozenset({
     "of", "the", "a", "an", "and", "or", "out", "to", "in", "on", "at", "for",
-    "by", "with", "your", "my", "our", "their", "his", "her", "its", "this",
+    "by", "with", "your", "my", "our", "their", "his", "her", "its", "this",  # vault-neutral-lexicon
     "that", "these", "those", "is", "are", "was", "were", "has", "have", "had",
     "been", "more", "less", "fewer", "than", "as", "per", "every", "each"})
 # A FIXED COMPARISON WINDOW, an approximation, or a bound — never a count of a
@@ -384,7 +384,7 @@ _WINDOW_LEAD_RE = re.compile(
 _PARTITIVE_LEAD_RE = re.compile(
     r"\b(?:\d{1,2}|" + "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
     + r"|some|several|many|few|none|any|all|each|one)\s+(?:out\s+)?of\s+"
-    r"(?:(?:your|my|our|their|his|her|its|the|these|those)\s+)?$", re.I)
+    r"(?:(?:your|my|our|their|his|her|its|the|these|those)\s+)?$", re.I)  # vault-neutral-lexicon
 # A count of PLANNED days is a count of intent, not of the entries beside it:
 # "two out of four planned days: Mar 3 and Mar 5" is a correct sentence in
 # which the mismatch IS the point. These words in the gap stand the check down.

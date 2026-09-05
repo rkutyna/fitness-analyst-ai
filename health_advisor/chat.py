@@ -332,6 +332,7 @@ ASK_CAUSES = (
     "no_gather_needed",
     "judge_refused",
     "denied_available_figure",
+    "withheld_available_figure",
     "contradicted_day_count",
 )
 
@@ -389,6 +390,7 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
                loop_outcomes: list[dict], judge_score: int | None = None,
                no_gather_needed: bool = False,
                denied_available_figure: bool = False,
+               withheld_eligible_figure: bool = False,
                contradicted_day_count: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
 
@@ -401,6 +403,10 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
     and before the generic gate verdict: both are Python-owned refusals that
     a bare ``gate_refused`` would make indistinguishable in the cause log,
     and the denial gate keeps the precedence it already had.
+
+    ``withheld_eligible_figure`` is a publisher-integrity refusal from the
+    independent fact-set completeness walk. It outranks answer-level denial
+    because the missing publication is the more fundamental event.
     """
     families = [_status_outcome_family(status) for status in loop_outcomes]
     if "backend_unavailable" in families:
@@ -411,6 +417,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "no_gather_needed"
     if not ledger:
         return "empty_gather"
+    if withheld_eligible_figure:
+        return "withheld_available_figure"
     if denied_available_figure:
         return "denied_available_figure"
     if contradicted_day_count:
@@ -1004,6 +1012,7 @@ _EMPTY_NARRATION_RE = re.compile(
 )
 
 _DENIED_AVAILABLE_FIGURE_REASON = "narration denied an available figure"
+_WITHHELD_ELIGIBLE_FIGURE_REASON = "fact set withheld an eligible figure"
 
 # #16. The defect is self-contradiction, not a bad measurement: every figure in
 # the two observed failures was right and only the day count was wrong, refuted
@@ -1323,6 +1332,25 @@ def _mark_denied_available_figure(verification: dict, *, question: str,
     return denied
 
 
+def _mark_withheld_eligible_figure(verification: dict,
+                                   withheld_fact_keys) -> bool:
+    """Refuse a response when Python's fact publisher dropped eligible keys.
+
+    This is a publisher-integrity finding, so it remains visible even when an
+    answer-level gate also refused the draft.
+    """
+    if not withheld_fact_keys:
+        return False
+    keys = sorted(str(key) for key in withheld_fact_keys)
+    verification.update({
+        "ok": False,
+        "grounded": False,
+        "reason": _WITHHELD_ELIGIBLE_FIGURE_REASON,
+        "withheld_fact_keys": keys,
+    })
+    return True
+
+
 def _contradicted_day_count_reason(result) -> str:
     """Render the finding so the refusal is actionable and auditable.
 
@@ -1433,8 +1461,11 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     gather_status = _ask_loop_outcome(gather_status_before,
                                       llm.last_loop_status())
     ledger = _read_ledger(ledger_path)
+    metric_facts = fact_template.build_fact_set(ledger)
+    withheld_fact_keys = fact_template.publish_completeness(
+        ledger, metric_facts)
     facts = {
-        **fact_template.build_fact_set(ledger),
+        **metric_facts,
         **fact_template.build_attachment_facts(ledger),
     }
     final_prompt = (
@@ -1526,11 +1557,14 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # word-form counts, so check whichever string would reach the user.
     contradicted_day_count = _mark_contradicted_day_count(
         verification, text=interpolated or template)
+    withheld_eligible_figure = _mark_withheld_eligible_figure(
+        verification, withheld_fact_keys)
     verification["cause"] = _ask_cause(
         verification, ledger=ledger, loop_outcomes=[gather_status, final_status],
         no_gather_needed=(not scan["placeholders"]
                           and bool(scan["advice_quantities"])),
         denied_available_figure=denied_available_figure,
+        withheld_eligible_figure=withheld_eligible_figure,
         contradicted_day_count=contradicted_day_count)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
@@ -1615,12 +1649,15 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # attempt 1 alone would make one failed attempt the way past this gate.
     retry_contradicted_day_count = _mark_contradicted_day_count(
         retry_verification, text=retry_interpolated or retry_template)
+    retry_withheld_eligible_figure = _mark_withheld_eligible_figure(
+        retry_verification, withheld_fact_keys)
     retry_verification["cause"] = _ask_cause(
         retry_verification, ledger=ledger,
         loop_outcomes=[gather_status, retry_status],
         no_gather_needed=(not retry_scan["placeholders"]
                           and bool(retry_scan["advice_quantities"])),
         denied_available_figure=retry_denied_available_figure,
+        withheld_eligible_figure=retry_withheld_eligible_figure,
         contradicted_day_count=retry_contradicted_day_count)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]

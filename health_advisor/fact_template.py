@@ -431,6 +431,111 @@ def _publish_unambiguous(candidates: list[tuple[str, dict]]) -> dict[str, dict]:
     return published
 
 
+def _weekly_period_for_eligibility(record: dict, entry: dict) -> str | None:
+    """Recover a weekly mean period without reading the publisher helpers."""
+    if entry.get("field") != "mean":
+        return None
+    path = _path_parts(entry.get("path", ""))
+    node = record.get("result")
+    try:
+        for part in path[:-1]:
+            node = node[part]
+    except (KeyError, IndexError, TypeError):
+        return None
+    period = node.get("week_start") if isinstance(node, dict) else None
+    return period if _period_date(period) is not None else None
+
+
+def _presentation_period_for_eligibility(entry: dict,
+                                         presentations: list[dict]):
+    """Resolve a raw leaf's period from its one unambiguous sibling."""
+    candidates = [candidate for candidate in presentations
+                  if candidate.get("metric") == entry.get("metric")
+                  and isinstance(candidate.get("value"), str)]
+    raw_path = str(entry.get("path") or "")
+    raw_parent = raw_path.rsplit(".", 1)[0]
+    exact = [candidate for candidate in candidates
+             if candidate.get("path") in {
+                 raw_parent + ".presentation.value",
+                 raw_parent + ".presentations."
+                 + str(entry.get("field") or "") + ".value",
+             }]
+    if len(exact) == 1:
+        return exact[0].get("period")
+    return candidates[0].get("period") if len(candidates) == 1 else None
+
+
+def eligible_fact_keys(ledger: list[dict]) -> set[str]:
+    """Return independently re-derived metric keys eligible for publication.
+
+    This walk is intentionally independent of :func:`build_fact_set`'s
+    candidate grouping and publishing helpers. It reads result entries and
+    re-derives eligibility from their metric, value, period, and constructible
+    key. That independence is the instrument: two readers that can disagree
+    can expose a publisher that is broken instead of checking itself. It is
+    also required for historical validation: ``_publish_unambiguous`` did not
+    exist before #42, so a check written against that helper could never run
+    against the code state where the bug lived.
+
+    Duplicate identities are eligible only when every owned value agrees.
+    A conflicting identity is ambiguous evidence, not a withholding event.
+    """
+    if not isinstance(ledger, list):
+        return set()
+
+    values_by_key: dict[str, list[object]] = {}
+    for record in ledger:
+        if not isinstance(record, dict) or record.get("result_elided"):
+            continue
+        try:
+            entries = _verify._ledger_scopes(record)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        presentations = [entry for entry in entries
+                         if entry.get("field") == "presentation"]
+        for entry in entries:
+            if (entry.get("kind") != "result"
+                    or entry.get("field") == "presentation"):
+                continue
+            metric = entry.get("metric")
+            if metric is None or not str(metric).strip():
+                continue
+            value = entry.get("value")
+            if value is None:
+                continue
+            period = entry.get("period")
+            if period is None:
+                period = _presentation_period_for_eligibility(
+                    entry, presentations)
+            if period is None:
+                period = _weekly_period_for_eligibility(record, entry)
+            if period is None:
+                continue
+            try:
+                key = fact_key(metric, period, entry.get("field"))
+            except (TypeError, ValueError):
+                continue
+            values_by_key.setdefault(key, []).append(value)
+
+    return {
+        key for key, values in values_by_key.items()
+        if all(value == values[0] for value in values[1:])
+    }
+
+
+def publish_completeness(ledger: list[dict], published_facts) -> set[str]:
+    """Return eligible keys missing from the fact set actually published.
+
+    ``published_facts`` is supplied by the caller so this check can compare
+    the real publisher output with the independent eligibility walk. A
+    returned key is a withholding event; an empty set means the two readers
+    agree for this ledger.
+    """
+    published_keys = set(published_facts) if isinstance(published_facts, dict) \
+        else set(published_facts or ())
+    return eligible_fact_keys(ledger) - published_keys
+
+
 def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
     """Build the closed fact set from result leaves in this call's ledger.
 

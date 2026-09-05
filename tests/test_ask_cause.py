@@ -121,6 +121,21 @@ def test_ask_cause_judge_refused_keeps_python_gate_reason(monkeypatch, vault):
     assert body["verification"]["reason"] == ""
 
 
+def test_publish_withholding_is_named_and_not_ok():
+    verification = {"ok": True, "grounded": True, "reason": ""}
+    key = "fact|metric=synthetic_metric|period=s:synthetic-period|field=mean"
+
+    assert chat._mark_withheld_eligible_figure(
+        verification, {key}) is True
+    assert verification["ok"] is False
+    assert verification["grounded"] is False
+    assert verification["reason"] == "fact set withheld an eligible figure"
+    assert chat._ask_cause(
+        verification, ledger=[{"sequence": 1}], loop_outcomes=[],
+        withheld_eligible_figure=True) == "withheld_available_figure"
+    assert "withheld_available_figure" in chat.ASK_CAUSES
+
+
 def test_a_kept_answer_with_no_judge_is_ok_not_judge_refused():
     """The fact-template arm never runs the judge; its kept answers are `ok`.
 

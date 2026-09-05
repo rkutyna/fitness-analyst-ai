@@ -95,6 +95,35 @@ def test_fact_template_flag_runs_gather_then_closed_set_narration(
     assert calls[1][1]["tools"] == []
 
 
+def test_fact_template_publish_withholding_is_rendered_as_refusal(
+        monkeypatch, vault):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    ledger = [{
+        "sequence": 1, "tool_name": "synthetic_metric", "arguments": {},
+        "result": {
+            "metric": "synthetic_metric", "period": "synthetic-period",
+            "mean": 123.45,
+        },
+    }]
+    key = fact_template.fact_key(
+        "synthetic_metric", "synthetic-period", "mean")
+    responses = iter(["acknowledged", "Result: {" + key + "}.",
+                      "Result: {" + key + "}."])
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(fact_template, "publish_completeness",
+                        lambda *args, **kwargs: {key})
+
+    result = chat.answer_question(vault, "How was my synthetic metric?")
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["ok"] is False
+    assert result["verification"]["cause"] == "withheld_available_figure"
+    assert result["verification"]["withheld_fact_keys"] == [key]
+
+
 def test_period_label_fact_is_excluded_from_figures_total(monkeypatch, vault):
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
     period = "2026-08-10:2026-08-16"

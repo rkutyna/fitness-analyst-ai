@@ -102,6 +102,48 @@ def test_fact_publishers_resolve_duplicate_values(publisher, case, expected):
             assert facts[key]["unit"] == "count/min"
 
 
+def _synthetic_eligibility_ledger(*, value=123.45):
+    """Build a private test ledger; no captured or user-shaped data."""
+    return [{
+        "sequence": 1,
+        "tool_name": "synthetic_metric",
+        "arguments": {},
+        "result": {
+            "metric": "synthetic_metric",
+            "period": "synthetic-period",
+            "mean": value,
+        },
+    }]
+
+
+def test_publish_completeness_walk_flags_an_eligible_key_in_both_directions():
+    ledger = _synthetic_eligibility_ledger()
+    key = fact_template.fact_key(
+        "synthetic_metric", "synthetic-period", "mean")
+
+    assert fact_template.publish_completeness(ledger, {}) == {key}
+    assert fact_template.publish_completeness(
+        ledger, {key: {"value": 123.45}}) == set()
+
+
+def test_publish_completeness_walk_handles_identical_and_conflicting_duplicates():
+    key = fact_template.fact_key(
+        "synthetic_metric", "synthetic-period", "mean")
+
+    identical = (_synthetic_eligibility_ledger()
+                 + _synthetic_eligibility_ledger())
+    published = fact_template.build_fact_set(identical)
+    assert key in published
+    assert fact_template.publish_completeness(identical, published) == set()
+
+    conflicting = (_synthetic_eligibility_ledger(value=123.45)
+                   + _synthetic_eligibility_ledger(value=234.56))
+    withheld_conflict = fact_template.build_fact_set(conflicting)
+    assert key not in withheld_conflict
+    assert fact_template.publish_completeness(
+        conflicting, withheld_conflict) == set()
+
+
 def test_weekly_mean_without_period_uses_week_start_as_fact_period():
     """The exact recovered key prevents a generic or invented period passing."""
     facts = fact_template.build_fact_set(_weekly_ledger())

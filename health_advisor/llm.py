@@ -173,27 +173,33 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
 # costs 3.2x turn latency (33.9 s against a 10.7 s median), so an endpoint 4x
 # faster that fails one turn in eight can be net SLOWER end to end. Decode rate
 # is not the objective; end-to-end turn latency including retries is.
-# ADMITTED 2026-09-05 — `reka/fp4`, `makora`, `fireworks`, `baseten/fp8`, on the
-# maintainer's blanket reading that OpenRouter's shield marks zero data
-# retention AND no training on prompts. Each carries that shield. They are
-# admitted to be MEASURED end to end, not because decode rate alone recommends
-# any of them; see the warning below the set.
+# ADMITTED 2026-09-06 — `reka/fp4` ONLY, and it is now the pin. Four shielded
+# endpoints were admitted on 2026-09-05 to be measured end to end; three were
+# removed the next day when the measurement came back. Membership here is
+# permission to receive health data, so an endpoint that cannot serve the
+# workload is not neutral to keep — it is surface with no benefit.
 #
-# Decode measured 2026-09-05 by slope, `reasoning=low`, synthetic prompts:
-# `fireworks` 125.5, `baseten/fp8` 111.1, `reka/fp4` 92.1-124.5, `makora` 80.8,
-# against the current pin `together` at 27.9-45.9 tok/s. All four honour
-# `max_tokens` exactly (cap 150 -> 150, finish_reason "length").
+# REMOVED after measurement — `makora`, `fireworks`, `baseten/fp8`. A six-arm
+# ask battery (n=72 each) found they could not carry four concurrent requests,
+# which no published throughput figure predicts: `fireworks` returned HTTP 429
+# on 91.4% of requests and fell back on 63 of 72 turns, `baseten/fp8` 429'd on
+# 52.3% with 25 fallbacks, `makora` on 44.1% with 17. `baseten/fp8` remains
+# approved for `z-ai/glm-5.3-flash`, where it was measured separately; the
+# per-model split is the point of keying this map by model.
 #
-# `reka/fp4`, `makora` and `fireworks` keep `structured_outputs`, so unlike
-# `coreweave/fp8`, `relace/fp4` and `baseten/fp8` they give up nothing that
-# `together` was admitted to provide. `reka/fp4` is fp4-quantized at 262,144
-# context — ample against measured ask prompts of ~35k tokens, but it is a
-# lower-precision endpoint serving a system whose model COPIES figures into
-# placeholders, so its grounding rate is the thing to watch, not its speed.
-# `fireworks` returned HTTP 429 on 3 of 4 synthetic attempts across two
-# sessions and publishes the lowest uptime of the group (98.45%); expect it to
-# fail under battery parallelism, and treat that as a result rather than a
-# flake. `makora` publishes 97.71%, lower still.
+# `reka/fp4` was chosen on END-TO-END TURN LATENCY, not decode rate, and the
+# deciding number was the tail: zero turns over 60 s in 72, worst case 47.7 s,
+# against `together`'s ten over 60 s and a worst case of 1,202.8 s, and
+# `coreweave/fp8`'s three over 300 s. Median 16.1 s against `together`'s 25.0,
+# p95 37.3 against 104.9. Grounding was identical on both clean arms — 72/72
+# narration, zero fallbacks — so nothing was traded for the speed.
+#
+# It keeps `structured_outputs`, so unlike `coreweave/fp8` and `relace/fp4` it
+# gives up nothing `together` was admitted to provide. It is fp4-quantized at
+# 262,144 context — ample against measured ask prompts of ~35k tokens, but it
+# is a lower-precision endpoint serving a system whose model COPIES figures
+# into placeholders. Its grounding held at 72/72 in that battery; re-check
+# that, not its speed, after any prompt or fact-template change.
 #
 # NOT ADMITTED — `wafer/fast`, despite the highest published throughput
 # (159 tps), a full capability profile and 99.89% uptime. It IGNORES
@@ -204,7 +210,7 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
 APPROVED_OPENROUTER_PROVIDERS = {
     "deepseek/deepseek-v4-flash-0731": frozenset({
         "coreweave/fp8", "together", "parasail/fp8", "relace/fp4",
-        "reka/fp4", "makora", "fireworks", "baseten/fp8"}),
+        "reka/fp4"}),
     "z-ai/glm-5.3-flash": frozenset({
         "baseten/fp8", "novita/fp8", "together"}),
 }
@@ -216,8 +222,6 @@ OPENROUTER_PROVIDER_TAGS = {
     "CoreWeave": "coreweave/fp8",
     "Relace": "relace/fp4",
     "Reka": "reka/fp4",
-    "Makora": "makora",
-    "Fireworks": "fireworks",
     "Together": "together",
     "Parasail": "parasail/fp8",
     "BaseTen": "baseten/fp8",
@@ -439,6 +443,12 @@ TIMEOUT_BRIEFING = min(
 # question yet recorded on this provider.
 TIMEOUT_ASK_TURN = int(os.environ.get("HA_ASK_TIMEOUT_TURN", "120"))
 DEADLINE_ASK_LOOP = int(os.environ.get("HA_ASK_DEADLINE", "300"))
+# Soft throughput floor, tokens/sec, applied to OpenRouter's own rolling
+# 5-minute p50 for each model+provider. It REORDERS the pinned list toward
+# endpoints currently clearing the floor; it never filters, never widens the
+# set, and never prevents a request. 0 disables it. See _openrouter_provider.
+OPENROUTER_MIN_THROUGHPUT = int(
+    os.environ.get("HA_OPENROUTER_MIN_THROUGHPUT", "50"))
 
 # Keep enough stderr to explain a failed scheduled run without allowing a CLI
 # diagnostic (which can contain a very large prompt/tool dump) to dominate the
@@ -764,8 +774,37 @@ def _openrouter_provider() -> dict:
     """
     order = _pinned_providers()
     if order:
-        return {"order": order, "allow_fallbacks": False,
-                "require_parameters": True}
+        # `order` is preference; `only` is the boundary. Both are the pinned
+        # list, so ordered failover happens strictly INSIDE the D15 set.
+        #
+        # Verified live against OpenRouter 2026-09-06, because the docs are
+        # ambiguous about whether allow_fallbacks:false stops at the first
+        # entry or walks the list. It WALKS, and the control proves it:
+        #   order=[fireworks]                     -> HTTP 429, 6 of 6
+        #   order=[fireworks, reka, coreweave]    -> Reka,     6 of 6
+        # and ordering is a real preference rather than "fastest wins":
+        #   order=[together, reka]                -> Together, 6 of 6
+        #
+        # `zdr` and `data_collection` are HARD filters, unlike the throughput
+        # preference below. They make OpenRouter itself refuse an endpoint that
+        # retains data or trains on prompts, so D15 no longer rests only on
+        # this process getting its own allow-list right. All five approved
+        # endpoints pass both, measured the same day, so they cost no coverage.
+        block = {"order": order, "only": order, "allow_fallbacks": False,
+                 "require_parameters": True,
+                 "zdr": True, "data_collection": "deny"}
+        # SOFT, and that asymmetry is the whole safety argument: a preference
+        # can only reorder what `only` already permits. Verified with a control
+        # differing in exactly this field:
+        #   order=[together, reka]                    -> Together, 6 of 6
+        #   order=[together, reka] + p50>=50          -> Reka,     6 of 6
+        #   order=[together] + p50>=100000 (nothing)  -> Together, 6 of 6
+        # The last line is the one that matters: an unmeetable floor still
+        # served the request. This can never strand a turn.
+        if OPENROUTER_MIN_THROUGHPUT > 0:
+            block["preferred_min_throughput"] = {
+                "p50": OPENROUTER_MIN_THROUGHPUT}
+        return block
     if OPENROUTER_PROVIDER_SORT:
         return {"sort": OPENROUTER_PROVIDER_SORT}
     return {}

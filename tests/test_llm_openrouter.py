@@ -321,8 +321,15 @@ def test_explicit_provider_list_wins_and_disables_fallbacks(openrouter, monkeypa
     monkeypatch.setattr(llm, "OPENROUTER_PROVIDER_SORT", "throughput")
     seen = _capture(openrouter)
     llm.complete("prompt")
+    # `only` mirrors `order` so the ordered walk cannot leave the pinned set,
+    # and the zdr/data_collection hard filters make OpenRouter refuse a
+    # retaining or training endpoint independently of our own allow-list.
     assert seen["body"]["provider"] == {
         "order": ["DeepInfra", "Together"],
+        "only": ["DeepInfra", "Together"],
         "allow_fallbacks": False,
         "require_parameters": True,
+        "zdr": True,
+        "data_collection": "deny",
+        "preferred_min_throughput": {"p50": llm.OPENROUTER_MIN_THROUGHPUT},
     }

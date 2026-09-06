@@ -342,8 +342,12 @@ def test_tool_loop_forwards_the_provider_pin_with_fallbacks_off(openrouter):
     llm.tool_loop("q", ctx=None, tools=[{"type": "function"}], max_turns=2)
     assert seen["body"]["provider"] == {
         "order": ["coreweave/fp8"],
+        "only": ["coreweave/fp8"],
         "allow_fallbacks": False,
         "require_parameters": True,
+        "zdr": True,
+        "data_collection": "deny",
+        "preferred_min_throughput": {"p50": llm.OPENROUTER_MIN_THROUGHPUT},
     }
     assert seen["body"]["reasoning"] == {"enabled": False}
     assert seen["body"]["model"] == "deepseek/deepseek-v4-flash-0731"

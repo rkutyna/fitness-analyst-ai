@@ -995,3 +995,100 @@ CREATE TABLE IF NOT EXISTS food_catalog (
     notes         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_food_catalog_name ON food_catalog (display_name);
+
+-- ---------------------------------------------------------------------------
+-- The weekly deep dive's own cross-run state (#155).
+--
+-- This used to be three JSON files in ONE process-wide directory
+-- (`<repo>/data/digest`), resolved from a module-level default that no
+-- production caller overrode. Every vault's deep dive therefore opened the
+-- same `deepdive_threads.json`, and because a pre-registered hypothesis id is
+-- the SAME STRING for every user by construction ('alcohol_to_deep_sleep'),
+-- one session's narration could quote another session's measured rho -- a
+-- number computed from a different user's data, then written back as an
+-- insight under the reader's own ownership.
+--
+-- Isolation here is the file the vault IS, exactly as D4 has it everywhere
+-- else: there is deliberately no owner/vault column, because a column is
+-- something one query can forget to filter on. A row in these tables is this
+-- vault's row because it is in this vault.
+--
+-- Unlike plan_statement_log these are NOT append-only. A thread's status is
+-- mutable state by design: it ages to 'stale' after three unconfirmed runs and
+-- a later matching observation reopens it. The observations themselves are
+-- append-only in practice -- nothing updates or deletes one -- and carry their
+-- own ordering so a reload reproduces the sequence a run recorded.
+-- ---------------------------------------------------------------------------
+
+-- Every run date the deep dive has been executed for in this vault. Thread
+-- aging counts MISSED RUNS, not calendar days, so the set of runs has to be
+-- durable independently of whether any thread was touched by a given run.
+CREATE TABLE IF NOT EXISTS deepdive_runs (
+    run_date     TEXT PRIMARY KEY,
+    recorded_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deepdive_threads (
+    thread_id     TEXT PRIMARY KEY,
+    -- The stable identity a caller asserts (a pre-registered hypothesis id),
+    -- or the opening claim when there is none. Matching on an explicit topic
+    -- is exact equality; the lexical matcher is used only when a caller has
+    -- no stable id to give.
+    topic         TEXT NOT NULL,
+    claim         TEXT NOT NULL,
+    status        TEXT NOT NULL CHECK (status IN ('open', 'stale', 'resolved')),
+    first_seen    TEXT NOT NULL,
+    last_seen     TEXT NOT NULL,
+    last_updated  TEXT NOT NULL,
+    stale_on      TEXT,
+    stale_reason  TEXT,
+    resolved_on   TEXT,
+    resolution    TEXT,
+    -- Creation order. The JSON store was a list and its order was load-bearing
+    -- for rendering and for id-collision suffixes, so it is preserved
+    -- explicitly rather than left to rowid, which VACUUM may renumber.
+    sequence      INTEGER NOT NULL,
+    recorded_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deepdive_threads_status
+    ON deepdive_threads (status, sequence);
+CREATE INDEX IF NOT EXISTS idx_deepdive_threads_topic
+    ON deepdive_threads (topic, status);
+
+-- Run dates a thread participated in, INCLUDING runs that only resolved or
+-- staled it. This is deliberately a superset of the observation run dates.
+CREATE TABLE IF NOT EXISTS deepdive_thread_run_dates (
+    thread_id  TEXT NOT NULL
+        REFERENCES deepdive_threads (thread_id) ON DELETE CASCADE,
+    run_date   TEXT NOT NULL,
+    PRIMARY KEY (thread_id, run_date)
+);
+
+CREATE TABLE IF NOT EXISTS deepdive_thread_observations (
+    sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id     TEXT NOT NULL
+        REFERENCES deepdive_threads (thread_id) ON DELETE CASCADE,
+    run_date      TEXT NOT NULL,
+    claim         TEXT NOT NULL,
+    -- The measured figures behind the claim, as recorded. Kept as JSON because
+    -- the shape is the caller's ({metric, field, value} today, scoped operands
+    -- for derived figures) and this table must not become a second, weaker
+    -- copy of the metric vocabulary.
+    numbers_json  TEXT NOT NULL,
+    recorded_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deepdive_thread_observations
+    ON deepdive_thread_observations (thread_id, sequence);
+
+-- One deep-dive trace per (run date, mode). The trace files were keyed by day
+-- alone, so two vaults deep-diving on one date overwrote each other's -- the
+-- cheaper half of the same defect.
+CREATE TABLE IF NOT EXISTS deepdive_traces (
+    run_date     TEXT NOT NULL,
+    mode         TEXT NOT NULL CHECK (mode IN ('deep', 'levers', 'arc')),
+    trace_json   TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL,
+    PRIMARY KEY (run_date, mode)
+);

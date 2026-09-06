@@ -173,9 +173,38 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
 # costs 3.2x turn latency (33.9 s against a 10.7 s median), so an endpoint 4x
 # faster that fails one turn in eight can be net SLOWER end to end. Decode rate
 # is not the objective; end-to-end turn latency including retries is.
+# ADMITTED 2026-09-05 — `reka/fp4`, `makora`, `fireworks`, `baseten/fp8`, on the
+# maintainer's blanket reading that OpenRouter's shield marks zero data
+# retention AND no training on prompts. Each carries that shield. They are
+# admitted to be MEASURED end to end, not because decode rate alone recommends
+# any of them; see the warning below the set.
+#
+# Decode measured 2026-09-05 by slope, `reasoning=low`, synthetic prompts:
+# `fireworks` 125.5, `baseten/fp8` 111.1, `reka/fp4` 92.1-124.5, `makora` 80.8,
+# against the current pin `together` at 27.9-45.9 tok/s. All four honour
+# `max_tokens` exactly (cap 150 -> 150, finish_reason "length").
+#
+# `reka/fp4`, `makora` and `fireworks` keep `structured_outputs`, so unlike
+# `coreweave/fp8`, `relace/fp4` and `baseten/fp8` they give up nothing that
+# `together` was admitted to provide. `reka/fp4` is fp4-quantized at 262,144
+# context — ample against measured ask prompts of ~35k tokens, but it is a
+# lower-precision endpoint serving a system whose model COPIES figures into
+# placeholders, so its grounding rate is the thing to watch, not its speed.
+# `fireworks` returned HTTP 429 on 3 of 4 synthetic attempts across two
+# sessions and publishes the lowest uptime of the group (98.45%); expect it to
+# fail under battery parallelism, and treat that as a result rather than a
+# flake. `makora` publishes 97.71%, lower still.
+#
+# NOT ADMITTED — `wafer/fast`, despite the highest published throughput
+# (159 tps), a full capability profile and 99.89% uptime. It IGNORES
+# `max_tokens`: a cap of 150 returned 7,709 completion tokens, 51.4x over,
+# reporting finish_reason "stop" rather than "length". The violation reports
+# success, so any generation cap would be silently inoperative. Re-test that
+# before proposing it.
 APPROVED_OPENROUTER_PROVIDERS = {
     "deepseek/deepseek-v4-flash-0731": frozenset({
-        "coreweave/fp8", "together", "parasail/fp8", "relace/fp4"}),
+        "coreweave/fp8", "together", "parasail/fp8", "relace/fp4",
+        "reka/fp4", "makora", "fireworks", "baseten/fp8"}),
     "z-ai/glm-5.3-flash": frozenset({
         "baseten/fp8", "novita/fp8", "together"}),
 }
@@ -186,6 +215,9 @@ APPROVED_OPENROUTER_PROVIDERS = {
 OPENROUTER_PROVIDER_TAGS = {
     "CoreWeave": "coreweave/fp8",
     "Relace": "relace/fp4",
+    "Reka": "reka/fp4",
+    "Makora": "makora",
+    "Fireworks": "fireworks",
     "Together": "together",
     "Parasail": "parasail/fp8",
     "BaseTen": "baseten/fp8",

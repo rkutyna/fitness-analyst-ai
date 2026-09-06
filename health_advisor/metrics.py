@@ -191,6 +191,23 @@ IMPACT_IMPLAUSIBLE_PACE_MIN = 5.0  # min/mi; faster than this is not human trave
 # Jogging is now a workout-scoped cadence classification. The pace constants
 # remain part of the bucket payload and the separate block dial; they do not
 # classify impact-volume jogging.
+#
+# The threshold is a RATE, so the series it reads has to be one too. A step
+# sample is an interval, not an observation of one bucket: HealthKit hands the
+# same walk to us as one-second point samples from one device and as
+# multi-minute totals from another, and a vault may store either shape. The
+# bucket's step total must therefore be built from the part of each sample
+# that actually overlaps the bucket, and scaled by the bucket width — never by
+# a fixed factor that assumes every sample is exactly one bucket wide. Doing
+# the latter reads a sample of span D as D/bucket_width times its true
+# cadence, which is how a 5-minute walking total became a four-figure spm
+# reading and a walk was classified as a jog.
+#
+# Two devices also record the same steps over overlapping intervals. Cadence
+# is a rate, so those streams are NOT additive — summing them roughly doubles
+# the reading and lifts an ordinary walk over this threshold. The bucket takes
+# the largest single stream instead, which is the same "one device wins"
+# principle the distance stream applies through workout arbitration.
 IMPACT_JOG_CADENCE_MIN = 140.0  # steps/min; walk/run gait transition; six oracles land within a minute of it
 # Retained for the separate block bridge predicate; not an impact-volume lane.
 IMPACT_JOG_HR_PACE_MAX = 18.0  # min/mi; block bridge's slow-bucket ceiling
@@ -287,6 +304,12 @@ def impact_bucket_rows(conn, window_predicate: str,
     retaining its distance. Point samples and rows before the vault's cutoff
     remain one bucket. The 12-hour span guard still rejects daily-total-style
     rows, and all of this is shared by both callers.
+
+    Step samples are distributed the same way and for the same reason, then
+    reduced to a rate: each bucket takes the largest per-device step total
+    overlapping it, scaled by the bucket width. Overlapping device streams are
+    not summed — cadence is a rate, and two devices recording one walk are two
+    measurements of it, not two walks.
 
     ``arbitration_window`` scopes the source-presence tests used by
     ``db._workout_arbitration``. It defaults to the same two bounds supplied to
@@ -421,12 +444,44 @@ def impact_bucket_rows(conn, window_predicate: str,
              {record_window_filter}
         GROUP BY local_date, bkt
         ),
-        s AS (
-          SELECT CAST(strftime('%s', start_utc) / {IMPACT_BUCKET_SECONDS} AS INT) AS bkt,
-                 SUM(value) * 3.0 AS cadence_spm
+        step_src AS (
+          SELECT source, value,
+                 CAST(strftime('%s', start_utc) AS INTEGER) AS ss,
+                 CAST(strftime('%s', end_utc) AS INTEGER) AS es,
+                 CAST(strftime('%s', start_utc) / {IMPACT_BUCKET_SECONDS} AS INT)
+                   AS first_bkt,
+                 CASE WHEN CAST(strftime('%s', end_utc) AS INTEGER)
+                           <= CAST(strftime('%s', start_utc) AS INTEGER)
+                      THEN CAST(strftime('%s', start_utc) / {IMPACT_BUCKET_SECONDS} AS INT)
+                      ELSE CAST((CAST(strftime('%s', end_utc) AS INTEGER) - 1)
+                                / {IMPACT_BUCKET_SECONDS} AS INT)
+                  END AS last_bkt
             FROM records
            WHERE metric = 'step_count'
              {record_window_filter}
+             AND CAST(strftime('%s', end_utc) AS INTEGER)
+                 - CAST(strftime('%s', start_utc) AS INTEGER) < ?
+        ), step_expanded AS (
+          SELECT source, value, ss, es, first_bkt AS bkt, last_bkt
+            FROM step_src
+          UNION ALL
+          SELECT source, value, ss, es, bkt + 1, last_bkt
+            FROM step_expanded
+           WHERE bkt < last_bkt
+        ), step_by_source AS (
+          SELECT bkt, source,
+                 SUM(CASE WHEN es <= ss THEN value
+                          ELSE value * (
+                               MIN(es, (bkt + 1) * {IMPACT_BUCKET_SECONDS})
+                               - MAX(ss, bkt * {IMPACT_BUCKET_SECONDS})
+                             ) / (es - ss) END) AS steps
+            FROM step_expanded
+        GROUP BY bkt, source
+        ),
+        s AS (
+          SELECT bkt,
+                 MAX(steps) * (60.0 / {IMPACT_BUCKET_SECONDS}) AS cadence_spm
+            FROM step_by_source
         GROUP BY bkt
         ),
         c AS (
@@ -467,6 +522,7 @@ def impact_bucket_rows(conn, window_predicate: str,
              IMPACT_MAX_SAMPLE_SPAN_SECONDS,
              *repeated_window_args,
              *repeated_window_args,
+             IMPACT_MAX_SAMPLE_SPAN_SECONDS,
          implausible_mi_ceiling, IMPACT_JOG_CADENCE_MIN,
          bucket_min / IMPACT_WALK_PACE_MAX,
          implausible_mi_ceiling),

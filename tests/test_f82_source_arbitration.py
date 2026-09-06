@@ -281,7 +281,15 @@ def test_arbitration_is_bounded_and_survives_a_low_sqlite_variable_limit(conn):
     assert set(args) == {"Demo Apple Watch", "Demo iPhone", "GymKit"}
     assert len(args) == len(set(args)) == 3
     assert clause.count("?") == 3
-    old_limit = conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 16)
+    # The bucket query itself binds a fixed, small number of values — none of
+    # them proportional to the rows it reads, which is the property this
+    # ceiling exists to hold. It was 16 until the step series gained its own
+    # sample-span guard (one more constant, bound the same way the distance
+    # series binds it). Raise this only alongside a bind that is likewise
+    # constant; a bind that grows with the data must be rejected here rather
+    # than accommodated, because the platform with the low limit is not the
+    # one this suite runs on.
+    old_limit = conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 17)
     try:
         rows = analysis.mx.impact_bucket_rows(
             conn, "local_date BETWEEN ? AND ?", ("2026-08-25", "2026-08-25"))

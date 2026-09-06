@@ -31,7 +31,7 @@ def _record(conn, metric: str, start: str, value: float, end: str | None = None)
     )
 
 
-def test_cadence_is_start_bucket_sum_times_three_and_window_is_type_agnostic(conn):
+def test_cadence_is_the_bucket_step_rate_and_the_window_is_type_agnostic(conn):
     _workout(conn, "2026-07-01T12:00:00Z", 40, workout_type="walking")
     _record(conn, "distance_walking_running", "2026-07-01T12:00:00Z", 0.03)
     _record(conn, "distance_walking_running", "2026-07-01T12:00:20Z", 0.03)
@@ -61,7 +61,15 @@ def test_high_cadence_outside_workout_window_is_not_jog(conn):
     assert [row["is_walk"] for row in rows] == [True, False]
 
 
-def test_step_count_is_not_distributed_across_buckets(conn):
+def test_a_wide_step_sample_is_read_across_the_buckets_it_spans(conn):
+    """A step sample is an interval, not an observation of one bucket.
+
+    47 steps over 3:05 is a shuffle at about 15 spm. Attributing all 47 to the
+    20 seconds the sample happens to start in read it as 141 spm and called it
+    a jog -- a walk classified as running purely because its device reported
+    the walk in one wide sample instead of many narrow ones. Every bucket the
+    sample covers now gets the share of it that overlaps that bucket.
+    """
     _workout(conn, "2026-07-01T12:00:00Z", 60)
     for i in range(3):
         start = f"2026-07-01T12:00:{i * 20:02d}Z"
@@ -73,10 +81,39 @@ def test_step_count_is_not_distributed_across_buckets(conn):
     rows = metrics.bucket_series(conn, "2026-07-01T12:00:00Z",
                                  "2026-07-01T12:01:00Z")
 
-    assert rows[0]["cadence_spm"] == pytest.approx(141.0)
-    assert rows[1]["cadence_spm"] is None
-    assert rows[2]["cadence_spm"] is None
-    assert [row["is_jog"] for row in rows] == [True, False, False]
+    # 47 steps over 185 s; each bucket takes its 20 s and is scaled to a minute.
+    per_bucket = pytest.approx(47.0 * 20.0 / 185.0 * 3.0, abs=0.01)
+    assert [row["cadence_spm"] for row in rows] == [per_bucket] * 3
+    assert [row["is_jog"] for row in rows] == [False, False, False]
+
+
+def test_two_devices_recording_one_walk_are_not_two_walks(conn):
+    """Cadence is a rate, so overlapping device streams are not additive.
+
+    Both devices report the same minute of walking. Summing them doubles the
+    reading and lifts an ordinary walk over the jog threshold; the bucket
+    takes the largest single stream instead, which is the walk's own cadence.
+    """
+    _workout(conn, "2026-07-01T12:00:00Z", 60)
+    for i in range(3):
+        start = f"2026-07-01T12:00:{i * 20:02d}Z"
+        _record(conn, "distance_walking_running", start, 0.03)
+    for source in ("watch", "phone"):
+        conn.execute(
+            "INSERT INTO records (metric, value, unit, start_utc, end_utc, "
+            "local_date, source, origin, dedupe_key) VALUES "
+            "('step_count', 100.0, 'count', '2026-07-01T12:00:00Z', "
+            "'2026-07-01T12:01:00Z', '2026-07-01', ?, 'test', ?)",
+            (source, f"step|{source}"),
+        )
+    conn.commit()
+
+    rows = metrics.bucket_series(conn, "2026-07-01T12:00:00Z",
+                                 "2026-07-01T12:01:00Z")
+
+    # 100 steps a minute each, not 200: one walk measured twice.
+    assert [row["cadence_spm"] for row in rows] == [pytest.approx(100.0)] * 3
+    assert [row["is_jog"] for row in rows] == [False, False, False]
 
 
 def test_implausible_pace_floor_and_raw_tables_are_unchanged(conn):

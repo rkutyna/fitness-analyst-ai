@@ -142,21 +142,40 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
 # tag is bare `together`, Parasail's is `parasail/fp8`. A wrong tag fails
 # closed here, which is the intended direction.
 #
-# CONSIDERED AND DECLINED — `relace/fp4` (decided 2026-08-30, #194). It is
-# the cheapest endpoint serving the pinned model ($0.065/$0.18 per M against
-# CoreWeave's $0.13/$0.28) at 1,048,576 context, so it clears the price half
-# easily. It fails on both of the halves that matter here. Its capability
-# profile is coreweave/fp8's exactly — no `structured_outputs`, no
-# `response_format`, `tool_choice` "auto" only — so it is a third provider that
-# cannot compel the terminal submit_answer call, which is the gap the two above
-# were added to close. And the no-training half could not be established from
-# published terms: OpenRouter's provider page states zero data retention, but
-# OpenRouter's own docs treat retention and training as separate policies, and
-# the privacy policy OpenRouter links for Relace 404s. Absent evidence is not
-# admission. Do not re-propose it without terms to quote.
+# ADMITTED 2026-09-05 — `relace/fp4`, on the maintainer's direct reading of the
+# provider's terms. This REVERSES the 2026-08-30 decline on its terms half only,
+# and that half was declined for absent evidence rather than adverse evidence:
+# OpenRouter's provider page stated zero data retention, OpenRouter's docs treat
+# retention and training as separate policies, and the privacy policy OpenRouter
+# linked for this provider 404'd at the time. The policy has since been read
+# directly and both halves confirmed. The earlier note said "do not re-propose
+# without terms to quote"; that condition is met by the reading, not by this
+# comment, so a session wanting the text should ask rather than re-decline on
+# the stale 404.
+#
+# THE CAPABILITY HALF OF #194's DECLINE STILL STANDS, and it is why membership
+# here is not a recommendation to pin. Relace's profile is coreweave/fp8's
+# exactly — no `structured_outputs`, no `response_format`, `tool_choice` "auto"
+# only — so it cannot compel the terminal submit_answer call, which is the gap
+# `together` and `parasail/fp8` were added to close. That profile is the one
+# under which 24 of 26 measured loop failures were malformed submit_answer
+# arguments.
+#
+# It is admitted because it is by far the fastest endpoint serving this model
+# and the cheapest ($0.065/$0.18 per M, 1,048,576 context): decode measured
+# 2026-09-05 at 185.5 tok/s by slope, against `coreweave/fp8` 91.2-110.0,
+# `parasail/fp8` 62.5 and `together` 27.9-45.9. It honours `max_tokens`
+# exactly (cap 150 -> 150 completion tokens, finish_reason "length") — which
+# `wafer/fast` does NOT, returning 7,709 against the same cap while reporting
+# "stop", and which is why that faster endpoint is absent from this set.
+#
+# BEFORE PINNING IT, measure the malformed-submit_answer rate (#308). A retry
+# costs 3.2x turn latency (33.9 s against a 10.7 s median), so an endpoint 4x
+# faster that fails one turn in eight can be net SLOWER end to end. Decode rate
+# is not the objective; end-to-end turn latency including retries is.
 APPROVED_OPENROUTER_PROVIDERS = {
     "deepseek/deepseek-v4-flash-0731": frozenset({
-        "coreweave/fp8", "together", "parasail/fp8"}),
+        "coreweave/fp8", "together", "parasail/fp8", "relace/fp4"}),
     "z-ai/glm-5.3-flash": frozenset({
         "baseten/fp8", "novita/fp8", "together"}),
 }
@@ -166,6 +185,7 @@ APPROVED_OPENROUTER_PROVIDERS = {
 # explicit and exact: an unfamiliar display name is not an approved provider.
 OPENROUTER_PROVIDER_TAGS = {
     "CoreWeave": "coreweave/fp8",
+    "Relace": "relace/fp4",
     "Together": "together",
     "Parasail": "parasail/fp8",
     "BaseTen": "baseten/fp8",

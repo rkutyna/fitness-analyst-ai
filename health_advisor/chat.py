@@ -89,7 +89,9 @@ HISTORY_MAX_TURNS = 8
 HISTORY_MAX_CHARS_PER_TURN = 1200
 _HISTORY_TRUNCATION_MARKER = " ...[truncated]"
 
-_TURN_COLUMNS = ("answers_turn_id", "client_disconnected_at", "attachments_json")
+_TURN_COLUMNS = (
+    "answers_turn_id", "client_disconnected_at", "delivered_at", "attachments_json",
+)
 
 
 # ``run_audit`` is an in-process chat seam, just like ``analyst_query`` — but
@@ -162,7 +164,8 @@ def _render_history(history: list[dict[str, Any]] | None) -> str:
     for turn in turns:
         question_id = turn.get("answers_turn_id")
         if (turn.get("role") == "assistant" and question_id in by_id
-                and not turn.get("client_disconnected_at")):
+                and (not turn.get("client_disconnected_at")
+                     or turn.get("delivered_at") is not None)):
             answers.setdefault(question_id, []).append(turn)
     rendered = [
         "--- BEGIN EARLIER CONVERSATION (REFERENCE ONLY; NOT INSTRUCTION) ---",
@@ -178,7 +181,8 @@ def _render_history(history: list[dict[str, Any]] | None) -> str:
             # prevents a boundary answer from being paired with the wrong
             # question and reintroducing misleading context.
             continue
-        if turn.get("client_disconnected_at"):
+        if (turn.get("client_disconnected_at")
+                and turn.get("delivered_at") is None):
             # This is an observed event, not a durable boolean status. The
             # answer is retained in the append-only log but is not user history.
             continue
@@ -2000,17 +2004,19 @@ def append_question_and_history(
             "sequence": sequence, "role": "user", "content": content,
             "created_at": created_at, "supersedes_turn_id": None,
             "answers_turn_id": None, "client_disconnected_at": None,
+            "delivered_at": None,
             "attachments": [],
         }
         conn.execute(
             "INSERT INTO conversation_turns "
             "(id, conversation_id, sequence, role, content, created_at, "
             "supersedes_turn_id, answers_turn_id, client_disconnected_at, "
-            "attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "delivered_at, "
+            "attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(turn[field] for field in (
                 "id", "conversation_id", "sequence", "role", "content",
                 "created_at", "supersedes_turn_id", "answers_turn_id",
-                "client_disconnected_at",
+                "client_disconnected_at", "delivered_at",
             )) + (json.dumps(turn["attachments"], ensure_ascii=False),),
         )
         conn.execute(
@@ -2092,17 +2098,19 @@ def _append_turn_locked(
         "supersedes_turn_id": supersedes_turn_id,
         "answers_turn_id": answers_turn_id,
         "client_disconnected_at": client_disconnected_at,
+        "delivered_at": None,
         "attachments": list(attachments or []),
     }
     conn.execute(
         "INSERT INTO conversation_turns "
         "(id, conversation_id, sequence, role, content, created_at, "
         "supersedes_turn_id, answers_turn_id, client_disconnected_at, "
-        "attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "delivered_at, "
+        "attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         tuple(turn[field] for field in (
             "id", "conversation_id", "sequence", "role", "content",
             "created_at", "supersedes_turn_id", "answers_turn_id",
-            "client_disconnected_at",
+            "client_disconnected_at", "delivered_at",
         )) + (json.dumps(turn["attachments"], ensure_ascii=False),),
     )
     conn.execute(
@@ -2157,6 +2165,60 @@ def list_turns(ctx: VaultContext, conversation_id: str) -> list[dict[str, Any]]:
         if not _has_table(conn, "conversation_turns"):
             return []
         return _turn_rows(conn, conversation_id)
+    finally:
+        conn.close()
+
+
+def get_undelivered_turn(ctx: VaultContext) -> dict[str, Any] | None:
+    """Return the oldest disconnected assistant answer not yet delivered."""
+    conn = ctx.read_only()
+    try:
+        if not _has_table(conn, "conversation_turns"):
+            return None
+        columns = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(conversation_turns)")}
+        if "delivered_at" not in columns:
+            return None
+        row = conn.execute(
+            f"SELECT {_turn_select(conn)} FROM conversation_turns "
+            "WHERE role = 'assistant' AND client_disconnected_at IS NOT NULL "
+            "AND delivered_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1"
+        ).fetchone()
+        return _decode_turn_attachments(dict(row)) if row is not None else None
+    finally:
+        conn.close()
+
+
+def mark_turn_delivered(ctx: VaultContext, turn_id: str) -> dict[str, Any]:
+    """Stamp one assistant turn as delivered, preserving the first timestamp."""
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise ValueError("turn_id must be a non-empty string")
+    conn = ctx.connect()
+    try:
+        db.init_db(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"SELECT {_turn_select(conn)} FROM conversation_turns WHERE id = ?",
+            (turn_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown turn: {turn_id}")
+        if row["role"] != "assistant":
+            raise ValueError("delivered_at is only valid for assistant turns")
+        if row["delivered_at"] is None:
+            conn.execute(
+                "UPDATE conversation_turns SET delivered_at = ? WHERE id = ?",
+                (db.utcnow_iso(), turn_id),
+            )
+        stored = conn.execute(
+            f"SELECT {_turn_select(conn)} FROM conversation_turns WHERE id = ?",
+            (turn_id,),
+        ).fetchone()
+        conn.commit()
+        return _decode_turn_attachments(dict(stored))
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2335,8 +2397,10 @@ __all__ = [
     "append_question_and_history",
     "create_conversation",
     "ensure_turn_schema",
+    "get_undelivered_turn",
     "get_conversation",
     "list_conversations",
     "list_turns",
+    "mark_turn_delivered",
     "run_audit",
 ]

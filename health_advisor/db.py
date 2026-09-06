@@ -137,6 +137,7 @@ _ADDED_COLUMNS = {
     "conversation_turns": {
         "answers_turn_id": "TEXT",
         "client_disconnected_at": "TEXT",
+        "delivered_at": "TEXT",
         "attachments_json": "TEXT",
     },
 }
@@ -221,7 +222,7 @@ def _migrate_conversation_turns_answers_constraint(conn: sqlite3.Connection) -> 
     """Rebuild old conversation_turns without losing its append-only log.
 
     This is deliberately separate from additive column migrations: changing a
-    CHECK constraint is a table migration. The replacement keeps the same nine
+    CHECK constraint is a table migration. The replacement keeps the same ten
     columns and all existing values, then the canonical schema recreates the
     triggers with the new opposite-role rule.
     """
@@ -232,6 +233,7 @@ def _migrate_conversation_turns_answers_constraint(conn: sqlite3.Connection) -> 
     copied = (
         "id", "conversation_id", "sequence", "role", "content", "created_at",
         "supersedes_turn_id", "answers_turn_id", "client_disconnected_at",
+        "delivered_at",
         "attachments_json",
     )
     expressions = [name if name in columns else "NULL" for name in copied]
@@ -264,11 +266,13 @@ def _migrate_conversation_turns_answers_constraint(conn: sqlite3.Connection) -> 
                 answers_turn_id TEXT
                     REFERENCES conversation_turns(id) ON DELETE RESTRICT,
                 client_disconnected_at TEXT,
+                delivered_at TEXT,
                 attachments_json TEXT,
                 UNIQUE (conversation_id, sequence),
                 CHECK (supersedes_turn_id IS NULL OR supersedes_turn_id <> id),
                 CHECK (answers_turn_id IS NULL OR role IN ('assistant', 'user')),
-                CHECK (client_disconnected_at IS NULL OR role = 'assistant')
+                CHECK (client_disconnected_at IS NULL OR role = 'assistant'),
+                CHECK (delivered_at IS NULL OR role = 'assistant')
             )
             """
         )
@@ -372,6 +376,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     # assistant-only trigger on an existing vault.
     _migrate_conversation_turns_answers_constraint(conn)
     _migrate_review_questions_kind_constraint(conn)
+    # Recreate the append-only trigger below so existing vaults gain the sole
+    # permitted mutation: a one-way delivered_at stamp.
+    conn.execute("DROP TRIGGER IF EXISTS conversation_turns_no_update")
     # CREATE TRIGGER IF NOT EXISTS cannot replace #108's assistant-only
     # trigger on a table that did not need a table rebuild.
     conn.execute("DROP TRIGGER IF EXISTS conversation_turns_answers_same_conversation")

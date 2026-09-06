@@ -181,6 +181,22 @@ def _ask_payload(raw: bytes) -> dict:
             "as_of": as_of}
 
 
+def _delivered_payload(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"malformed delivered payload: {exc}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422,
+                            detail="delivered payload must be an object")
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id.strip():
+        raise HTTPException(status_code=422,
+                            detail="turn_id must be a non-empty string")
+    return turn_id.strip()
+
+
 def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
                  executor_factory=analyst_sandbox.default_executor):
     """Run one analyst question and adapt the CLI JSON for HTTP.
@@ -850,6 +866,23 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 executor_factory=analyst_executor_factory)
         finally:
             analyst_permit.release()
+
+    @app.get("/v1/ask/undelivered")
+    def undelivered_route(x_health_secret: str | None = Header(default=None)):
+        _require_ask_secret(x_health_secret)
+        return chat.get_undelivered_turn(ctx) or {}
+
+    @app.post("/v1/ask/delivered")
+    def delivered_route(raw: bytes = Depends(_raw_body),
+                        x_health_secret: str | None = Header(default=None)):
+        _require_ask_secret(x_health_secret)
+        turn_id = _delivered_payload(raw)
+        try:
+            return chat.mark_turn_delivered(ctx, turn_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/ask")
     async def ask(request: Request, raw: bytes = Depends(_raw_body),

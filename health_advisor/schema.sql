@@ -47,9 +47,9 @@ CREATE TABLE IF NOT EXISTS conversations (
 -- ---------------------------------------------------------------------------
 -- conversation_turns: the append-only conversation event log.
 --
--- A correction is another row, linked through supersedes_turn_id. UPDATE and
--- DELETE are refused by triggers below, so callers cannot replace history by
--- editing a turn in place.
+-- A correction is another row, linked through supersedes_turn_id. Content and
+-- other turn fields cannot be edited in place; the trigger below permits only
+-- the one-way delivery marker. DELETE remains refused.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS conversation_turns (
     id                  TEXT PRIMARY KEY,
@@ -64,11 +64,13 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     answers_turn_id     TEXT
         REFERENCES conversation_turns(id) ON DELETE RESTRICT,
     client_disconnected_at TEXT,
+    delivered_at        TEXT,
     attachments_json    TEXT,
     UNIQUE (conversation_id, sequence),
     CHECK (supersedes_turn_id IS NULL OR supersedes_turn_id <> id),
     CHECK (answers_turn_id IS NULL OR role IN ('assistant', 'user')),
-    CHECK (client_disconnected_at IS NULL OR role = 'assistant')
+    CHECK (client_disconnected_at IS NULL OR role = 'assistant'),
+    CHECK (delivered_at IS NULL OR role = 'assistant')
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_turns_conversation
@@ -80,9 +82,24 @@ CREATE INDEX IF NOT EXISTS idx_conversation_turns_answers
 
 CREATE TRIGGER IF NOT EXISTS conversation_turns_no_update
 BEFORE UPDATE ON conversation_turns
+WHEN NOT (
+    OLD.id IS NEW.id
+    AND OLD.conversation_id IS NEW.conversation_id
+    AND OLD.sequence IS NEW.sequence
+    AND OLD.role IS NEW.role
+    AND OLD.content IS NEW.content
+    AND OLD.created_at IS NEW.created_at
+    AND OLD.supersedes_turn_id IS NEW.supersedes_turn_id
+    AND OLD.answers_turn_id IS NEW.answers_turn_id
+    AND OLD.client_disconnected_at IS NEW.client_disconnected_at
+    AND OLD.attachments_json IS NEW.attachments_json
+    AND OLD.delivered_at IS NULL
+    AND NEW.delivered_at IS NOT NULL
+    AND NEW.role = 'assistant'
+)
 BEGIN
     SELECT RAISE(ABORT,
-        'conversation turns are append-only; insert a superseding turn');
+        'conversation turns are append-only; only delivery may be stamped');
 END;
 
 CREATE TRIGGER IF NOT EXISTS conversation_turns_no_delete

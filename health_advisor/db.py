@@ -133,6 +133,7 @@ _ADDED_COLUMNS = {
         "jog_niggle": "TEXT",
         "jog_niggle_detail": "TEXT",
         "talk_test": "TEXT",
+        "waist_circumference": "REAL",
     },
     "conversation_turns": {
         "answers_turn_id": "TEXT",

@@ -1,5 +1,7 @@
 """MCP log_subjective / get_subjective round-trip on a temp DB."""
 
+import pytest
+
 from health_advisor import deepdive_verify as DV
 
 
@@ -12,6 +14,24 @@ def test_log_and_get_round_trip(tools):
     got = tools.get_subjective("2026-07-15", "2026-07-17")
     assert got["count"] == 1
     assert got["days"][0]["notes"] == "quads sore from hike"
+
+
+def test_waist_can_round_trip_through_phone_tool(tools, conn):
+    out = tools.log_subjective(
+        "2026-07-16", waist_circumference=123.45,
+        waist_circumference_unit="cm")
+    assert out["ok"] is True
+    assert out["stored"]["waist_circumference"] == pytest.approx(48.6023622)
+
+    got = tools.get_subjective("2026-07-16", "2026-07-16")
+    waist = got["days"][0]
+    assert waist["waist_circumference"] == pytest.approx(48.6023622)
+    assert waist["waist_circumference_unit"] == "in"
+    stored = conn.execute(
+        "SELECT value, source, origin FROM records "
+        "WHERE metric = 'waist_circumference'").fetchone()
+    assert stored["value"] == pytest.approx(48.6023622)
+    assert (stored["source"], stored["origin"]) == ("checkin", "checkin")
 
 
 def test_log_validation_error_is_structured(tools):

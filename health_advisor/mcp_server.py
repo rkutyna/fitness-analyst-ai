@@ -1853,13 +1853,19 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
                    alcohol_drinks: float | None = None,
                    food_note: str = "", jog_niggle: str = "",
                    jog_niggle_detail: str = "", talk_test: str = "",
+                   waist_circumference: float | None = None,
+                   waist_circumference_unit: str = "",
                    notes: str = "") -> dict:
     """Store the user's nightly subjective check-in for a day (YYYY-MM-DD).
     Scales: stress, soreness (muscle), energy, sleep_quality (last night's
     sleep) are integers 1=lowest/worst to 5=highest/best for energy and
     sleep_quality, 5=most severe for stress and soreness. caffeine_drinks /
     alcohol_drinks are counts of drinks (non-negative; 0 is a valid answer).
-    'notes' is a catch-all for anything that doesn't fit (illness, travel,
+    waist_circumference is a self-reported tape measurement. It is stored in
+    the catalog's canonical length unit and is attributed to this check-in,
+    never to HealthKit. If no unit is supplied, the vault's declared unit
+    system selects the input unit (the legacy/default system is canonical
+    inches; metric vaults accept cm). 'notes' is a catch-all for anything that doesn't fit (illness, travel,
     niggles, life events).
 
     Three further fields, kept deliberately cheap to answer — one free-text
@@ -1886,7 +1892,8 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
     earlier: a check-in is a report of a day that happened."""
     if err := _bad_dates(day=day):
         return {"ok": False, "error": err}
-    local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    settings = ctx.settings()
+    local_timezone = _as_timezone(settings["local_timezone"])
     today = _today(local_timezone).isoformat()
     # A check-in about a day that hasn't happened is not a correction anyone can
     # make. Left open, a mis-parsed "tomorrow" writes a future row that then
@@ -1899,6 +1906,7 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
     conn = ctx.connect()
     try:
         db.init_db(conn)
+        unit_system = settings["unit_system"]
         row = subj.log(conn, day, stress=stress, soreness=soreness,
                        energy=energy, sleep_quality=sleep_quality,
                        caffeine_drinks=caffeine_drinks,
@@ -1907,6 +1915,9 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
                        jog_niggle=jog_niggle.strip() or None,
                        jog_niggle_detail=jog_niggle_detail.strip() or None,
                        talk_test=talk_test.strip() or None,
+                       waist_circumference=waist_circumference,
+                       waist_circumference_unit=waist_circumference_unit.strip() or None,
+                       unit_system=unit_system,
                        notes=notes.strip() or None)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
@@ -1934,7 +1945,8 @@ def get_subjective(ctx: VaultContext, start_date: str, end_date: str) -> dict:
     # write lock on the production database to answer a SELECT.
     conn = ctx.read_only()
     try:
-        days = subj.get_range(conn, start_date, end_date)
+        days = subj.get_range(conn, start_date, end_date,
+                              unit_system=V.unit_system(conn))
     except sqlite3.OperationalError as e:
         # Read-only can no longer CREATE TABLE its way past a missing table, so
         # the missing table has to be an answer instead of a crash.

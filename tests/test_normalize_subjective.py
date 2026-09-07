@@ -27,3 +27,9 @@ def test_subjective_not_wear_filtered():
     from health_advisor import correlate as C
     assert not C._needs_wear("subjective_stress")
     assert not C._needs_wear("caffeine_drinks")
+
+
+def test_waist_circumference_is_canonical_inch_body_metric():
+    assert nz.CATALOG["waist_circumference"] == {
+        "unit": "in", "agg": "last", "group": "body"}
+    assert nz.is_known_metric("waist_circumference")

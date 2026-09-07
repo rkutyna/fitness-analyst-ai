@@ -104,3 +104,45 @@ def test_get_range_ascending(wconn):
     days = [r["date"] for r in S.get_range(wconn, "2026-07-14", "2026-07-16")]
     assert days == ["2026-07-15", "2026-07-16"]
     assert S.get_day(wconn, "2026-07-14") is None
+
+
+def test_waist_round_trip_is_canonical_and_self_reported(wconn):
+    # Input is synthetic and deliberately supplied in a metric vault unit.
+    row = S.log(wconn, DAY, waist_circumference=123.45,
+                waist_circumference_unit="cm", unit_system="metric")
+
+    assert row["waist_circumference"] == pytest.approx(48.6023622)
+    raw = wconn.execute(
+        "SELECT value, unit, source, origin FROM records "
+        "WHERE metric = 'waist_circumference'").fetchone()
+    assert raw["value"] == pytest.approx(48.6023622)
+    assert (raw["unit"], raw["source"], raw["origin"]) == (
+        "in", "checkin", "checkin")
+    daily = wconn.execute(
+        "SELECT last, unit FROM daily_metrics "
+        "WHERE metric = 'waist_circumference' AND date = ?", (DAY,)).fetchone()
+    assert daily["last"] == pytest.approx(48.6023622)
+    assert daily["unit"] == "in"
+
+    read_back = S.get_range(wconn, DAY, DAY, unit_system="metric")[0]
+    assert read_back["waist_circumference"] == pytest.approx(123.45)
+    assert read_back["waist_circumference_unit"] == "cm"
+    assert read_back["field_metrics"]["waist_circumference"] == (
+        "waist_circumference")
+
+
+def test_fortnightly_windows_compute_four_misses_without_backfill(wconn):
+    statuses = S.measurement_status(
+        wconn, "2026-01-05", "2026-03-02")
+
+    closed = statuses[:4]
+    assert [(row["start"], row["end"], row["status"]) for row in closed] == [
+        ("2026-01-05", "2026-01-18", "missed"),
+        ("2026-01-19", "2026-02-01", "missed"),
+        ("2026-02-02", "2026-02-15", "missed"),
+        ("2026-02-16", "2026-03-01", "missed"),
+    ]
+    assert statuses[4]["status"] == "due"
+    assert wconn.execute(
+        "SELECT COUNT(*) FROM records WHERE metric = 'waist_circumference'"
+    ).fetchone()[0] == 0

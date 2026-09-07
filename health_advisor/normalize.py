@@ -124,6 +124,10 @@ CATALOG: dict[str, dict] = {
     "blood_oxygen_saturation":    {"unit": "%",          "agg": "mean", "group": "vitals"},
     "body_mass":                  {"unit": "lb",         "agg": "last", "group": "body"},
     "body_mass_index":            {"unit": "count",      "agg": "last", "group": "body"},
+    # A tape measurement is a point-in-time, self-reported body measure.  It
+    # uses the same canonical imperial length unit as the existing inch-valued
+    # mobility metric; vault consumers may present it as cm for metric vaults.
+    "waist_circumference":         {"unit": "in",         "agg": "last", "group": "body"},
     "height":                     {"unit": "ft",         "agg": "last", "group": "body"},
     "sleeping_wrist_temperature": {"unit": "degF",       "agg": "mean", "group": "vitals"},
     # mobility

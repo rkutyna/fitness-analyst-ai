@@ -502,6 +502,7 @@ CREATE TABLE IF NOT EXISTS subjective (
     sleep_quality   INTEGER,            -- 1-5, last night's sleep (wake day)
     caffeine_drinks REAL,               -- count of caffeinated drinks
     alcohol_drinks  REAL,               -- count of standard drinks
+    waist_circumference REAL,           -- self-reported tape measure, canonical in
     notes           TEXT,               -- catch-all free text
     updated_at      TEXT NOT NULL       -- ISO-8601 UTC of last write
 );

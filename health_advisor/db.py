@@ -445,6 +445,44 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def register_device_token(
+    conn: sqlite3.Connection,
+    token: str,
+    apns_environment: str,
+    *,
+    seen_at: str | None = None,
+) -> dict[str, str]:
+    """Insert or refresh one APNs device registration.
+
+    The token is the primary key deliberately: registering the same device
+    token again must refresh its liveness rather than create a second row.
+    The environment is part of the registration state because APNs does not
+    accept a token issued by one environment at the other environment.
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("device token must be a non-empty string")
+    if apns_environment not in {"sandbox", "production"}:
+        raise ValueError("APNs environment must be sandbox or production")
+    token = token.strip()
+    seen_at = seen_at or utcnow_iso()
+    conn.execute(
+        "INSERT INTO device_tokens "
+        "(token, first_seen_at, last_seen_at, apns_environment) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(token) DO UPDATE SET "
+        "last_seen_at=excluded.last_seen_at, "
+        "apns_environment=excluded.apns_environment",
+        (token, seen_at, seen_at, apns_environment),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT token, first_seen_at, last_seen_at, apns_environment "
+        "FROM device_tokens WHERE token = ?",
+        (token,),
+    ).fetchone()
+    return dict(row)
+
+
 def workout_session_marks_available(conn: sqlite3.Connection) -> bool:
     """Whether this connection can see the additive mark table.
 

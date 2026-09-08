@@ -197,6 +197,26 @@ def _delivered_payload(raw: bytes) -> str:
     return turn_id.strip()
 
 
+def _device_token_payload(raw: bytes) -> tuple[str, str]:
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"malformed device token payload: {exc}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422,
+                            detail="device token payload must be an object")
+    token = payload.get("device_token", payload.get("token"))
+    environment = payload.get("environment", payload.get("apns_environment"))
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(status_code=422,
+                            detail="device_token must be a non-empty string")
+    if environment not in ("sandbox", "production"):
+        raise HTTPException(status_code=422,
+                            detail="environment must be sandbox or production")
+    return token.strip(), environment
+
+
 def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
                  executor_factory=analyst_sandbox.default_executor):
     """Run one analyst question and adapt the CLI JSON for HTTP.
@@ -848,6 +868,19 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         if isinstance(raw, Response):
             return raw
         return _healthkit_ingest(ctx, request, raw, x_health_secret)
+
+    @app.post("/v1/push/register")
+    @app.post("/v1/device-token")
+    def register_device_token(raw: bytes = Depends(_raw_body),
+                              x_health_secret: str | None = Header(default=None)):
+        _require_ask_secret(x_health_secret)
+        token, environment = _device_token_payload(raw)
+        db_conn = ctx.connect()
+        try:
+            row = db.register_device_token(db_conn, token, environment)
+        finally:
+            db_conn.close()
+        return {"ok": True, "apns_environment": row["apns_environment"]}
 
     @app.post("/v1/analyst")
     async def analyst_route(request: Request, raw: bytes = Depends(_raw_body),

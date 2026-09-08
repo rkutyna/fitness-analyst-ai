@@ -8,6 +8,25 @@
 PRAGMA foreign_keys = ON;
 
 -- ---------------------------------------------------------------------------
+-- device_tokens: APNs delivery registration, scoped to one environment.
+--
+-- A token is the identity of a device registration in this vault.  APNs
+-- sandbox and production are separate namespaces, so the environment is
+-- stored with the token and is updated when a client re-registers it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS device_tokens (
+    token              TEXT PRIMARY KEY,
+    first_seen_at      TEXT NOT NULL,
+    last_seen_at       TEXT NOT NULL,
+    apns_environment    TEXT NOT NULL CHECK (
+        apns_environment IN ('sandbox', 'production')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_tokens_environment
+    ON device_tokens (apns_environment);
+
+-- ---------------------------------------------------------------------------
 -- vault_meta: facts about this database as a vault, not about its contents.
 --
 -- `owner` is the one that matters: the user whose vault this is. A session

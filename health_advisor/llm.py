@@ -33,6 +33,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -41,6 +44,139 @@ import urllib.parse
 from . import claim_contract as _CLAIM_CONTRACT
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@dataclass
+class ModelCallAccounting:
+    """One answer turn's model-call measurements.
+
+    The transport records only timings and token counts.  In particular, no
+    prompt or completion text is retained here or in the question log.
+    """
+
+    started: float = field(default_factory=time.monotonic)
+    calls: list[dict] = field(default_factory=list)
+    finished: float | None = None
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    def record(self, elapsed_seconds: float, usage: dict | None = None) -> None:
+        usage = usage or {}
+        self.calls.append({
+            "elapsed_seconds": max(0.0, float(elapsed_seconds)),
+            "prompt_tokens": _token_count(usage.get("prompt_tokens")),
+            "cached_tokens": _token_count(usage.get("cached_tokens")),
+            "completion_tokens": _token_count(usage.get("completion_tokens")),
+            "reasoning_tokens": _token_count(usage.get("reasoning_tokens")),
+        })
+
+    def snapshot(self, *, require_nonzero: bool = False) -> dict:
+        if require_nonzero and not self.calls:
+            raise RuntimeError("ask model-call accounting recorded zero model calls")
+        elapsed = ((self.finished if self.finished is not None
+                    else time.monotonic()) - self.started)
+        call_elapsed = sum(call["elapsed_seconds"] for call in self.calls)
+        return {
+            "elapsed_seconds": max(0.0, elapsed),
+            "python_seconds": max(0.0, elapsed - call_elapsed),
+            "model_call_count": len(self.calls),
+            "model_calls": [dict(call) for call in self.calls],
+        }
+
+
+_MODEL_CALL_ACCOUNTING: ContextVar[ModelCallAccounting | None] = ContextVar(
+    "health_advisor_model_call_accounting", default=None)
+
+
+@contextmanager
+def model_call_accounting():
+    """Account model transports for one logical answer turn."""
+    accounting = ModelCallAccounting()
+    token = _MODEL_CALL_ACCOUNTING.set(accounting)
+    try:
+        yield accounting
+    finally:
+        accounting.finished = time.monotonic()
+        _MODEL_CALL_ACCOUNTING.reset(token)
+
+
+def _token_count(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_model_call(elapsed_seconds: float, usage: dict | None = None,
+                       *, prompt_tokens: int | None = None,
+                       cached_tokens: int | None = None,
+                       completion_tokens: int | None = None,
+                       reasoning_tokens: int | None = None) -> None:
+    """Record one transport call if an answer turn is being measured.
+
+    ``usage`` accepts either OpenRouter's nested usage shape or Ollama's
+    ``prompt_eval_count``/``eval_count`` shape.  The record deliberately has
+    no model-generated content.
+    """
+    accounting = _MODEL_CALL_ACCOUNTING.get()
+    if accounting is None:
+        return
+    usage = usage if isinstance(usage, dict) else {}
+    if prompt_tokens is not None:
+        usage = {**usage, "prompt_tokens": prompt_tokens}
+    if cached_tokens is not None:
+        usage = {**usage, "cached_tokens": cached_tokens}
+    if completion_tokens is not None:
+        usage = {**usage, "completion_tokens": completion_tokens}
+    if reasoning_tokens is not None:
+        usage = {**usage, "reasoning_tokens": reasoning_tokens}
+    if "prompt_eval_count" in usage or "eval_count" in usage:
+        usage = _usage_tokens(usage, ollama=True)
+    else:
+        usage = _usage_tokens({"usage": usage})
+    accounting.record(elapsed_seconds, usage)
+
+
+def _usage_tokens(data: dict, *, ollama: bool = False) -> dict[str, int]:
+    """Normalize provider usage without retaining model-generated content."""
+    data = data if isinstance(data, dict) else {}
+    usage = data.get("usage") if not ollama else data
+    usage = usage if isinstance(usage, dict) else {}
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    if ollama:
+        return {
+            "prompt_tokens": _token_count(data.get("prompt_eval_count")),
+            "cached_tokens": 0,
+            "completion_tokens": _token_count(data.get("eval_count")),
+            "reasoning_tokens": 0,
+        }
+    return {
+        "prompt_tokens": _token_count(usage.get("prompt_tokens")),
+        "cached_tokens": _token_count(
+            prompt_details.get("cached_tokens", usage.get("cached_tokens"))),
+        "completion_tokens": _token_count(usage.get("completion_tokens")),
+        "reasoning_tokens": _token_count(
+            completion_details.get("reasoning_tokens",
+                                  usage.get("reasoning_tokens"))),
+    }
+
+
+@contextmanager
+def _measured_model_call():
+    """Measure one provider request, including a request that raises."""
+    started = time.monotonic()
+    usage = {}
+    try:
+        yield usage
+    finally:
+        _record_model_call(time.monotonic() - started, usage)
 
 BACKEND = os.environ.get("HA_LLM_BACKEND", "codex")
 CODEX_MODEL = os.environ.get("HA_CODEX_MODEL", "gpt-5.6-luna")
@@ -714,6 +850,7 @@ def _codex_exec(prompt: str, *, reasoning: str = "medium", timeout: int,
                           timeout_seconds=timeout)
         return ""
     finally:
+        _record_model_call(time.monotonic() - started)
         if out_path:
             try:
                 os.unlink(out_path)
@@ -938,6 +1075,8 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
         provider = _openrouter_provider()
         if provider:
             payload["provider"] = provider
+        call_started = time.monotonic()
+        data = {}
         try:
             with _client(timeout) as client:
                 resp = client.post(
@@ -970,6 +1109,10 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                                  request_made=True,
                                  detail=f"{type(exc).__name__}: {exc}")
             return ""
+        finally:
+            _record_model_call(
+                time.monotonic() - call_started,
+                data.get("usage") if isinstance(data, dict) else None)
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -978,6 +1121,8 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
         "options": options or GROUNDED_OPTS,
         "keep_alive": KEEP_ALIVE,
     }
+    call_started = time.monotonic()
+    data = {}
     try:
         with _client(timeout) as client:
             resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
@@ -1002,6 +1147,8 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                              request_made=True,
                              detail=f"{type(exc).__name__}: {exc}")
         return ""
+    finally:
+        _record_model_call(time.monotonic() - call_started, data)
 
 
 # Read-only tools exposed to the deep-dive researcher. write_insight and the
@@ -1652,17 +1799,24 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None):
     provider = _openrouter_provider()
     if provider:
         payload["provider"] = provider
-    with _client(timeout) as client:
-        resp = client.post(f"{OPENROUTER_URL}/chat/completions", json=payload,
-                           headers={"Authorization":
-                                    f"Bearer {_openrouter_api_key()}"})
-        resp.raise_for_status()
-        data = resp.json()
-    _assert_openrouter_response_provider(data)
-    choices = data.get("choices") or []
-    msg = (choices[0].get("message") if choices else None) or {}
-    prompt_tokens = int((data.get("usage") or {}).get("prompt_tokens") or 0)
-    return msg, prompt_tokens
+    call_started = time.monotonic()
+    data = {}
+    try:
+        with _client(timeout) as client:
+            resp = client.post(f"{OPENROUTER_URL}/chat/completions", json=payload,
+                               headers={"Authorization":
+                                        f"Bearer {_openrouter_api_key()}"})
+            resp.raise_for_status()
+            data = resp.json()
+        _assert_openrouter_response_provider(data)
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") if choices else None) or {}
+        prompt_tokens = int((data.get("usage") or {}).get("prompt_tokens") or 0)
+        return msg, prompt_tokens
+    finally:
+        _record_model_call(
+            time.monotonic() - call_started,
+            data.get("usage") if isinstance(data, dict) else None)
 
 
 def _openai_assistant_turn(msg: dict, turn: int) -> tuple[dict, list[dict]]:
@@ -1817,10 +1971,16 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     "options": CREATIVE_OPTS,
                     "keep_alive": KEEP_ALIVE,
                 }
-                with _client(timeout) as client:
-                    resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-                    resp.raise_for_status()
-                    msg = (resp.json().get("message")) or {}
+                call_started = time.monotonic()
+                data = {}
+                try:
+                    with _client(timeout) as client:
+                        resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                    msg = (data.get("message")) or {}
+                finally:
+                    _record_model_call(time.monotonic() - call_started, data)
             if msg.get("tool_calls"):
                 # The assistant turn carrying the tool_calls, then one result per
                 # call — paired by id on the OpenAI wire, by name on Ollama's.
@@ -2103,11 +2263,17 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                    "stream": False, "think": think, "tools": tools,
                    "options": {**CREATIVE_OPTS, "num_ctx": num_ctx},
                    "keep_alive": KEEP_ALIVE}
-        with _client(timeout) as client:
-            resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        return (data.get("message") or {}), int(data.get("prompt_eval_count") or 0)
+        call_started = time.monotonic()
+        data = {}
+        try:
+            with _client(timeout) as client:
+                resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            return (data.get("message") or {}), int(
+                data.get("prompt_eval_count") or 0)
+        finally:
+            _record_model_call(time.monotonic() - call_started, data)
 
     last_content = ""
     try:

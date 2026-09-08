@@ -890,7 +890,8 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
     return last_verification, None, attempts, failures
 
 
-def _record_question(question: str, as_of: str | None, result: dict) -> None:
+def _record_question(question: str, as_of: str | None, result: dict,
+                     accounting: dict | None = None) -> None:
     """Append one JSONL row per ask when ``HA_ASK_QUESTION_LOG`` names a file.
 
     Default OFF. Recording the user's questions is a data-collection decision,
@@ -900,24 +901,39 @@ def _record_question(question: str, as_of: str | None, result: dict) -> None:
     by unsetting one variable and a test points it at ``tmp_path``. A failed
     write is announced on stderr and never breaks the answer.
     """
-    path = os.environ.get("HA_ASK_QUESTION_LOG", "").strip()
-    if not path:
-        return
-    verification = result.get("verification") or {}
-    row = {
-        "asked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "question": question,
-        "as_of": as_of,
-        "mode": result.get("mode"),
-        "reason": verification.get("reason", ""),
-        "figures_verified": verification.get("figures_verified", 0),
-        "figures_total": verification.get("figures_total", 0),
-    }
     try:
+        path = os.environ.get("HA_ASK_QUESTION_LOG", "").strip()
+        if not path:
+            return
+        accounting = accounting or {}
+        verification = result.get("verification") or {}
+        mode = result.get("mode")
+        model_call_count = accounting.get("model_call_count", 0)
+        row = {
+            "asked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "question": question,
+            "as_of": as_of,
+            "mode": mode,
+            "reason": verification.get("reason", ""),
+            "figures_verified": verification.get("figures_verified", 0),
+            "figures_total": verification.get("figures_total", 0),
+            "elapsed_seconds": accounting.get("elapsed_seconds", 0.0),
+            "python_seconds": accounting.get("python_seconds", 0.0),
+            "model_call_count": model_call_count,
+            "model_calls": accounting.get("model_calls", []),
+        }
+        print(f"ask question model-call count: {model_call_count}",
+              file=sys.stderr)
+        if model_call_count == 0 and mode != "fallback":
+            print("ask question accounting recorded zero model calls for "
+                  f"mode={mode!r}", file=sys.stderr)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        print(f"ask question log write failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        try:
+            print(f"ask question log write failed: {exc}", file=sys.stderr)
+        except Exception:
+            pass
 
 
 def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = None,
@@ -941,24 +957,27 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
     is supplied, because ``/v1/ask`` hands ``verification`` to API clients
     verbatim and a draft that failed the gate must not reach them.
     """
-    audit_match = (_AUDIT_COMMAND_RE.match(question)
-                   if isinstance(question, str) else None)
-    if audit_match:
-        # The endpoint has already appended the user's command and will append
-        # this returned assistant result.  Do not create a second conversation
-        # here; this is the command form of the same in-process run_audit seam.
-        result = run_audit(ctx, audit_match.group(1), as_of=as_of,
-                           analyst_query_fn=analyst_query_fn, persist=False,
-                           audits=audits)
-    else:
-        result = _answer_question_inner(ctx, question, as_of=as_of,
-                                        ledger_path=ledger_path, history=history,
-                                        capture=capture,
-                                        analyst_query_fn=analyst_query_fn)
-    if attachments is not None:
-        result = {**result, "attachments": list(result.get("attachments", []))
-                  + list(attachments)}
-    _record_question(question, as_of, result)
+    from . import llm
+    with llm.model_call_accounting() as turn_accounting:
+        audit_match = (_AUDIT_COMMAND_RE.match(question)
+                       if isinstance(question, str) else None)
+        if audit_match:
+            # The endpoint has already appended the user's command and will append
+            # this returned assistant result.  Do not create a second conversation
+            # here; this is the command form of the same in-process run_audit seam.
+            result = run_audit(ctx, audit_match.group(1), as_of=as_of,
+                               analyst_query_fn=analyst_query_fn, persist=False,
+                               audits=audits)
+        else:
+            result = _answer_question_inner(ctx, question, as_of=as_of,
+                                            ledger_path=ledger_path, history=history,
+                                            capture=capture,
+                                            analyst_query_fn=analyst_query_fn)
+        if attachments is not None:
+            result = {**result, "attachments": list(result.get("attachments", []))
+                      + list(attachments)}
+        timing = turn_accounting.snapshot()
+    _record_question(question, as_of, result, timing)
     return result
 
 

@@ -1328,8 +1328,12 @@ def test_question_log_records_the_question_and_verdict_only(
                         lambda *args, **kwargs: next(verifications))
     monkeypatch.setattr(chat, "_read_ledger", lambda path: [{"sequence": 1}])
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
-    monkeypatch.setattr(llm, "tool_loop",
-                        lambda *args, **kwargs: next(drafts))
+    def fake_tool_loop(*args, **kwargs):
+        # This unit test replaces the transport; account for its logical model
+        # turns so the row still exercises the production measurement shape.
+        llm._record_model_call(0.0)
+        return next(drafts)
+    monkeypatch.setattr(llm, "tool_loop", fake_tool_loop)
     log_path = tmp_path / "questions.jsonl"
     monkeypatch.setenv("HA_ASK_QUESTION_LOG", str(log_path))
 
@@ -1341,8 +1345,70 @@ def test_question_log_records_the_question_and_verdict_only(
     assert row["question"] == "How did I sleep?"
     assert row["mode"] == "fallback"
     assert row["figures_verified"] == 1
+    assert row["model_call_count"] == 2
+    assert len(row["model_calls"]) == 2
+    assert set(row["model_calls"][0]) == {
+        "elapsed_seconds", "prompt_tokens", "cached_tokens",
+        "completion_tokens", "reasoning_tokens",
+    }
+    assert row["elapsed_seconds"] == pytest.approx(
+        row["python_seconds"] + sum(
+            call["elapsed_seconds"] for call in row["model_calls"]),
+        abs=0.001)
     assert "secret" not in lines[0]
     assert "text" not in row and "prose" not in row
+
+
+def test_question_log_returns_a_fast_fallback_with_measured_zero_calls(
+        monkeypatch, vault, tmp_path):
+    """A fallback that never contacted a model is a measured zero, not an error."""
+    answer = {
+        "mode": "fallback",
+        "text": "deterministic fallback answer",
+        "verification": {"reason": "no model answer"},
+    }
+    monkeypatch.setattr(chat, "_answer_question_inner",
+                        lambda *args, **kwargs: answer)
+    log_path = tmp_path / "questions.jsonl"
+    monkeypatch.setenv("HA_ASK_QUESTION_LOG", str(log_path))
+
+    result = chat.answer_question(vault, "What happened?")
+
+    assert result is answer
+    row = json.loads(log_path.read_text(encoding="utf-8"))
+    assert row["mode"] == "fallback"
+    assert row["model_call_count"] == 0
+    assert row["model_calls"] == []
+    assert row["elapsed_seconds"] >= row["python_seconds"] >= 0
+
+
+def test_question_log_failures_never_replace_the_answer(
+        monkeypatch, vault, tmp_path, capsys):
+    answer = {"mode": "fallback", "verification": {}}
+    monkeypatch.setattr(chat, "_answer_question_inner",
+                        lambda *args, **kwargs: answer)
+    monkeypatch.setenv("HA_ASK_QUESTION_LOG", str(tmp_path / "questions.jsonl"))
+    monkeypatch.setattr(chat.json, "dumps",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(
+                            TypeError("unserializable")))
+
+    assert chat.answer_question(vault, "What happened?") is answer
+    assert "ask question log write failed" in capsys.readouterr().err
+
+
+def test_question_log_warns_but_keeps_a_nonfallback_zero(
+        monkeypatch, vault, tmp_path, capsys):
+    answer = {"mode": "narration", "verification": {}}
+    monkeypatch.setattr(chat, "_answer_question_inner",
+                        lambda *args, **kwargs: answer)
+    log_path = tmp_path / "questions.jsonl"
+    monkeypatch.setenv("HA_ASK_QUESTION_LOG", str(log_path))
+
+    assert chat.answer_question(vault, "What happened?") is answer
+    assert "recorded zero model calls" in capsys.readouterr().err
+    row = json.loads(log_path.read_text(encoding="utf-8"))
+    assert row["mode"] == "narration"
+    assert row["model_call_count"] == 0
 
 
 def test_question_log_off_by_default_writes_nothing(

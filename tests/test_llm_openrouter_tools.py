@@ -59,6 +59,47 @@ def _assistant(content="", tool_calls=None, usage=1, extra=None,
             "usage": {"prompt_tokens": usage, "completion_tokens": 1}}
 
 
+def test_model_call_accounting_records_nested_usage(openrouter):
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "provider": "CoreWeave",
+            "usage": {
+                "prompt_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "completion_tokens": 8,
+                "completion_tokens_details": {"reasoning_tokens": 5},
+            },
+        })
+
+    openrouter(handler)
+    with llm.model_call_accounting() as accounting:
+        message, prompt_tokens = llm._openrouter_post(
+            [{"role": "user", "content": "question"}],
+            tools=[], timeout=5)
+
+    row = accounting.snapshot(require_nonzero=True)
+    assert message["content"] == "done"
+    assert prompt_tokens == 12
+    assert row["model_call_count"] == 1
+    call = row["model_calls"][0]
+    assert call["prompt_tokens"] == 12
+    assert call["cached_tokens"] == 3
+    assert call["completion_tokens"] == 8
+    assert call["reasoning_tokens"] == 5
+    assert row["elapsed_seconds"] >= row["python_seconds"]
+    assert row["elapsed_seconds"] == pytest.approx(
+        row["python_seconds"] + row["model_calls"][0]["elapsed_seconds"],
+        abs=1e-6)
+
+
+def test_zero_model_call_accounting_can_be_rejected_by_a_caller():
+    with llm.model_call_accounting() as accounting:
+        pass
+    with pytest.raises(RuntimeError, match="zero model calls"):
+        accounting.snapshot(require_nonzero=True)
+
+
 def _call(name, arguments, call_id="call_0"):
     """One OpenAI-shaped tool call: arguments are a JSON *string* on this wire."""
     return {"id": call_id, "type": "function",

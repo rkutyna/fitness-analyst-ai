@@ -1375,7 +1375,12 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     if not rows:
         return {"start": start, "end": end, "by": by, "as_of": as_of,
                 "count": 0, "periods": [],
-                "note": "no distance samples in this range"}
+                # This is an unavailable window, not a measured zero. Keep
+                # the distinction in the Python result so a model cannot turn
+                # an empty list into "you did nothing".
+                "data_status": "unavailable",
+                "reason": (f"vault has no distance samples in {start}..{end}; "
+                           "this is no data, not zero activity")}
 
     out = {"start": start, "end": end, "by": by, "as_of": as_of,
            "count": len(periods), "periods": periods,

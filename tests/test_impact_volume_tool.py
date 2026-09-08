@@ -277,6 +277,17 @@ def test_window_entirely_after_as_of_has_a_typed_reason(conn, tools):
     }
 
 
+def test_window_with_no_vault_rows_is_unavailable_not_zero(conn, tools):
+    out = tools.get_impact_volume("2025-08-25", "2025-09-14", by="week")
+
+    assert out["periods"] == []
+    assert out["count"] == 0
+    assert out["data_status"] == "unavailable"
+    assert out["reason"] == (
+        "vault has no distance samples in 2025-08-25..2025-09-14; "
+        "this is no data, not zero activity")
+
+
 def test_four_week_blocks_pin_complete_and_last_day_anchors(blockdb, tools):
     """The same explicit range must preserve both valid readings of the window."""
     complete = tools.get_impact_volume(

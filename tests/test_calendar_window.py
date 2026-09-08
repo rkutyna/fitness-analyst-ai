@@ -52,6 +52,65 @@ def test_past_days_is_a_day_window():
                                     "past 5 days", "day")
 
 
+def test_absolute_dates_are_python_resolved_and_bare_month_day_uses_nearest_past():
+    today = date(2026, 9, 6)
+
+    assert resolve_window("the week starting August 31", today) == CalendarWindow(
+        "2026-08-31", "2026-09-06", "the week starting August 31", "week")
+    assert resolve_window("the week starting 2026-08-31", today) == CalendarWindow(
+        "2026-08-31", "2026-09-06", "the week starting 2026-08-31", "week")
+    assert resolve_window("How did I do on August 31?", today) == CalendarWindow(
+        "2026-08-31", "2026-08-31", "August 31", "day")
+    assert resolve_window("What about Sep 1 through Sep 7?", today) == CalendarWindow(
+        "2026-09-01", "2026-09-07", "Sep 1 through Sep 7", None)
+    assert resolve_window("How did I do on August 31?", date(2027, 1, 1)).start == (
+        "2026-08-31")
+
+
+def test_absolute_calendar_window_overrides_model_sent_dates(tmp_path):
+    config, resolved = chat._calendar_window_config(
+        None, "How did I do on August 31?", "2026-09-06")
+
+    assert resolved == CalendarWindow("2026-08-31", "2026-08-31",
+                                     "August 31", "day")
+    assert config["status"] == "single"
+    ledger_path = tmp_path / "calls.jsonl"
+    sidecar = tmp_path / "calls.jsonl.window_override.json"
+    chat._write_window_override(str(sidecar), config)
+    ledger = D._CallLedger(str(ledger_path))
+    seen = []
+
+    def get_impact_volume(start, end, by="week"):
+        seen.append((start, end, by))
+        return {"periods": []}
+
+    wrapped = D._ledger_wrapper("get_impact_volume", get_impact_volume, ledger)
+    wrapped(start="2025-08-31", end="2025-09-06", by="day")
+    assert seen == [("2026-08-31", "2026-08-31", "day")]
+
+
+def test_uncovered_window_is_rendered_as_missing_data_not_zero():
+    window = CalendarWindow("2025-08-25", "2025-09-14", "the week starting August 31",
+                            "week")
+    ledger = [{
+        "sequence": 1,
+        "tool_name": "get_impact_volume",
+        "arguments": {"start": window.start, "end": window.end, "by": "week"},
+        "result": {
+            "start": window.start, "end": window.end, "count": 0,
+            "periods": [], "data_status": "unavailable",
+            "reason": "vault has no distance samples in 2025-08-25..2025-09-14; "
+                      "this is no data, not zero activity",
+        },
+    }]
+
+    assert chat._window_data_unavailable(ledger, window) is True
+    assert chat._unavailable_window_answer(window) == (
+        "I don't have activity data for 2025-08-25 through 2025-09-14; "
+        "the vault has no distance samples for that period, so I can't "
+        "report zero activity.")
+
+
 def test_chat_as_of_comes_from_daily_metrics_not_vault_timezone(vault, conn):
     seed_metric(conn, "step_count", "2026-08-14", [1, 2])
     vaultmod.set_local_timezone(conn, "Pacific/Honolulu")

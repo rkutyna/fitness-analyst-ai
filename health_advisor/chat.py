@@ -293,7 +293,8 @@ def _fallback_answer() -> str:
 
 
 def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],
-                       as_of: str | None = None) -> dict:
+                       as_of: str | None = None,
+                       resolved_window=None) -> dict:
     """Verify an ask response, refusing the zero-call loophole structurally."""
     from . import deepdive_verify as DV
 
@@ -306,7 +307,8 @@ def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],
             "tier1_path_bound": 0, "tier2_metric_recomputed": 0,
         }
     verdict = DV.verify_coach_claims(
-        conn, prose, claims, as_of=as_of, payload=ledger)
+        conn, prose, claims, as_of=as_of, payload=ledger,
+        resolved_window=resolved_window)
     numbers = verdict.get("verdict", {}).get("numbers", [])
     verified = sum(1 for number in numbers if number.get("ok"))
     total = len(numbers)
@@ -1027,6 +1029,7 @@ _CONTRADICTED_DAY_COUNT_REASON = "narration contradicts its own day itemisation"
 _RESULT_METADATA_KEYS = frozenset({
     "note", "start", "end", "limit", "truncated", "unit", "metric",
     "period", "first_date", "last_date", "group", "agg", "n_days", "ok",
+    "reason", "data_status", "as_of", "by", "count",
 })
 
 
@@ -1184,6 +1187,37 @@ def _record_matches_asked_window(record: dict, resolved_window) -> bool:
             if period.get("period_start") == expected[0]:
                 return True
     return False
+
+
+_WINDOW_DATA_UNAVAILABLE_REASON = "calendar window has no vault data"
+
+
+def _window_data_unavailable(ledger: list[dict], resolved_window) -> bool:
+    """Detect an explicitly empty result for the Python-resolved window.
+
+    An empty list is not a zero measurement. This gate is intentionally based
+    on the tool's typed ``data_status`` and the absence of all result data, so
+    a model cannot manufacture a zero from an uncovered period.
+    """
+    if resolved_window is None or isinstance(resolved_window, tuple):
+        return False
+    matching = [record for record in ledger if isinstance(record, dict)
+                and _record_matches_asked_window(record, resolved_window)]
+    if not matching or any(_has_nonempty_result_data(record.get("result"))
+                           for record in matching):
+        return False
+    return any(
+        isinstance(record.get("result"), dict)
+        and record["result"].get("data_status") == "unavailable"
+        for record in matching
+    )
+
+
+def _unavailable_window_answer(resolved_window) -> str:
+    """Render the deterministic user-facing refusal for an uncovered window."""
+    return (f"I don't have activity data for {resolved_window.start} through "
+            f"{resolved_window.end}; the vault has no distance samples for "
+            "that period, so I can't report zero activity.")
 
 
 def _ledger_has_asked_metric_value(ledger: list[dict], metric: str,
@@ -1790,12 +1824,20 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         try:
             # Pass the complete first draft: _coach_grounding's ledger gate is
             # sound only over the whole answer, never a span/sentence.
+            verify_options = {"as_of": as_of}
+            if resolved_window is not None:
+                verify_options["resolved_window"] = resolved_window
             verification = _verify_ask_answer(
-                verify_conn, prose.strip(), claims, ledger, as_of=as_of)
+                verify_conn, prose.strip(), claims, ledger, **verify_options)
             score = (_ask_judge(question, prose.strip(), verification)
                      if verification.get("ok") else None)
         finally:
             verify_conn.close()
+        if _window_data_unavailable(ledger, resolved_window):
+            verification.update({
+                "ok": False, "grounded": False,
+                "reason": _WINDOW_DATA_UNAVAILABLE_REASON,
+            })
         denied_available_figure = _mark_denied_available_figure(
             verification, question=question, text=prose.strip(), ledger=ledger,
             answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
@@ -1847,12 +1889,20 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         try:
             # Pass the complete retry draft: _coach_grounding's ledger gate is
             # sound only over the whole answer, never a span/sentence.
+            verify_options = {"as_of": as_of}
+            if resolved_window is not None:
+                verify_options["resolved_window"] = resolved_window
             verification = _verify_ask_answer(
-                verify_conn, prose.strip(), claims, ledger, as_of=as_of)
+                verify_conn, prose.strip(), claims, ledger, **verify_options)
             score = (_ask_judge(question, prose.strip(), verification)
                      if verification.get("ok") else None)
         finally:
             verify_conn.close()
+        if _window_data_unavailable(ledger, resolved_window):
+            verification.update({
+                "ok": False, "grounded": False,
+                "reason": _WINDOW_DATA_UNAVAILABLE_REASON,
+            })
         denied_available_figure = _mark_denied_available_figure(
             verification, question=question, text=prose.strip(), ledger=ledger,
             answer_has_asked_metric_figure=_prose_has_asked_metric_figure(
@@ -1882,6 +1932,23 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             }
 
         selected = _select_better_failed_attempt(first_attempt, retry_attempt)
+        if (_window_data_unavailable(selected["ledger"], resolved_window)
+                and resolved_window is not None
+                and not isinstance(resolved_window, tuple)):
+            unavailable_verification = {
+                **selected["verification"],
+                "judge_score": selected["judge_score"],
+                "retry": True,
+                "ok": False,
+                "grounded": False,
+                "reason": _WINDOW_DATA_UNAVAILABLE_REASON,
+            }
+            return {
+                "text": _unavailable_window_answer(resolved_window),
+                "mode": "fallback",
+                "tool_trace": selected["ledger"],
+                "verification": unavailable_verification,
+            }
         # Keep whole-answer refusal as the default. With the opt-in flag, a
         # selected attempt may be salvaged only when verified claims are at
         # least half of the union of verified and unverified figure evidence;

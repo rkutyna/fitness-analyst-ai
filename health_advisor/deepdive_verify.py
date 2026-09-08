@@ -645,6 +645,61 @@ def _is_ledger(payload) -> bool:
         for record in payload))
 
 
+def _window_bounds(value) -> tuple[str, str] | None:
+    """Extract inclusive bounds from a Python-owned result or argument."""
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("requested_range")
+    if isinstance(nested, dict):
+        value = nested
+    start, end = value.get("start"), value.get("end")
+    if isinstance(start, str) and isinstance(end, str):
+        return start, end
+    return None
+
+
+def _record_matches_window(record: dict, resolved_window) -> bool:
+    """Whether a ledger record carries the exact Python-resolved window."""
+    if resolved_window is None or isinstance(resolved_window, tuple):
+        return False
+    expected = (resolved_window.start, resolved_window.end)
+    if _window_bounds(record.get("arguments")) == expected:
+        return True
+    result = record.get("result")
+    if _window_bounds(result) == expected:
+        return True
+    if isinstance(result, dict):
+        for period in result.get("periods") or []:
+            if not isinstance(period, dict):
+                continue
+            if _window_bounds(period) == expected:
+                return True
+            if period.get("period_start") == expected[0]:
+                return True
+    return False
+
+
+def _calendar_window_assertion(payload, resolved_window) -> dict:
+    """Record whether grounding evidence covers the user's Python window.
+
+    Without a resolved window there is nothing Python can assert; the caller
+    leaves ``window_asserted`` absent in that case rather than pretending that
+    arithmetic verification proves a calendar scope.
+    """
+    if resolved_window is None:
+        return {}
+    expected = None if isinstance(resolved_window, tuple) else [
+        resolved_window.start, resolved_window.end]
+    asserted = (_is_ledger(payload) and not isinstance(resolved_window, tuple)
+                and any(_record_matches_window(record, resolved_window)
+                        for record in payload
+                        if isinstance(record, dict)))
+    return {
+        "window_asserted": bool(asserted),
+        "asked_window": expected,
+    }
+
+
 def _path_text(path: tuple) -> str:
     rendered = "$"
     for part in path:
@@ -1622,10 +1677,12 @@ def verify_all(conn, findings: list[dict], as_of: str | None = None,
 
 
 def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
-                        payload=None, tool_results=None) -> dict:
+                        payload=None, tool_results=None,
+                        resolved_window=None) -> dict:
     """Verify numbered coach prose through the existing scoped verifier."""
     if payload is None:
         payload = tool_results
+    window_verdict = _calendar_window_assertion(payload, resolved_window)
     # Number-free compatibility prose does not need a claim record. Once prose
     # contains a number, every number must be represented by a scoped claim.
     unsupported = G._numeric_tokens(prose)
@@ -1633,6 +1690,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
     if not unsupported and not degenerate:
         return {"ok": True, "grounded": True, "unsupported": [],
                 "claims": [], "tier_counts": {"path": 0, "metric": 0},
+                **window_verdict,
                 **_rebind_instrumentation([])}
     if not isinstance(claims, list) or not claims:
         return {"ok": False, "grounded": False, "unsupported": unsupported,
@@ -1640,6 +1698,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
                            if degenerate else
                            "numbered coach prose has no structured claims"),
                 "tier_counts": {"path": 0, "metric": 0},
+                **window_verdict,
                 **_rebind_instrumentation([])}
 
     structural_claims = _structural_claims(payload)
@@ -1661,12 +1720,22 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
                 "reason": (failed or {}).get("reason", "claim verification failed"),
                 "verdict": verdict, "structural_claims": structural_claims,
                 "tier_counts": tier_counts,
+                **window_verdict,
+                **_rebind_instrumentation(verdict["numbers"])}
+
+    if resolved_window is not None and not window_verdict.get("window_asserted"):
+        return {"ok": False, "grounded": False, "unsupported": bad,
+                "reason": "grounding evidence does not cover Python-resolved window",
+                "verdict": verdict, "structural_claims": structural_claims,
+                "tier_counts": tier_counts,
+                **window_verdict,
                 **_rebind_instrumentation(verdict["numbers"])}
 
     return {"ok": grounded, "grounded": grounded, "unsupported": bad,
             "reason": "" if grounded else "prose number is not in claims",
             "verdict": verdict, "structural_claims": structural_claims,
             "tier_counts": tier_counts,
+            **window_verdict,
             **_rebind_instrumentation(verdict["numbers"])}
 
 

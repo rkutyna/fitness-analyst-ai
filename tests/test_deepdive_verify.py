@@ -1,6 +1,7 @@
 """Regression tests for result-local metric ownership in ledger claims."""
 
 from health_advisor import deepdive_verify as DV
+from health_advisor.calendar_window import CalendarWindow
 
 
 def _claim(metric, period, field, value, path):
@@ -21,6 +22,39 @@ def _record(result, tool_name="test_tool"):
         "result": result,
         "result_elided": False,
     }]
+
+
+def test_grounding_asserts_the_python_resolved_window():
+    window = CalendarWindow("2026-08-31", "2026-09-06", "this week", "week")
+    claim = _claim("jog_minutes", "2026-08-31:2026-09-06", "jog_minutes",
+                   85.7, "$.result.jog_minutes")
+    right_window = _record({
+        "start": "2026-08-31", "end": "2026-09-06",
+        "metric": "jog_minutes", "period": "2026-08-31:2026-09-06",
+        "jog_minutes": 85.7,
+    }, tool_name="get_impact_volume")
+    wrong_window = _record({
+        "start": "2025-08-25", "end": "2025-09-14",
+        "metric": "jog_minutes", "period": "2025-08-25:2025-09-14",
+        "jog_minutes": 85.7,
+    }, tool_name="get_impact_volume")
+
+    accepted = DV.verify_coach_claims(
+        None, "I did 85.7 jog minutes.", [claim], payload=right_window,
+        resolved_window=window)
+    wrong_claim = _claim("jog_minutes", "2025-08-25:2025-09-14", "jog_minutes",
+                         85.7, "$.result.jog_minutes")
+    refused = DV.verify_coach_claims(
+        None, "I did 85.7 jog minutes.", [wrong_claim], payload=wrong_window,
+        resolved_window=window)
+
+    assert accepted["ok"] is True
+    assert accepted["window_asserted"] is True
+    assert accepted["asked_window"] == ["2026-08-31", "2026-09-06"]
+    assert refused["ok"] is False
+    assert refused["window_asserted"] is False
+    assert refused["reason"] == (
+        "grounding evidence does not cover Python-resolved window")
 
 
 def test_coach_grounding_does_not_cross_license_day_count_as_percentage():

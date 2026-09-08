@@ -917,6 +917,31 @@ CREATE INDEX IF NOT EXISTS idx_review_week_proposals_current
     ON review_week_proposals (conversation_id, proposal_id, version, recorded_at);
 
 -- ---------------------------------------------------------------------------
+-- review_objects: the typed weekly review, projected from the event log.  One
+-- row per published version; no row is updated.  The complete review -- its
+-- Python-computed metric rows (each a figure or an explicit status), its
+-- narrated sections and its interview-sourced content -- lives in the event
+-- payload and is mirrored here for a fast client read.  Rebuild replays these
+-- rows from conversation_turns alone, exactly as review_week_proposals does.
+--
+-- Markdown is a rendered view of this object and is never parsed back.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS review_objects (
+    projection_id   TEXT PRIMARY KEY,
+    event_turn_id   TEXT NOT NULL
+        REFERENCES conversation_turns(id) ON DELETE RESTRICT,
+    conversation_id TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE RESTRICT,
+    review_date     TEXT NOT NULL,
+    version         INTEGER NOT NULL CHECK (version > 0),
+    review_json     TEXT NOT NULL,
+    recorded_at     TEXT NOT NULL,
+    UNIQUE (conversation_id, review_date, version, event_turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_objects_current
+    ON review_objects (conversation_id, review_date, version, recorded_at);
+
+-- ---------------------------------------------------------------------------
 -- retro_claims: attribution of an observed HealthKit workout to a proposed
 -- session.  This is not a grading/enforcement projection: it records what
 -- Python judged about the selected workout at claim time.  The source of the

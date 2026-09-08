@@ -46,6 +46,9 @@ from . import claim_contract as _CLAIM_CONTRACT
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# Above float noise on a monotonic clock, far below any real overlap.
+_ACCOUNTING_TOLERANCE_S = 0.001
+
 @dataclass
 class ModelCallAccounting:
     """One answer turn's model-call measurements.
@@ -73,16 +76,44 @@ class ModelCallAccounting:
         })
 
     def snapshot(self, *, require_nonzero: bool = False) -> dict:
+        """Publish the turn's accounting, INCLUDING when it does not add up.
+
+        ``python_seconds`` is derived as ``elapsed - call_elapsed``, so
+        ``elapsed == python_seconds + call_elapsed`` is an algebraic identity
+        whenever the calls fall inside the window -- which is every correct
+        turn. A test asserting that identity therefore measures nothing.
+
+        The one thing the arithmetic CAN reveal is ``call_elapsed > elapsed``:
+        transport time attributed to a turn that is shorter than the transport.
+        Model calls happen inside the window, so that is impossible in correct
+        operation, and what produces it is accounting leaking across turns -- a
+        contextvar that outlived the turn that set it. Clamping
+        ``python_seconds`` to zero absorbs exactly that signal and reports a
+        tidy, wrong number, which is indistinguishable from a healthy turn.
+
+        So the clamp stays (a negative duration helps nobody) and the overrun
+        is published beside it as ``accounting_anomaly``: ``None`` on a healthy
+        turn, a description otherwise. The tolerance is a millisecond, well
+        above float noise on a monotonic clock and far below any real overlap.
+        """
         if require_nonzero and not self.calls:
             raise RuntimeError("ask model-call accounting recorded zero model calls")
-        elapsed = ((self.finished if self.finished is not None
-                    else time.monotonic()) - self.started)
+        elapsed = max(0.0, (self.finished if self.finished is not None
+                            else time.monotonic()) - self.started)
         call_elapsed = sum(call["elapsed_seconds"] for call in self.calls)
+        anomaly = None
+        overrun = call_elapsed - elapsed
+        if overrun > _ACCOUNTING_TOLERANCE_S:
+            anomaly = (f"model-call time {call_elapsed:.6f}s exceeds the turn's "
+                       f"{elapsed:.6f}s window by {overrun:.6f}s across "
+                       f"{len(self.calls)} call(s)")
+            print(f"ask model-call accounting anomaly: {anomaly}", file=sys.stderr)
         return {
-            "elapsed_seconds": max(0.0, elapsed),
+            "elapsed_seconds": elapsed,
             "python_seconds": max(0.0, elapsed - call_elapsed),
             "model_call_count": len(self.calls),
             "model_calls": [dict(call) for call in self.calls],
+            "accounting_anomaly": anomaly,
         }
 
 

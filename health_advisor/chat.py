@@ -921,6 +921,9 @@ def _record_question(question: str, as_of: str | None, result: dict,
             "python_seconds": accounting.get("python_seconds", 0.0),
             "model_call_count": model_call_count,
             "model_calls": accounting.get("model_calls", []),
+            # None on a healthy turn. Non-null means the turn's own arithmetic
+            # did not add up -- see ModelCallAccounting.snapshot.
+            "accounting_anomaly": accounting.get("accounting_anomaly"),
         }
         print(f"ask question model-call count: {model_call_count}",
               file=sys.stderr)

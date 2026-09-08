@@ -875,3 +875,72 @@ def test_derived_ledger_path_matches_the_mcp_config():
     assert llm._derived_ledger_path("/x/run.json", None) == "/x/run_ledger.jsonl"
     assert llm._derived_ledger_path("/x/run.json", "/y/explicit.jsonl") == "/y/explicit.jsonl"
     assert llm._derived_ledger_path(None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Accounting reconciliation (health_advisor#305, follow-up)
+# ---------------------------------------------------------------------------
+
+def test_healthy_turn_reports_no_accounting_anomaly():
+    """The identity holds by construction, so this pins the HEALTHY baseline.
+
+    On its own it proves nothing -- `python_seconds` is derived as the
+    difference, so the sum always reconciles. It exists so the anomaly test
+    below is a contrast rather than an assertion in a vacuum.
+    """
+    import time as _t
+    with llm.model_call_accounting() as accounting:
+        started = _t.monotonic()
+        _t.sleep(0.02)
+        llm._record_model_call(_t.monotonic() - started, {"prompt_tokens": 10})
+    row = accounting.snapshot()
+
+    assert row["accounting_anomaly"] is None
+    call_total = sum(call["elapsed_seconds"] for call in row["model_calls"])
+    assert row["elapsed_seconds"] == pytest.approx(
+        row["python_seconds"] + call_total, abs=1e-9)
+
+
+def test_call_time_exceeding_the_turn_window_is_published_not_clamped_away():
+    """Transport time longer than the turn that contains it is impossible.
+
+    Calls happen inside the window, so `call_elapsed > elapsed` means the
+    accounting counted a call belonging to another turn -- what a leaked
+    contextvar looks like. `python_seconds` clamps to 0 either way, so the
+    clamp alone would report a tidy, wrong number that reads exactly like a
+    healthy turn. The overrun must be published instead.
+    """
+    with llm.model_call_accounting() as accounting:
+        llm._record_model_call(99.0, {"prompt_tokens": 10})
+    row = accounting.snapshot()
+
+    assert row["python_seconds"] == 0.0, "the clamp still keeps the duration sane"
+    assert row["accounting_anomaly"] is not None, (
+        "an overrun must be reported; clamping it away makes a broken turn "
+        "indistinguishable from a healthy one")
+    assert "exceeds" in row["accounting_anomaly"]
+    assert "99.0" in row["accounting_anomaly"]
+
+
+def test_the_anomaly_reaches_the_question_log_row():
+    """A field nothing publishes is not an instrument."""
+    import json as _json, os as _os, tempfile as _tf
+    from health_advisor import chat as _chat
+
+    path = _tf.mkstemp(suffix=".jsonl")[1]
+    previous = _os.environ.get("HA_ASK_QUESTION_LOG")
+    _os.environ["HA_ASK_QUESTION_LOG"] = path
+    try:
+        _chat._record_question("q?", "2026-09-08",
+                               {"mode": "normal", "verification": {}},
+                               {"model_call_count": 1, "model_calls": [],
+                                "elapsed_seconds": 0.1, "python_seconds": 0.0,
+                                "accounting_anomaly": "model-call time exceeds"})
+    finally:
+        if previous is None:
+            _os.environ.pop("HA_ASK_QUESTION_LOG", None)
+        else:
+            _os.environ["HA_ASK_QUESTION_LOG"] = previous
+
+    row = _json.loads(open(path).readlines()[-1])
+    assert row["accounting_anomaly"] == "model-call time exceeds"

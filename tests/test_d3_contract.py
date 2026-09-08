@@ -369,9 +369,10 @@ def test_get_latest_says_when_its_sample_is_an_aggregate(conn, tools):
 
 
 def test_the_vault_bucket_width_is_the_width_consumers_read():
-    """Two copies of one number is how the vault ends up storing a resolution
-    nothing reads any more."""
+    """Every bucketed consumer reads the width the vault retains."""
     from health_advisor import metrics as mx
 
     assert V.VAULT_BUCKET_SECONDS["distance_walking_running"] is \
+        mx.IMPACT_BUCKET_SECONDS
+    assert V.VAULT_BUCKET_SECONDS["step_count"] is \
         mx.IMPACT_BUCKET_SECONDS

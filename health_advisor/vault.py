@@ -30,7 +30,8 @@ from . import metrics
 VAULT_RAW_SERIES = frozenset({
     # metrics.bucket_series, HR zones, hr_load, and benchmark need raw heart rate.
     "heart_rate",
-    # metrics.bucket_series, impact_volume, and longest_block classify movement buckets.
+    # metrics.bucket_series, impact_volume, and longest_block classify movement
+    # and jog buckets from step cadence at metrics.IMPACT_BUCKET_SECONDS.
     "distance_walking_running",
     # running_form.monthly_running_power aggregates 20-second power buckets.
     "running_power",
@@ -40,11 +41,10 @@ VAULT_RAW_SERIES = frozenset({
     "sleep_awake",
     # derive.py uses the in-bed interval to establish the sleep session boundary.
     "sleep_in_bed",
-    # get_intraday's time-of-day pattern. Nothing derives from raw steps — the
-    # training dial reads distance and heart rate — so this is here for a user
-    # question rather than a computation, and it is affordable only because it
-    # is bucketed (D9): 884,431 samples become 142,419 five-minute buckets,
-    # +53 MB once and +8 MB/year. Decided 2026-08-22, see #16.
+    # get_intraday's time-of-day pattern and the cadence-only jog classifier.
+    # The latter reads step_count at metrics.IMPACT_BUCKET_SECONDS (#193), so
+    # D3 must retain this series at that resolution rather than at the wider
+    # question-oriented intraday resolution.
     "step_count",
 })
 
@@ -64,11 +64,10 @@ VAULT_BUCKET_SECONDS: dict[str, int] = {
     # copies of one number is how the vault ends up storing a resolution its
     # consumers no longer read.
     "distance_walking_running": metrics.IMPACT_BUCKET_SECONDS,
-    # `get_intraday` rejects `bucket_hours < 1`, so an hour is the finest
-    # question anything can ask of this series — five minutes is twelve times
-    # finer than that and leaves room for a tool that wants better, at a cost
-    # (+8 MB/year) small enough not to need re-deciding.
-    "step_count": 300,
+    # `get_intraday` still rejects `bucket_hours < 1`; that tool contract does
+    # not define storage resolution. The cadence-only jog classifier reads this
+    # series at the 20-second impact width, so keep the two constants coupled.
+    "step_count": metrics.IMPACT_BUCKET_SECONDS,
 }
 
 

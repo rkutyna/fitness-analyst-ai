@@ -211,6 +211,41 @@ def test_a_bucketed_series_is_stored_coarser_and_says_so(tmp_path):
         "the bucket keeps its earliest real sample, not a synthetic boundary"
 
 
+def test_step_count_rebuild_uses_classifier_bucket_width(tmp_path):
+    """A rebuild must retain cadence at the width the classifier reads."""
+    from health_advisor import metrics
+    from health_advisor.vault import raw_resolution_seconds
+
+    source = tmp_path / "source.db"
+    target = tmp_path / "vault.db"
+    conn = db.connect(source)
+    db.init_db(conn)
+    db.insert_records(conn, [
+        _record("step_count", 2.0, "2026-08-20", n)
+        for n in (1, 21, 41)
+    ])
+    conn.commit()
+    conn.close()
+
+    report = build_vault(source, target, measure_gzip=False)
+
+    assert vault.VAULT_BUCKET_SECONDS["step_count"] == \
+        metrics.IMPACT_BUCKET_SECONDS
+    assert raw_resolution_seconds("step_count") == metrics.IMPACT_BUCKET_SECONDS
+    info = report["bucketed_by_metric"]["step_count"]
+    assert info["seconds"] == metrics.IMPACT_BUCKET_SECONDS
+    assert info["raw"] == 3
+    assert info["buckets"] == 3
+
+    conn = db.connect(target, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM records WHERE metric='step_count'"
+        ).fetchone()[0] == 3
+    finally:
+        conn.close()
+
+
 def test_bucketing_is_per_source_so_arbitration_survives(tmp_path):
     """Two devices' samples must not collapse into one row.
 

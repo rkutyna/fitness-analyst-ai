@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -244,6 +245,101 @@ def test_step_count_rebuild_uses_classifier_bucket_width(tmp_path):
         ).fetchone()[0] == 3
     finally:
         conn.close()
+
+
+def test_build_persists_resolution_allowlist_and_source_span(tmp_path):
+    source = tmp_path / "source.db"
+    target = tmp_path / "vault.db"
+    _source_db(source)
+
+    build_vault(source, target, measure_gzip=False)
+
+    conn = db.connect(target, read_only=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM vault_meta"))
+    finally:
+        conn.close()
+
+    assert json.loads(meta[vault.VAULT_META_BUCKET_SECONDS]) == {
+        "distance_walking_running": 20,
+        "step_count": 20,
+    }
+    assert json.loads(meta[vault.VAULT_META_RAW_SERIES]) == sorted(
+        VAULT_RAW_SERIES
+    )
+    assert json.loads(meta[vault.VAULT_META_SOURCE_RECORDS_SPAN]) == {
+        "from": "2026-08-20",
+        "through": "2026-08-20",
+    }
+
+
+def test_resolution_lookup_reads_this_vault_and_refuses_coarse_build(
+    tmp_path, monkeypatch
+):
+    """A 300-second build cannot answer a 20-second computation."""
+    from health_advisor import metrics
+    from health_advisor.vault import raw_resolution_seconds, resolution_refusal
+
+    source = tmp_path / "source.db"
+    coarse = tmp_path / "coarse.db"
+    fine = tmp_path / "fine.db"
+    _consolidated_source(source)
+
+    monkeypatch.setitem(vault.VAULT_BUCKET_SECONDS, "step_count", 300)
+    build_vault(source, coarse, measure_gzip=False)
+
+    conn = db.connect(coarse, read_only=True)
+    try:
+        assert raw_resolution_seconds(conn, "step_count") == 300
+        assert raw_resolution_seconds("step_count", conn=conn) == 300
+        refusal = resolution_refusal(
+            conn, "step_count", metrics.IMPACT_BUCKET_SECONDS,
+            needed_for="cardiac_decoupling",
+        )
+    finally:
+        conn.close()
+    assert refusal == {
+        "status": "unavailable",
+        "metric": "step_count",
+        "needed_for": "cardiac_decoupling",
+        "reason": "resolution_too_coarse",
+        "detail": (
+            "'step_count' is stored at 300 s, but cardiac_decoupling "
+            "requires 20 s or finer"
+        ),
+    }
+
+    # A fresh build at the consumer's width is allowed through. The consumer
+    # owns the figure; this vault contract only decides whether it may compute.
+    monkeypatch.setitem(vault.VAULT_BUCKET_SECONDS, "step_count", 20)
+    build_vault(source, fine, measure_gzip=False)
+    conn = db.connect(fine, read_only=True)
+    try:
+        assert raw_resolution_seconds(conn, "step_count") == 20
+        assert resolution_refusal(
+            conn, "step_count", metrics.IMPACT_BUCKET_SECONDS,
+            needed_for="cardiac_decoupling",
+        ) is None
+    finally:
+        conn.close()
+
+
+def test_unmarked_vault_resolution_is_unknown_and_fails_safe(tmp_path):
+    source = tmp_path / "source.db"
+    target = tmp_path / "legacy.db"
+    _source_db(source)
+    conn = db.connect(target)
+    db.init_db(conn)
+    conn.commit()
+    try:
+        assert vault.raw_resolution_seconds(conn, "step_count") is None
+        refusal = vault.resolution_refusal(
+            conn, "step_count", 20, needed_for="cardiac_decoupling"
+        )
+    finally:
+        conn.close()
+    assert refusal["status"] == "unavailable"
+    assert refusal["reason"] == "resolution_unknown"
 
 
 def test_bucketing_is_per_source_so_arbitration_survives(tmp_path):

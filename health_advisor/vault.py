@@ -11,6 +11,7 @@ deliberate re-derivation migration.
 from __future__ import annotations
 
 import gzip
+import json
 import math
 import os
 import sqlite3
@@ -69,6 +70,14 @@ VAULT_BUCKET_SECONDS: dict[str, int] = {
     # series at the 20-second impact width, so keep the two constants coupled.
     "step_count": metrics.IMPACT_BUCKET_SECONDS,
 }
+
+# Build facts are deliberately separate from the schema version. A vault can
+# have the current table shape while still having been built before these
+# facts were recorded; consumers must treat that older vault as unknown rather
+# than infer a resolution from today's constants.
+VAULT_META_BUCKET_SECONDS = "bucket_seconds"
+VAULT_META_RAW_SERIES = "raw_series"
+VAULT_META_SOURCE_RECORDS_SPAN = "source_records_span"
 
 
 # --------------------------------------------------------------------------- #
@@ -508,9 +517,100 @@ def raw_series_available(metric: str) -> bool:
     return metric in VAULT_RAW_SERIES
 
 
-def raw_resolution_seconds(metric: str) -> int:
-    """The finest resolution the vault holds for ``metric``. 0 means as recorded."""
-    return VAULT_BUCKET_SECONDS.get(metric, 0)
+def raw_resolution_seconds(
+    metric: str | sqlite3.Connection | None = None,
+    maybe_metric: str | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> int | None:
+    """The finest resolution a vault holds for ``metric``.
+
+    Pass a vault connection to ask about that particular file. ``0`` means
+    sample resolution; a positive value is the stored bucket width. A vault
+    without build metadata returns ``None`` because its resolution is unknown
+    and must not be assumed to match today's ``VAULT_BUCKET_SECONDS``.
+
+    The connection is optional for compatibility with callers that only need
+    the current build plan. That legacy form falls back to the module map; it
+    does not make a claim about an existing vault. ``raw_resolution_seconds``
+    also accepts ``(conn, metric)`` for consumers that naturally put the vault
+    first.
+    """
+    if isinstance(metric, sqlite3.Connection):
+        if conn is not None or maybe_metric is None:
+            raise TypeError("pass either (conn, metric) or metric, conn=conn")
+        conn, metric = metric, maybe_metric
+    elif maybe_metric is not None:
+        raise TypeError("pass either (conn, metric) or metric, conn=conn")
+    if metric is None:
+        raise TypeError("metric is required")
+
+    if conn is None:
+        # This is the build plan, not a statement about an existing vault.
+        return VAULT_BUCKET_SECONDS.get(metric, 0)
+
+    encoded_buckets = _vault_meta_value(conn, VAULT_META_BUCKET_SECONDS)
+    encoded_raw = _vault_meta_value(conn, VAULT_META_RAW_SERIES)
+    if encoded_buckets is None or encoded_raw is None:
+        return None
+    try:
+        buckets = json.loads(encoded_buckets)
+        raw_series = json.loads(encoded_raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(buckets, dict) or not isinstance(raw_series, list):
+        return None
+    if not all(isinstance(item, str) for item in raw_series):
+        return None
+    if metric in buckets:
+        seconds = buckets[metric]
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
+            return None
+        return seconds
+    if metric in raw_series:
+        return 0
+    return None
+
+
+def resolution_refusal(
+    conn: sqlite3.Connection,
+    metric: str,
+    required_seconds: int,
+    *,
+    needed_for: str,
+) -> dict | None:
+    """Return a status answer when a computation cannot trust resolution.
+
+    ``None`` means the stored resolution is known and fine. The returned
+    dictionaries are deliberately answers, not exceptions or empty results:
+    a coarse or unmarked vault must not produce a plausible number.
+    """
+    if required_seconds <= 0:
+        raise ValueError("required_seconds must be positive")
+    stored = raw_resolution_seconds(conn, metric)
+    if stored is None:
+        return {
+            "status": "unavailable",
+            "metric": metric,
+            "needed_for": needed_for,
+            "reason": "resolution_unknown",
+            "detail": (
+                f"{metric!r} has no recorded build resolution; {needed_for} "
+                "declines rather than assume the vault is fine"
+            ),
+        }
+    if stored > required_seconds:
+        return {
+            "status": "unavailable",
+            "metric": metric,
+            "needed_for": needed_for,
+            "reason": "resolution_too_coarse",
+            "detail": (
+                f"{metric!r} is stored at {stored} s, but {needed_for} "
+                f"requires {required_seconds} s or finer"
+            ),
+        }
+    return None
 
 
 def raw_unavailable(metric: str, *, needed_for: str) -> dict:
@@ -696,6 +796,27 @@ def _source_history_imported_through(
         if row and row[0] is not None:
             return row[0]
     return None
+
+
+def _source_records_span(
+    source: sqlite3.Connection, source_tables: set[str]
+) -> dict[str, str | None]:
+    """Return the source's complete raw-record local-date span.
+
+    This is intentionally measured before D3 filtering. A filtered vault must
+    retain the extent of the source it was built from, including dates whose
+    raw series were not allowlisted, so a later rebuild cannot mistake a
+    truncated source for complete history.
+    """
+    if "records" not in source_tables:
+        return {"from": None, "through": None}
+    row = source.execute(
+        "SELECT MIN(local_date), MAX(local_date) FROM records"
+    ).fetchone()
+    return {
+        "from": row[0] if row else None,
+        "through": row[1] if row else None,
+    }
 
 
 def _cap_history_to_live_floor(
@@ -962,6 +1083,13 @@ def build_vault(
     try:
         source = db.connect(source_path, read_only=True)
         source_tables = _table_names(source)
+        bucket_seconds = {
+            metric: int(seconds)
+            for metric, seconds in sorted(VAULT_BUCKET_SECONDS.items())
+            if metric in VAULT_RAW_SERIES
+        }
+        raw_series = sorted(VAULT_RAW_SERIES)
+        source_records_span = _source_records_span(source, source_tables)
         source_history = _source_history_imported_through(source, source_tables)
         # A replace inherits an existing declaration and also cannot lower it.
         # A newer source date may extend the declaration, but an older source
@@ -1024,9 +1152,7 @@ def build_vault(
         # bucketed series is stored coarser, not omitted, and a report that
         # calls it "dropped" is the kind of thing somebody later believes.
         bucketed_by_metric: dict[str, tuple[int, int]] = {}
-        for metric, seconds in sorted(VAULT_BUCKET_SECONDS.items()):
-            if metric not in VAULT_RAW_SERIES:
-                continue
+        for metric, seconds in bucket_seconds.items():
             written = _copy_bucketed(source, target, metric, seconds)[1]
             raw = dropped_by_metric.pop(metric, 0)
             if not raw and not written:
@@ -1078,6 +1204,18 @@ def build_vault(
             target.execute(
                 "INSERT OR REPLACE INTO vault_meta (key, value) "
                 "VALUES ('history_imported_through', ?)", (history,))
+        target.executemany(
+            "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",
+            [
+                (VAULT_META_BUCKET_SECONDS,
+                 json.dumps(bucket_seconds, sort_keys=True, separators=(",", ":"))),
+                (VAULT_META_RAW_SERIES,
+                 json.dumps(raw_series, separators=(",", ":"))),
+                (VAULT_META_SOURCE_RECORDS_SPAN,
+                 json.dumps(source_records_span, sort_keys=True,
+                            separators=(",", ":"))),
+            ],
+        )
 
         # Carry the fencing epoch forward. A fresh SQLite file starts at
         # user_version 0, so rebuilding a vault that had committed at epoch 5
@@ -1145,7 +1283,7 @@ def build_vault(
             "records_copied": records_copied,
             "records_dropped": records_seen - records_copied,
             "copied_by_metric": dict(sorted(copied_by_metric.items())),
-            "bucketed_by_metric": {m: {"seconds": VAULT_BUCKET_SECONDS[m],
+            "bucketed_by_metric": {m: {"seconds": bucket_seconds[m],
                                        "raw": raw, "buckets": n}
                                    for m, (raw, n) in bucketed_by_metric.items()},
             "dropped_by_metric": dict(sorted(dropped_by_metric.items())),

@@ -65,7 +65,8 @@ class ModelCallAccounting:
     def call_count(self) -> int:
         return len(self.calls)
 
-    def record(self, elapsed_seconds: float, usage: dict | None = None) -> None:
+    def record(self, elapsed_seconds: float, usage: dict | None = None,
+               *, finish_reason: str | None = None) -> None:
         usage = usage or {}
         self.calls.append({
             "elapsed_seconds": max(0.0, float(elapsed_seconds)),
@@ -73,6 +74,8 @@ class ModelCallAccounting:
             "cached_tokens": _token_count(usage.get("cached_tokens")),
             "completion_tokens": _token_count(usage.get("completion_tokens")),
             "reasoning_tokens": _token_count(usage.get("reasoning_tokens")),
+            "finish_reason": (str(finish_reason)
+                              if finish_reason is not None else None),
         })
 
     def snapshot(self, *, require_nonzero: bool = False) -> dict:
@@ -144,7 +147,8 @@ def _record_model_call(elapsed_seconds: float, usage: dict | None = None,
                        *, prompt_tokens: int | None = None,
                        cached_tokens: int | None = None,
                        completion_tokens: int | None = None,
-                       reasoning_tokens: int | None = None) -> None:
+                       reasoning_tokens: int | None = None,
+                       finish_reason: str | None = None) -> None:
     """Record one transport call if an answer turn is being measured.
 
     ``usage`` accepts either OpenRouter's nested usage shape or Ollama's
@@ -167,7 +171,7 @@ def _record_model_call(elapsed_seconds: float, usage: dict | None = None,
         usage = _usage_tokens(usage, ollama=True)
     else:
         usage = _usage_tokens({"usage": usage})
-    accounting.record(elapsed_seconds, usage)
+    accounting.record(elapsed_seconds, usage, finish_reason=finish_reason)
 
 
 def _usage_tokens(data: dict, *, ollama: bool = False) -> dict[str, int]:
@@ -199,6 +203,15 @@ def _usage_tokens(data: dict, *, ollama: bool = False) -> dict[str, int]:
     }
 
 
+def _openai_finish_reason(data: dict) -> str | None:
+    """Read the provider's per-choice completion reason without retaining text."""
+    if not isinstance(data, dict):
+        return None
+    choices = data.get("choices") or []
+    choice = (choices[0] if choices else None) or {}
+    return choice.get("finish_reason") if isinstance(choice, dict) else None
+
+
 @contextmanager
 def _measured_model_call():
     """Measure one provider request, including a request that raises."""
@@ -218,6 +231,11 @@ MODEL = os.environ.get("HA_LLM_MODEL", "qwen3.5:9b-q4_K_M")
 KEEP_ALIVE = os.environ.get("HA_LLM_KEEP_ALIVE", "10m")  # stay resident across narrate→judge→retry
 OPENROUTER_URL = os.environ.get("HA_OPENROUTER_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.environ.get("HA_OPENROUTER_MODEL")
+
+# The 60-sample ask battery measured a 1,144.5-token median, a 4,151-token
+# p95, and a 5,365-token maximum for final calls. A 4,200-token ceiling sits
+# just above p95, bounding the observed tail without cutting typical answers.
+ANSWER_MAX_TOKENS = 4200
 
 
 def _read_openrouter_api_key_file(path: str) -> str:
@@ -1143,7 +1161,8 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
         finally:
             _record_model_call(
                 time.monotonic() - call_started,
-                data.get("usage") if isinstance(data, dict) else None)
+                data.get("usage") if isinstance(data, dict) else None,
+                finish_reason=_openai_finish_reason(data))
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -1640,11 +1659,14 @@ def _submit_answer_response(call: dict) -> ResearchResponse:
 # every backend.
 # ---------------------------------------------------------------------------
 
-def _openai_sampling(options: dict | None) -> dict:
+def _openai_sampling(options: dict | None, *, max_tokens: int | None = None) -> dict:
     """The subset of an Ollama sampling profile the OpenAI wire accepts."""
     source = options or GROUNDED_OPTS
-    return {key: source[key] for key in
-            ("temperature", "top_p", "presence_penalty") if key in source}
+    sampling = {key: source[key] for key in
+                ("temperature", "top_p", "presence_penalty") if key in source}
+    if max_tokens is not None:
+        sampling["max_tokens"] = max_tokens
+    return sampling
 
 
 def _derived_ledger_path(scratch_path, ledger_path):
@@ -1809,7 +1831,8 @@ def _openrouter_ready(on_log=None) -> bool:
     return True
 
 
-def _openrouter_post(messages: list[dict], *, tools, timeout, options=None):
+def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
+                     max_tokens: int | None = None):
     """One OpenAI-dialect chat turn. Returns (assistant message, prompt tokens).
 
     Transport, headers, provider pin and error handling mirror ``complete()``'s
@@ -1823,7 +1846,7 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None):
         "messages": _payload_messages(messages),
         "stream": False,
         "reasoning": _openrouter_reasoning_field(_openrouter_reasoning_mode()),
-        **_openai_sampling(options),
+        **_openai_sampling(options, max_tokens=max_tokens),
     }
     if tools:
         payload["tools"] = list(tools)
@@ -1833,6 +1856,7 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None):
         payload["provider"] = provider
     call_started = time.monotonic()
     data = {}
+    finish_reason = None
     try:
         with _client(timeout) as client:
             resp = client.post(f"{OPENROUTER_URL}/chat/completions", json=payload,
@@ -1842,13 +1866,18 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None):
             data = resp.json()
         _assert_openrouter_response_provider(data)
         choices = data.get("choices") or []
-        msg = (choices[0].get("message") if choices else None) or {}
+        choice = (choices[0] if choices else None) or {}
+        finish_reason = _openai_finish_reason(data)
+        msg = choice.get("message") or {}
+        if isinstance(msg, dict):
+            msg = {**msg, "_finish_reason": finish_reason}
         prompt_tokens = int((data.get("usage") or {}).get("prompt_tokens") or 0)
         return msg, prompt_tokens
     finally:
         _record_model_call(
             time.monotonic() - call_started,
-            data.get("usage") if isinstance(data, dict) else None)
+            data.get("usage") if isinstance(data, dict) else None,
+            finish_reason=finish_reason)
 
 
 def _openai_assistant_turn(msg: dict, turn: int) -> tuple[dict, list[dict]]:
@@ -1910,6 +1939,7 @@ def _prune_orphaned_tool_turns(messages: list[dict]) -> list[dict]:
 def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
               max_turns: int = 12, timeout: int = TIMEOUT_TOOL_TURN,
               deadline: int = DEADLINE_TOOL_LOOP,
+              max_tokens: int | None = None,
               ledger_path: str | None = None, tool_names=None,
               claim_instructions: str | None = _RESEARCH_CLAIM_INSTRUCTIONS,
               submit_tool: bool = False,
@@ -1992,7 +2022,9 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                 return ResearchResponse()
             if openai_dialect:
                 msg, _ = _openrouter_post(messages, tools=wire_tools, timeout=timeout,
-                                          options=CREATIVE_OPTS)
+                                          options=CREATIVE_OPTS,
+                                          max_tokens=(max_tokens
+                                                      if not wire_tools else None))
             else:
                 payload = {
                     "model": MODEL,
@@ -2013,6 +2045,10 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     msg = (data.get("message")) or {}
                 finally:
                     _record_model_call(time.monotonic() - call_started, data)
+            truncated = msg.get("_finish_reason") == "length"
+            if truncated:
+                _announce("tool_loop_truncated",
+                          f"answer generation reached max_tokens={max_tokens}")
             if msg.get("tool_calls"):
                 # The assistant turn carrying the tool_calls, then one result per
                 # call — paired by id on the OpenAI wire, by name on Ollama's.
@@ -2092,7 +2128,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                         messages.append({"role": "user", "content": index_text})
                 continue
             answer = _research_response(_strip_think(msg.get("content") or "").strip())
-            if not answer:
+            if not answer and not truncated:
                 _announce("tool_loop_empty_answer",
                           f"model finished at turn {turn} with no text")
             return answer

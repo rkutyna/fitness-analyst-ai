@@ -93,6 +93,47 @@ def test_model_call_accounting_records_nested_usage(openrouter):
         abs=1e-6)
 
 
+def test_answer_cap_is_present_only_on_the_final_call(openrouter):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_assistant("done"))
+
+    openrouter(handler)
+    llm._registry = lambda ctx, include=None: _tool(lambda **k: {"ok": 1})
+
+    llm.tool_loop("gather", ctx=None, tools=[{"name": "probe"}], max_turns=4)
+    result = llm.tool_loop("final", ctx=None, tools=[],
+                           max_tokens=llm.ANSWER_MAX_TOKENS)
+
+    assert str(result) == "done"
+    assert "max_tokens" not in bodies[0]
+    assert bodies[1]["max_tokens"] == llm.ANSWER_MAX_TOKENS
+
+
+def test_length_finish_reason_is_accounted_and_surfaces_in_loop_status(openrouter):
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial"},
+                "finish_reason": "length",
+            }],
+            "provider": "CoreWeave",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4200},
+        })
+
+    openrouter(handler)
+    with llm.model_call_accounting() as accounting:
+        result = llm.tool_loop("q", ctx=None, tools=[],
+                               max_tokens=llm.ANSWER_MAX_TOKENS)
+
+    assert str(result) == "partial"
+    assert accounting.snapshot(require_nonzero=True)["model_calls"][0][
+        "finish_reason"] == "length"
+    assert llm.last_loop_status()["outcome"] == "tool_loop_truncated"
+
+
 def test_zero_model_call_accounting_can_be_rejected_by_a_caller():
     with llm.model_call_accounting() as accounting:
         pass

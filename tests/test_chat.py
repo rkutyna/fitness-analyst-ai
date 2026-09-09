@@ -1386,7 +1386,7 @@ def test_question_log_records_the_question_and_verdict_only(
     assert len(row["model_calls"]) == 2
     assert set(row["model_calls"][0]) == {
         "elapsed_seconds", "prompt_tokens", "cached_tokens",
-        "completion_tokens", "reasoning_tokens",
+        "completion_tokens", "reasoning_tokens", "finish_reason",
     }
     assert row["elapsed_seconds"] == pytest.approx(
         row["python_seconds"] + sum(

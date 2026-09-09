@@ -1577,6 +1577,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         final_prompt, ctx=ctx, tools=[], think=True, ledger_path=ledger_path,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
+        max_tokens=llm.ANSWER_MAX_TOKENS,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
     final_status = _ask_loop_outcome(final_status_before,
                                      llm.last_loop_status())
@@ -1678,6 +1679,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         repair_prompt, ctx=ctx, tools=[], think=True, ledger_path=ledger_path,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
+        max_tokens=llm.ANSWER_MAX_TOKENS,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
     retry_status = _ask_loop_outcome(retry_status_before,
                                      llm.last_loop_status())

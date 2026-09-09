@@ -2170,6 +2170,39 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
 
 
 @tool
+def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
+                         as_of: str) -> dict:
+    """Compare the last two fixed-length blocks of a metric, gated by MDC95.
+
+    Each block's inclusive `period` is `YYYY-MM-DD:YYYY-MM-DD`; copy that exact
+    string into a claim. The result includes each block's `mean`, `n`, and
+    sample `sd`, the recent-minus-previous `diff`, and `mdc95`.
+
+    **Do not report a change smaller than mdc95 as a change.** When the noise
+    floor cannot be estimated, `mdc95` and `exceeds_mdc95` are null, so the
+    result cannot support a real-change claim. A block below the 75% coverage
+    floor returns `status: "insufficient_coverage"` and no mean.
+
+    Metric ownership is per field: a fact-template may attribute `mean`, `sd`,
+    and `diff` to the queried metric; it must not inherit that metric for
+    context fields such as `period`, `n`, `mdc95`, `exceeds_mdc95`, dates, or
+    refusal status. Python owns every returned number and verdict.
+    """
+    if err := _bad_dates(as_of=as_of):
+        return {"error": err}
+    if (isinstance(block_weeks, bool) or not isinstance(block_weeks, int)
+            or block_weeks <= 0):
+        return {"error": "block_weeks must be a positive integer"}
+    conn = ctx.read_only()
+    try:
+        if not _metric_exists(conn, metric):
+            return {"error": f"no data for metric {metric!r}"}
+        return A.block_comparison(conn, metric, block_weeks, as_of)
+    finally:
+        conn.close()
+
+
+@tool
 def get_block_structure(ctx: VaultContext, day: str) -> dict:
     """How long the user ran CONTINUOUSLY, and whether it was easy enough to count.
 

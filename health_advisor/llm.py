@@ -1210,7 +1210,8 @@ COACH_TOOLS = (
     "get_training_load_detail", "get_run_form", "get_briefing", "get_latest",
     "correlate_metrics", "scan_correlations", "get_planned_session",
     "get_week_plan", "get_plan_overview", "get_subjective", "food_lookup",
-    "food_meal_total", "get_weekly_series", "get_block_structure",
+    "food_meal_total", "get_weekly_series", "get_block_comparison",
+    "get_block_structure",
     "get_weekly_readiness", "get_benchmark_series", "get_monthly_running_power",
     "analyst_query",
 )

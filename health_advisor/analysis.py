@@ -151,6 +151,10 @@ MOVER_TOPK = {"daily": 3, "deep": 8}
 # gait stats), skip near-zero baselines, and cap absurd % swings.
 MOVER_MIN_WINDOW_DAYS = 21
 MOVER_BASE_FLOOR = 1e-6
+# A fixed-length comparison needs most of each block present before its mean is
+# a reportable fact. This is the same 75% coverage convention as movers(),
+# expressed as a fraction so it scales with a requested block length.
+BLOCK_MIN_COVERAGE_FRACTION = 0.75
 # A % change says nothing about whether the metric moved further than it moves
 # anyway. walking_asymmetry_percentage "UP 85.9%" was the #1 talking point at
 # t≈1.4 — noise, read to the user as an injury signal. A mover must clear this
@@ -390,6 +394,82 @@ def mdc95(sd_day: float, rho: float, n_days: int) -> float:
     rho = min(max(rho, 0.0), 0.95)      # a negative or near-1 rho is not usable here
     se = (sd_day / math.sqrt(n_days)) * math.sqrt((1 + rho) / (1 - rho))
     return 1.96 * math.sqrt(2.0) * se
+
+
+def block_comparison(conn, metric: str, block_weeks: int, as_of: str) -> dict:
+    """Compare two adjacent fixed-length blocks, gated by coverage and MDC95.
+
+    The block periods are inclusive calendar dates ending at `as_of`. Values
+    come from `metrics.series`, so each metric uses its catalog aggregation.
+    A block with less than 75% of its expected days is a typed refusal; its
+    mean is never computed. MDC95 is for the requested full block length, even
+    when a block is present at the coverage floor.
+    """
+    if (isinstance(block_weeks, bool) or not isinstance(block_weeks, int)
+            or block_weeks <= 0):
+        return {"status": "invalid_block_weeks", "block_weeks": block_weeks,
+                "metric": metric, "as_of": as_of}
+
+    block_days = block_weeks * 7
+    min_days = max(1, math.ceil(block_days * BLOCK_MIN_COVERAGE_FRACTION))
+    recent_end = date.fromisoformat(as_of)
+    recent_start = recent_end - timedelta(days=block_days - 1)
+    previous_end = recent_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=block_days - 1)
+    ranges = {
+        "previous": (previous_start, previous_end),
+        "recent": (recent_start, recent_end),
+    }
+
+    blocks = {}
+    for name, (start, end) in ranges.items():
+        _days, vals, _ = mx.series(conn, metric, start.isoformat(), end.isoformat())
+        block = {
+            "period": f"{start.isoformat()}:{end.isoformat()}",
+            "n": len(vals),
+        }
+        if len(vals) >= min_days:
+            block["mean"] = statistics.fmean(vals)
+            block["sd"] = statistics.stdev(vals)
+        else:
+            block["required_n"] = min_days
+        blocks[name] = block
+
+    if any("mean" not in block for block in blocks.values()):
+        return {
+            "metric": metric,
+            "block_weeks": block_weeks,
+            "as_of": as_of,
+            "status": "insufficient_coverage",
+            "blocks": blocks,
+            "diff": None,
+            "mdc95": None,
+            "exceeds_mdc95": None,
+        }
+
+    diff = blocks["recent"]["mean"] - blocks["previous"]["mean"]
+    floor = metric_noise_floor(conn, metric, as_of)
+    floor_mdc = None
+    if floor["sd_day"] is not None and floor["rho"] is not None:
+        floor_mdc = mdc95(floor["sd_day"], floor["rho"], block_days)
+    return {
+        "metric": metric,
+        "block_weeks": block_weeks,
+        "as_of": as_of,
+        "blocks": {
+            name: {
+                "period": block["period"],
+                "mean": mx.r(block["mean"], 2),
+                "n": block["n"],
+                "sd": mx.r(block["sd"], 2),
+            }
+            for name, block in blocks.items()
+        },
+        "diff": mx.r(diff, 2),
+        "mdc95": mx.r(floor_mdc, 2),
+        "exceeds_mdc95": (abs(diff) > floor_mdc
+                           if floor_mdc is not None else None),
+    }
 
 
 def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:

@@ -2368,14 +2368,35 @@ def _audit_flag_ledger(report: dict) -> list[dict]:
 
 
 def _audit_fallback(report: dict) -> str:
-    flagged = [check["check_id"] for check in report.get("checks", [])
-               if check.get("flag")]
+    """Narrate a deterministic audit without ever confusing two opposite claims.
+
+    "Found no flagged checks" asserts that something was examined and nothing
+    was wrong.  An audit that could not run also arrives here with
+    ``checks: []`` -- and until 2026-09-09 produced the identical sentence, so
+    a tester deployment with no claims register (permanently, by design) would
+    narrate a clean audit to every user on every ask.  Nothing model-side can
+    catch that: the sentence is composed in Python, so it is not prose a
+    grounding check, template gate or claim scan ever sees.
+
+    An empty check list is therefore never evidence of a clean result.  The
+    only state that earns the reassuring sentence is one where checks actually
+    ran.
+    """
+    checks = report.get("checks", [])
+    flagged = [check["check_id"] for check in checks if check.get("flag")]
     label = ("conclusions-still-hold" if report.get("name") ==
              "conclusions_still_hold_mini" else "injury-risk")
-    if not flagged:
-        return f"The deterministic {label} audit found no flagged checks."
-    return (f"The deterministic {label} audit flagged: "
-            + ", ".join(flagged) + ".")
+    if flagged:
+        return (f"The deterministic {label} audit flagged: "
+                + ", ".join(flagged) + ".")
+    if not checks:
+        # Prefer whatever the producer stated about itself; fall back to saying
+        # plainly that nothing was examined rather than inventing a reason.
+        stated = report.get("register_status") or report.get("status")
+        because = f" ({stated})" if stated else ""
+        return (f"The deterministic {label} audit examined nothing, so it has "
+                f"neither confirmed nor contradicted anything{because}.")
+    return f"The deterministic {label} audit found no flagged checks."
 
 
 def _narrate_audit(ctx: VaultContext, report: dict) -> dict:

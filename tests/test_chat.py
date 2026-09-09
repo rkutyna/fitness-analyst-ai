@@ -917,6 +917,43 @@ def test_capture_records_the_failed_draft_and_the_retry(monkeypatch, vault, conn
     assert capture[1]["judge_score"] == 100
 
 
+def test_accounting_out_of_band_dict_is_populated_with_stub_call_count(
+        monkeypatch, vault, conn):
+    """``accounting``, like ``capture``, is an out-of-band side channel: the
+    caller's dict is filled with the turn's ModelCallAccounting snapshot
+    (the same shape ``_record_question`` receives), and the returned
+    response — the shape ``/v1/ask`` hands to clients — is unaffected."""
+    ledger, draft = _verified_draft()
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(chat, "_ask_judge", lambda *args, **kwargs: 100)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+
+    stub_calls = []
+
+    def fake_tool_loop(*args, **kwargs):
+        # This unit test replaces the transport; account for its logical
+        # model turn so the snapshot still exercises the production shape.
+        stub_calls.append(1)
+        llm._record_model_call(0.0)
+        return draft
+
+    monkeypatch.setattr(llm, "tool_loop", fake_tool_loop)
+
+    accounting = {}
+    result = chat.answer_question(vault, "How is my jogging?",
+                                  accounting=accounting)
+
+    assert result["mode"] == "narration"
+    assert set(result) == ASK_RESULT_KEYS
+    assert set(accounting) == {
+        "elapsed_seconds", "python_seconds", "model_call_count",
+        "model_calls", "accounting_anomaly",
+    }
+    assert accounting["model_call_count"] == len(stub_calls) == 1
+    assert len(accounting["model_calls"]) == len(stub_calls)
+    assert accounting["accounting_anomaly"] is None
+
+
 def test_unrun_judge_is_none_in_capture_and_response(monkeypatch, vault, conn):
     verifications = iter([
         _failed_verification(figures_verified=0, figures_total=1,

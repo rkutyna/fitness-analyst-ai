@@ -943,6 +943,7 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                     ledger_path: str | None = None,
                     history: list[dict[str, Any]] | None = None,
                     capture: list | None = None,
+                    accounting: dict | None = None,
                     analyst_query_fn=None,
                     attachments: list[dict[str, Any]] | None = None,
                     audits: Mapping[str, tuple[Callable, Callable]] | None = None
@@ -959,6 +960,13 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
     measurement callers only. The returned dict is identical whether or not it
     is supplied, because ``/v1/ask`` hands ``verification`` to API clients
     verbatim and a draft that failed the gate must not reach them.
+
+    ``accounting``, when a dict is supplied, is filled in place with this
+    turn's ``ModelCallAccounting.snapshot()`` — the same measurement
+    ``_record_question`` writes to the question log — before this function
+    returns. It is a second out-of-band side channel, alongside ``capture``,
+    for measurement callers; like ``capture`` it never changes the returned
+    dict or the ``/v1/ask`` response shape.
     """
     from . import llm
     with llm.model_call_accounting() as turn_accounting:
@@ -980,6 +988,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
             result = {**result, "attachments": list(result.get("attachments", []))
                       + list(attachments)}
         timing = turn_accounting.snapshot()
+    if accounting is not None:
+        accounting.update(timing)
     _record_question(question, as_of, result, timing)
     return result
 

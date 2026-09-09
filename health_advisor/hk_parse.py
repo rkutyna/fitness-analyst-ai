@@ -157,8 +157,65 @@ def _anchor_type_supported(type_identifier: str) -> bool:
     )
 
 
+class _Unhandled(list[str]):
+    """Legacy human strings plus durable, machine-readable rejection facts."""
+
+    def __init__(self, *, batch_id: str, device_id: str):
+        super().__init__()
+        self.batch_id = batch_id
+        self.device_id = device_id
+        self.context: dict | None = None
+        self.rejections: list[dict] = []
+
+
+def _reason_category(reason: str) -> str:
+    """Map parser prose to the small vocabulary the diagnostics tool reports."""
+    if reason.startswith("unknown type_identifier"):
+        return "unknown_type"
+    if "UnitError" in reason or reason.startswith("unknown unit") \
+            or reason.startswith("cannot convert"):
+        return "unit_mismatch"
+    return "malformed"
+
+
+def _structured_rejection(unhandled: _Unhandled, index: int, reason: str,
+                          point_kind: str) -> None:
+    item = unhandled.context or {}
+    type_identifier = item.get("type_identifier")
+    metric = None
+    if isinstance(type_identifier, str) and type_identifier in nz.HK_QUANTITY:
+        metric = nz.hk_quantity_to_canonical(type_identifier)
+    elif isinstance(type_identifier, str) and type_identifier:
+        # Preserve an unsupported source identifier so the rejection is still
+        # searchable; it is not presented as a canonical stored metric.
+        metric = type_identifier
+    local_date = item.get("local_date")
+    if point_kind == "sample":
+        start_dt = _parse_dt(item.get("start"))
+        end_dt = _parse_dt(item.get("end"))
+        date_dt = end_dt if metric and metric.startswith("sleep_") else start_dt
+        local_date = nz.local_date_of(date_dt) if date_dt else None
+    unhandled.rejections.append({
+        "point_kind": point_kind,
+        "point_index": index,
+        "batch_id": unhandled.batch_id,
+        "metric": metric,
+        "type_identifier": type_identifier,
+        "local_date": local_date,
+        "source": ((item.get("source_revision") or {}).get("source_name")
+                   if isinstance(item.get("source_revision"), dict) else None),
+        "device_id": unhandled.device_id,
+        "hk_uuid": item.get("hk_uuid"),
+        "unit": item.get("unit"),
+        "reason": _reason_category(reason),
+        "detail": reason,
+    })
+
+
 def _unhandled(unhandled: list[str], index: int, reason: str) -> None:
     unhandled.append(f"samples[{index}]: {reason}")
+    if isinstance(unhandled, _Unhandled):
+        _structured_rejection(unhandled, index, reason, "sample")
 
 
 def _workout_unhandled(unhandled: list[str], index: int, reason: str) -> None:
@@ -167,12 +224,15 @@ def _workout_unhandled(unhandled: list[str], index: int, reason: str) -> None:
 
 def _daily_total_unhandled(unhandled: list[str], index: int, reason: str) -> None:
     unhandled.append(f"daily_totals[{index}]: {reason}")
+    if isinstance(unhandled, _Unhandled):
+        _structured_rejection(unhandled, index, reason, "daily_total")
 
 
 def _record(metric: str, value: float, unit: str | None,
             start_dt: datetime, end_dt: datetime, source: str,
             hk_uuid: str, type_identifier: str, revision_json: str | None,
-            device_id: str, *, source_value: Any, source_metric: str) -> dict:
+            device_id: str, *, source_value: Any, source_metric: str,
+            point_index: int) -> dict:
     start_utc = nz.to_utc_iso(start_dt)
     end_utc = nz.to_utc_iso(end_dt)
     # local_date is intentionally derived here.  A client field of the same
@@ -196,12 +256,14 @@ def _record(metric: str, value: float, unit: str | None,
         "hk_type_identifier": type_identifier,
         "source_revision_json": revision_json,
         "hk_device_id": device_id,
+        "_point_index": point_index,
     }
 
 
 def _parse_sample(sample: dict, index: int, device_id: str,
                   records: list[dict], pairs: set[tuple[str, str]],
-                  unhandled: list[str]) -> None:
+                  unhandled: _Unhandled) -> None:
+    unhandled.context = sample
     # `device` is NOT required: HealthKit returns no device for a great many
     # samples, and demanding one drops real data into `unhandled` silently.
     # The wire contract lists it as optional; this used to require it.
@@ -297,7 +359,8 @@ def _parse_sample(sample: dict, index: int, device_id: str,
             return
         row = _record(metric, value, unit, start_dt, end_dt, source,
                       sample["hk_uuid"], type_identifier, revision_json, device_id,
-                      source_value=sample["value"], source_metric=type_identifier)
+                      source_value=sample["value"], source_metric=type_identifier,
+                      point_index=index)
         records.append(row)
         pairs.add((metric, row["local_date"]))
         return
@@ -322,7 +385,8 @@ def _parse_sample(sample: dict, index: int, device_id: str,
         row = _record(metric, value, unit, start_dt, end_dt, source,
                       sample["hk_uuid"], type_identifier, revision_json, device_id,
                       source_value=sample["value"],
-                      source_metric=f"{type_identifier}:{metric}")
+                      source_metric=f"{type_identifier}:{metric}",
+                      point_index=index)
         records.append(row)
         pairs.add((metric, row["local_date"]))
 
@@ -401,7 +465,8 @@ def _parse_workout(workout: dict, index: int, workouts: list[dict],
 
 def _parse_daily_total(total: dict, index: int, device_id: str,
                        daily_totals: list[dict], daily_total_dates: set[str],
-                       unhandled: list[str]) -> None:
+                       unhandled: _Unhandled) -> None:
+    unhandled.context = total
     required = ("type_identifier", "local_date", "value", "unit", "interval",
                 "state", "queried_at")
     missing = _required(total, required, f"daily_totals[{index}]")
@@ -473,6 +538,7 @@ def _parse_daily_total(total: dict, index: int, device_id: str,
         "state": total["state"],
         "device_id": device_id,
         "queried_at": total["queried_at"],
+        "_point_index": index,
     })
     daily_total_dates.add(total["local_date"])
 
@@ -510,7 +576,8 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
     anchors: list[dict] = []
     anchor_results: list[dict] = []
     rejected_anchors: list[dict] = []
-    unhandled: list[str] = []
+    unhandled = _Unhandled(batch_id=envelope["batch_id"],
+                           device_id=device["id"])
     for i, anchor in enumerate(anchors_wire):
         anchor = _mapping(anchor, f"payload.anchors[{i}]")
         _reject_unknown(anchor, _ANCHOR_FIELDS, f"payload.anchors[{i}]")
@@ -574,6 +641,7 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # Unknown sample fields reject the batch before any point can be emitted.
     for i, sample in enumerate(samples):
         if not isinstance(sample, dict):
+            unhandled.context = None
             _unhandled(unhandled, i, "sample is not an object")
             continue
         sample = _mapping(sample, f"payload.samples[{i}]")
@@ -607,6 +675,7 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "daily_total_dates": daily_total_dates,
         "pairs": pairs,
         "unhandled": unhandled,
+        "rejections": unhandled.rejections,
         "deletions": deletions,
         "anchors": anchors,
         "rejected_anchors": rejected_anchors,

@@ -2110,6 +2110,88 @@ def food_meal_total(ctx: VaultContext, items: list[dict]) -> dict:
 
 
 @tool
+def get_ingest_diagnostics(ctx: VaultContext, metric: str, start: str,
+                           end: str) -> dict:
+    """Explain HealthKit ingest coverage for one metric and local date range.
+
+    ``arrived`` is stored plus rejected points once the structured rejection
+    ledger exists. ``stored`` is the current number
+    of matching raw records. ``rejected`` is Python-counted by category and
+    ``rejection_details`` preserves the parser's exact detail and raw unit.
+    ``last_stored_timestamp`` is grouped by the source in ``records``. An old
+    vault with no structured ledger returns ``arrived: 0`` rather than
+    fabricating history from its aggregates.
+
+    Dates are inclusive local calendar dates. An empty range is explicit:
+    every count is zero and both rejection details and source timestamps are
+    empty. This tool is read-only and the vault is supplied by ``ctx``; there
+    is no ambient database path.
+    """
+    if err := _bad_dates(start=start, end=end):
+        return {"error": err}
+    conn = ctx.read_only()
+    try:
+        stored_rows = conn.execute(
+            "SELECT source, COUNT(*) AS n, MAX(start_utc) AS last_stored_timestamp "
+            "FROM records WHERE metric = ? AND local_date BETWEEN ? AND ? "
+            "GROUP BY source ORDER BY source",
+            (metric, start, end),
+        ).fetchall()
+        stored = sum(row["n"] for row in stored_rows)
+        last_stored = {
+            (row["source"] if row["source"] is not None else ""): row["last_stored_timestamp"]
+            for row in stored_rows
+        }
+        has_ledger = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'ingest_diagnostics'"
+        ).fetchone() is not None
+        arrived = 0
+        rejected: dict[str, int] = {}
+        rejection_details: list[dict] = []
+        if has_ledger:
+            for row in conn.execute(
+                "SELECT reason, COUNT(*) AS n FROM ingest_diagnostics "
+                "WHERE metric = ? AND local_date BETWEEN ? AND ? "
+                "GROUP BY reason ORDER BY reason",
+                (metric, start, end),
+            ):
+                rejected[row["reason"]] = row["n"]
+            arrived = stored + sum(rejected.values())
+            for row in conn.execute(
+                "SELECT metric, reason, unit, detail, source, device_id, batch_id, "
+                "local_date, COUNT(*) AS n FROM ingest_diagnostics "
+                "WHERE metric = ? AND local_date BETWEEN ? AND ? "
+                "GROUP BY reason, unit, detail, source, "
+                "device_id, batch_id, local_date ORDER BY local_date, reason, detail",
+                (metric, start, end),
+            ):
+                rejection_details.append({
+                    "metric": row["metric"], "reason": row["reason"], "count": row["n"],
+                    "unit": row["unit"], "detail": row["detail"],
+                    "source": row["source"], "device_id": row["device_id"],
+                    "batch_id": row["batch_id"], "local_date": row["local_date"],
+                })
+    finally:
+        conn.close()
+    return {
+        "metric": metric,
+        "start": start,
+        "end": end,
+        "arrived": arrived,
+        "stored": stored,
+        "rejected": rejected,
+        "rejection_details": rejection_details,
+        "last_stored_timestamp": last_stored,
+        "stored_by_source": [
+            {"source": row["source"], "count": row["n"],
+             "last_stored_timestamp": row["last_stored_timestamp"]}
+            for row in stored_rows
+        ],
+    }
+
+
+@tool
 def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> dict:
     """Weekly means of a metric, each with its day count and its noise floor.
 

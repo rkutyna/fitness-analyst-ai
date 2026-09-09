@@ -1951,6 +1951,41 @@ def log_ingest(
         conn.commit()
 
 
+def log_ingest_diagnostics(conn: sqlite3.Connection,
+                           rows: Iterable[dict]) -> int:
+    """Persist rejected points for one parsed HealthKit batch.
+
+    The receiver calls this inside its batch transaction, so a failed ingest
+    cannot leave a diagnostic row claiming that a point arrived. The unique
+    batch/point key also makes a direct retry harmless, including when metric
+    is unknown for a malformed point.
+    """
+    rows = list(rows)
+    if not rows:
+        return 0
+    outer = conn.in_transaction
+    now = utcnow_iso()
+    values = []
+    for row in rows:
+        values.append((
+            row["batch_id"], row["point_kind"], row["point_index"],
+            row.get("metric"), row.get("type_identifier"),
+            row.get("local_date"), row.get("source"), row["device_id"],
+            row.get("hk_uuid"), row.get("unit"),
+            row.get("reason"), row.get("detail", ""), row.get("created_at", now),
+        ))
+    cur = conn.executemany(
+        "INSERT OR IGNORE INTO ingest_diagnostics "
+        "(batch_id, point_kind, point_index, metric, type_identifier, "
+        "local_date, source, device_id, hk_uuid, unit, reason, detail, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        values,
+    )
+    if not outer:
+        conn.commit()
+    return cur.rowcount
+
+
 # --------------------------------------------------------------------------- #
 # Maintenance entry point
 # --------------------------------------------------------------------------- #

@@ -507,6 +507,37 @@ CREATE TABLE IF NOT EXISTS ingest_log (
 );
 
 -- ---------------------------------------------------------------------------
+-- ingest_diagnostics: one durable row for each rejected point from a
+-- HealthKit-direct batch. Rejected rows retain the exact parser detail (and
+-- raw unit) so a future source spelling can be added without grepping prose.
+-- This table starts at deployment; historical ingest_log detail is not
+-- backfilled because it did not carry one row per point.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ingest_diagnostics (
+    id              INTEGER PRIMARY KEY,
+    batch_id        TEXT NOT NULL,
+    point_kind      TEXT NOT NULL CHECK (point_kind IN ('sample', 'daily_total')),
+    point_index     INTEGER NOT NULL,
+    metric          TEXT,
+    type_identifier TEXT,
+    local_date      TEXT,
+    source          TEXT,
+    device_id       TEXT NOT NULL,
+    hk_uuid         TEXT,
+    unit            TEXT,
+    reason          TEXT NOT NULL,
+    detail          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (batch_id, device_id, point_kind, point_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_diagnostics_metric_date
+    ON ingest_diagnostics (metric, local_date);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_diagnostics_batch
+    ON ingest_diagnostics (batch_id, device_id);
+
+-- ---------------------------------------------------------------------------
 -- subjective: nightly Telegram check-in, one row per local day. Partial
 -- upsert (a write only overwrites the fields it provides). Numeric fields are
 -- mirrored into records/daily_metrics (source/origin 'checkin') by

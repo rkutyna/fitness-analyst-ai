@@ -452,6 +452,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         return JSONResponse(response)
 
     accepted: list[dict] = []
+    diagnostic_rows: list[dict] = list(parsed["rejections"])
     affected: set[tuple[str, str]] = set()
     rec_added = 0
     daily_totals_added = 0
@@ -613,6 +614,20 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     (row["hk_device_id"], row["hk_type_identifier"], row["hk_uuid"]),
                 ).fetchone()
                 if tombstone is not None:
+                    diagnostic_rows.append({
+                        "batch_id": parsed["batch_id"],
+                        "point_kind": "sample",
+                        "point_index": row["_point_index"],
+                        "metric": row["metric"],
+                        "type_identifier": row["hk_type_identifier"],
+                        "local_date": row["local_date"],
+                        "source": row["source"],
+                        "device_id": row["hk_device_id"],
+                        "hk_uuid": row["hk_uuid"],
+                        "unit": row["unit"],
+                        "reason": "dedupe",
+                        "detail": "sample matched a durable deletion tombstone",
+                    })
                     continue
                 accepted.append(row)
                 affected.add((row["metric"], row["local_date"]))
@@ -664,10 +679,14 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 for day in parsed["workout_dates"]
                 if day >= db.workout_source_arbitration_cutoff(conn)
             )
-            for row in parsed["daily_totals"]:
+            # The parser assigns wire indexes while walking the list. Keep the
+            # same positional traversal here; accepted totals are not copied
+            # into the rejection-only diagnostics table.
+            for _, row in enumerate(parsed["daily_totals"]):
                 affected.add((row["metric"], row["local_date"]))
             daily_totals_added = db.insert_daily_totals(
                 conn, parsed["daily_totals"], batch_id=parsed["batch_id"])
+            db.log_ingest_diagnostics(conn, diagnostic_rows)
             dm = db.recompute_daily_metrics(conn, pairs=sorted(affected))
 
             # Session attribution is a records concern, so it runs after the

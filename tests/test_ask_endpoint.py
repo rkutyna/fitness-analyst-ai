@@ -221,6 +221,18 @@ def test_ask_requires_a_non_empty_secret_and_ingest_keeps_optional_behavior(
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize("presented", ["bad-secret", "ask-secrex"])
+def test_shared_secret_rejects_same_length_wrong_values(monkeypatch, presented):
+    """Refusal coverage for both guards, including a last-byte mismatch."""
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+
+    for require in (receiver._require_ask_secret,
+                    receiver._require_ingest_secret):
+        with pytest.raises(Exception) as exc:
+            require(presented)
+        assert getattr(exc.value, "status_code", None) == 401
+
+
 def test_endpoint_records_user_and_assistant_turn_and_provenance(monkeypatch, vault):
     monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeoutError
+import hmac
 import io
 import json
 import os
@@ -148,6 +149,16 @@ MAX_BODY_BYTES = int(os.environ.get("HA_MAX_BODY_BYTES", str(256 * 1024 * 1024))
 ANALYST_INTERNAL_WAIT_SECONDS = 120.0
 
 
+def _secret_bytes(value: str | None) -> bytes | None:
+    """Encode a presented header without letting malformed input escape."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+
+
 def _require_ask_secret(x_health_secret: str | None) -> None:
     """Require a configured, non-empty secret for the interactive endpoint.
 
@@ -155,7 +166,9 @@ def _require_ask_secret(x_health_secret: str | None) -> None:
     check. An accidentally empty ask secret must never turn a health question
     endpoint into an unauthenticated data reader.
     """
-    if not SHARED_SECRET or x_health_secret != SHARED_SECRET:
+    presented = _secret_bytes(x_health_secret)
+    if (not SHARED_SECRET or presented is None or
+            not hmac.compare_digest(presented, SHARED_SECRET.encode("utf-8"))):
         raise HTTPException(status_code=401, detail="missing or bad shared secret")
 
 
@@ -838,7 +851,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
 
 
 def _require_ingest_secret(x_health_secret: str | None) -> None:
-    if SHARED_SECRET and x_health_secret != SHARED_SECRET:
+    presented = _secret_bytes(x_health_secret)
+    if (SHARED_SECRET and
+            (presented is None or
+             not hmac.compare_digest(presented, SHARED_SECRET.encode("utf-8")))):
         raise HTTPException(status_code=401, detail="missing or bad shared secret")
 
 

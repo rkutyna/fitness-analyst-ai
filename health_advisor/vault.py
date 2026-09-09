@@ -17,7 +17,8 @@ import os
 import sqlite3
 import tempfile
 import time
-from datetime import date, timedelta
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -78,6 +79,16 @@ VAULT_BUCKET_SECONDS: dict[str, int] = {
 VAULT_META_BUCKET_SECONDS = "bucket_seconds"
 VAULT_META_RAW_SERIES = "raw_series"
 VAULT_META_SOURCE_RECORDS_SPAN = "source_records_span"
+
+# Receiver rows are samples, not build buckets. These are bounds on the amount
+# of evidence inspected, not a resolution default: the value written below is
+# always a width measured from stored rows. A repeated width is required so a
+# single malformed or unusual sample cannot declare a vault's resolution.
+RESOLUTION_SAMPLE_LIMIT = 10_000
+# Ten observations reject an isolated malformed interval while remaining far
+# below the thousands of observations per width in the live vault's last
+# 10,000 rows.
+RESOLUTION_MIN_REPEAT = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -515,6 +526,116 @@ def compact(conn: sqlite3.Connection, *, through: str) -> dict[str, int]:
 def raw_series_available(metric: str) -> bool:
     """Whether sample-level rows for ``metric`` exist in a D3 vault at all."""
     return metric in VAULT_RAW_SERIES
+
+
+def _sample_width_seconds(start_utc: str, end_utc: str) -> int | None:
+    """Return one stored interval's rounded width, or None when unusable."""
+    try:
+        start = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    width = int(round((end - start).total_seconds()))
+    return width if width > 0 else None
+
+
+def _recorded_resolution_seconds(
+    conn: sqlite3.Connection, metric: str,
+) -> int | None:
+    """Infer one metric's resolution from repeated recent stored widths.
+
+    The smallest width with at least ``RESOLUTION_MIN_REPEAT`` observations is
+    selected. Thus a mixture of fine samples and a few coarse samples remains
+    visibly fine; averaging the mixture would invent a width no row has.
+    Returning None is intentional when there is not enough repeated evidence.
+    """
+    counts: Counter[int] = Counter()
+    rows = conn.execute(
+        # Bound the window over USABLE intervals: a zero-width sample says
+        # nothing about resolution, and a run of them at the head of the
+        # table must not hide the valid widths beneath (found at review on
+        # the dev snapshot, whose newest 10,000 step rows are all zero-width).
+        "SELECT start_utc, end_utc FROM records "
+        "WHERE metric = ? AND end_utc > start_utc "
+        "ORDER BY id DESC LIMIT ?",
+        (metric, RESOLUTION_SAMPLE_LIMIT),
+    )
+    for row in rows:
+        width = _sample_width_seconds(row[0], row[1])
+        if width is not None:
+            counts[width] += 1
+    candidates = [
+        width for width, count in counts.items()
+        if count >= RESOLUTION_MIN_REPEAT
+    ]
+    return min(candidates) if candidates else None
+
+
+def mark_receiver_resolutions(conn: sqlite3.Connection) -> dict[str, int]:
+    """Record resolutions measured from a receiver-built vault's raw rows.
+
+    ``build_vault`` writes the same two metadata keys while it knows its own
+    copy operation. Receiver databases have no such operation, so ``init_db``
+    calls this once after schema migration. Existing metadata is never
+    replaced, and a metric without enough evidence is omitted rather than
+    assigned the current build bucket width.
+    """
+    encoded_buckets = _vault_meta_value(conn, VAULT_META_BUCKET_SECONDS)
+    encoded_raw = _vault_meta_value(conn, VAULT_META_RAW_SERIES)
+    if encoded_buckets is None and encoded_raw is None:
+        buckets: dict[str, int] = {}
+        raw_series: list[str] = []
+    else:
+        try:
+            buckets = json.loads(encoded_buckets or "{}")
+            raw_series = json.loads(encoded_raw or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(buckets, dict) or not isinstance(raw_series, list):
+            return {}
+        if not all(isinstance(item, str) for item in raw_series):
+            return {}
+
+    known = set(buckets) | set(raw_series)
+    added: dict[str, int] = {}
+    for metric in sorted(VAULT_BUCKET_SECONDS):
+        # The no-rewrite rule is per series: one existing mark does not stop a
+        # different, still-unknown series from being measured later.
+        if metric in known:
+            continue
+        resolution = _recorded_resolution_seconds(conn, metric)
+        if resolution is None:
+            continue
+        added[metric] = resolution
+        if resolution < VAULT_BUCKET_SECONDS[metric]:
+            raw_series.append(metric)
+        else:
+            buckets[metric] = resolution
+
+    if not added:
+        return {}
+
+    # Match build_vault's raw-series declaration for non-bucketed dependencies.
+    raw_series.extend(
+        metric for metric in sorted(VAULT_RAW_SERIES - set(VAULT_BUCKET_SECONDS))
+        if metric not in raw_series
+    )
+    raw_series = sorted(set(raw_series))
+    conn.executemany(
+        "INSERT INTO vault_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [
+            (VAULT_META_BUCKET_SECONDS, json.dumps(
+                buckets, sort_keys=True, separators=(",", ":"))),
+            (VAULT_META_RAW_SERIES, json.dumps(
+                raw_series, separators=(",", ":"))),
+        ],
+    )
+    return added
 
 
 def raw_resolution_seconds(

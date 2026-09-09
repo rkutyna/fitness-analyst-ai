@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -342,6 +343,147 @@ def test_unmarked_vault_resolution_is_unknown_and_fails_safe(tmp_path):
     assert refusal["reason"] == "resolution_unknown"
 
 
+def test_receiver_write_marks_after_init_without_restart(tmp_path):
+    """The receiver's real init-then-batch order records the mark promptly."""
+    target = tmp_path / "receiver-write.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+
+    def interval(metric, n, width):
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n)
+        row = _record(metric, 1.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        return row
+
+    db.insert_records(
+        conn,
+        [interval("step_count", n, 2) for n in range(1, 101, 10)]
+        + [interval("distance_walking_running", n, 1)
+           for n in range(3, 103, 10)],
+    )
+
+    assert vault.raw_resolution_seconds(conn, "step_count") == 0
+    assert vault.raw_resolution_seconds(conn, "distance_walking_running") == 0
+    marked = dict(conn.execute("SELECT key, value FROM vault_meta"))
+    assert json.loads(marked[vault.VAULT_META_BUCKET_SECONDS]) == {}
+    assert json.loads(marked[vault.VAULT_META_RAW_SERIES]) == [
+        "distance_walking_running", "heart_rate", "running_power",
+        "sleep_asleep", "sleep_awake", "sleep_in_bed", "step_count",
+    ]
+    conn.close()
+
+
+def test_receiver_init_marks_recorded_resolutions_without_rewriting_them(tmp_path):
+    """Receiver rows determine the mark; the build plan never does."""
+    target = tmp_path / "receiver.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+
+    def interval(metric, n, width):
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n)
+        row = _record(metric, 1.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        return row
+
+    db.insert_records(conn, [
+        interval("distance_walking_running", n, 1)
+        for n in range(1, 101, 10)
+    ])
+    assert vault.raw_resolution_seconds(conn, "distance_walking_running") == 0
+    assert vault.raw_resolution_seconds(conn, "step_count") is None
+
+    db.insert_records(conn, [interval("step_count", n, 2)
+                             for n in range(2, 102, 10)])
+    assert vault.raw_resolution_seconds(conn, "step_count") == 0
+    assert vault.raw_resolution_seconds(conn, "distance_walking_running") == 0
+    marked = dict(conn.execute("SELECT key, value FROM vault_meta"))
+    assert json.loads(marked[vault.VAULT_META_BUCKET_SECONDS]) == {}
+    assert json.loads(marked[vault.VAULT_META_RAW_SERIES]) == [
+        "distance_walking_running", "heart_rate", "running_power",
+        "sleep_asleep", "sleep_awake", "sleep_in_bed", "step_count",
+    ]
+    before = marked
+
+    db.insert_records(conn, [interval("step_count", n, 20)
+                             for n in range(202, 302, 10)])
+    assert dict(conn.execute("SELECT key, value FROM vault_meta")) == before
+    conn.close()
+
+
+def test_receiver_marking_records_coarse_rows_and_refuses_them(tmp_path):
+    target = tmp_path / "coarse-receiver.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+    rows = []
+    for n in range(1, 101, 10):
+        row = _record("step_count", 1.0, "2026-08-20", n)
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=300)).isoformat() + "+00:00"
+        rows.append(row)
+    db.insert_records(conn, rows)
+    try:
+        assert vault.raw_resolution_seconds(conn, "step_count") == 300
+        refusal = vault.resolution_refusal(
+            conn, "step_count", 20, needed_for="cardiac_decoupling"
+        )
+    finally:
+        conn.close()
+    assert refusal["reason"] == "resolution_too_coarse"
+
+
+def test_receiver_marking_omits_a_series_without_repeated_evidence(tmp_path):
+    target = tmp_path / "partial-receiver.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+
+    def interval(metric, n, width):
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n)
+        row = _record(metric, 1.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        return row
+
+    db.insert_records(
+        conn,
+        [interval("step_count", 1, 2)]
+        + [interval("distance_walking_running", n, 1)
+           for n in range(3, 103, 10)],
+    )
+    try:
+        assert vault.raw_resolution_seconds(conn, "step_count") is None
+        assert vault.raw_resolution_seconds(conn, "distance_walking_running") == 0
+        marked = json.loads(conn.execute(
+            "SELECT value FROM vault_meta WHERE key = ?",
+            (vault.VAULT_META_BUCKET_SECONDS,),
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    assert marked == {}
+
+
+def test_receiver_marking_distinguishes_sample_and_bucket_widths(tmp_path):
+    def marked_resolution(target, width):
+        conn = db.connect(target)
+        db.init_db(conn)
+        rows = []
+        for n in range(1, 101, 10):
+            start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n)
+            row = _record("step_count", 1.0, "2026-08-20", n)
+            row["start_utc"] = start.isoformat() + "+00:00"
+            row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+            rows.append(row)
+        db.insert_records(conn, rows)
+        result = vault.raw_resolution_seconds(conn, "step_count")
+        conn.close()
+        return result
+
+    assert marked_resolution(tmp_path / "twenty.db", 20) == 20
+    assert marked_resolution(tmp_path / "two.db", 2) == 0
+
+
 def test_bucketing_is_per_source_so_arbitration_survives(tmp_path):
     """Two devices' samples must not collapse into one row.
 
@@ -550,3 +692,36 @@ def test_watermark_cap_clears_when_every_day_carries_live_data(tmp_path):
     second = vault.build_vault(source, vault_path, replace=True,
                                measure_gzip=False)
     assert second["history_imported_through"] == "2026-08-21"
+
+
+def test_receiver_marking_skips_zero_width_rows_before_bounding_the_window(
+    tmp_path, monkeypatch,
+):
+    """The evidence window counts usable intervals, not the newest rows.
+
+    Found at review on the dev snapshot (13.9M records): its newest 10,000
+    step_count rows are all zero-width, so a window bounded BEFORE the
+    zero-width filter saw nothing usable and left the vault unknown forever,
+    although thousands of valid widths sat just below the window.
+    """
+    monkeypatch.setattr(vault, "RESOLUTION_SAMPLE_LIMIT", 12)
+    target = tmp_path / "zero-width-head.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+
+    def interval(n, width):
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n)
+        row = _record("step_count", 1.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        return row
+
+    # One batch: ten valid 2 s samples, then fifteen zero-width rows that are
+    # the newest by id. Marking runs once, after the whole batch.
+    rows = [interval(n, 2) for n in range(1, 101, 10)]
+    rows += [_record("step_count", 1.0, "2026-08-21", n) for n in range(1, 16)]
+    db.insert_records(conn, rows)
+    try:
+        assert vault.raw_resolution_seconds(conn, "step_count") == 0
+    finally:
+        conn.close()

@@ -418,6 +418,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     _apply_column_migrations(conn)
     _apply_table_migrations(conn)
 
+    # A receiver vault has no build step from which to copy resolution facts.
+    # Measure its existing raw rows after the schema is ready; build_vault
+    # already writes these keys itself. The marker is additive and idempotent.
+    from . import vault
+    vault.mark_receiver_resolutions(conn)
+
     # The declaration is metadata about the shape after the complete
     # migration sequence above, not about the code that happened to open the
     # file. Preserve created_at while advancing an existing declaration;
@@ -835,6 +841,12 @@ def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
     before = conn.execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0]
     conn.executemany(sql, rows)
     after = conn.execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0]
+    # Receiver batches arrive after init_db. Reconsider only the series still
+    # absent from both resolution metadata keys; the marker's two meta lookups
+    # make this cheap once every mapped series has a decision.
+    if rows:
+        from . import vault
+        vault.mark_receiver_resolutions(conn)
     return after - before
 
 

@@ -32,6 +32,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -1084,6 +1085,139 @@ def _client(timeout: float) -> httpx.Client:
     return httpx.Client(timeout=timeout, transport=_TRANSPORT)
 
 
+def _openrouter_reported_provider(body: bytes) -> str | None:
+    """Extract a provider name from a complete or partial response body."""
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("provider"), str):
+        return data["provider"]
+    match = re.search(rb'"provider"\s*:\s*"([^"\\]*)"', body)
+    if match:
+        return match.group(1).decode("utf-8", errors="replace")
+    return None
+
+
+class _OpenRouterDeadlineTimeout(httpx.ReadTimeout):
+    """Marker preventing the deadline handler from logging twice."""
+
+
+def _openrouter_deadline_timeout(*, flow: str, model: str | None,
+                                 providers: str | None, timeout: float,
+                                 started: float, body: bytes) -> httpx.ReadTimeout:
+    """Log one stalled request and move its first pinned provider to the end."""
+    global OPENROUTER_PROVIDERS, PLAN_PROVIDERS
+    order = _pinned_providers(providers)
+    demoted = order[0] if order else None
+    next_order = order
+    if len(order) > 1:
+        next_order = order[1:] + order[:1]
+        if flow == "plan":
+            PLAN_PROVIDERS = ",".join(next_order)
+        else:
+            OPENROUTER_PROVIDERS = ",".join(next_order)
+    reported = _openrouter_reported_provider(body) if body else None
+    reported_text = reported if reported is not None else (
+        "unknown" if body else "none")
+    detail = (
+        "OpenRouter wall-clock deadline expired: "
+        f"flow={flow} model={model} pin={'PLAN_PROVIDERS' if flow == 'plan' else 'OPENROUTER_PROVIDERS'} "
+        f"provider_order={order!r} elapsed={time.monotonic() - started:.3f}s "
+        f"timeout={timeout}s reported_provider={reported_text!r} "
+        f"demoted={demoted!r} next_provider_order={next_order!r}"
+    )
+    _announce("openrouter_deadline", detail)
+    return _OpenRouterDeadlineTimeout(detail)
+
+
+def _openrouter_request(payload: dict, *, timeout: float, flow: str,
+                        model: str | None = None,
+                        providers: str | None = None) -> dict:
+    """Make one OpenRouter request with a total, rather than read, deadline."""
+    started = time.monotonic()
+    deadline = started + float(timeout)
+    body = bytearray()
+    request_url = f"{OPENROUTER_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {_openrouter_api_key()}"}
+    timer_fired = threading.Event()
+    handles: dict[str, object] = {}
+
+    def close_request() -> None:
+        # Shut the SOCKET down; never close the response or client from this
+        # thread. Measured on a real loopback socket: response.close()/client.close()
+        # from the timer thread neither interrupted a recv blocked in the reading
+        # thread nor avoided contending for its connection lock (a trickling stub
+        # took 5.5 s against a 3 s timeout). shutdown() is lock-free and wakes the
+        # blocked recv, which then fails and is re-raised as the deadline timeout.
+        # Before headers there is no response yet; that phase is one read and the
+        # per-operation read timeout already bounds it.
+        import socket
+        timer_fired.set()
+        response = handles.get("response")
+        stream = getattr(response, "extensions", {}).get("network_stream") \
+            if response is not None else None
+        sock = stream.get_extra_info("socket") if stream is not None else None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    deadline_timer = threading.Timer(max(0.0, float(timeout)), close_request)
+    deadline_timer.daemon = True
+    try:
+        with _client(timeout) as client:
+            handles["client"] = client
+            deadline_timer.start()
+            if hasattr(client, "stream"):
+                with client.stream("POST", request_url, json=payload,
+                                   headers=headers) as resp:
+                    handles["response"] = resp
+                    resp.raise_for_status()
+                    for chunk in resp.iter_bytes():
+                        body.extend(chunk)
+                        if time.monotonic() >= deadline:
+                            raise _openrouter_deadline_timeout(
+                                flow=flow, model=model, providers=providers,
+                                timeout=timeout, started=started,
+                                body=bytes(body))
+            else:
+                resp = client.post(request_url, json=payload, headers=headers)
+                handles["response"] = resp
+                resp.raise_for_status()
+                body.extend(resp.content)
+                if time.monotonic() >= deadline:
+                    raise _openrouter_deadline_timeout(
+                        flow=flow, model=model, providers=providers,
+                        timeout=timeout, started=started,
+                        body=bytes(body))
+        if time.monotonic() >= deadline:
+            raise _openrouter_deadline_timeout(
+                flow=flow, model=model, providers=providers, timeout=timeout,
+                started=started, body=bytes(body))
+        return json.loads(body)
+    except _OpenRouterDeadlineTimeout:
+        raise
+    except httpx.TimeoutException as exc:
+        if timer_fired.is_set() or time.monotonic() >= deadline:
+            raise _openrouter_deadline_timeout(
+                flow=flow, model=model, providers=providers, timeout=timeout,
+                started=started, body=bytes(body)) \
+                from exc
+        raise
+    except Exception as exc:
+        if timer_fired.is_set() or time.monotonic() >= deadline:
+            raise _openrouter_deadline_timeout(
+                flow=flow, model=model, providers=providers, timeout=timeout,
+                started=started, body=bytes(body)) from exc
+        raise
+    finally:
+        deadline_timer.cancel()
+        if deadline_timer.is_alive():
+            deadline_timer.join()
+
+
 def _openrouter_api_key() -> str:
     """Get the process-configured key without logging or exposing it."""
     return OPENROUTER_API_KEY
@@ -1183,14 +1317,9 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
         call_started = time.monotonic()
         data = {}
         try:
-            with _client(timeout) as client:
-                resp = client.post(
-                    f"{OPENROUTER_URL}/chat/completions",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            data = _openrouter_request(
+                payload, timeout=timeout, flow=flow, model=request_model,
+                providers=request_providers)
             _assert_openrouter_response_provider(data, model=request_model)
             content = data["choices"][0]["message"]["content"]
             text = _strip_think(content).strip()
@@ -1914,12 +2043,9 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
     data = {}
     finish_reason = None
     try:
-        with _client(timeout) as client:
-            resp = client.post(f"{OPENROUTER_URL}/chat/completions", json=payload,
-                               headers={"Authorization":
-                                        f"Bearer {_openrouter_api_key()}"})
-            resp.raise_for_status()
-            data = resp.json()
+        data = _openrouter_request(
+            payload, timeout=timeout, flow="tool_loop", model=OPENROUTER_MODEL,
+            providers=OPENROUTER_PROVIDERS)
         _assert_openrouter_response_provider(data)
         choices = data.get("choices") or []
         choice = (choices[0] if choices else None) or {}

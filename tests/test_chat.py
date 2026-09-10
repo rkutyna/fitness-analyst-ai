@@ -18,6 +18,12 @@ from health_advisor.context import VaultContext, VaultOwnershipError
 from tests.conftest import seed_metric
 
 
+@pytest.fixture(autouse=True)
+def _seed_model_path_vault(conn):
+    """Keep legacy model-orchestration tests off the new day-zero path."""
+    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
+
+
 def test_first_question_prompt_is_unchanged_without_history(monkeypatch, vault,
                                                             conn):
     prompts = []

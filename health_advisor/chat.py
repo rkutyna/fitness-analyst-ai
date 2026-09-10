@@ -374,6 +374,7 @@ ASK_CAUSES = (
     "denied_available_figure",
     "withheld_available_figure",
     "contradicted_day_count",
+    "no_data_yet",
 )
 
 _BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
@@ -431,7 +432,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
                no_gather_needed: bool = False,
                denied_available_figure: bool = False,
                withheld_eligible_figure: bool = False,
-               contradicted_day_count: bool = False) -> str:
+               contradicted_day_count: bool = False,
+               no_data_yet: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
 
     ``judge_score`` is ``None`` when no judge ran — the fact-template arm
@@ -448,6 +450,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
     independent fact-set completeness walk. It outranks answer-level denial
     because the missing publication is the more fundamental event.
     """
+    if no_data_yet:
+        return "no_data_yet"
     families = [_status_outcome_family(status) for status in loop_outcomes]
     if "backend_unavailable" in families:
         return "backend_unavailable"
@@ -971,6 +975,61 @@ def _record_question(question: str, as_of: str | None, result: dict,
             print(f"ask question log write failed: {exc}", file=sys.stderr)
         except Exception:
             pass
+
+
+def _no_data_answer(ctx: VaultContext, as_of: str | None) -> dict | None:
+    """Return the Python-owned day-zero answer, or ``None`` for real data.
+
+    The first-date probe is deliberately separate from ``cold_start.describe``:
+    a vault with data must not walk any analytical surface just to decide which
+    ask path it is on.  The full description is only needed after that cheap
+    probe says the vault is empty, where it returns the status text used below.
+    """
+    if not os.path.exists(ctx.db_path):
+        # Prompt-only callers may use an uninitialized context.  There is no
+        # vault to classify, and opening it read-only would fail.
+        return None
+
+    from . import cold_start
+
+    conn = ctx.read_only()
+    try:
+        effective_as_of = as_of or _today(conn).isoformat()
+        if cold_start._first_date(conn, effective_as_of) is not None:
+            return None
+        description = cold_start.describe(
+            conn, effective_as_of,
+            surfaces={"readiness", "training_load", "correlate"},
+        )
+        if description.get("days_of_history") != 0:
+            return None
+        verification = {
+            "ok": True,
+            "grounded": True,
+            "unsupported": [],
+            "figures_total": 0,
+            "figures_verified": 0,
+            "tool_calls": 0,
+            "cause": _ask_cause(
+                {"ok": True}, ledger=[], loop_outcomes=[], no_data_yet=True
+            ),
+        }
+        text = " ".join([
+            "Nothing has synced yet.",
+            description["readiness"]["status_text"],
+            description["training_load"]["status_text"],
+            description["correlate"]["status_text"],
+            "Once your phone has synced a few days, ask again.",
+        ])
+        return {
+            "text": text,
+            "mode": "status",
+            "tool_trace": [],
+            "verification": verification,
+            "days_of_history": 0,
+        }
+    finally:
+        conn.close()
 
 
 def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = None,
@@ -1808,6 +1867,10 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
 
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")
+
+    no_data = _no_data_answer(ctx, as_of)
+    if no_data is not None:
+        return no_data
 
     owned_ledger = ledger_path is None
     temp_path = None

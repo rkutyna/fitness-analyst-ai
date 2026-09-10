@@ -23,6 +23,7 @@ import pytest
 from health_advisor import chat
 from health_advisor import fact_template
 from health_advisor import llm
+from tests.conftest import seed_metric
 
 
 QUESTION = "How often did I cycle last week?"
@@ -31,6 +32,12 @@ AS_OF = "2031-03-09"
 # One invented week of invented riding. The period is what fact keys are built
 # from, so it has to agree with the ledger the arm reads.
 PERIOD = "2031-03-02:2031-03-08"
+
+
+@pytest.fixture(autouse=True)
+def _seed_one_real_day(conn):
+    """Keep this gate suite on the normal ask path after the day-zero guard."""
+    seed_metric(conn, "step_count", "2031-03-08", [1000])
 
 
 def _ride_ledger() -> list[dict]:

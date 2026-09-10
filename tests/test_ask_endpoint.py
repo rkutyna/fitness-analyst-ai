@@ -9,6 +9,13 @@ from fastapi.testclient import TestClient
 from health_advisor import chat, llm, receiver
 from health_advisor import agents, analysis
 from health_advisor import deepdive_verify as DV
+from tests.conftest import seed_metric
+
+
+@pytest.fixture(autouse=True)
+def _seed_model_path_vault(conn):
+    """Leave endpoint orchestration tests on the normal path."""
+    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 LEDGER_FIXTURE = Path(__file__).parent / "fixtures/jog_ledger_live_20260824_claims.jsonl"

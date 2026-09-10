@@ -29,8 +29,14 @@ import httpx
 import pytest
 
 from health_advisor import chat, llm
+from tests.conftest import seed_metric
 
 _REAL_REGISTRY = llm._registry
+
+
+@pytest.fixture(autouse=True)
+def _seed_model_path_vault(conn):
+    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 @pytest.fixture

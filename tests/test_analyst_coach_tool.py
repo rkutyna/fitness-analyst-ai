@@ -6,10 +6,17 @@ import json
 import threading
 
 import httpx
+import pytest
 from fastapi.responses import JSONResponse
 
 from health_advisor import chat, llm, receiver
 from health_advisor.analyst_envelope import Envelope
+from tests.conftest import seed_metric
+
+
+@pytest.fixture(autouse=True)
+def _seed_model_path_vault(conn):
+    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 def _envelope() -> Envelope:

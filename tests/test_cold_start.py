@@ -94,3 +94,19 @@ def test_probe_tolerates_a_daily_metrics_table_without_source_kind():
     conn.execute("INSERT INTO daily_metrics VALUES ('resting_heart_rate','2026-09-01',1,60,60,60,60,60,'count/min')")
     probe = cold_start._probe(conn, "2026-09-09", "2026-10-01", {"resting_heart_rate"})
     assert probe.execute("SELECT count(*) FROM daily_metrics").fetchone()[0] >= 1
+
+
+def test_status_text_names_the_surface_in_words_not_identifiers(tmp_path):
+    """The sentence a tester reads says "training load", never "training_load"
+    (measured live 2026-09-10: three of three answers repeated the identifier)."""
+    import sqlite3
+    from health_advisor import db, cold_start
+    conn = sqlite3.connect(tmp_path / "empty.db")
+    conn.row_factory = sqlite3.Row
+    db.init_db(conn)
+    out = cold_start.describe(conn, "2026-09-09")
+    for surface, block in out.items():
+        if surface == "days_of_history":
+            continue
+        assert "_" not in block["status_text"], (surface, block["status_text"])
+    assert "training load starts" in out["training_load"]["status_text"]

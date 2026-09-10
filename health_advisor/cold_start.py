@@ -150,7 +150,7 @@ def _status_text(surface: str, status: str, starts_on_day: int | None,
     if surface == "correlate":
         return (f"correlate starts after {starts_on_day} paired days; "
                 f"you have {pairs_now or 0} paired days ({as_of})")
-    return (f"{surface} starts on day {starts_on_day} of data; "
+    return (f"{surface.replace('_', ' ')} starts on day {starts_on_day} of data; "
             f"you are on day {day_now} ({as_of})")
 
 
@@ -173,7 +173,7 @@ def _no_data_block(surface: str, as_of: str) -> dict:
         "as_of": as_of,
         "starts_on_date": None,
         "reason": "no health data has synced to this vault yet",
-        "status_text": (f"no health data has synced yet; {surface} starts after "
+        "status_text": (f"no health data has synced yet; {surface.replace('_', ' ')} starts after "
                         f"{needs}"),
     }
 

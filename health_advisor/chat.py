@@ -1141,6 +1141,25 @@ _EMPTY_NARRATION_RE = re.compile(
     r"(?:data|information|records?)\s+(?:is|are)\s+missing)\b",
     re.IGNORECASE,
 )
+_STATED_ABSENCE_RE = re.compile(
+    r"\b(?:no|without)\s+(?:[\w-]+\s+){1,4}"
+    r"(?:data|information|records?|measurements?|readings?)\b",
+    re.IGNORECASE,
+)
+
+
+def _judge_exempt_absence(prose: str, verification: dict) -> bool:
+    """Skip fluency judging for a Python-passed answer that states absence."""
+    if not verification.get("ok") or verification.get("unsupported"):
+        return False
+    verdict = verification.get("verdict")
+    if not isinstance(verdict, dict) or verdict.get("n_failed") != 0:
+        return False
+    return bool(
+        isinstance(prose, str)
+        and (_EMPTY_NARRATION_RE.search(prose)
+             or _STATED_ABSENCE_RE.search(prose))
+    )
 
 _DENIED_AVAILABLE_FIGURE_REASON = "narration denied an available figure"
 _WITHHELD_ELIGIBLE_FIGURE_REASON = "fact set withheld an eligible figure"
@@ -1960,8 +1979,12 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 verify_options["resolved_window"] = resolved_window
             verification = _verify_ask_answer(
                 verify_conn, prose.strip(), claims, ledger, **verify_options)
-            score = (_ask_judge(question, prose.strip(), verification)
-                     if verification.get("ok") else None)
+            score = (
+                None
+                if _judge_exempt_absence(prose.strip(), verification)
+                else (_ask_judge(question, prose.strip(), verification)
+                      if verification.get("ok") else None)
+            )
         finally:
             verify_conn.close()
         if _window_data_unavailable(ledger, resolved_window):
@@ -1989,7 +2012,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             "ledger": ledger,
         }
 
-        if verification.get("ok") and score >= 70 and prose.strip():
+        if (verification.get("ok") and (score is None or score >= 70)
+                and prose.strip()):
             return {
                 "text": prose.strip(), "mode": "narration",
                 "tool_trace": ledger,
@@ -2025,8 +2049,12 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 verify_options["resolved_window"] = resolved_window
             verification = _verify_ask_answer(
                 verify_conn, prose.strip(), claims, ledger, **verify_options)
-            score = (_ask_judge(question, prose.strip(), verification)
-                     if verification.get("ok") else None)
+            score = (
+                None
+                if _judge_exempt_absence(prose.strip(), verification)
+                else (_ask_judge(question, prose.strip(), verification)
+                      if verification.get("ok") else None)
+            )
         finally:
             verify_conn.close()
         if _window_data_unavailable(ledger, resolved_window):
@@ -2054,7 +2082,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             "ledger": ledger,
         }
 
-        if verification.get("ok") and score >= 70 and prose.strip():
+        if (verification.get("ok") and (score is None or score >= 70)
+                and prose.strip()):
             return {
                 "text": prose.strip(), "mode": "narration",
                 "tool_trace": ledger,

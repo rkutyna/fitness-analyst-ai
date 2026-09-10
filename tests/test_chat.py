@@ -61,6 +61,102 @@ def test_fact_template_flag_zero_keeps_the_existing_prose_path(
     assert "CLOSED FACT SET" not in prompts[0]
 
 
+def _recorded_empty_sleep_draft():
+    """The judge-arm draft recorded for consumer #379."""
+    prose = (
+        "I checked the available health data for last week "
+        "(2026-08-31 through 2026-09-06), and I have to be straight with "
+        "you: there is no sleep data to report. The vault reports no sleep "
+        "metrics at all — sleep time (sleep_asleep) is listed as missing "
+        "with zero days of coverage. The sleep-timing regularity tool "
+        "returned 0 nights for the window — it needs at least 14 consecutive "
+        "nights. In short, the watch didn't record any sleep for last week, "
+        "so I can't tell you how you slept."
+    )
+    ledger = [
+        {
+            "sequence": 1,
+            "tool_name": "get_briefing",
+            "arguments": {"start": "2026-08-31", "end": "2026-09-06"},
+            "result": {"window_days": 14},
+            "result_elided": False,
+        },
+        {
+            "sequence": 2,
+            "tool_name": "get_sleep_regularity",
+            "arguments": {},
+            "result": {"n_nights": 0},
+            "result_elided": False,
+        },
+    ]
+    draft = llm.ResearchResponse(prose)
+    draft.claims = [{
+        "field": "n_nights",
+        "value": 0,
+        "source": {"sequence": 2, "path": "$.result.n_nights"},
+    }]
+    return ledger, draft
+
+
+def test_recorded_empty_sleep_answer_skips_a_failing_judge(
+        monkeypatch, vault, conn):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    ledger, draft = _recorded_empty_sleep_draft()
+    judge_calls = []
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", lambda *args, **kwargs: draft)
+    monkeypatch.setattr(
+        chat, "_ask_judge",
+        lambda *args, **kwargs: judge_calls.append(args) or 55,
+    )
+
+    results = [chat.answer_question(
+        vault, "How did I sleep last week?", as_of="2026-09-10")
+        for _ in range(5)]
+
+    assert [result["mode"] for result in results] == ["narration"] * 5
+    assert all(result["text"] == draft.text for result in results)
+    assert all(result["verification"]["judge_score"] is None
+               for result in results)
+    assert all(result["verification"]["cause"] == "ok"
+               for result in results)
+    assert judge_calls == []
+
+
+def test_empty_sleep_exemption_does_not_keep_a_figure_claim(
+        monkeypatch, vault, conn):
+    ledger, draft = _recorded_empty_sleep_draft()
+    draft = llm.ResearchResponse("I slept for 8 hours.", draft.claims)
+    judge_calls = []
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", lambda *args, **kwargs: draft)
+    monkeypatch.setattr(
+        chat, "_verify_ask_answer",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "grounded": True,
+            "unsupported": [],
+            "reason": "",
+            "figures_verified": 1,
+            "figures_total": 1,
+            "verdict": {"n_checkable": 1, "n_failed": 0, "numbers": []},
+        },
+    )
+    monkeypatch.setattr(
+        chat, "_ask_judge",
+        lambda *args, **kwargs: judge_calls.append(args) or 55,
+    )
+
+    result = chat.answer_question(
+        vault, "How did I sleep last week?", as_of="2026-09-10")
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["cause"] == "judge_refused"
+    assert judge_calls
+
+
 def test_fact_template_flag_runs_gather_then_closed_set_narration(
         monkeypatch, vault):
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")

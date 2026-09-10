@@ -79,6 +79,50 @@ def _verify(path):
     )
 
 
+def test_onboarding_vault_meta_settings_round_trip_and_clear(tmp_path):
+    conn = db.connect(tmp_path / "settings.db")
+    db.init_db(conn)
+
+    vault.set_week_start(conn, 0)
+    vault.set_first_sync_reach_days(conn, 30)
+    vault.set_first_sync_records(conn, 400)
+    assert vault.week_start(conn) == 0
+    assert vault.first_sync_reach_days(conn) == 30
+    assert vault.first_sync_records(conn) == 400
+    assert conn.in_transaction
+
+    vault.set_week_start(conn, None)
+    vault.set_first_sync_reach_days(conn, None)
+    vault.set_first_sync_records(conn, None)
+    assert vault.week_start(conn) is None
+    assert vault.first_sync_reach_days(conn) is None
+    assert vault.first_sync_records(conn) is None
+    assert not conn.execute(
+        "SELECT 1 FROM vault_meta WHERE key IN "
+        "('week_start', 'first_sync_reach_days', 'first_sync_records')"
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+
+def test_onboarding_vault_meta_settings_reject_invalid_values(tmp_path):
+    conn = db.connect(tmp_path / "invalid-settings.db")
+    db.init_db(conn)
+
+    with pytest.raises(ValueError, match=r"week_start.*7"):
+        vault.set_week_start(conn, 7)
+    with pytest.raises(ValueError, match=r"week_start.*-1"):
+        vault.set_week_start(conn, -1)
+    with pytest.raises(ValueError, match="first_sync_reach_days"):
+        vault.set_first_sync_reach_days(conn, -1)
+    with pytest.raises(ValueError, match="first_sync_records"):
+        vault.set_first_sync_records(conn, -1)
+
+    conn.rollback()
+    conn.close()
+
+
 def test_allowlist_contains_every_d3_raw_dependency_and_is_single_source():
     """Exact equality, not containment.
 

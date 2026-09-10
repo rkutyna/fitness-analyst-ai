@@ -318,6 +318,73 @@ def set_unit_system(conn: sqlite3.Connection, name: str | None) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (name,))
 
 
+def week_start(conn: sqlite3.Connection) -> int | None:
+    """The intake-declared first weekday, Monday as 0, or ``None``."""
+    value = _vault_meta_value(conn, "week_start")
+    return int(value) if value is not None else None
+
+
+def set_week_start(conn: sqlite3.Connection, weekday: int | None) -> None:
+    """Declare (or clear) the intake-declared first weekday."""
+    if weekday is None:
+        conn.execute("DELETE FROM vault_meta WHERE key = 'week_start'")
+        return
+    if (isinstance(weekday, bool) or not isinstance(weekday, int)
+            or not 0 <= weekday <= 6):
+        raise ValueError(
+            f"week_start must be an integer from 0 to 6 or None, got {weekday!r}"
+        )
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('week_start', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (weekday,))
+
+
+def first_sync_reach_days(conn: sqlite3.Connection) -> int | None:
+    """The iOS first-sync reach in days, or ``None`` if undeclared."""
+    value = _vault_meta_value(conn, "first_sync_reach_days")
+    return int(value) if value is not None else None
+
+
+def set_first_sync_reach_days(
+    conn: sqlite3.Connection, days: int | None,
+) -> None:
+    """Declare (or clear) the iOS first-sync reach in days."""
+    if days is None:
+        conn.execute("DELETE FROM vault_meta WHERE key = 'first_sync_reach_days'")
+        return
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        raise ValueError(
+            f"first_sync_reach_days must be a non-negative integer or None, "
+            f"got {days!r}"
+        )
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('first_sync_reach_days', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (days,))
+
+
+def first_sync_records(conn: sqlite3.Connection) -> int | None:
+    """The iOS first-sync record count, or ``None`` if undeclared."""
+    value = _vault_meta_value(conn, "first_sync_records")
+    return int(value) if value is not None else None
+
+
+def set_first_sync_records(
+    conn: sqlite3.Connection, count: int | None,
+) -> None:
+    """Declare (or clear) the iOS first-sync record count."""
+    if count is None:
+        conn.execute("DELETE FROM vault_meta WHERE key = 'first_sync_records'")
+        return
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError(
+            f"first_sync_records must be a non-negative integer or None, "
+            f"got {count!r}"
+        )
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('first_sync_records', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (count,))
+
+
 def _vault_meta_value(conn: sqlite3.Connection, key: str) -> str | None:
     """One vault_meta value, or None when unset OR when the table does not exist.
 

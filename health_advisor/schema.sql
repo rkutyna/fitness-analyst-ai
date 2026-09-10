@@ -40,6 +40,10 @@ CREATE INDEX IF NOT EXISTS idx_device_tokens_environment
 -- therefore "a claimed vault cannot be opened by the wrong session", not "every
 -- open is authorised". `VaultContext.claim()` is what makes it true of a vault.
 --
+-- `week_start` is written by the intake's structure card.
+-- `first_sync_reach_days` is written by the iOS first sync through the receiver.
+-- `first_sync_records` is written by the iOS first sync through the receiver.
+--
 -- `history_imported_through`, when present, is the inclusive final local date
 -- imported by `vault.build_vault`. HealthKit-direct ingest refuses a whole batch
 -- containing a record on or before that date. An absent key deliberately leaves

@@ -24,6 +24,16 @@ _KEY_PART_RE = re.compile(r"^(metric|period|field)=(.*)$")
 _ATTACHMENT_KEY_PART_RE = re.compile(r"^(table|column|row|trend)=(.*)$")
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\}")
 _ADVICE_PREFIX = "advice:"
+_COLD_START_FIELDS = frozenset({
+    "status_text", "starts_on_day", "day_now", "starts_on_date", "status",
+})
+_COLD_START_REFUSAL_STATUSES = frozenset({
+    "establishing_baseline", "insufficient_history", "insufficient_data",
+    "partial", "nothing_moved",
+})
+_COLD_START_PATH_RE = re.compile(
+    r"^\$\.result\.([^.]+)\.cold_start\.([^\.]+)$"
+)
 
 
 def _advice_metric_names(facts: dict[str, dict] | None) -> list[str]:
@@ -431,6 +441,50 @@ def _publish_unambiguous(candidates: list[tuple[str, dict]]) -> dict[str, dict]:
     return published
 
 
+def _cold_start_entries(entries: list[dict], *, sequence=None) -> list[tuple[str, dict]]:
+    """Return refusal-only cold-start leaves as exact JSON-path facts.
+
+    Cold-start values are structural facts, not metric-series values: they have
+    no metric or period identity. Their ledger JSON path is nevertheless a
+    stable, source-backed identity and is the spelling the template can copy.
+    Only the five public leaves needed to explain a refusal enter the closed
+    set; nearby ``reason`` and ``as_of`` context remains out of the narration
+    vocabulary.
+    """
+    by_path = {
+        str(entry.get("path")): entry for entry in entries
+        if isinstance(entry, dict)
+    }
+    candidates: list[tuple[str, dict]] = []
+    for path, status_entry in by_path.items():
+        match = _COLD_START_PATH_RE.fullmatch(path)
+        if not match or match.group(2) != "status":
+            continue
+        if status_entry.get("value") not in _COLD_START_REFUSAL_STATUSES:
+            continue
+        surface = match.group(1)
+        prefix = f"$.result.{surface}.cold_start."
+        for field in _COLD_START_FIELDS:
+            leaf_path = prefix + field
+            entry = by_path.get(leaf_path)
+            if entry is None or entry.get("value") is None:
+                continue
+            candidates.append((leaf_path, {
+                "key": leaf_path,
+                "path": leaf_path,
+                "surface": surface,
+                "field": field,
+                "metric": None,
+                "period": None,
+                "value": entry["value"],
+                "unit": None,
+                "display": str(entry["value"]),
+                "source": {"sequence": sequence,
+                           "path": leaf_path},
+            }))
+    return candidates
+
+
 def _weekly_period_for_eligibility(record: dict, entry: dict) -> str | None:
     """Recover a weekly mean period without reading the publisher helpers."""
     if entry.get("field") != "mean":
@@ -484,6 +538,7 @@ def eligible_fact_keys(ledger: list[dict]) -> set[str]:
         return set()
 
     values_by_key: dict[str, list[object]] = {}
+    cold_values_by_path: dict[str, list[object]] = {}
     for record in ledger:
         if not isinstance(record, dict) or record.get("result_elided"):
             continue
@@ -491,6 +546,23 @@ def eligible_fact_keys(ledger: list[dict]) -> set[str]:
             entries = _verify._ledger_scopes(record)
         except (AttributeError, TypeError, ValueError):
             continue
+        # Cold-start facts are deliberately checked separately from metric
+        # ownership: they have no metric/period identity, but their paths are
+        # still eligible, source-backed publication keys.
+        by_path = {str(entry.get("path")): entry for entry in entries}
+        for path, status_entry in by_path.items():
+            match = _COLD_START_PATH_RE.fullmatch(path)
+            if not match or match.group(2) != "status":
+                continue
+            if status_entry.get("value") not in _COLD_START_REFUSAL_STATUSES:
+                continue
+            prefix = f"$.result.{match.group(1)}.cold_start."
+            for field in _COLD_START_FIELDS:
+                leaf = by_path.get(prefix + field)
+                if leaf is not None and leaf.get("value") is not None:
+                    cold_values_by_path[prefix + field] = (
+                        cold_values_by_path.get(prefix + field, [])
+                        + [leaf.get("value")])
         presentations = [entry for entry in entries
                          if entry.get("field") == "presentation"]
         for entry in entries:
@@ -519,6 +591,9 @@ def eligible_fact_keys(ledger: list[dict]) -> set[str]:
 
     return {
         key for key, values in values_by_key.items()
+        if all(value == values[0] for value in values[1:])
+    } | {
+        path for path, values in cold_values_by_path.items()
         if all(value == values[0] for value in values[1:])
     }
 
@@ -613,6 +688,18 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
                 "source": source,
             }))
     facts = _publish_unambiguous(resolved_candidates)
+    cold_candidates: list[tuple[str, dict]] = []
+    for record in ledger:
+        if not isinstance(record, dict) or record.get("result_elided"):
+            continue
+        try:
+            entries = [entry for entry in _verify._ledger_scopes(record)
+                       if entry.get("kind") == "result"]
+        except (AttributeError, TypeError, ValueError):
+            continue
+        cold_candidates.extend(_cold_start_entries(
+            entries, sequence=record.get("sequence")))
+    facts.update(_publish_unambiguous(cold_candidates))
     _add_period_label_facts(facts)
     return facts
 
@@ -758,6 +845,40 @@ def render_fact_set(facts: dict[str, dict]) -> str:
     """Render facts for the final model turn in deterministic JSON."""
     return json.dumps(facts or {}, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), default=str)
+
+
+def cold_start_guidance(facts: dict[str, dict]) -> str:
+    """Describe how a refusal surface must use its published status sentence."""
+    grouped: dict[str, dict[str, str]] = {}
+    for key, fact in (facts or {}).items():
+        path = fact.get("path", key) if isinstance(fact, dict) else key
+        match = _COLD_START_PATH_RE.fullmatch(str(path))
+        if not match:
+            continue
+        grouped.setdefault(match.group(1), {})[match.group(2)] = str(key)
+
+    lines = []
+    for surface in sorted(grouped):
+        leaves = grouped[surface]
+        status_key = leaves.get("status")
+        status_value = (facts.get(status_key, {}).get("value")
+                        if status_key else None)
+        if status_value not in _COLD_START_REFUSAL_STATUSES:
+            continue
+        status_text = leaves.get("status_text")
+        if status_text:
+            lines.append(
+                f"- {surface}: use {{{status_text}}} as the sentence stating "
+                "why this surface is refusing; do not replace it with a "
+                "generic 'unavailable' paraphrase."
+            )
+    if not lines:
+        return ""
+    return (
+        "COLD-START REFUSAL GUIDANCE: when a surface is refusing, use its "
+        "Python-owned status_text placeholder as the sentence to state the "
+        "measured start and current day.\n" + "\n".join(lines)
+    )
 
 
 def scan_template(template: str, facts: dict[str, dict]) -> dict:

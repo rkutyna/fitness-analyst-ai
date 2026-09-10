@@ -1650,6 +1650,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         **metric_facts,
         **fact_template.build_attachment_facts(ledger),
     }
+    cold_start_guidance = fact_template.cold_start_guidance(facts)
     final_prompt = (
         "You are writing the final answer to the user's question. Return a "
         "prose TEMPLATE only, with no JSON, commentary, or claim metadata. "
@@ -1681,7 +1682,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "the recorded period, unless the wording is inside a supplied "
         "placeholder. "
         "If the facts do not support a figure, omit it.\n\n"
-        "USER QUESTION:\n" + question.strip() + "\n\n"
+        + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
+        + "USER QUESTION:\n" + question.strip() + "\n\n"
         "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
         fact_template.render_fact_set(facts))
     final_status_before = llm.last_loop_status()

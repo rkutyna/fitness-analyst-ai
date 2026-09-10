@@ -818,11 +818,16 @@ def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
         "value = excluded.value, unit = excluded.unit, origin = excluded.origin"
     )
     rows = [{**{k: None for k in _RECORD_OPTIONAL}, **r} for r in rows]
+    mapped_metrics = set()
     if rows:
         # Import lazily: vault.py imports db for its copy/upsert helpers. The
         # declaration check is once per call, before executemany, not once per
         # row in a receiver chunk.
         from . import vault
+        mapped_metrics = {
+            row["metric"] for row in rows
+            if row["metric"] in vault.VAULT_BUCKET_SECONDS
+        }
 
         if vault.is_vault(conn):
             watermark = vault.compacted_through(conn)
@@ -841,12 +846,10 @@ def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
     before = conn.execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0]
     conn.executemany(sql, rows)
     after = conn.execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0]
-    # Receiver batches arrive after init_db. Reconsider only the series still
-    # absent from both resolution metadata keys; the marker's two meta lookups
-    # make this cheap once every mapped series has a decision.
-    if rows:
-        from . import vault
-        vault.mark_receiver_resolutions(conn)
+    # Receiver batches arrive after init_db. Only a mapped series in this batch
+    # supplies new evidence; its bounded window may refine its existing mark.
+    if mapped_metrics:
+        vault.mark_receiver_resolutions(conn, mapped_metrics=mapped_metrics)
     return after - before
 
 

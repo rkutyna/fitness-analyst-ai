@@ -412,6 +412,93 @@ def test_receiver_init_marks_recorded_resolutions_without_rewriting_them(tmp_pat
     conn.close()
 
 
+def test_receiver_resolution_refines_from_bucket_to_samples(tmp_path):
+    """A later finer batch replaces an earlier coarse receiver mark."""
+    target = tmp_path / "refining-receiver.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+
+    def interval(n, width):
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n * 100)
+        row = _record("step_count", 1.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        return row
+
+    db.insert_records(
+        conn,
+        [interval(n, 60) for n in range(vault.RESOLUTION_MIN_REPEAT)],
+    )
+    assert vault.raw_resolution_seconds(conn, "step_count") == 60
+
+    db.insert_records(
+        conn,
+        [interval(n + 100, 2) for n in range(vault.RESOLUTION_MIN_REPEAT)],
+    )
+    assert vault.raw_resolution_seconds(conn, "step_count") == 0
+    conn.close()
+
+
+def test_receiver_resolution_never_coarsens_a_sample_mark(tmp_path):
+    """A later coarse batch cannot hide an earlier sample-resolution mark."""
+    target = tmp_path / "non-coarsening-receiver.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+
+    def interval(n, width):
+        start = datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n * 1000)
+        row = _record("step_count", 1.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        return row
+
+    db.insert_records(
+        conn,
+        [interval(n, 2) for n in range(vault.RESOLUTION_MIN_REPEAT)],
+    )
+    assert vault.raw_resolution_seconds(conn, "step_count") == 0
+
+    db.insert_records(
+        conn,
+        [interval(n + 100, 600) for n in range(vault.RESOLUTION_MIN_REPEAT)],
+    )
+    assert vault.raw_resolution_seconds(conn, "step_count") == 0
+    conn.close()
+
+
+def test_receiver_refinement_queries_only_batch_mapped_series(tmp_path):
+    """A batch for an unmapped metric performs no resolution-window query."""
+    target = tmp_path / "query-bounded-receiver.db"
+    conn = db.connect(target)
+    db.init_db(conn)
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    db.insert_records(conn, [_record("active_energy", 1.0, "2026-08-20", 1)])
+    assert not any("ORDER BY id DESC LIMIT" in sql for sql in statements)
+
+    statements.clear()
+    db.insert_records(conn, [
+        {
+            **_record("step_count", 1.0, "2026-08-20", n),
+            "start_utc": (
+                datetime(2026, 8, 20, 0, 0, 0) + timedelta(seconds=n * 100)
+            ).isoformat() + "+00:00",
+            "end_utc": (
+                datetime(2026, 8, 20, 0, 0, 0)
+                + timedelta(seconds=n * 100 + 60)
+            ).isoformat() + "+00:00",
+        }
+        for n in range(vault.RESOLUTION_MIN_REPEAT)
+    ])
+    window_queries = [
+        sql for sql in statements if "ORDER BY id DESC LIMIT" in sql
+    ]
+    assert len(window_queries) == 1
+    assert "metric = 'step_count'" in window_queries[0]
+    conn.close()
+
+
 def test_receiver_marking_records_coarse_rows_and_refuses_them(tmp_path):
     target = tmp_path / "coarse-receiver.db"
     conn = db.connect(target)

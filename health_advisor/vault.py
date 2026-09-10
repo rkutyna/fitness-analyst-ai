@@ -575,14 +575,19 @@ def _recorded_resolution_seconds(
     return min(candidates) if candidates else None
 
 
-def mark_receiver_resolutions(conn: sqlite3.Connection) -> dict[str, int]:
+def mark_receiver_resolutions(
+    conn: sqlite3.Connection,
+    mapped_metrics: Iterable[str] | None = None,
+) -> dict[str, int]:
     """Record resolutions measured from a receiver-built vault's raw rows.
 
     ``build_vault`` writes the same two metadata keys while it knows its own
     copy operation. Receiver databases have no such operation, so ``init_db``
-    calls this once after schema migration. Existing metadata is never
-    replaced, and a metric without enough evidence is omitted rather than
-    assigned the current build bucket width.
+    calls this once after schema migration. On an ingest batch,
+    ``mapped_metrics`` identifies the mapped series that received rows; those
+    series may refine an existing mark, but only toward finer measured data.
+    A metric without enough evidence is omitted rather than assigned the
+    current build bucket width.
     """
     encoded_buckets = _vault_meta_value(conn, VAULT_META_BUCKET_SECONDS)
     encoded_raw = _vault_meta_value(conn, VAULT_META_RAW_SERIES)
@@ -601,22 +606,46 @@ def mark_receiver_resolutions(conn: sqlite3.Connection) -> dict[str, int]:
             return {}
 
     known = set(buckets) | set(raw_series)
+    candidates = set(VAULT_BUCKET_SECONDS)
+    if mapped_metrics is not None:
+        candidates = candidates & set(mapped_metrics)
     added: dict[str, int] = {}
-    for metric in sorted(VAULT_BUCKET_SECONDS):
-        # The no-rewrite rule is per series: one existing mark does not stop a
-        # different, still-unknown series from being measured later.
-        if metric in known:
+    changed = False
+    for metric in sorted(candidates):
+        # Opening a database only establishes an absent mark. A batch carrying
+        # this metric is the new evidence that permits an existing mark to
+        # refine; this keeps build_vault's declaration independent.
+        if metric in known and mapped_metrics is None:
             continue
         resolution = _recorded_resolution_seconds(conn, metric)
         if resolution is None:
             continue
-        added[metric] = resolution
-        if resolution < VAULT_BUCKET_SECONDS[metric]:
-            raw_series.append(metric)
-        else:
-            buckets[metric] = resolution
+        if metric not in known:
+            added[metric] = resolution
+            changed = True
+            if resolution < VAULT_BUCKET_SECONDS[metric]:
+                raw_series.append(metric)
+            else:
+                buckets[metric] = resolution
+            continue
 
-    if not added:
+        if metric in raw_series:
+            current = 0
+        else:
+            current = buckets.get(metric)
+            if (isinstance(current, bool) or not isinstance(current, int)
+                    or current <= 0):
+                continue
+        if resolution >= current:
+            continue
+        added[metric] = resolution
+        changed = True
+        if metric in buckets:
+            del buckets[metric]
+        if metric not in raw_series:
+            raw_series.append(metric)
+
+    if not changed:
         return {}
 
     # Match build_vault's raw-series declaration for non-bucketed dependencies.

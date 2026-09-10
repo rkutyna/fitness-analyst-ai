@@ -279,13 +279,47 @@ def _write_window_override(path: str, config: dict) -> None:
         os.fsync(fh.fileno())
 
 
-def _fallback_answer() -> str:
-    """Render the safe no-claim answer through the shared fallback renderer."""
+def _fallback_answer(verification: dict | None = None) -> str:
+    """Render a safe fallback that names known verification failures."""
     from . import agents
 
+    seed = "I couldn't verify a grounded answer to that question"
+    if isinstance(verification, dict):
+        tokens = []
+        for token in verification.get("unsupported") or []:
+            token = str(token)
+            if token not in tokens:
+                tokens.append(token)
+        numeric_verdict = verification.get("verdict") or {}
+        if (isinstance(numeric_verdict, dict)
+                and "n_failed" in numeric_verdict):
+            try:
+                failed = int(numeric_verdict.get("n_failed", 0))
+                checkable = int(numeric_verdict.get("n_checkable", 0))
+                numeric_status = ("passed" if checkable > 0 and failed == 0
+                                  else "did not pass" if failed else
+                                  "was unavailable")
+            except (TypeError, ValueError):
+                numeric_status = "was unavailable"
+        else:
+            numeric_status = "was unavailable"
+        if tokens:
+            # Count, never the literal: an unsupported token is a figure the
+            # model derived and Python could not bind, and repeating it inside
+            # the refusal would still put an unverified number in front of the
+            # user (#370 Done-when 4; the one rule).
+            count = len(tokens)
+            noun = "one figure" if count == 1 else f"{count} figures"
+            pronoun = "it" if count == 1 else "them"
+            seed = (f"I couldn't tie {noun} in my draft to your data, so I'm "
+                    f"not showing {pronoun}; the numeric verification verdict "
+                    f"{numeric_status}")
+        else:
+            seed = (f"I couldn't verify the draft; the numeric verification "
+                    f"verdict {numeric_status}")
     rendered = agents.render_fallback({
         "talking_points": [{
-            "seed": "I couldn't verify a grounded answer to that question"
+            "seed": seed
         }],
         "suggestions": [],
     })
@@ -1752,7 +1786,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                     ledger)
     if not retry_verification["ok"] or retry_interpolated is None:
         return {
-            "text": _fallback_answer(), "mode": "fallback",
+            "text": _fallback_answer(retry_verification), "mode": "fallback",
             "tool_trace": ledger,
             "verification": {**retry_verification, "retry": True},
         }
@@ -2013,7 +2047,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 "span_suppression_failures": suppression_failures,
             })
         return {
-            "text": _fallback_answer(), "mode": "fallback",
+            "text": _fallback_answer(fallback_verification), "mode": "fallback",
             "tool_trace": selected["ledger"],
             "verification": fallback_verification,
         }

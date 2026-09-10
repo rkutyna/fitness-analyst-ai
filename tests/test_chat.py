@@ -600,7 +600,7 @@ def test_fact_template_double_rejection_is_one_retry_then_same_fallback(
 
     assert result["mode"] == "fallback"
     assert set(result) == {"text", "mode", "tool_trace", "verification"}
-    assert result["text"] == chat._fallback_answer()
+    assert result["text"] == chat._fallback_answer(result["verification"])
     assert "Your rate is 60 today." not in result["text"]
     assert "60" not in result["text"]
     assert "63" not in result["text"]
@@ -853,6 +853,7 @@ ASK_VERIFICATION_KEYS = {
     "ok", "grounded", "unsupported", "reason", "verdict", "structural_claims",
     "figures_verified", "figures_total", "tier_counts", "tier1_path_bound",
     "tier2_metric_recomputed", "tool_calls", "judge_score", "cause",
+    "payload_literals",
 }
 CAPTURE_KEYS = {"attempt", "prose", "claims", "verification", "judge_score",
                 "ledger"}
@@ -1258,6 +1259,7 @@ def test_span_suppression_failure_twice_refuses_whole_answer(
     assert result["verification"]["span_suppression_attempts"] == 2
     assert result["verification"]["span_suppression_failures"] == 2
     assert "26" not in result["text"]
+    assert "one figure" in result["text"]
 
 
 def test_all_claims_failed_never_attempts_span_suppression(

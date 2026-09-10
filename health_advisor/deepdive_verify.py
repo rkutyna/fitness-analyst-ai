@@ -95,6 +95,7 @@ _WORKOUT_RE = re.compile(r"heart_rate|duration|distance|energy|pace|speed", re.I
 _SCAN_COUNT_RE = re.compile(r"tested_count|passed_fdr_count|n_tests", re.I)
 
 _NUM_IN_STR = re.compile(r"-?\d[\d,]*\.?\d*")
+_NUMERIC_LITERAL_RE = re.compile(r"-?\d[\d,]*\.?\d*\Z")
 
 # A model can spend a whole response emitting the same punctuation-only token
 # as a markdown bullet. Keep this detector intentionally narrow: meaningful
@@ -395,7 +396,9 @@ def _scoped_grounding_claims(claims, payload) -> list[dict]:
             if (resolve_payload_value(payload, claim) or {}).get("ok")]
 
 
-def _coach_grounding(prose: str, claims: list[dict], payload=None) -> tuple[bool, list[str]]:
+def _coach_grounding(prose: str, claims: list[dict], payload=None,
+                     literal_bindings_out: list[dict] | None = None
+                     ) -> tuple[bool, list[str]]:
     """Ground numeric occurrences in one complete answer.
 
     The ledger branch below counts numeric-token occurrences as a multiset;
@@ -433,6 +436,12 @@ def _coach_grounding(prose: str, claims: list[dict], payload=None) -> tuple[bool
         for token in _presentation_matches(prose, claims):
             if token in remaining:
                 remaining.remove(token)
+        literal_bindings = _payload_literal_bindings(payload, remaining)
+        for binding in literal_bindings:
+            if binding["token"] in remaining:
+                remaining.remove(binding["token"])
+        if literal_bindings_out is not None:
+            literal_bindings_out.extend(literal_bindings)
         return not remaining, remaining
 
     # Do not turn the claims list into a bag of floats. The old call to
@@ -461,6 +470,12 @@ def _coach_grounding(prose: str, claims: list[dict], payload=None) -> tuple[bool
     for token in _structural_matches(prose, _structural_claims(payload)):
         if token in remaining:
             remaining.remove(token)
+    literal_bindings = _payload_literal_bindings(payload, remaining)
+    for binding in literal_bindings:
+        if binding["token"] in remaining:
+            remaining.remove(binding["token"])
+    if literal_bindings_out is not None:
+        literal_bindings_out.extend(literal_bindings)
     return not remaining, remaining
 
 
@@ -780,6 +795,87 @@ def _ledger_scopes(record: dict) -> list[dict]:
         if root in record and not (root == "result" and record.get("result_elided")):
             walk(record[root], (), root=root)
     return out
+
+
+def _payload_literal_entries(payload) -> list[dict]:
+    """Return numeric scalar leaves published by ledgered tool results.
+
+    This is intentionally separate from ``_ledger_scopes``: a scalar such as
+    ``window_days`` is Python-published context, but it is not a metric claim
+    and must not inherit a nearby metric, period, or field label. Only result
+    leaves are walked; tool arguments and elided results are not evidence.
+    Numeric strings qualify only when the complete string is the number itself
+    (for example ``"14"``). Strings such as ``"14 d"`` and ISO dates never
+    authorize their component tokens.
+    """
+    if not _is_ledger(payload):
+        return []
+    out: list[dict] = []
+
+    def walk(node, path: tuple):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                walk(child, path + (key,))
+            return
+        if isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, path + (index,))
+            return
+        numeric_scalar = (isinstance(node, (int, float))
+                          and not isinstance(node, bool))
+        numeric_string = (isinstance(node, str)
+                          and bool(_NUMERIC_LITERAL_RE.fullmatch(node)))
+        if not numeric_scalar and not numeric_string:
+            return
+        out.append({"value": node, "path": _path_text(path),
+                    "tool_name": record.get("tool_name")})
+
+    for record in payload:
+        if not isinstance(record, dict) or record.get("result_elided"):
+            continue
+        result = record.get("result")
+        walk(result, ("result",))
+    return out
+
+
+def _payload_literal_bindings(payload, tokens: list[str]) -> list[dict]:
+    """Bind unmatched prose tokens to exact scalar values in tool results.
+
+    Numeric ``int``/``float`` leaves compare by numeric value, while a numeric
+    string must equal the prose token exactly. This narrow rule accepts facts
+    Python published without turning units or date strings into measurements.
+    Each returned record names the tool and result key path that supplied the
+    literal.
+    """
+    if not tokens:
+        return []
+    entries = _payload_literal_entries(payload)
+    bindings: list[dict] = []
+    for token in tokens:
+        token_value = _as_float(token)
+        if token_value is None:
+            continue
+        hit = next((entry for entry in entries
+                    if ((isinstance(entry["value"], str)
+                         and entry["value"] == token)
+                        or (not isinstance(entry["value"], str)
+                            and float(entry["value"]) == token_value))),
+                   None)
+        if hit is None:
+            continue
+        path = hit["path"]
+        suffix = path[len("$.result"):]
+        tool_name = str(hit.get("tool_name") or "tool")
+        bindings.append({
+            "token": token,
+            "value": hit["value"],
+            "source": "payload_literal",
+            "tier": "payload_literal",
+            "tool_name": hit["tool_name"],
+            "path": path,
+            "key_path": tool_name + suffix,
+        })
+    return bindings
 
 
 def _source_path_matches(entry_path: str, requested: str) -> bool:
@@ -1690,6 +1786,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
     if not unsupported and not degenerate:
         return {"ok": True, "grounded": True, "unsupported": [],
                 "claims": [], "tier_counts": {"path": 0, "metric": 0},
+                "payload_literals": [],
                 **window_verdict,
                 **_rebind_instrumentation([])}
     if not isinstance(claims, list) or not claims:
@@ -1698,10 +1795,12 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
                            if degenerate else
                            "numbered coach prose has no structured claims"),
                 "tier_counts": {"path": 0, "metric": 0},
+                "payload_literals": [],
                 **window_verdict,
                 **_rebind_instrumentation([])}
 
     structural_claims = _structural_claims(payload)
+    payload_literals: list[dict] = []
     verdict = verify_finding(
         conn, {"claim": prose, "numbers": claims}, as_of=as_of,
         payload=payload)
@@ -1711,7 +1810,8 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
     # Keep the complete ask prose here. The occurrence multiset in
     # _coach_grounding is not sound when sentence fragments share claims.
     grounded, bad = _coach_grounding(
-        prose, verified_claims, payload=payload)
+        prose, verified_claims, payload=payload,
+        literal_bindings_out=payload_literals)
     tier_counts = _binding_tier_counts(verdict["numbers"])
     if not verdict["ok"]:
         failed = next((n for n in verdict["numbers"] if not n["ok"]), None)
@@ -1720,6 +1820,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
                 "reason": (failed or {}).get("reason", "claim verification failed"),
                 "verdict": verdict, "structural_claims": structural_claims,
                 "tier_counts": tier_counts,
+                "payload_literals": payload_literals,
                 **window_verdict,
                 **_rebind_instrumentation(verdict["numbers"])}
 
@@ -1728,6 +1829,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
                 "reason": "grounding evidence does not cover Python-resolved window",
                 "verdict": verdict, "structural_claims": structural_claims,
                 "tier_counts": tier_counts,
+                "payload_literals": payload_literals,
                 **window_verdict,
                 **_rebind_instrumentation(verdict["numbers"])}
 
@@ -1735,6 +1837,7 @@ def verify_coach_claims(conn, prose: str, claims, as_of: str | None = None,
             "reason": "" if grounded else "prose number is not in claims",
             "verdict": verdict, "structural_claims": structural_claims,
             "tier_counts": tier_counts,
+            "payload_literals": payload_literals,
             **window_verdict,
             **_rebind_instrumentation(verdict["numbers"])}
 

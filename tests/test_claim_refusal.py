@@ -180,7 +180,7 @@ def test_rule_r_near_zero_integer_floor_and_direction_bridge():
 def test_rule_r_value_domain_ignores_source_sequence_and_keeps_string_values():
     answer, ledger = _captured()
     verdict = chat._verify_ask_answer(
-        None, "The result is 1.", answer["claims"], ledger)
+        None, "The result is 19.", answer["claims"], ledger)
     assert verdict["ok"] is False
 
     string_ledger, string_claim = _synthetic_claim(

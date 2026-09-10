@@ -231,6 +231,10 @@ MODEL = os.environ.get("HA_LLM_MODEL", "qwen3.5:9b-q4_K_M")
 KEEP_ALIVE = os.environ.get("HA_LLM_KEEP_ALIVE", "10m")  # stay resident across narrate→judge→retry
 OPENROUTER_URL = os.environ.get("HA_OPENROUTER_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.environ.get("HA_OPENROUTER_MODEL")
+# The plan flow's model, or None to use the daily model. Kept raw and resolved at
+# call time by _plan_model(): snapshotting OPENROUTER_MODEL here would freeze the
+# plan pair at import while the daily pair can still be reassigned.
+PLAN_MODEL = os.environ.get("HA_PLAN_MODEL")
 
 # The 60-sample ask battery measured a 1,144.5-token median, a 4,151-token
 # p95, and a 5,365-token maximum for final calls. A 4,200-token ceiling sits
@@ -283,6 +287,17 @@ OPENROUTER_REASONING = os.environ.get("HA_OPENROUTER_REASONING")
 # pin cannot silently degrade to whoever else is cheap); HA_OPENROUTER_PROVIDER_SORT
 # ("throughput", "price", "latency") only reorders OpenRouter's own routing.
 OPENROUTER_PROVIDERS = os.environ.get("HA_OPENROUTER_PROVIDERS", "")
+PLAN_PROVIDERS = os.environ.get("HA_PLAN_PROVIDERS")
+
+
+def _plan_model() -> str | None:
+    """HA_PLAN_MODEL, or the daily model when it is unset."""
+    return PLAN_MODEL if PLAN_MODEL is not None else OPENROUTER_MODEL
+
+
+def _plan_providers() -> str:
+    """HA_PLAN_PROVIDERS, or the daily pin when it is unset (set-but-empty is refused)."""
+    return PLAN_PROVIDERS if PLAN_PROVIDERS is not None else OPENROUTER_PROVIDERS
 OPENROUTER_PROVIDER_SORT = os.environ.get("HA_OPENROUTER_PROVIDER_SORT", "")
 
 # D15 (2026-08-24 amendment): this is an explicit allow-list for every
@@ -398,19 +413,31 @@ APPROVED_OPENROUTER_PROVIDERS = {
         "reka/fp4"}),
     "z-ai/glm-5.3-flash": frozenset({
         "baseten/fp8", "novita/fp8", "together"}),
+    "deepseek/deepseek-v4-pro": frozenset({
+        "novita/fp8", "fireworks", "deepinfra/fp8", "siliconflow/fp8",
+        "baseten/fp4", "nextbit/fp8", "digitalocean", "parasail/fp8",
+        "coreweave/fp8", "together"}),
 }
+# `coreweave/fp8` and `together` are green on Roger's table and carry these
+# tags on the Flash listing, but were NOT serving V4 Pro when the endpoints
+# were resolved on 2026-09-10.
 
 # OpenRouter reports the provider's display name in responses, while the
 # request-side pin and D15 allow-list use endpoint tags. Keep this translation
 # explicit and exact: an unfamiliar display name is not an approved provider.
 OPENROUTER_PROVIDER_TAGS = {
-    "CoreWeave": "coreweave/fp8",
-    "Relace": "relace/fp4",
-    "Reka": "reka/fp4",
-    "Together": "together",
-    "Parasail": "parasail/fp8",
-    "BaseTen": "baseten/fp8",
-    "Novita": "novita/fp8",
+    "DigitalOcean": frozenset({"digitalocean"}),
+    "Fireworks": frozenset({"fireworks"}),
+    "DeepInfra": frozenset({"deepinfra/fp8"}),
+    "SiliconFlow": frozenset({"siliconflow/fp8"}),
+    "Novita": frozenset({"novita/fp8"}),
+    "BaseTen": frozenset({"baseten/fp8", "baseten/fp4"}),
+    "Parasail": frozenset({"parasail/fp8"}),
+    "NextBit": frozenset({"nextbit/fp8"}),
+    "CoreWeave": frozenset({"coreweave/fp8"}),
+    "Together": frozenset({"together"}),
+    "Relace": frozenset({"relace/fp4"}),
+    "Reka": frozenset({"reka/fp4"}),
 }
 
 # D15 (#138): the provider pin says who OpenRouter routes to. It says nothing
@@ -472,14 +499,17 @@ def assert_endpoint_approved(backend: str | None = None) -> None:
             f"{url!r} is not https.")
 
 
-def _pinned_providers() -> list[str]:
+def _pinned_providers(value: str | None = None) -> list[str]:
     """HA_OPENROUTER_PROVIDERS parsed into the order sent to OpenRouter."""
-    return [name.strip() for name in OPENROUTER_PROVIDERS.split(",") if name.strip()]
+    value = OPENROUTER_PROVIDERS if value is None else value
+    return [name.strip() for name in value.split(",") if name.strip()]
 
 
-def _approved_openrouter_providers() -> frozenset[str] | None:
+def _approved_openrouter_providers(
+        model: str | None = None) -> frozenset[str] | None:
     """Return the D15 provider set belonging to the configured model."""
-    return APPROVED_OPENROUTER_PROVIDERS.get(OPENROUTER_MODEL)
+    model = OPENROUTER_MODEL if model is None else model
+    return APPROVED_OPENROUTER_PROVIDERS.get(model)
 
 
 OPENROUTER_REASONING_MODES = ("on", "off", "low")
@@ -521,6 +551,50 @@ def _openrouter_reasoning_field(mode: str) -> dict:
     return {"enabled": mode == "on"}
 
 
+def _assert_openrouter_pair(*, model: str | None, providers: str,
+                            model_variable: str,
+                            providers_variable: str) -> None:
+    """Apply the D15 model/provider checks to one configured flow."""
+    known_models = ", ".join(sorted(APPROVED_OPENROUTER_PROVIDERS))
+    if model is None:
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            f"{model_variable} is unset; set it to a pinned model "
+            f"(known models: {known_models})."
+        )
+    if model.startswith("~"):
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            f"{model_variable} {model!r} is a floating model; set a pinned "
+            f"model (known models: {known_models})."
+        )
+    approved_providers = _approved_openrouter_providers(model)
+    if approved_providers is None:
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            f"{model_variable} {model!r} has no approved provider set "
+            f"(known models: {known_models})."
+        )
+    approved = ", ".join(sorted(approved_providers))
+    pinned = _pinned_providers(providers)
+    if not pinned:
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            f"model {model!r}: {providers_variable} must be set and "
+            f"non-empty (approved: {approved})."
+        )
+    # Every name has to be approved, not just one of them: fallbacks are off, so
+    # the whole list is who may receive the health data.
+    unapproved = [name for name in pinned if name not in approved_providers]
+    if unapproved:
+        raise RuntimeError(
+            "LLM backend 'openrouter' is not approved under D15: "
+            f"{model_variable}={model!r}, {providers_variable} names "
+            f"{', '.join(repr(name) for name in unapproved)}, which D15 does "
+            f"not approve (approved: {approved})."
+        )
+
+
 def assert_backend_approved() -> None:
     """Refuse a provider-facing process whose backend is outside D15's list."""
     if BACKEND not in APPROVED_BACKENDS:
@@ -545,46 +619,20 @@ def assert_backend_approved() -> None:
             "HA_OPENROUTER_API_KEY_FILE and OPENROUTER_API_KEY are both set "
             "but disagree; remove one or make them identical. Refusing to "
             "start rather than silently choosing different credentials.")
-    known_models = ", ".join(sorted(APPROVED_OPENROUTER_PROVIDERS))
-    if OPENROUTER_MODEL is None:
-        raise RuntimeError(
-            "LLM backend 'openrouter' is not approved under D15: "
-            "HA_OPENROUTER_MODEL is unset; set it to a pinned model "
-            f"(known models: {known_models})."
-        )
-    if OPENROUTER_MODEL.startswith("~"):
-        raise RuntimeError(
-            "LLM backend 'openrouter' is not approved under D15: "
-            f"OPENROUTER_MODEL {OPENROUTER_MODEL!r} is a floating model; "
-            "set a pinned model "
-            f"(known models: {known_models})."
-        )
-    approved_providers = _approved_openrouter_providers()
-    if approved_providers is None:
-        raise RuntimeError(
-            "LLM backend 'openrouter' is not approved under D15: "
-            f"OPENROUTER_MODEL {OPENROUTER_MODEL!r} has no approved provider "
-            f"set (known models: {known_models})."
-        )
-    approved = ", ".join(sorted(approved_providers))
-    pinned = _pinned_providers()
-    if not pinned:
-        raise RuntimeError(
-            "LLM backend 'openrouter' is not approved under D15: "
-            f"model {OPENROUTER_MODEL!r}: "
-            "HA_OPENROUTER_PROVIDERS must be set and non-empty "
-            f"(approved: {approved})."
-        )
-    # Every name has to be approved, not just one of them: fallbacks are off, so
-    # the whole list is who may receive the health data.
-    unapproved = [n for n in pinned if n not in approved_providers]
-    if unapproved:
-        raise RuntimeError(
-            "LLM backend 'openrouter' is not approved under D15: "
-            f"model {OPENROUTER_MODEL!r}: "
-            f"HA_OPENROUTER_PROVIDERS names {', '.join(repr(n) for n in unapproved)}, "
-            f"which D15 does not approve (approved: {approved})."
-        )
+    _assert_openrouter_pair(
+        model=OPENROUTER_MODEL,
+        providers=OPENROUTER_PROVIDERS,
+        model_variable="HA_OPENROUTER_MODEL",
+        providers_variable="HA_OPENROUTER_PROVIDERS",
+    )
+    # A missing plan variable inherits the daily pair, resolved now rather than
+    # at import.
+    _assert_openrouter_pair(
+        model=_plan_model(),
+        providers=_plan_providers(),
+        model_variable="HA_PLAN_MODEL",
+        providers_variable="HA_PLAN_PROVIDERS",
+    )
     _openrouter_reasoning_mode()
 
 TIMEOUT_BRIEF = 180       # tool-less, reasoning-OFF call (briefings)
@@ -951,14 +999,14 @@ def _strip_think(text: str) -> str:
     return _THINK_RE.sub("", text or "")
 
 
-def _openrouter_provider() -> dict:
+def _openrouter_provider(providers: str | None = None) -> dict:
     """The `provider` routing block, or {} to let OpenRouter choose.
 
     An explicit allow-list wins and disables fallbacks: a pin that silently
     fails over to an unpinned provider is not a pin, and here the thing being
     pinned is who receives the health data.
     """
-    order = _pinned_providers()
+    order = _pinned_providers(providers)
     if order:
         # `order` is preference; `only` is the boundary. Both are the pinned
         # list, so ordered failover happens strictly INSIDE the D15 set.
@@ -996,7 +1044,7 @@ def _openrouter_provider() -> dict:
     return {}
 
 
-def _assert_openrouter_response_provider(data: dict) -> None:
+def _assert_openrouter_response_provider(data: dict, *, model: str | None = None) -> None:
     """Refuse a response served by a provider D15 does not approve.
 
     OpenRouter returns a display name, not the endpoint tag used in the
@@ -1008,21 +1056,23 @@ def _assert_openrouter_response_provider(data: dict) -> None:
     if not isinstance(data, dict) or "provider" not in data:
         return
     display_name = data.get("provider")
-    tag = (OPENROUTER_PROVIDER_TAGS.get(display_name)
-           if isinstance(display_name, str) else None)
-    approved_providers = _approved_openrouter_providers()
+    tags = (OPENROUTER_PROVIDER_TAGS.get(display_name)
+            if isinstance(display_name, str) else None)
+    approved_providers = _approved_openrouter_providers(model)
+    model = OPENROUTER_MODEL if model is None else model
     if approved_providers is None:
         detail = (
             f"OpenRouter served provider {display_name!r} for model "
-            f"{OPENROUTER_MODEL!r}, which has no approved provider set "
+            f"{model!r}, which has no approved provider set "
             f"(known models: {', '.join(sorted(APPROVED_OPENROUTER_PROVIDERS))})."
         )
         _announce("openrouter_provider_mismatch", detail)
         raise RuntimeError(detail)
-    if tag not in approved_providers:
+    if not tags or not (tags & approved_providers):
         detail = (
             f"OpenRouter served provider {display_name!r}, which maps to "
-            f"{tag!r}; it is not approved for model {OPENROUTER_MODEL!r}. "
+            f"{sorted(tags) if tags else None!r}; it is not approved for model "
+            f"{model!r}. "
             f"Approved endpoint tags for this model are "
             f"{', '.join(sorted(approved_providers))}."
         )
@@ -1071,12 +1121,18 @@ def openrouter_credits(timeout: float = 10) -> dict[str, float]:
 
 
 def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
-             options: dict | None = None) -> str:
+             options: dict | None = None, flow: str = "daily",
+             max_tokens: int | None = None) -> str:
     """Single-shot text/JSON completion. Returns the model's message content, or
     "" on ANY error (timeout, transport, non-200, bad JSON, empty content).
     On the codex backend `options` (Ollama sampling) is ignored and `think`
     maps to reasoning effort."""
+    if flow not in ("daily", "plan"):
+        raise ValueError(f"unsupported completion flow {flow!r}")
     _begin_complete()
+    request_model = OPENROUTER_MODEL if flow == "daily" else _plan_model()
+    request_providers = (OPENROUTER_PROVIDERS if flow == "daily"
+                         else _plan_providers())
     openrouter_reasoning = None
     if BACKEND == "openrouter":
         try:
@@ -1115,13 +1171,13 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                                  detail="OPENROUTER_API_KEY is unset")
             return ""
         payload = {
-            "model": OPENROUTER_MODEL,
+            "model": request_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "reasoning": _openrouter_reasoning_field(openrouter_reasoning),
-            **_openai_sampling(options),
+            **_openai_sampling(options, max_tokens=max_tokens),
         }
-        provider = _openrouter_provider()
+        provider = _openrouter_provider(request_providers)
         if provider:
             payload["provider"] = provider
         call_started = time.monotonic()
@@ -1135,7 +1191,7 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                 )
                 resp.raise_for_status()
                 data = resp.json()
-            _assert_openrouter_response_provider(data)
+            _assert_openrouter_response_provider(data, model=request_model)
             content = data["choices"][0]["message"]["content"]
             text = _strip_think(content).strip()
             _set_complete_status(

@@ -147,6 +147,12 @@ your health data is chosen at request time by price and availability. So:
 - The approved set is keyed by model, since a provider's terms and its endpoint
   capabilities are per-model facts.
 
+`HA_OPENROUTER_MODEL` selects the daily model. The optional plan-flow pair,
+`HA_PLAN_MODEL` and `HA_PLAN_PROVIDERS`, is read once at startup and defaults to
+the daily pair when unset. For the admitted DeepSeek V4 Pro plan model, an
+example pin is `novita/fp8,deepinfra/fp8,parasail/fp8`; every name must be
+approved for the model it accompanies.
+
 **4. There is deliberately no default provider in code.** This is the load-bearing
 decision. A default would mean that forgetting to pin still sends your data
 somewhere — to a provider that happens to be approved, chosen by accident. There

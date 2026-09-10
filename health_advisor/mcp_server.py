@@ -1758,6 +1758,7 @@ def correlate_metrics(ctx: VaultContext, metric_x: str, metric_y: str, lag_days:
     (with 95% CI), Spearman rho, p-values, n_pairs, coverage, and caveats.
     Correlation is NOT causation — report it as an association."""
     conn = ctx.read_only()
+    cold_block = None
     try:
         for m in (metric_x, metric_y):
             if not _metric_exists(conn, m):
@@ -1769,9 +1770,14 @@ def correlate_metrics(ctx: VaultContext, metric_x: str, metric_y: str, lag_days:
             return {"error": str(e)}
         xs, ys, meta = C.paired_series(conn, metric_x, metric_y, lag_days,
                                        start_iso, end_iso)
+        res = C.correlate(xs, ys)
+        if res["status"] == "insufficient_data":
+            from . import cold_start
+            cold_block = cold_start.describe(
+                conn, end_iso, metric_x=metric_x, metric_y=metric_y,
+                surfaces={"correlate"})["correlate"]
     finally:
         conn.close()
-    res = C.correlate(xs, ys)
     lag_semantics = ("same day" if lag_days == 0 else
                      f"{metric_x} on day D-{lag_days} vs {metric_y} on day D")
     caveats = []
@@ -1787,7 +1793,10 @@ def correlate_metrics(ctx: VaultContext, metric_x: str, metric_y: str, lag_days:
         caveats.append("correlation is not causation — report as association")
     return {"metric_x": metric_x, "metric_y": metric_y, "lag_days": lag_days,
             "lag_semantics": lag_semantics, "period": period,
-            "window": [start_iso, end_iso], **meta, **res, "caveats": caveats}
+            "window": [start_iso, end_iso], **meta, **res,
+            **({"cold_start": cold_block, "status_text": cold_block["status_text"]}
+               if cold_block is not None else {}),
+            "caveats": caveats}
 
 
 @tool

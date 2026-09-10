@@ -150,6 +150,7 @@ MOVER_TOPK = {"daily": 3, "deep": 8}
 # the 28-day window present (excludes newly-resumed metrics like a new watch's
 # gait stats), skip near-zero baselines, and cap absurd % swings.
 MOVER_MIN_WINDOW_DAYS = 21
+MOVER_WINDOW_DAYS = 28
 MOVER_BASE_FLOOR = 1e-6
 # A fixed-length comparison needs most of each block present before its mean is
 # a reportable fact. This is the same 75% coverage convention as movers(),
@@ -886,7 +887,8 @@ def _prior_band(conn, as_of: str) -> str | None:
     return prev
 
 
-def readiness(conn, as_of: str | None = None) -> dict:
+def readiness(conn, as_of: str | None = None, *,
+              _include_cold_start: bool = True) -> dict:
     """Recovery readiness for `as_of`, or an explicit refusal to score.
 
     `status` is one of:
@@ -900,6 +902,16 @@ def readiness(conn, as_of: str | None = None) -> dict:
     consumer can always render "N days old" instead of implying "today".
     """
     as_of = _as_of(conn, as_of)
+
+    def refusal(out: dict) -> dict:
+        if _include_cold_start:
+            from . import cold_start
+            block = cold_start.describe(conn, as_of,
+                                        surfaces={"readiness"})["readiness"]
+            out["cold_start"] = block
+            out["status_text"] = block["status_text"]
+        return out
+
     subs, factors, baselined, ages = _readiness_subscores(conn, as_of)
     fresh_age = min((ages[k] for k in subs if k in ages), default=None)
     any_age = min(ages.values(), default=None)
@@ -913,17 +925,17 @@ def readiness(conn, as_of: str | None = None) -> dict:
         if baselined:
             stale_days = min(ages[k] for k in baselined if k in ages)
             latest = (date.fromisoformat(as_of) - timedelta(days=stale_days)).isoformat()
-            return {"status": "stale", "score": None, "band": None,
+            return refusal({"status": "stale", "score": None, "band": None,
                     "as_of": as_of, "latest_date": latest,
                     "stale_days": stale_days,
                     "max_age_days": READINESS_MAX_AGE_DAYS,
                     "note": f"recovery inputs are {stale_days} days old "
                             f"(latest {latest}); not scored",
-                    "factors": factors}
-        return {"status": "establishing_baseline", "score": None, "band": None,
+                    "factors": factors})
+        return refusal({"status": "establishing_baseline", "score": None, "band": None,
                 "as_of": as_of, "latest_date": None, "stale_days": any_age,
                 "note": "recovery readiness needs HRV / resting-HR history; "
-                        "still building a baseline", "factors": factors}
+                        "still building a baseline", "factors": factors})
 
     score = _composite(subs)
     prior = _prior_band(conn, as_of)
@@ -951,6 +963,11 @@ def readiness(conn, as_of: str | None = None) -> dict:
            "field_metrics": {"score": "readiness"}}
     if note:
         out["note"] = note
+    if status == "partial" and _include_cold_start:
+        from . import cold_start
+        block = cold_start.describe(conn, as_of)["readiness"]
+        out["cold_start"] = block
+        out["status_text"] = block["status_text"]
     return out
 
 
@@ -1301,7 +1318,8 @@ def _band_acwr(ratio: float) -> str:
     return "ramping-fast"
 
 
-def training_load(conn, as_of: str | None = None) -> dict:
+def training_load(conn, as_of: str | None = None, *,
+                  _include_cold_start: bool = True) -> dict:
     as_of = _as_of(conn, as_of)
     load_metric = next((m for m in ACWR_LOAD_METRICS if mx.metric_exists(conn, m)), None)
     if not load_metric:
@@ -1317,10 +1335,16 @@ def training_load(conn, as_of: str | None = None) -> dict:
                           _acwr_load_rows(conn, load_metric, as_of,
                                           ACWR_WINDOW_DAYS))
     if len(rows) < ACWR_MIN_CHRONIC_DAYS:
-        return {"status": "insufficient_history", "acwr": None,
+        out = {"status": "insufficient_history", "acwr": None,
                 "load_metric": load_metric, "n_days": len(rows),
                 "min_required": ACWR_MIN_CHRONIC_DAYS,
                 "window_days": ACWR_WINDOW_DAYS}
+        if _include_cold_start:
+            from . import cold_start
+            out["cold_start"] = cold_start.describe(
+                conn, as_of, surfaces={"training_load"})["training_load"]
+            out["status_text"] = out["cold_start"]["status_text"]
+        return out
 
     # Wear gate: keep only days sampled densely enough to describe a worn day.
     # BOTH load figures are means over worn days (scaled to a week): filtering
@@ -1332,9 +1356,15 @@ def training_load(conn, as_of: str | None = None) -> dict:
     worn = [v for _, v, _ in worn_rows]
     min_worn = math.ceil(ACWR_WORN_FRACTION * len(rows))
     if len(worn) < min_worn:
-        return {"status": "insufficient_wear", "acwr": None,
+        out = {"status": "insufficient_wear", "acwr": None,
                 "load_metric": load_metric, "n_worn_days": len(worn),
                 "n_days": len(rows), "min_required": min_worn}
+        if _include_cold_start:
+            from . import cold_start
+            out["cold_start"] = cold_start.describe(
+                conn, as_of, surfaces={"training_load"})["training_load"]
+            out["status_text"] = out["cold_start"]["status_text"]
+        return out
 
     # Acute window is bound by calendar date, not by row position: with a gap in
     # the last week, rows[-7:] would reach back into an 8th day and blend an
@@ -1343,16 +1373,28 @@ def training_load(conn, as_of: str | None = None) -> dict:
     acute_start = (date.fromisoformat(as_of) - timedelta(days=6)).isoformat()
     recent = [v for d, v, _ in worn_rows if d >= acute_start]
     if len(recent) < ACWR_MIN_ACUTE_DAYS:
-        return {"status": "insufficient_recent", "acwr": None,
+        out = {"status": "insufficient_recent", "acwr": None,
                 "load_metric": load_metric, "n_recent_days": len(recent),
                 "n_worn_days": len(worn), "n_days": len(rows),
                 "min_required": ACWR_MIN_ACUTE_DAYS}
+        if _include_cold_start:
+            from . import cold_start
+            out["cold_start"] = cold_start.describe(
+                conn, as_of, surfaces={"training_load"})["training_load"]
+            out["status_text"] = out["cold_start"]["status_text"]
+        return out
 
     acute = (sum(recent) / len(recent)) * 7
     chronic = (sum(worn) / len(worn)) * 7
     ratio = acute / chronic if chronic else None
     if ratio is None:
-        return {"status": "no_load", "acwr": None, "load_metric": load_metric}
+        out = {"status": "no_load", "acwr": None, "load_metric": load_metric}
+        if _include_cold_start:
+            from . import cold_start
+            out["cold_start"] = cold_start.describe(
+                conn, as_of, surfaces={"training_load"})["training_load"]
+            out["status_text"] = out["cold_start"]["status_text"]
+        return out
 
     # workout mix (best-effort; empty list if no workouts table rows)
     wstart = (date.fromisoformat(as_of) - timedelta(days=27)).isoformat()
@@ -1452,10 +1494,38 @@ def _all_metrics(conn):
     return [r["metric"] for r in rows]
 
 
-def movers(conn, as_of: str | None = None, scope: str = "daily") -> list[dict]:
+class MoverResults(list):
+    """List-compatible mover rows with deterministic empty-result metadata."""
+
+    def __init__(self, rows, *, status: str, status_text: str | None = None,
+                 cold_start: dict | None = None):
+        super().__init__(rows)
+        self.status = status
+        self.status_text = status_text
+        self.cold_start = cold_start
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return {
+                "status": self.status,
+                "status_text": self.status_text,
+                "cold_start": self.cold_start,
+            }[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def movers(conn, as_of: str | None = None, scope: str = "daily",
+           *, _include_cold_start: bool = True) -> MoverResults:
     as_of = _as_of(conn, as_of)
-    start = (date.fromisoformat(as_of) - timedelta(days=27)).isoformat()
+    start = (date.fromisoformat(as_of) - timedelta(days=MOVER_WINDOW_DAYS - 1)).isoformat()
     found = []
+    eligible_window = False
     for m in _all_metrics(conn):
         dates, present_vals, unit = mx.series(conn, m, start, as_of)
         if len(present_vals) < MOVER_MIN_WINDOW_DAYS:
@@ -1463,9 +1533,11 @@ def movers(conn, as_of: str | None = None, scope: str = "daily") -> list[dict]:
         # Compare recent vs baseline over WORN days only, so a sparse/intermittent
         # baseline (e.g. backfill before live sync began) can't fabricate a swing.
         # Require most of the window to be worn, or there's no trustworthy baseline.
-        vals = _worn_values(conn, m, as_of, _daily_load_rows(conn, m, as_of, 28))
+        vals = _worn_values(conn, m, as_of,
+                            _daily_load_rows(conn, m, as_of, MOVER_WINDOW_DAYS))
         if len(vals) < MOVER_MIN_WINDOW_DAYS:
             continue
+        eligible_window = True
         rn = max(1, min(7, len(vals) // 3))
         recent_vals, base_vals = vals[-rn:], vals[:-rn]
         recent = sum(recent_vals) / len(recent_vals)
@@ -1497,7 +1569,24 @@ def movers(conn, as_of: str | None = None, scope: str = "daily") -> list[dict]:
                       "recent_avg": mx.r(recent),
                       "baseline_avg": mx.r(base), "n_days": len(vals)})
     found.sort(key=lambda x: (abs(x["effect_sd"]), abs(x["pct"])), reverse=True)
-    return found[:MOVER_TOPK.get(scope, 3)]
+    rows = found[:MOVER_TOPK.get(scope, 3)]
+    if rows:
+        return MoverResults(rows, status="ok")
+    status = "nothing_moved" if eligible_window else "insufficient_history"
+    cold = None
+    status_text = None
+    if _include_cold_start:
+        if status == "insufficient_history":
+            from . import cold_start
+            cold = cold_start.describe(
+                conn, as_of, surfaces={"movers"})["movers"]
+            status_text = cold["status_text"]
+        else:
+            status_text = ("nothing has moved by more than "
+                           f"{MOVER_MIN_EFFECT_SD:g} SD in the last "
+                           f"{MOVER_WINDOW_DAYS} days")
+    return MoverResults([], status=status, status_text=status_text,
+                        cold_start=cold)
 
 
 def long_term(conn, as_of: str | None = None) -> list[dict]:
@@ -1712,6 +1801,7 @@ def build_briefing(conn, scope: str = "daily", as_of: str | None = None, *,
     rd = readiness(conn, as_of)
     tl = training_load(conn, as_of)
     wf = workout_focus(conn, as_of, metric_units=metric_units)
+    mv = movers(conn, as_of, scope)
     parts = {
         "as_of": as_of,
         "scope": scope,
@@ -1719,7 +1809,10 @@ def build_briefing(conn, scope: str = "daily", as_of: str | None = None, *,
         "readiness": rd,
         "trends": trends(conn, as_of),
         "training_load": tl,
-        "movers": movers(conn, as_of, scope),
+        "movers": mv,
+        "movers_status": mv["status"],
+        "movers_status_text": mv["status_text"],
+        "movers_cold_start": mv["cold_start"],
         "long_term": long_term(conn, as_of) if scope == "deep" else [],
         "suggestions": suggestions(rd, tl, wf),
         "highlights": highlights(conn, as_of),

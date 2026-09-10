@@ -29,6 +29,8 @@ def test_correlate_metrics_insufficient(conn, tools):
     out = tools.correlate_metrics("step_count", "active_energy", period="30d")
     assert out["status"] == "insufficient_data"
     assert "pearson_r" not in out
+    assert out["cold_start"]["status"] == "insufficient_data"
+    assert out["cold_start"]["starts_on_day"] == 8
 
 
 def test_scan_correlations_tool(conn, tools):

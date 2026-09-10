@@ -418,7 +418,7 @@ APPROVED_OPENROUTER_PROVIDERS = {
         "baseten/fp4", "nextbit/fp8", "digitalocean", "parasail/fp8",
         "coreweave/fp8", "together"}),
 }
-# `coreweave/fp8` and `together` are green on Roger's table and carry these
+# `coreweave/fp8` and `together` are green-shield on OpenRouter's provider table and carry these
 # tags on the Flash listing, but were NOT serving V4 Pro when the endpoints
 # were resolved on 2026-09-10.
 

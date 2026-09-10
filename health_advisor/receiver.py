@@ -24,6 +24,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 import hmac
 import io
 import json
+import logging
 import os
 import shutil
 import stat
@@ -50,6 +51,42 @@ from . import llm
 from . import normalize as nz
 from . import vault
 from . import analyst_sandbox
+
+logger = logging.getLogger(__name__)
+
+
+_LAST_FILE_SIGNATURE: tuple[int, int] | None = None
+
+
+def _load_file_secret(path: str, *, file_stat=None) -> tuple[str, tuple[int, int]]:
+    """Read and validate a secret file, optionally using an already-read stat."""
+    try:
+        raw = Path(path).read_text()
+    except OSError as exc:
+        raise RuntimeError(
+            f"HA_SECRET_FILE={path!r} is set but could not be read ({exc}). "
+            "Refusing to start: falling back to HA_SHARED_SECRET here could "
+            "serve an unauthenticated receiver that looks configured."
+        ) from exc
+
+    if file_stat is None:
+        file_stat = os.stat(path)
+    mode = stat.S_IMODE(file_stat.st_mode)
+    if mode not in (0o600, 0o400):
+        raise RuntimeError(
+            f"refusing to start: {path} is mode {mode:o}; D16 requires 600 or "
+            "400. Run chmod 600 on it (host side)."
+        )
+
+    secret = "".join(raw.split())          # same as tr -d '[:space:]'
+    if len(secret) < 16:
+        raise RuntimeError(
+            f"refusing to start: the secret in {path} is {len(secret)} chars "
+            "after trimming; D16 requires >= 16. An empty one disables auth "
+            "entirely, which is why this raises instead of falling back."
+        )
+    return secret, (file_stat.st_mtime_ns, file_stat.st_size)
+
 
 def _load_shared_secret() -> tuple[str, str]:
     """The shared secret, preferring a file over the environment (#101, F-43).
@@ -101,33 +138,63 @@ def _load_shared_secret() -> tuple[str, str]:
             )
         return env_secret, "env"
 
-    try:
-        raw = Path(path).read_text()
-    except OSError as exc:
-        raise RuntimeError(
-            f"HA_SECRET_FILE={path!r} is set but could not be read ({exc}). "
-            "Refusing to start: falling back to HA_SHARED_SECRET here could "
-            "serve an unauthenticated receiver that looks configured."
-        ) from exc
-
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    if mode not in (0o600, 0o400):
-        raise RuntimeError(
-            f"refusing to start: {path} is mode {mode:o}; D16 requires 600 or "
-            "400. Run chmod 600 on it (host side)."
-        )
-
-    secret = "".join(raw.split())          # same as tr -d '[:space:]'
-    if len(secret) < 16:
-        raise RuntimeError(
-            f"refusing to start: the secret in {path} is {len(secret)} chars "
-            "after trimming; D16 requires >= 16. An empty one disables auth "
-            "entirely, which is why this raises instead of falling back."
-        )
+    global _LAST_FILE_SIGNATURE
+    secret, signature = _load_file_secret(path)
+    _LAST_FILE_SIGNATURE = signature
     return secret, "file"
 
 
 SHARED_SECRET, SHARED_SECRET_SOURCE = _load_shared_secret()
+_SECRET_FILE_PATH = (os.environ.get("HA_SECRET_FILE", "").strip()
+                     if SHARED_SECRET_SOURCE == "file" else None)
+_SECRET_FILE_SIGNATURE = (_LAST_FILE_SIGNATURE
+                          if SHARED_SECRET_SOURCE == "file" else None)
+_SECRET_FILE_RELOADS = 0
+
+
+def _refresh_file_secret() -> None:
+    """Refresh a file-backed secret after a changed (mtime, size) pair.
+
+    A bad replacement is an operational error, not an authentication state:
+    retain the last valid secret and remember the bad file signature so the
+    same failure is logged only once. The environment path never enters this
+    function.
+    """
+    global SHARED_SECRET, _SECRET_FILE_SIGNATURE, _SECRET_FILE_RELOADS
+    if SHARED_SECRET_SOURCE != "file" or _SECRET_FILE_PATH is None:
+        return
+
+    try:
+        file_stat = os.stat(_SECRET_FILE_PATH)
+    except OSError as exc:
+        signature = ("stat-error", type(exc).__name__, getattr(exc, "errno", None))
+        if _SECRET_FILE_SIGNATURE == signature:
+            return
+        _SECRET_FILE_SIGNATURE = signature
+        logger.warning(
+            "secret file reload refused; retaining previous secret (%s)", exc)
+        return
+
+    signature = (file_stat.st_mtime_ns, file_stat.st_size)
+    if signature == _SECRET_FILE_SIGNATURE:
+        return
+
+    try:
+        secret, _ = _load_file_secret(_SECRET_FILE_PATH, file_stat=file_stat)
+    except (OSError, RuntimeError) as exc:
+        _SECRET_FILE_SIGNATURE = signature
+        logger.warning(
+            "secret file reload refused; retaining previous secret (%s)", exc)
+        return
+
+    SHARED_SECRET = secret
+    _SECRET_FILE_SIGNATURE = signature
+    _SECRET_FILE_RELOADS += 1
+
+
+def _shared_secret_for_request() -> str:
+    _refresh_file_secret()
+    return SHARED_SECRET
 
 # Keep individual executemany calls bounded without giving up the HealthKit
 # batch's one-transaction atomicity.
@@ -166,9 +233,10 @@ def _require_ask_secret(x_health_secret: str | None) -> None:
     check. An accidentally empty ask secret must never turn a health question
     endpoint into an unauthenticated data reader.
     """
+    secret = _shared_secret_for_request()
     presented = _secret_bytes(x_health_secret)
-    if (not SHARED_SECRET or presented is None or
-            not hmac.compare_digest(presented, SHARED_SECRET.encode("utf-8"))):
+    if (not secret or presented is None or
+            not hmac.compare_digest(presented, secret.encode("utf-8"))):
         raise HTTPException(status_code=401, detail="missing or bad shared secret")
 
 
@@ -292,6 +360,7 @@ def _analyst(ctx, request: Request, raw: bytes,
         run_code_fn=run_code_fn, executor_factory=executor_factory)
 
 def _health(ctx):
+    _refresh_file_secret()
     conn = ctx.read_only()
     try:
         n = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
@@ -306,6 +375,7 @@ def _health(ctx):
             # secret. #101 needs this observable: "we deployed the file
             # version" is a claim, and this is the check.
             "secret_source": SHARED_SECRET_SOURCE,
+            "secret_reloads": _SECRET_FILE_RELOADS,
             "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE}
 
 
@@ -435,7 +505,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     small enough for the commit to be atomic, and an exception leaves records,
     tombstones, anchors, and the commit key all rolled back together.
     """
-    _require_ingest_secret(x_health_secret)
+    _require_ingest_secret(x_health_secret, request=request)
 
     try:
         payload = json.loads(raw)
@@ -850,12 +920,18 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     return JSONResponse(response)
 
 
-def _require_ingest_secret(x_health_secret: str | None) -> None:
+def _require_ingest_secret(x_health_secret: str | None, *, request: Request | None = None) -> None:
+    state = getattr(request, "state", None)
+    if state is not None and getattr(state, "ingest_secret_checked", False):
+        return
+    secret = _shared_secret_for_request()
     presented = _secret_bytes(x_health_secret)
-    if (SHARED_SECRET and
+    if (secret and
             (presented is None or
-             not hmac.compare_digest(presented, SHARED_SECRET.encode("utf-8")))):
+             not hmac.compare_digest(presented, secret.encode("utf-8")))):
         raise HTTPException(status_code=401, detail="missing or bad shared secret")
+    if state is not None:
+        state.ingest_secret_checked = True
 
 
 def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
@@ -885,7 +961,8 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         # Returning its response as the dependency value lets the sync route
         # short-circuit without moving the blocking ingest work onto the loop.
         if ingest_guard is not None:
-            _require_ingest_secret(request.headers.get("x-health-secret"))
+            _require_ingest_secret(
+                request.headers.get("x-health-secret"), request=request)
             if refusal := ingest_guard():
                 return refusal
         return await _raw_body(request)

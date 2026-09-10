@@ -10,12 +10,20 @@ configured. Every failure mode therefore raises at startup instead.
 """
 from __future__ import annotations
 
+import importlib
+import logging
+import os
+
 import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from health_advisor import receiver
 
 
 GOOD = "a-perfectly-good-secret-value"
+OLD_FILE_SECRET = "old-file-secret-for-test"
+NEW_FILE_SECRET = "new-file-secret-for-test"
 
 
 def _secret_file(tmp_path, contents: str, mode: int = 0o600):
@@ -36,6 +44,36 @@ def _load(monkeypatch, *, file=None, env=None, require=None):
     if require is not None:
         monkeypatch.setenv("HA_REQUIRE_SECRET", require)
     return receiver._load_shared_secret()
+
+
+def _reload_with_file(monkeypatch, path):
+    monkeypatch.delenv("HA_SHARED_SECRET", raising=False)
+    monkeypatch.setenv("HA_SECRET_FILE", str(path))
+    return importlib.reload(receiver)
+
+
+def _restore_receiver(monkeypatch):
+    monkeypatch.delenv("HA_SECRET_FILE", raising=False)
+    monkeypatch.delenv("HA_SHARED_SECRET", raising=False)
+    monkeypatch.delenv("HA_REQUIRE_SECRET", raising=False)
+    importlib.reload(receiver)
+
+
+def _register(client, secret, token):
+    return client.post(
+        "/v1/push/register",
+        json={"device_token": token, "environment": "sandbox"},
+        headers={"x-health-secret": secret},
+    )
+
+
+def _replace_secret(path, contents, mode=0o600):
+    previous = path.stat()
+    path.write_text(contents)
+    path.chmod(mode)
+    # Keep same-sized rotations deterministic on filesystems with coarse clocks.
+    os_mtime_ns = previous.st_mtime_ns + 1_000_000
+    os.utime(path, ns=(previous.st_atime_ns, os_mtime_ns))
 
 
 # --------------------------------------------------------------- the env path
@@ -164,3 +202,105 @@ def test_a_bad_file_still_refuses_when_the_guard_is_off(monkeypatch, tmp_path):
     path = _secret_file(tmp_path, "short")
     with pytest.raises(RuntimeError, match="chars after trimming"):
         _load(monkeypatch, file=path, env=GOOD)
+
+
+# -------------------------------------------------------------- live rotation
+
+def test_file_secret_rotates_for_a_live_client_and_reports_one_reload(
+        monkeypatch, tmp_path, vault):
+    path = _secret_file(tmp_path, OLD_FILE_SECRET)
+    _reload_with_file(monkeypatch, path)
+    try:
+        with TestClient(receiver.create_app(vault)) as client:
+            assert _register(client, OLD_FILE_SECRET, "before-rotation").status_code == 200
+
+            _replace_secret(path, NEW_FILE_SECRET)
+            health = client.get("/health")
+            assert health.json()["secret_reloads"] == 1
+            assert _register(client, OLD_FILE_SECRET, "old-header").status_code == 401
+            assert _register(client, NEW_FILE_SECRET, "new-header").status_code == 200
+            with pytest.raises(HTTPException):
+                receiver._require_ingest_secret(OLD_FILE_SECRET)
+            receiver._require_ingest_secret(NEW_FILE_SECRET)
+
+            health = client.get("/health")
+            assert health.status_code == 200
+            assert health.json()["secret_source"] == "file"
+            assert health.json()["secret_reloads"] == 1
+    finally:
+        _restore_receiver(monkeypatch)
+
+
+@pytest.mark.parametrize("replacement, mode, new_secret", [
+    ("too-short", 0o600, "too-short"),
+    (NEW_FILE_SECRET, 0o644, NEW_FILE_SECRET),
+])
+def test_invalid_file_rotation_keeps_old_secret_and_logs_once(
+        monkeypatch, tmp_path, vault, caplog, replacement, mode, new_secret):
+    path = _secret_file(tmp_path, OLD_FILE_SECRET)
+    _reload_with_file(monkeypatch, path)
+    try:
+        with caplog.at_level(logging.WARNING, logger=receiver.__name__):
+            with TestClient(receiver.create_app(vault)) as client:
+                _replace_secret(path, replacement, mode=mode)
+                assert _register(client, OLD_FILE_SECRET, "old-still-works").status_code == 200
+                assert _register(client, new_secret, "new-is-refused").status_code == 401
+                assert _register(client, OLD_FILE_SECRET, "old-still-works-again").status_code == 200
+
+                health = client.get("/health")
+                assert health.json()["secret_reloads"] == 0
+
+        reload_warnings = [
+            record for record in caplog.records
+            if "secret file reload" in record.getMessage()
+        ]
+        assert len(reload_warnings) == 1
+    finally:
+        _restore_receiver(monkeypatch)
+
+
+def test_environment_secret_is_not_reread(monkeypatch):
+    monkeypatch.delenv("HA_SECRET_FILE", raising=False)
+    monkeypatch.setenv("HA_SHARED_SECRET", "old-environment-secret")
+    importlib.reload(receiver)
+    try:
+        receiver._require_ingest_secret("old-environment-secret")
+        monkeypatch.setenv("HA_SHARED_SECRET", "new-environment-secret")
+        receiver._require_ingest_secret("old-environment-secret")
+        with pytest.raises(HTTPException):
+            receiver._require_ingest_secret("new-environment-secret")
+    finally:
+        _restore_receiver(monkeypatch)
+
+
+def test_file_auth_checks_one_stat_and_reads_only_after_a_signature_change(
+        monkeypatch, tmp_path):
+    path = _secret_file(tmp_path, OLD_FILE_SECRET)
+    _reload_with_file(monkeypatch, path)
+    try:
+        real_stat = receiver.os.stat
+        real_read_text = receiver.Path.read_text
+        stat_calls = []
+        read_calls = []
+
+        def counted_stat(*args, **kwargs):
+            stat_calls.append(args[0])
+            return real_stat(*args, **kwargs)
+
+        def counted_read_text(self, *args, **kwargs):
+            read_calls.append(self)
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(receiver.os, "stat", counted_stat)
+        monkeypatch.setattr(receiver.Path, "read_text", counted_read_text)
+        receiver._require_ask_secret(OLD_FILE_SECRET)
+        assert len(stat_calls) == 1
+        assert read_calls == []
+
+        _replace_secret(path, NEW_FILE_SECRET)
+        stats_before_rotated_request = len(stat_calls)
+        receiver._require_ask_secret(NEW_FILE_SECRET)
+        assert len(stat_calls) == stats_before_rotated_request + 1
+        assert len(read_calls) == 1
+    finally:
+        _restore_receiver(monkeypatch)

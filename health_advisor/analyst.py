@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -445,6 +446,11 @@ def _write_run_record(run_dir: str, *, run_id: str, question: str,
 # --------------------------------------------------------------------------- #
 # The flow
 # --------------------------------------------------------------------------- #
+def _attempt_dir(run_dir: str, attempt: int) -> str:
+    """The per-attempt directory: ``<run_dir>/attempt-<n>``, created by the executor."""
+    return os.path.join(run_dir, f"attempt-{attempt}")
+
+
 def run_analyst(question: str, vault_path: str, run_dir: str, *,
                  complete_fn=None, run_code_fn: _AnalystRunner | None = None,
                  executor=None, limits: RunLimits | None = None,
@@ -492,8 +498,14 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
     run_kwargs = {"limits": limits}
     if corpus_path is not None:
         run_kwargs["corpus_path"] = corpus_path
+    # Every attempt gets its own directory under run_dir. The executors create
+    # code.py, profile.sb and runner.py EXCLUSIVELY (#20), so a repair attempt
+    # written into the first attempt's directory failed with FileExistsError
+    # on every real executor -- measured live 2026-09-11, the whole repair
+    # loop dead since the exclusive create landed. The run record stays at
+    # run_dir; the attempt directories sit beside it.
     result: "Envelope | Refusal" = run_code_fn(
-        code1, vault_path, run_dir, exec_obj, **run_kwargs)
+        code1, vault_path, _attempt_dir(run_dir, 1), exec_obj, **run_kwargs)
 
     prompt2: str | None = None
     code2: str | None = None
@@ -524,7 +536,8 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
             corpus_configured=corpus_path is not None)
         code2 = extract_code(complete_fn(prompt2))
         code2_sha256 = hashlib.sha256(code2.encode("utf-8")).hexdigest()
-        result = run_code_fn(code2, vault_path, run_dir, exec_obj, **run_kwargs)
+        result = run_code_fn(code2, vault_path, _attempt_dir(run_dir, attempts + 2),
+                             exec_obj, **run_kwargs)
         final_code = code2
         final_code_sha256 = code2_sha256
         attempts += 1

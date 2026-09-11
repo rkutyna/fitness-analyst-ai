@@ -380,3 +380,63 @@ def test_module_imports_without_analyst_runner(monkeypatch):
     every test above having imported `analyst` at collection time)."""
     assert callable(analyst.run_analyst)
     assert callable(analyst.main)
+
+
+
+def test_repair_attempt_runs_in_its_own_directory(tmp_path, vault_path, monkeypatch):
+    """A second attempt must not collide with the first's exclusive artefacts.
+
+    Measured live 2026-09-11: with one run_dir for both attempts every repair
+    failed with FileExistsError on code.py (the executors create their
+    artefacts exclusively since #20), so the repair loop had been dead on every
+    real executor. Both halves are pinned: the directories handed to the
+    runner differ per attempt, and a real executor completes a repair.
+    """
+    import os
+    import sys
+    from health_advisor import analyst as analyst_mod
+    from health_advisor import analyst_runner as runner_mod
+    from health_advisor import analyst_sandbox as sandbox_mod
+    from health_advisor import db
+
+    conn = db.connect(vault_path)
+    db.init_db(conn)
+    conn.close()
+
+    seen_dirs = []
+    responses = iter([
+        "emit('t', ['x'], ['count'], [[1]])",                      # zero-read -> refused
+        "rows = conn.execute('select 1').fetchall()\n"
+        "emit('t', ['x'], ['count'], [[1]])",
+    ])
+
+    def fake_run(code, vault, run_dir, executor, **kwargs):
+        seen_dirs.append(run_dir)
+        if len(seen_dirs) == 1:
+            return analyst_mod.Refusal("ZERO_READ: no vault read")
+        return runner_mod.run_analyst_code(code, vault, run_dir, executor, **kwargs)
+
+    if sys.platform == "darwin":
+        try:
+            executor = sandbox_mod.SeatbeltExecutor()
+        except RuntimeError as exc:
+            import pytest
+            pytest.skip(str(exc))
+    else:
+        executor = object()
+        fake_second = fake_run
+
+        def fake_run(code, vault, run_dir, executor, **kwargs):  # noqa: F811
+            seen_dirs.append(run_dir)
+            return analyst_mod.Refusal("ZERO_READ: no vault read")
+
+    rc = analyst_mod.run_analyst(
+        "q", vault_path, str(tmp_path / "run"),
+        complete_fn=lambda prompt: next(responses),
+        run_code_fn=fake_run, executor=executor, json_output=True,
+        out=__import__("io").StringIO(),
+    )
+    assert len(seen_dirs) == 2
+    assert seen_dirs[0] != seen_dirs[1]
+    assert os.path.dirname(seen_dirs[0]) == os.path.dirname(seen_dirs[1]) == str(tmp_path / "run")
+    assert os.path.exists(tmp_path / "run" / "run_record.json")

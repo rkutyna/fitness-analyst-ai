@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -51,6 +52,7 @@ from . import llm
 from . import normalize as nz
 from . import vault
 from . import analyst_sandbox
+from . import analyst_corpus
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +301,8 @@ def _device_token_payload(raw: bytes) -> tuple[str, str]:
 
 
 def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
-                 executor_factory=analyst_sandbox.default_executor):
+                 executor_factory=analyst_sandbox.default_executor,
+                 corpus_path: str | None = None):
     """Run one analyst question and adapt the CLI JSON for HTTP.
 
     The sandbox is probed before ``run_analyst`` is called. That keeps an
@@ -339,7 +342,8 @@ def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
         exit_code = analyst.run_analyst(
             question, ctx.db_path, run_dir,
             complete_fn=complete_fn, run_code_fn=run_code_fn,
-            executor=executor, json_output=True, out=output)
+            executor=executor, json_output=True, out=output,
+            corpus_path=corpus_path)
         payload = json.loads(output.getvalue())
         if exit_code == 0:
             payload["refused"] = False
@@ -351,15 +355,36 @@ def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
 
 def _analyst(ctx, request: Request, raw: bytes,
              x_health_secret: str | None = None, *, complete_fn=None,
-             run_code_fn=None, executor_factory=analyst_sandbox.default_executor):
+             run_code_fn=None, executor_factory=analyst_sandbox.default_executor,
+             corpus_path: str | None = None):
     """Handle one analyst request outside the FastAPI wiring."""
     _require_ask_secret(x_health_secret)
     payload = _ask_payload(raw)
     return _run_analyst(
         ctx, payload["question"], complete_fn=complete_fn,
-        run_code_fn=run_code_fn, executor_factory=executor_factory)
+        run_code_fn=run_code_fn, executor_factory=executor_factory,
+        corpus_path=corpus_path)
 
-def _health(ctx):
+def _corpus_status(corpus_path: str | None) -> dict:
+    if corpus_path is None:
+        return {"corpus_configured": False, "corpus_version": None}
+    conn = None
+    try:
+        conn = analyst_corpus.open_corpus(corpus_path)
+        row = conn.execute(
+            "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
+        ).fetchone()
+        version = int(row[0]) if row else None
+    except (analyst_corpus.CiteRefusal, ValueError, TypeError,
+            sqlite3.DatabaseError):
+        version = None
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"corpus_configured": True, "corpus_version": version}
+
+
+def _health(ctx, corpus_path: str | None = None):
     _refresh_file_secret()
     conn = ctx.read_only()
     try:
@@ -376,7 +401,8 @@ def _health(ctx):
             # version" is a claim, and this is the check.
             "secret_source": SHARED_SECRET_SOURCE,
             "secret_reloads": _SECRET_FILE_RELOADS,
-            "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE}
+            "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE,
+            **_corpus_status(corpus_path)}
 
 
 def _ask_freshness(ctx, as_of: str | None) -> dict:
@@ -936,6 +962,7 @@ def _require_ingest_secret(x_health_secret: str | None, *, request: Request | No
 
 def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                analyst_executor_factory=analyst_sandbox.default_executor,
+               analyst_corpus_path: str | None = None,
                ingest_guard: Callable[[], Response | None] | None = None,
                health_extra: Callable[[], dict] | None = None) -> FastAPI:
     """One receiver bound to one user's vault.
@@ -969,7 +996,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
 
     @app.get("/health")
     def health():
-        payload = _health(ctx)
+        payload = _health(ctx, analyst_corpus_path)
         if health_extra is not None:
             payload.update(health_extra())
         return payload
@@ -1008,7 +1035,8 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 _run_analyst, ctx, payload["question"],
                 complete_fn=analyst_complete_fn,
                 run_code_fn=analyst_run_code_fn,
-                executor_factory=analyst_executor_factory)
+                executor_factory=analyst_executor_factory,
+                corpus_path=analyst_corpus_path)
         finally:
             analyst_permit.release()
 
@@ -1089,7 +1117,8 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 response = _run_analyst(
                     ctx, question, complete_fn=analyst_complete_fn,
                     run_code_fn=analyst_run_code_fn,
-                    executor_factory=analyst_executor_factory)
+                    executor_factory=analyst_executor_factory,
+                    corpus_path=analyst_corpus_path)
                 if response.status_code != 200:
                     detail = getattr(response, "body", b"")
                     try:
@@ -1187,6 +1216,8 @@ def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:
         "--analyst-executor", choices=("default", "transient"), default=None,
         help="explicit analyst substrate; otherwise use the platform default",
     )
+    ap.add_argument("--corpus", default=None,
+                    help="path to the read-only evidence corpus")
     args = ap.parse_args(argv)
     ctx = VaultContext.local(args.vault, user_id=args.user, writable=True)
     # Resolve this once at process startup. In particular, do not silently
@@ -1194,6 +1225,9 @@ def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:
     selected_executor = args.analyst_executor
     if selected_executor is None:
         selected_executor = os.environ.get("HEALTH_ADVISOR_ANALYST_EXECUTOR")
+    corpus_path = args.corpus
+    if corpus_path is None:
+        corpus_path = os.environ.get("HEALTH_ADVISOR_CORPUS")
     if selected_executor not in (None, "", "default", "transient"):
         ap.error(
             "HEALTH_ADVISOR_ANALYST_EXECUTOR must be 'default' or 'transient'"
@@ -1203,7 +1237,9 @@ def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:
         executor_factory = analyst_sandbox.TransientUnitExecutor
     # Keep access logging disabled so request metadata cannot become a health-data
     # trail in the journal.
-    uvicorn.run(app_factory(ctx, analyst_executor_factory=executor_factory),
+    uvicorn.run(app_factory(
+        ctx, analyst_executor_factory=executor_factory,
+        analyst_corpus_path=corpus_path),
                 host=args.host, port=args.port,
                 access_log=args.access_log, log_level="info")
     return 0

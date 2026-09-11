@@ -357,6 +357,7 @@ class CiteState:
     docs_cited: dict[str, None] = field(default_factory=dict)
     queries: list[dict] = field(default_factory=list)
     chunks_returned: list[list] = field(default_factory=list)
+    passages: list[dict] = field(default_factory=list)
     # #232: BOUNDED at ``caps.refusals_retained`` entries. The three fields
     # below are the whole retained record of refusal, and none of their sizes
     # is a function of how many times the child called ``cite()``:
@@ -395,6 +396,7 @@ class CiteState:
             "docs_cited": list(self.docs_cited),
             "queries": [dict(q) for q in self.queries],
             "chunks_returned": [list(c) for c in self.chunks_returned],
+            "passages": [dict(p) for p in self.passages],
             "refusal_codes": [dict(r) for r in self.refusals],
             # #232: the record must SAY it dropped things. A truncated list
             # with no count is a record that lies about a loop by omission --
@@ -669,6 +671,7 @@ def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
     state.queries.append({"query": query, "expression": expression,
                           "k": k, "doc_id": target, "returned": len(passages)})
     state.chunks_returned.extend([p.doc_id, p.chunk_ix] for p in passages)
+    state.passages.extend(p.as_dict() for p in passages)
     return passages
 
 

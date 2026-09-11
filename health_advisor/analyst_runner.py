@@ -17,6 +17,7 @@ import selectors
 import select
 import signal
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -26,8 +27,10 @@ from pathlib import Path
 from typing import Any
 
 from . import analyst_envelope as envelope
+from . import analyst_corpus
 from . import analyst_ledger as ledger
 from . import analyst_sandbox as sandbox
+from .corpus_build import check_corpus_integrity
 from .analyst_sandbox import _write_exclusive
 from . import normalize
 
@@ -68,6 +71,24 @@ class AnalystLimits:
 
 class QueryRowLimitExceeded(RuntimeError):
     """Raised in the child when the parent refuses an oversized result."""
+
+
+class AnalystEnvelope(envelope.Envelope):
+    """Validated analyst output with a separate parent-owned cite ledger."""
+
+    def __init__(self, base: envelope.Envelope, citation_ledger: dict):
+        super().__init__(
+            run_id=base.run_id, question=base.question,
+            code_sha256=base.code_sha256, vault_sha256=base.vault_sha256,
+            vault_version=base.vault_version, ledger=base.ledger,
+            tables=base.tables, counts=base.counts,
+        )
+        self.citation_ledger = dict(citation_ledger)
+
+    def to_dict(self) -> dict:
+        result = super().to_dict()
+        result["citation_ledger"] = dict(self.citation_ledger)
+        return result
 
 
 # This source is intentionally independent of vault_path.  ``code_path`` is
@@ -337,6 +358,27 @@ finally:
 
 def _named_socket_runner_source(code_path: str) -> str:
     return NAMED_SOCKET_RUNNER_TEMPLATE.replace("__code_path__", repr(code_path))
+
+
+def _named_socket_runner_source_with_cite(code_path: str) -> str:
+    """Adapt the named channel to the fixed anchors only for cite-enabled runs."""
+    source = _named_socket_runner_source(code_path)
+    source = source.replace(
+        '_QUERY_SOCKET.connect(_os.environ["ANALYST_QUERY_SOCKET"])\n',
+        '_QUERY_SOCKET.connect(_os.environ["ANALYST_QUERY_SOCKET"])\n'
+        '_QUERY_FD = _QUERY_SOCKET.fileno()\n', 1)
+    source = source.replace(
+        "_part = _sock.recv(_remaining)",
+        "_part = (_sock.recv(_remaining) if hasattr(_sock, 'recv') "
+        "else _os.read(_sock, _remaining))", 1)
+    source = source.replace(
+        "class _QueryProxy:\n    def __repr__",
+        "class _QueryProxy:\n"
+        "    def __init__(self, _fd):\n        del _fd\n\n"
+        "    def __repr__", 1)
+    source = source.replace(
+        "conn = _QueryProxy()", "conn = _QueryProxy(_QUERY_FD)", 1)
+    return analyst_corpus.child_source_with_cite(source)
 
 
 def _frame(payload: dict) -> bytes:
@@ -724,7 +766,8 @@ def _last_for_sum_shape_reason(sql: str, params: list[Any]) -> str | None:
 
 
 def _service_query(sock: socket.socket, conn, max_rows: int,
-                   pending: bytearray) -> tuple[bool, str | None]:
+                   pending: bytearray, corpus_conn=None,
+                   cite_state=None) -> tuple[bool, str | None]:
     try:
         chunk = sock.recv(_CHUNK)
     except BlockingIOError:
@@ -745,6 +788,16 @@ def _service_query(sock: socket.socket, conn, max_rows: int,
     del pending[:_FRAME_HEADER + size]
     request = json.loads(body.decode("utf-8"))
     try:
+        if not isinstance(request, dict):
+            _send_frame(sock, {"ok": False, "error_type": "CiteRefusal",
+                                "error": "a query request must be an object"})
+            return True, None
+        if request.get("op") == "cite":
+            if corpus_conn is None or cite_state is None:
+                _send_frame(sock, {"ok": False, "error_type": "CiteRefusal",
+                                    "error": "citation retrieval is not configured"})
+                return True, None
+            if request.get("op") == "cite": return analyst_corpus.serve_cite_frame(request, lambda p: _send_frame(sock, p), corpus_conn, cite_state)
         sql = request["sql"]
         params = _decode_params(request.get("params", []))
         if not isinstance(sql, str):
@@ -785,7 +838,8 @@ def _high_fd(fd: int) -> int:
 
 
 def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
-                  limits: Any, vault_path: str):
+                  limits: Any, vault_path: str,
+                  corpus_configured: bool = False):
     """Seatbelt invocation with fd 3 output and fd 4 query input/output."""
     del vault_path
     run_dir_real, work_dir_real = executor._prepare_run_dir(run_dir)
@@ -866,10 +920,11 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
         # The child is told its descriptor numbers instead of having them
         # dup2'd into fixed slots by a `preexec_fn`. `preexec_fn` is unsafe in
         # a process with threads, and the template parameterises both numbers.
-        _write_exclusive(
-            runner_path,
-            _runner_source(str(code_path), query_fd=query_fd, out_fd=out_w),
-        )
+        runner_source = _runner_source(
+            str(code_path), query_fd=query_fd, out_fd=out_w)
+        if corpus_configured:
+            runner_source = analyst_corpus.child_source_with_cite(runner_source)
+        _write_exclusive(runner_path, runner_source)
 
         popen_attempted = True
         proc = subprocess.Popen(
@@ -979,20 +1034,25 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
 
 
 def _invoke_executor(executor, code: str, run_dir: str, query_fd: int,
-                     limits: Any, vault_path: str):
+                     limits: Any, vault_path: str,
+                     corpus_configured: bool = False):
     if isinstance(executor, sandbox.SeatbeltExecutor):
         return _run_seatbelt(executor, code, run_dir, query_fd, limits,
-                             vault_path)
+                             vault_path, corpus_configured)
     if isinstance(executor, sandbox.TransientUnitExecutor):
         return executor.run_with_named_query_channel(
             code, run_dir, query_fd,
-            runner_source=_named_socket_runner_source("code.py"),
+            runner_source=(_named_socket_runner_source_with_cite("code.py")
+                           if corpus_configured else
+                           _named_socket_runner_source("code.py")),
             limits=_limits_for_executor(limits))
     method = getattr(executor, "run_with_query_channel", None)
     if method is None:
         raise TypeError("executor must support the analyst query channel")
-    return method(code, run_dir, query_fd,
-                  runner_source=_runner_source("code.py"),
+    runner_source = _runner_source("code.py")
+    if corpus_configured:
+        runner_source = analyst_corpus.child_source_with_cite(runner_source)
+    return method(code, run_dir, query_fd, runner_source=runner_source,
                   limits=_limits_for_executor(limits))
 
 
@@ -1003,6 +1063,7 @@ def run_analyst_code(
     executor,
     *,
     limits=None,
+    corpus_path: str | None = None,
 ) -> "envelope.Envelope | envelope.Refusal":
     """Run arbitrary analyst Python with parent-mediated SQL execution."""
     # Compile in the parent before spending a sandbox run. The model available
@@ -1019,6 +1080,38 @@ def run_analyst_code(
             f"{exc.lineno}: {exc.msg}. Offending text: "
             f"{(exc.text or '').strip()[:120]!r}")
     max_rows = _max_query_rows(limits)
+    corpus_conn = None
+    cite_state = None
+    if corpus_path is None:
+        citation_ledger = {
+            "corpus_configured": False,
+            "corpus_version": None,
+            "retrieval_channel_closed": True,
+        }
+    else:
+        try:
+            corpus_conn = analyst_corpus.open_corpus(corpus_path)
+            integrity_count = check_corpus_integrity(corpus_conn)
+            if integrity_count != 0:
+                raise analyst_corpus.CiteRefusal(
+                    "corpus_integrity",
+                    f"corpus integrity check found {integrity_count} invalid chunk(s)",
+                )
+            version_row = corpus_conn.execute(
+                "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
+            ).fetchone()
+            corpus_version = int(version_row[0]) if version_row else None
+            if corpus_version is None:
+                raise analyst_corpus.CiteRefusal(
+                    "corpus_version", "the corpus has no readable version")
+            cite_state = analyst_corpus.CiteState()
+        except (analyst_corpus.CiteRefusal, ValueError, TypeError,
+                sqlite3.DatabaseError) as exc:
+            if corpus_conn is not None:
+                corpus_conn.close()
+            return envelope.Refusal(str(exc))
+        citation_ledger = {"corpus_configured": True,
+                           "corpus_version": corpus_version}
     parent_conn = ledger.open_ledgered(vault_path)
     query_parent, query_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     query_child_fd = query_child.detach()
@@ -1028,7 +1121,8 @@ def run_analyst_code(
     def _worker():
         try:
             raw_result.append(_invoke_executor(
-                executor, code, run_dir, query_child_fd, limits, vault_path))
+                executor, code, run_dir, query_child_fd, limits, vault_path,
+                corpus_path is not None))
         except BaseException as exc:
             worker_error.append(exc)
 
@@ -1044,8 +1138,13 @@ def run_analyst_code(
             if not ready:
                 continue
             try:
-                more, reason = _service_query(
-                    query_parent, parent_conn, max_rows, pending)
+                if corpus_conn is None:
+                    more, reason = _service_query(
+                        query_parent, parent_conn, max_rows, pending)
+                else:
+                    more, reason = _service_query(
+                        query_parent, parent_conn, max_rows, pending,
+                        corpus_conn, cite_state)
                 if reason is not None:
                     cap_reason = reason
                 if not more:
@@ -1055,6 +1154,9 @@ def run_analyst_code(
     finally:
         query_parent.close()
         worker.join(timeout=6)
+    if cite_state is not None:
+        citation_ledger = dict(citation_ledger)
+        citation_ledger.update(cite_state.citation_ledger())
     parent_ledger = parent_conn.ledger.as_dict()
     # This ledger was accumulated by THIS process's authorizer, against a
     # connection the child never held. The flag is what lets a caller say so
@@ -1100,10 +1202,15 @@ def run_analyst_code(
                     "table. Reduced diagnostic: "
                     + _reduce_diagnostic(result.stderr))
             else:
-                outcome = envelope.validate(
+                validated = envelope.validate(
                     result.fd3_bytes, run_id=run_id, question="",
                     code_sha256=code_sha, vault_sha256=vault_sha,
                     vault_version=parent_version, ledger=parent_ledger)
+                outcome = (AnalystEnvelope(validated, citation_ledger)
+                            if isinstance(validated, envelope.Envelope)
+                            else validated)
     finally:
         parent_conn.close()
+        if corpus_conn is not None:
+            corpus_conn.close()
     return outcome

@@ -160,6 +160,7 @@ def build_analyst_prompt(
     schema_summary: str,
     *,
     caps: Mapping[str, Any],
+    corpus_configured: bool = False,
 ) -> str:
     """Build the model instruction from a schema summary and explicit caps.
 
@@ -168,6 +169,18 @@ def build_analyst_prompt(
     ``envelope_bytes``, and ``wall_clock_seconds``.  Values are rendered as
     supplied; this function does not choose or silently replace limits.
     """
+    cite_guidance = ""
+    if corpus_configured:
+        cite_guidance = """
+Evidence interface (corpus configured):
+- `cite(query, k=5, doc_id=None)` returns a list of passage records with
+  `doc_id`, `chunk_ix`, `span`, `title`, `year`, `doi`, and `license`.
+- `span` is verbatim corpus text. Quote the span when using it; do not restate
+  it as if it were a quotation.
+- A finding never comes from memory. Retrieve the supporting passage with
+  `cite` before using an evidence claim, and keep the citation information
+  alongside the finding.
+"""
     return f"""You are writing a small Python analysis against a read-only health vault.
 
 Question:
@@ -279,6 +292,8 @@ Canonical metric/unit/aggregation vocabulary (read from normalize.CATALOG):
 
 Vault schema summary:
 {schema_summary}
+
+{cite_guidance}
 
 Before returning code, choose a bounded query and an aggregation shape that fit the caps. Read the vault, derive the requested result in Python, and emit only the compact result tables."""
 

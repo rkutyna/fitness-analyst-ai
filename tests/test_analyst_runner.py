@@ -87,7 +87,7 @@ class LocalChannelExecutor:
             env={"PATH": "/usr/bin:/bin", "HOME": str(run),
                  "TMPDIR": str(run), "ANALYST_QUERY_FD": "4"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            pass_fds=(3, 4), preexec_fn=preexec,
+            close_fds=False, preexec_fn=preexec,
             start_new_session=True,
         )
         os.close(out_w)

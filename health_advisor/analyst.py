@@ -72,7 +72,8 @@ __all__ = ["main", "run_analyst", "build_arg_parser"]
 # --------------------------------------------------------------------------- #
 class _AnalystRunner(Protocol):
     def __call__(self, code: str, vault_path: str, run_dir: str, executor,
-                 *, limits: RunLimits | None = None) -> "Envelope | Refusal":
+                 *, limits: RunLimits | None = None,
+                 corpus_path: str | None = None) -> "Envelope | Refusal":
         ...
 
 
@@ -177,9 +178,11 @@ def refusal_guidance(reason: str) -> str:
 
 
 def build_repair_prompt(question: str, schema: str, caps: dict[str, Any],
-                        refusal_reason: str) -> str:
+                        refusal_reason: str,
+                        *, corpus_configured: bool = False) -> str:
     """A second prompt carrying the first run's refusal and its remediation."""
-    base = build_analyst_prompt(question, schema, caps=caps)
+    base = build_analyst_prompt(
+        question, schema, caps=caps, corpus_configured=corpus_configured)
     return (
         f"{base}\n\n"
         "Your previous code was refused by the runtime.\n"
@@ -311,7 +314,13 @@ def render_provenance(**kwargs) -> str:
 
 def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
                      vault_version: int, code_sha256: str, record_path: str,
-                     question: str, code: str, json_output: bool, out) -> None:
+                     question: str, code: str, json_output: bool, out,
+                     citation_ledger: dict | None = None) -> None:
+    citation_ledger = citation_ledger or {
+        "corpus_configured": False,
+        "corpus_version": None,
+        "retrieval_channel_closed": True,
+    }
     if json_output:
         payload = {
             "question": question,
@@ -329,6 +338,7 @@ def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
                 run_id=run_id, vault_sha256=vault_sha256,
                 vault_version=vault_version, code_sha256=code_sha256,
                 ledger=envelope.ledger, record_path=record_path),
+            "citation_ledger": citation_ledger,
             "code": code,
         }
         print(json.dumps(payload, indent=2, sort_keys=True), file=out)
@@ -343,6 +353,16 @@ def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
         run_id=run_id, vault_sha256=vault_sha256, vault_version=vault_version,
         code_sha256=code_sha256, ledger=envelope.ledger,
         record_path=record_path), file=out)
+    print(file=out)
+    print("Citations:", file=out)
+    if citation_ledger.get("corpus_configured"):
+        for passage in citation_ledger.get("passages") or ():
+            print(
+                "  doc_id={doc_id} chunk_ix={chunk_ix} span={span!r} "
+                "title={title!r} year={year!r} doi={doi!r} license={license!r}"
+                .format(**passage), file=out)
+    else:
+        print("  corpus not configured", file=out)
     print(file=out)
     print("Code:", file=out)
     print(code, file=out)
@@ -407,7 +427,8 @@ def _write_run_record(run_dir: str, *, run_id: str, question: str,
 def run_analyst(question: str, vault_path: str, run_dir: str, *,
                  complete_fn=None, run_code_fn: _AnalystRunner | None = None,
                  executor=None, limits: RunLimits | None = None,
-                 json_output: bool = False, out=None) -> int:
+                 json_output: bool = False, out=None,
+                 corpus_path: str | None = None) -> int:
     """Run one analyst-mode question end to end. Returns a process exit code.
 
     ``complete_fn`` defaults to ``llm.complete``; ``run_code_fn`` defaults to
@@ -442,12 +463,16 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
         conn.close()
 
     caps = _caps_for_prompt()
-    prompt1 = build_analyst_prompt(question, schema, caps=caps)
+    prompt1 = build_analyst_prompt(
+        question, schema, caps=caps, corpus_configured=corpus_path is not None)
     code1 = extract_code(complete_fn(prompt1))
     code1_sha256 = hashlib.sha256(code1.encode("utf-8")).hexdigest()
 
+    run_kwargs = {"limits": limits}
+    if corpus_path is not None:
+        run_kwargs["corpus_path"] = corpus_path
     result: "Envelope | Refusal" = run_code_fn(
-        code1, vault_path, run_dir, exec_obj, limits=limits)
+        code1, vault_path, run_dir, exec_obj, **run_kwargs)
 
     prompt2: str | None = None
     code2: str | None = None
@@ -473,10 +498,12 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
         budget = MAX_SYNTAX_ATTEMPTS if syntax else MAX_SUBSTANTIVE_ATTEMPTS
         if attempts >= budget:
             break
-        prompt2 = build_repair_prompt(question, schema, caps, result.reason)
+        prompt2 = build_repair_prompt(
+            question, schema, caps, result.reason,
+            corpus_configured=corpus_path is not None)
         code2 = extract_code(complete_fn(prompt2))
         code2_sha256 = hashlib.sha256(code2.encode("utf-8")).hexdigest()
-        result = run_code_fn(code2, vault_path, run_dir, exec_obj, limits=limits)
+        result = run_code_fn(code2, vault_path, run_dir, exec_obj, **run_kwargs)
         final_code = code2
         final_code_sha256 = code2_sha256
         attempts += 1
@@ -497,7 +524,8 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
         result, run_id=run_id, vault_sha256=vault_sha256,
         vault_version=vault_version, code_sha256=final_code_sha256,
         record_path=str(record_path), question=question, code=final_code,
-        json_output=json_output, out=out)
+        json_output=json_output, out=out,
+        citation_ledger=getattr(result, "citation_ledger", None))
     return 0
 
 
@@ -516,6 +544,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Path to the health vault SQLite file.")
     parser.add_argument("--question", required=True,
                         help="The question to answer.")
+    parser.add_argument("--corpus", default=None,
+                        help="Path to the read-only evidence corpus.")
     parser.add_argument("--run-dir", default=None,
                         help="Directory for run artifacts (default: a fresh "
                              "temp directory).")
@@ -547,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return run_analyst(args.question, args.vault, run_dir,
-                           json_output=args.json)
+                           json_output=args.json, corpus_path=args.corpus)
     except Exception as exc:  # a clean failure, not a bare traceback
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

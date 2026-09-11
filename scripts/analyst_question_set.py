@@ -78,11 +78,15 @@ def _weekly_sql(metric: str, *, jog: bool = False, one_day: bool = False) -> str
         source = f"SELECT date, {value} AS v FROM daily_metrics WHERE metric = ?"
     week_start = ("date(date, '-' || ((CAST(strftime('%w', date) AS INTEGER) "
                   "+ 6) % 7) || ' days')")
+    # The window is the last eight COMPLETE Monday-to-Sunday weeks on or
+    # before the vault's last date, computed in Python by _complete_week_bounds
+    # and bound as parameters. The previous "latest - 63 .. latest - 8 days"
+    # assumed the last date fell mid-week and dropped the final complete week
+    # whenever it did not (measured 2026-09-11: the vault ended on a Monday and
+    # answers reporting the true last eight weeks scored wrong).
     return f"""
-        WITH latest AS (SELECT MAX(date) AS d FROM daily_metrics),
-        bounded AS (
-            {source} AND date BETWEEN date((SELECT d FROM latest), '-63 days')
-            AND date((SELECT d FROM latest), '-8 days')
+        WITH bounded AS (
+            {source} AND date BETWEEN ? AND ?
         )
         SELECT {week_start} AS week_start, {expression} AS value
         FROM bounded
@@ -90,6 +94,19 @@ def _weekly_sql(metric: str, *, jog: bool = False, one_day: bool = False) -> str
         GROUP BY strftime('%Y-W%W', date)
         ORDER BY week_start
     """
+
+
+def _complete_week_bounds(conn: sqlite3.Connection, weeks: int = 8) -> tuple[str, str]:
+    """(first Monday, last Sunday) of the last ``weeks`` complete weeks."""
+    from datetime import date, timedelta
+    latest = conn.execute("SELECT MAX(date) FROM daily_metrics").fetchone()[0]
+    last_day = date.fromisoformat(latest)
+    # The last complete week ends on the most recent Sunday strictly before or
+    # on last_day only if last_day itself is a Sunday; otherwise the Sunday before.
+    days_since_sunday = (last_day.weekday() + 1) % 7   # Monday=1 ... Sunday=0
+    last_sunday = last_day - timedelta(days=days_since_sunday)
+    first_monday = last_sunday - timedelta(days=7 * weeks - 1)
+    return first_monday.isoformat(), last_sunday.isoformat()
 
 
 def _code_for(question: Question) -> str:
@@ -120,9 +137,10 @@ def scripted_complete_fn() -> Callable[[str], str]:
 
 
 def _oracle(conn: sqlite3.Connection, question: Question) -> list[dict]:
+    start, end = _complete_week_bounds(conn)
     rows = conn.execute(
         _weekly_sql(question.metric, jog=question.metric == "jog_minutes"),
-        (question.metric,),
+        (question.metric, start, end),
     ).fetchall()
     return [{"week": row[0], "value": row[1]} for row in rows]
 
@@ -175,18 +193,32 @@ def _envelope_values(payload: dict) -> list[dict]:
             for row in payload["tables"][0]["rows"]]
 
 
+MIN_OVERLAPPING_WEEKS = 6
+
+
 def _correct_first_attempt(oracle: list[dict], payload: dict) -> bool:
+    """Every week the answer states agrees with the oracle, on enough weeks.
+
+    Compared by week key, not by position: "the last eight complete weeks"
+    is a window the model may align one week differently from the oracle,
+    and a table may arrive in descending order. Measured live 2026-09-11:
+    eight of eleven answers were cross-checked and correct on every shared
+    week and the positional comparison scored them all wrong. A stated week
+    the oracle does not know, a value disagreement, or fewer than
+    MIN_OVERLAPPING_WEEKS shared weeks is still incorrect.
+    """
     actual = _envelope_values(payload)
-    if len(actual) != len(oracle):
+    if not actual:
         return False
-    # The oracle's week label is `%Y-W%W`; compare by the Monday encoded in the
-    # child table, avoiding any dependence on a model's display formatting.
-    for expected, found in zip(oracle, actual):
-        if expected["week"] != found["week"]:
+    expected = {row["week"]: float(row["value"]) for row in oracle}
+    shared = 0
+    for found in actual:
+        if found["week"] not in expected:
             return False
-        if abs(float(expected["value"]) - float(found["value"])) > 0.05:
+        if abs(expected[found["week"]] - float(found["value"])) > 0.05:
             return False
-    return True
+        shared += 1
+    return shared >= MIN_OVERLAPPING_WEEKS
 
 
 def run_question_set(vault_path: str | Path, *, complete_fn=None,

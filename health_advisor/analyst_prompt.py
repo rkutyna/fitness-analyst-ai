@@ -270,7 +270,9 @@ Date formats, exact — filter with the stored form, never a guessed one:
 
 Required result shapes:
 - one row per session for session analyses
-- one row per week for trend questions
+- one row per week for trend questions; a "complete week" is a Monday-to-Sunday
+  week that ends on or before the vault's last date -- never include the
+  partial current week, and never stop a week early
 - one row per comparison group for outcome checks
 
 Deterministic quantity declaration (required when your result is one of these
@@ -320,6 +322,9 @@ Vault schema summary:
 {schema_summary}
 
 {cite_guidance}
+
+Reply with exactly ONE fenced ```python block containing the whole program and
+nothing outside it; a reply without code cannot run and is refused.
 
 Before returning code, choose a bounded query and an aggregation shape that fit the caps. Read the vault, derive the requested result in Python, and emit only the compact result tables."""
 

@@ -206,9 +206,16 @@ def extract_code(reply: str) -> str:
     code when there is no fence."""
     if not reply:
         return ""
-    match = _CODE_FENCE_RE.search(reply)
-    if match:
-        return match.group(1).strip("\n")
+    # Several fences: take the longest non-empty one. A reply that opens an
+    # empty fence and then explains itself in prose used to extract to "" --
+    # two of eleven live answers on 2026-09-11 -- and an empty program is a
+    # refusal (EMPTY_COMPLETION), so prefer the block that holds the program.
+    blocks = [m.group(1).strip("\n") for m in _CODE_FENCE_RE.finditer(reply)]
+    blocks = [b for b in blocks if b.strip()]
+    if blocks:
+        return max(blocks, key=len)
+    if _CODE_FENCE_RE.search(reply):
+        return ""
     return reply.strip()
 
 

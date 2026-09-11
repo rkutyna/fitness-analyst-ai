@@ -513,3 +513,13 @@ def test_envelope_with_no_table_is_refused():
                           ledger={"query_count": 1, "rows_read": 1, "tables_read": ["daily_metrics"]})
     assert isinstance(result, env.Refusal)
     assert "no table" in result.reason
+
+
+
+def test_extract_code_prefers_the_non_empty_fence():
+    from health_advisor.analyst import extract_code
+
+    reply = "Here is the plan.\n```python\n```\nActually:\n```python\nrows = 1\nemit('t', ['x'], ['count'], [[rows]])\n```\n"
+    assert extract_code(reply).startswith("rows = 1")
+    assert extract_code("```python\n```\nno code here") == ""
+    assert extract_code("x = 1") == "x = 1"

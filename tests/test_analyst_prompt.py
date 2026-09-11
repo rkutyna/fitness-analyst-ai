@@ -172,3 +172,14 @@ def test_prompt_states_the_stored_date_formats():
         "`yyyymmdd`",
     ):
         assert phrase in prompt_text
+
+
+
+def test_prompt_defines_complete_week_and_demands_one_fenced_block():
+    from health_advisor import analyst_prompt
+
+    caps = {"rows_per_table": 1, "tables_per_run": 1, "cells_total": 1,
+            "distinct_numeric_tokens": 1, "envelope_bytes": 1, "wall_clock_seconds": 1}
+    prompt = analyst_prompt.build_analyst_prompt("q", "schema", caps=caps)
+    assert "complete week" in prompt and "partial current week" in prompt
+    assert "exactly ONE fenced" in prompt

@@ -1496,8 +1496,38 @@ def test_question_log_records_the_question_and_verdict_only(
         row["python_seconds"] + sum(
             call["elapsed_seconds"] for call in row["model_calls"]),
         abs=0.001)
+    assert "timing_anomaly" not in row
     assert "secret" not in lines[0]
     assert "text" not in row and "prose" not in row
+
+
+def test_question_log_publishes_calls_exceeding_elapsed(
+        monkeypatch, tmp_path, capsys):
+    log_path = tmp_path / "questions.jsonl"
+    monkeypatch.setenv("HA_ASK_QUESTION_LOG", str(log_path))
+
+    chat._record_question(
+        "How long did that take?", "2026-09-08",
+        {"mode": "normal", "verification": {}},
+        {
+            "elapsed_seconds": 0.1,
+            "python_seconds": 0.0,
+            "model_call_count": 2,
+            "model_calls": [
+                {"elapsed_seconds": 0.06},
+                {"elapsed_seconds": 0.06},
+            ],
+        },
+    )
+
+    row = json.loads(log_path.read_text(encoding="utf-8"))
+    assert row["python_seconds"] == pytest.approx(-0.02)
+    assert row["timing_anomaly"] == {
+        "kind": "calls_exceed_elapsed",
+        "excess_seconds": pytest.approx(0.02),
+        "model_call_count": 2,
+    }
+    assert "ask_question_timing_anomaly" in capsys.readouterr().err
 
 
 def test_question_log_returns_a_fast_fallback_with_measured_zero_calls(

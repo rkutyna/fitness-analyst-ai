@@ -951,6 +951,26 @@ def _record_question(question: str, as_of: str | None, result: dict,
         verification = result.get("verification") or {}
         mode = result.get("mode")
         model_call_count = accounting.get("model_call_count", 0)
+        elapsed_seconds = float(accounting.get("elapsed_seconds", 0.0))
+        model_calls = accounting.get("model_calls", [])
+        call_elapsed = sum(
+            float(call.get("elapsed_seconds", 0.0))
+            for call in model_calls if isinstance(call, dict)
+        )
+        remainder = elapsed_seconds - call_elapsed
+        timing_anomaly = None
+        if call_elapsed - elapsed_seconds > 0.001:
+            timing_anomaly = {
+                "kind": "calls_exceed_elapsed",
+                "excess_seconds": call_elapsed - elapsed_seconds,
+                "model_call_count": model_call_count,
+            }
+            from . import llm
+            llm._announce(
+                "ask_question_timing_anomaly",
+                f"calls exceed elapsed by {timing_anomaly['excess_seconds']:.6f}s "
+                f"across {model_call_count} model call(s)",
+            )
         row = {
             "asked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "question": question,
@@ -959,14 +979,16 @@ def _record_question(question: str, as_of: str | None, result: dict,
             "reason": verification.get("reason", ""),
             "figures_verified": verification.get("figures_verified", 0),
             "figures_total": verification.get("figures_total", 0),
-            "elapsed_seconds": accounting.get("elapsed_seconds", 0.0),
-            "python_seconds": accounting.get("python_seconds", 0.0),
+            "elapsed_seconds": elapsed_seconds,
+            "python_seconds": remainder if timing_anomaly else max(0.0, remainder),
             "model_call_count": model_call_count,
-            "model_calls": accounting.get("model_calls", []),
+            "model_calls": model_calls,
             # None on a healthy turn. Non-null means the turn's own arithmetic
             # did not add up -- see ModelCallAccounting.snapshot.
             "accounting_anomaly": accounting.get("accounting_anomaly"),
         }
+        if timing_anomaly is not None:
+            row["timing_anomaly"] = timing_anomaly
         print(f"ask question model-call count: {model_call_count}",
               file=sys.stderr)
         if model_call_count == 0 and mode != "fallback":

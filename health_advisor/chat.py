@@ -1122,6 +1122,14 @@ def _fact_template_figure_count(scan: dict, facts: dict[str, dict]) -> int:
                if (facts.get(key) or {}).get("field") != "period_label")
 
 
+def _fact_template_tier_counts(scan: dict, facts: dict[str, dict]) -> dict:
+    """Report the assurances for the placeholders actually interpolated."""
+    resolved = (sum(1 for key in scan.get("placeholders", [])
+                    if key in (facts or {}))
+                if scan.get("ok") else 0)
+    return {"path": resolved, "metric": None}
+
+
 # Every branch requires an explicit data object. The first deploy shipped
 # branches like bare "cannot find" and bare "missing", and within hours a
 # live slotless coaching answer ("if you cannot find a sturdy table ...",
@@ -1708,6 +1716,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # refused.
     ledger_ok = bool(ledger) or (not scan["placeholders"]
                                  and bool(scan["advice_quantities"]))
+    tier_counts = _fact_template_tier_counts(scan, facts)
     verification = {
         "ok": bool(scan["ok"] and ledger_ok),
         "grounded": bool(scan["ok"] and ledger_ok),
@@ -1718,9 +1727,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                               if scan["ok"] else 0),
         "figures_total": _fact_template_figure_count(scan, facts),
         "advice_quantities": advice_quantities,
-        "tier_counts": {"path": 0, "metric": 0},
-        "tier1_path_bound": 0,
-        "tier2_metric_recomputed": 0,
+        "tier_counts": tier_counts,
+        "tier1_path_bound": tier_counts["path"],
+        "tier2_metric_recomputed": tier_counts["metric"],
         "tool_calls": len(ledger),
         "judge_score": None,
         "template_compliant": bool(scan["ok"]),
@@ -1800,6 +1809,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     retry_template = str(raw or "").strip()
     retry_scan = fact_template.scan_template(retry_template, facts)
     retry_advice_quantities: list[str] = []
+    retry_tier_counts = _fact_template_tier_counts(retry_scan, facts)
     retry_verification = {
         "ok": bool(retry_scan["ok"] and (
             ledger or (not retry_scan["placeholders"]
@@ -1814,9 +1824,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                               if retry_scan["ok"] else 0),
         "figures_total": _fact_template_figure_count(retry_scan, facts),
         "advice_quantities": retry_advice_quantities,
-        "tier_counts": {"path": 0, "metric": 0},
-        "tier1_path_bound": 0,
-        "tier2_metric_recomputed": 0,
+        "tier_counts": retry_tier_counts,
+        "tier1_path_bound": retry_tier_counts["path"],
+        "tier2_metric_recomputed": retry_tier_counts["metric"],
         "tool_calls": len(ledger),
         "judge_score": None,
         "template_compliant": bool(retry_scan["ok"]),

@@ -192,8 +192,10 @@ def run_question_set(vault_path: str | Path, *, complete_fn=None,
     run_code_fn = run_code_fn or _scripted_run_code
     conn = db.connect(vault_path, read_only=True)
     results = []
-    run_root = Path(tempfile.mkdtemp(prefix="analyst_question_set_",
-                                     dir=str(Path(vault_path).parent)))
+    # The system temp root, never beside the vault: the sandbox profile denies
+    # file-read-data under the user's home directory by design, so a run root
+    # inside a checkout fails every child with "Operation not permitted".
+    run_root = Path(tempfile.mkdtemp(prefix="analyst_question_set_"))
     try:
         for question in QUESTIONS:
             output = io.StringIO()

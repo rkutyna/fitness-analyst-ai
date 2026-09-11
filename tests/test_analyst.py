@@ -406,8 +406,8 @@ def test_repair_attempt_runs_in_its_own_directory(tmp_path, vault_path, monkeypa
     seen_dirs = []
     responses = iter([
         "emit('t', ['x'], ['count'], [[1]])",                      # zero-read -> refused
-        "rows = conn.execute('select 1').fetchall()\n"
-        "emit('t', ['x'], ['count'], [[1]])",
+        "rows = conn.execute('select count(*) from daily_metrics').fetchall()\n"
+        "emit('t', ['x'], ['count'], [[rows[0][0]]])",
     ])
 
     def fake_run(code, vault, run_dir, executor, **kwargs):
@@ -438,5 +438,36 @@ def test_repair_attempt_runs_in_its_own_directory(tmp_path, vault_path, monkeypa
     )
     assert len(seen_dirs) == 2
     assert seen_dirs[0] != seen_dirs[1]
+    if sys.platform == "darwin":
+        # The whole point: the repaired second attempt ran and rendered.
+        assert rc == 0, "second attempt did not succeed on the real executor"
     assert os.path.dirname(seen_dirs[0]) == os.path.dirname(seen_dirs[1]) == str(tmp_path / "run")
     assert os.path.exists(tmp_path / "run" / "run_record.json")
+
+
+
+def test_run_dir_under_home_is_refused_with_a_stated_reason(tmp_path, vault_path):
+    import os
+    import sys
+    import pytest
+    from health_advisor import analyst as analyst_mod
+    from health_advisor import analyst_sandbox as sandbox_mod
+    from health_advisor import db
+
+    if sys.platform != "darwin":
+        pytest.skip("Seatbelt-only rule")
+    conn = db.connect(vault_path)
+    db.init_db(conn)
+    conn.close()
+    home_run_dir = os.path.join(os.path.expanduser("~"), ".ha-analyst-test-run-dir")
+    try:
+        executor = sandbox_mod.SeatbeltExecutor()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+    with pytest.raises(ValueError, match="home directory"):
+        analyst_mod.run_analyst(
+            "q", vault_path, home_run_dir,
+            complete_fn=lambda prompt: "emit('t', ['x'], ['count'], [[1]])",
+            executor=executor, json_output=True, out=__import__("io").StringIO(),
+        )
+    assert not os.path.exists(home_run_dir)

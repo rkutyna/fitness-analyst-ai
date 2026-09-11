@@ -446,6 +446,26 @@ def _write_run_record(run_dir: str, *, run_id: str, question: str,
 # --------------------------------------------------------------------------- #
 # The flow
 # --------------------------------------------------------------------------- #
+def _refuse_home_run_dir(run_dir: str, executor) -> None:
+    """A run_dir under the home directory can never run under Seatbelt.
+
+    The profile denies file-read-data under the real home (analyst_sandbox
+    build_profile), so the child cannot even open runner.py; the symptom is
+    "analyst process exited with status 2", which reads like model code
+    failing. Refuse up front with the actual reason. Only the Seatbelt
+    executor carries this rule; fakes and the Linux executor do not.
+    """
+    if not isinstance(executor, analyst_sandbox.SeatbeltExecutor):
+        return
+    real_home = os.path.realpath(os.path.expanduser("~"))
+    real_run = os.path.realpath(run_dir)
+    if real_run == real_home or real_run.startswith(real_home + os.sep):
+        raise ValueError(
+            "run_dir is inside the home directory, which the sandbox profile "
+            "denies to the child; use a directory under the system temp root "
+            "(the CLI default) instead")
+
+
 def _attempt_dir(run_dir: str, attempt: int) -> str:
     """The per-attempt directory: ``<run_dir>/attempt-<n>``, created by the executor."""
     return os.path.join(run_dir, f"attempt-{attempt}")
@@ -489,6 +509,7 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
     finally:
         conn.close()
 
+    _refuse_home_run_dir(run_dir, exec_obj)
     caps = _caps_for_prompt()
     prompt1 = build_analyst_prompt(
         question, schema, caps=caps, corpus_configured=corpus_path is not None)

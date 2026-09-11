@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 from datetime import date, timedelta
 
 from . import correlate as C
@@ -1884,6 +1885,161 @@ def verify_research_claims(prose: str, claims, ledger) -> dict:
             "reason": "", "verdict": verdict,
             "figures_verified": figure_total, "figures_total": figure_total,
             **_rebind_instrumentation(verdict["numbers"])}
+
+
+# The parent-side citation resolver deliberately has its own SQL path.  It
+# never accepts a child-reported citation ledger and never merges its result
+# into the vault ledger namespace.  The INNER JOIN is part of the contract:
+# FTS5 cannot enforce a foreign key, so a chunk without a vetted docs row is
+# not citable text.
+_CITATION_ROW_SQL = """
+SELECT chunks.body, d.title, d.year, d.doi, d.license, d.approver
+  FROM chunks INNER JOIN docs d ON d.doc_id = chunks.doc_id
+ WHERE chunks.doc_id = ? AND chunks.chunk_ix = ?
+"""
+_CITATION_VERSION_SQL = (
+    "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
+)
+_CITATION_SNIPPET_MARKERS_RE = re.compile(r"\.\.\.|[\[\]]")
+_CITATION_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_citation(text) -> str:
+    """Normalize only whitespace and retrieval snippet markers."""
+    if not isinstance(text, str):
+        return ""
+    text = _CITATION_SNIPPET_MARKERS_RE.sub(" ", text)
+    return _CITATION_WS_RE.sub(" ", text).strip()
+
+
+def _citation_refusal(reason: str) -> dict:
+    return {"ok": False, "reason": reason}
+
+
+def _citation_verdict(results: list[dict], *, reason: str = "") -> dict:
+    ok = not reason and all(result.get("ok") for result in results)
+    return {
+        "ok": ok,
+        "grounded": ok,
+        "unsupported": [] if ok else [
+            result.get("reason", "citation claim refused")
+            for result in results if not result.get("ok")],
+        "reason": reason,
+        "verdict": {"ok": ok, "citations": results},
+        # Keep the resolved records available at the outer boundary as well;
+        # renderers do not need to know the research verifier's inner shape.
+        "citations": results,
+        "citations_verified": sum(result.get("ok", False)
+                                   for result in results),
+        "citations_total": len(results),
+    }
+
+
+def verify_citation_claims(prose: str, claims, corpus_path) -> dict:
+    """Verify citation claims against the explicitly supplied corpus file.
+
+    ``corpus_path`` is opened read-only here, in the parent, for every
+    verification.  The caller's prose and any child-produced report are not
+    evidence.  A citation claim resolves only through the ``chunks`` to
+    ``docs`` inner join, then through normalized verbatim span membership.
+    """
+    del prose  # Citation resolution is keyed by the claim, not prose tokens.
+    if not isinstance(claims, list) or not claims:
+        return _citation_verdict([], reason="citation answer has no structured claims")
+    if not isinstance(corpus_path, (str, os.PathLike)) or not os.fspath(corpus_path):
+        return _citation_verdict([], reason="citation verifier has no corpus path")
+
+    path = os.fspath(corpus_path)
+    conn = None
+    try:
+        # Do not use analyst_corpus.open_corpus here: it rejects an orphaned
+        # file before this verifier can prove that the JOIN makes the orphan
+        # claim unreachable.  The verifier's own query is the acceptance gate.
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        version_row = conn.execute(_CITATION_VERSION_SQL).fetchone()
+        current_version = version_row[0] if version_row else None
+        results = []
+        first_reason = ""
+
+        for claim in claims:
+            source = claim.get("source") if isinstance(claim, dict) else None
+            if not isinstance(source, dict):
+                result = _citation_refusal(
+                    "citation source has neither doc_id nor sequence")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+
+            doc_id = source.get("doc_id")
+            chunk_ix = source.get("chunk_ix")
+            if doc_id is None and source.get("sequence") is None:
+                result = _citation_refusal(
+                    "citation source has neither doc_id nor sequence")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+            if doc_id is None:
+                result = _citation_refusal("citation source has no doc_id")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+
+            claimed_version = source.get("corpus_version")
+            if str(claimed_version) != str(current_version):
+                result = _citation_refusal(
+                    f"citation minted against corpus_version {claimed_version}, "
+                    f"current is {current_version}")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+
+            row = conn.execute(_CITATION_ROW_SQL, (doc_id, chunk_ix)).fetchone()
+            if row is None:
+                result = _citation_refusal(
+                    f"citation does not resolve: {doc_id} chunk {chunk_ix}")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+
+            body, title, year, doi, license_name, approver = row
+            span = source.get("span")
+            if not _normalize_citation(span) or (
+                    _normalize_citation(span) not in _normalize_citation(body)):
+                result = _citation_refusal(
+                    f"citation span not found in {doc_id} chunk {chunk_ix}")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+
+            if not str(license_name or "").strip() or not str(approver or "").strip():
+                result = _citation_refusal(
+                    f"citation document is not vetted: {doc_id}")
+                results.append(result)
+                first_reason = first_reason or result["reason"]
+                continue
+
+            results.append({
+                "ok": True,
+                "doc_id": str(doc_id),
+                "chunk_ix": int(chunk_ix),
+                "span": span,
+                "title": title,
+                "year": year,
+                "doi": doi,
+                "license": license_name,
+                "approver": approver,
+                "corpus_version": int(current_version),
+            })
+
+        return _citation_verdict(results, reason=first_reason)
+    except (OSError, sqlite3.DatabaseError) as exc:
+        detail = "citation corpus could not be opened"
+        if isinstance(exc, sqlite3.OperationalError) and "no such table" in str(exc):
+            detail = "citation corpus has no corpus_meta, chunks or docs table"
+        return _citation_verdict([], reason=detail)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def judge_evidence(verdicts: list[dict]) -> list[dict]:

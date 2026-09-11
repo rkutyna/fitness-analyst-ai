@@ -848,6 +848,32 @@ def split_claim_channel(text: str) -> tuple[str, list[dict] | None]:
     return text or "", None
 
 
+def partition_claim_sources(claims) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split a claim list by the shape of its ``source``: figure, citation, other.
+
+    ``split_claim_channel`` keeps its two-tuple and returns every claim
+    unchanged; this is the dispatch seam beside it.  A ``source`` carrying
+    ``sequence`` is the existing figure channel (verified against the tool
+    ledger); one carrying ``doc_id`` is the citation channel (verified against
+    the corpus by ``deepdive_verify.verify_citation_claims``); anything else
+    is neither and is returned in the third list so a caller can refuse it
+    rather than lose it.  A claim carrying both goes to the figure channel:
+    the ledger is the stricter oracle and a citation cannot vouch for a number.
+    """
+    figure: list[dict] = []
+    citation: list[dict] = []
+    other: list[dict] = []
+    for claim in claims or ():
+        source = claim.get("source") if isinstance(claim, dict) else None
+        if isinstance(source, dict) and "sequence" in source:
+            figure.append(claim)
+        elif isinstance(source, dict) and "doc_id" in source:
+            citation.append(claim)
+        else:
+            other.append(claim)
+    return figure, citation, other
+
+
 def _numbers_in(obj) -> set[str]:
     """All numeric tokens appearing anywhere in a briefing (as normalized strings)."""
     found = set()

@@ -2129,6 +2129,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
               submit_repair: bool = False,
               submit_repair_budget: int = SUBMIT_ANSWER_REPAIR_BUDGET,
               analyst_query_fn=None,
+              on_tool_call=None,
               ) -> ResearchResponse:
     """Researcher path: let the model call the read tools in-process until it
     returns a final text answer. Returns "" on any error, deadline/turn
@@ -2195,6 +2196,21 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
         messages.append({"role": "user", "content": claim_instructions})
     wire_tools = (list(tools) + [SUBMIT_ANSWER_TOOL]) if submit_tool else tools
     repairs_spent = 0
+    tool_sequence = 1
+    if ledger_path:
+        try:
+            with open(ledger_path, encoding="utf-8") as fh:
+                existing_sequences = []
+                for line in fh:
+                    try:
+                        value = json.loads(line).get("sequence")
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        existing_sequences.append(value)
+                tool_sequence = max(existing_sequences, default=0) + 1
+        except (FileNotFoundError, OSError):
+            pass
     start = time.monotonic()
     try:
         for turn in range(max_turns):
@@ -2293,6 +2309,17 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                             args = json.loads(args)
                         except Exception:
                             args = {}
+                    if on_tool_call is not None:
+                        try:
+                            on_tool_call(name, tool_sequence)
+                        except Exception as exc:
+                            try:
+                                print(
+                                    "[llm.tool_call_progress_error] "
+                                    f"{type(exc).__name__}: {exc}",
+                                    file=sys.stderr, flush=True)
+                            except Exception:
+                                pass
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}
@@ -2301,6 +2328,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                             result = entry[0](**args)
                         except Exception as e:  # surface, don't raise (matches tools)
                             result = {"error": str(e)}
+                        tool_sequence += 1
                     messages.append(_tool_result_message(
                         call, name, _encode_tool_result(result, name),
                         openai_dialect=openai_dialect))

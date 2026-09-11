@@ -55,8 +55,15 @@ from . import vault
 from . import analyst_sandbox
 from . import analyst_corpus
 from . import push
+from . import ask_progress
 
 logger = logging.getLogger(__name__)
+
+
+PROGRESS_REGISTRY = ask_progress.ProgressRegistry()
+# Lowercase alias keeps the registry easy to discover for in-process callers;
+# both names refer to the same process-local store.
+progress_registry = PROGRESS_REGISTRY
 
 
 _LAST_FILE_SIGNATURE: tuple[int, int] | None = None
@@ -262,8 +269,13 @@ def _ask_payload(raw: bytes) -> dict:
     as_of = payload.get("as_of")
     if as_of is not None and not isinstance(as_of, str):
         raise HTTPException(status_code=422, detail="as_of must be a date string")
+    progress_id = payload.get("progress_id")
+    if progress_id is not None and (
+            not isinstance(progress_id, str) or not progress_id.strip()):
+        raise HTTPException(status_code=422,
+                            detail="progress_id must be a non-empty string")
     return {"question": question.strip(), "conversation_id": conversation_id,
-            "as_of": as_of}
+            "as_of": as_of, "progress_id": progress_id}
 
 
 def _delivered_payload(raw: bytes) -> str:
@@ -1196,6 +1208,16 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/v1/ask/progress")
+    def ask_progress_route(progress_id: str,
+                           x_health_secret: str | None = Header(default=None)):
+        _require_ask_secret(x_health_secret)
+        entry = PROGRESS_REGISTRY.get(progress_id)
+        if entry is None:
+            raise HTTPException(status_code=404,
+                                detail="unknown or expired progress_id")
+        return entry
+
     @app.post("/v1/ask")
     async def ask(request: Request, raw: bytes = Depends(_raw_body),
                   x_health_secret: str | None = Header(default=None)):
@@ -1298,21 +1320,61 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             finally:
                 loop.call_soon_threadsafe(analyst_permit.release)
 
-        result = await asyncio.to_thread(
-            chat.answer_question, ctx, payload["question"],
-            as_of=payload["as_of"], history=history,
-            analyst_query_fn=internal_analyst_query,
-            attachments=attachments)
-        disconnected_at = db.utcnow_iso() if await request.is_disconnected() else None
-        chat.append_turn(
-            ctx, conversation_id, "assistant", result["text"],
-            answers_turn_id=question_turn["id"],
-            client_disconnected_at=disconnected_at,
-            attachments=result.get("attachments", attachments),
-            after_commit=(dispatcher.enqueue
-                          if dispatcher is not None
-                          and result.get("mode") != "fallback" else None),
-        )
+        progress_id = payload["progress_id"]
+        progress_callback = None
+        if progress_id is not None:
+            PROGRESS_REGISTRY.start(progress_id)
+
+            def progress_callback(tool_name, sequence):
+                PROGRESS_REGISTRY.add_step(progress_id, sequence, tool_name)
+
+        answer_kwargs = {
+            "as_of": payload["as_of"],
+            "history": history,
+            "analyst_query_fn": internal_analyst_query,
+            "attachments": attachments,
+        }
+        if progress_callback is not None:
+            answer_kwargs["on_tool_call"] = progress_callback
+        try:
+            result = await asyncio.to_thread(
+                chat.answer_question, ctx, payload["question"],
+                **answer_kwargs)
+        except BaseException:
+            if progress_id is not None:
+                PROGRESS_REGISTRY.finish(progress_id, "error")
+            raise
+        try:
+            disconnected_at = db.utcnow_iso() if await request.is_disconnected() else None
+            chat.append_turn(
+                ctx, conversation_id, "assistant", result["text"],
+                answers_turn_id=question_turn["id"],
+                client_disconnected_at=disconnected_at,
+                attachments=result.get("attachments", attachments),
+                after_commit=(dispatcher.enqueue
+                              if dispatcher is not None
+                              and result.get("mode") != "fallback" else None),
+            )
+            response = {
+                "request_id": uuid.uuid4().hex,
+                "conversation_id": conversation_id,
+                "text": result["text"],
+                "answer": result["text"],
+                "mode": result["mode"],
+                "tool_trace": result["tool_trace"],
+                "provenance": {"tool_calls": len(result["tool_trace"])},
+                "verification": result["verification"],
+                "attachments": result.get("attachments", attachments),
+                "freshness": _ask_freshness(ctx, payload["as_of"]),
+            }
+        except BaseException:
+            if progress_id is not None:
+                PROGRESS_REGISTRY.finish(progress_id, "error")
+            raise
+        if progress_id is not None:
+            PROGRESS_REGISTRY.finish(
+                progress_id,
+                "done" if result.get("mode") == "narration" else "fallback")
         # No "ok"/"status"/"cancelled" fields. They were literals — True,
         # "complete", False — under a docstring promising explicit completion
         # state, so a failed or cancelled turn could not have reported itself
@@ -1322,18 +1384,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         # which are computed. The store separately records an observed client
         # disconnect on the immutable assistant turn; it is not a response
         # status literal that a client could mistake for delivery.
-        return {
-            "request_id": uuid.uuid4().hex,
-            "conversation_id": conversation_id,
-            "text": result["text"],
-            "answer": result["text"],
-            "mode": result["mode"],
-            "tool_trace": result["tool_trace"],
-            "provenance": {"tool_calls": len(result["tool_trace"])},
-            "verification": result["verification"],
-            "attachments": result.get("attachments", attachments),
-            "freshness": _ask_freshness(ctx, payload["as_of"]),
-        }
+        return response
 
     return app
 

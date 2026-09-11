@@ -1043,7 +1043,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                     accounting: dict | None = None,
                     analyst_query_fn=None,
                     attachments: list[dict[str, Any]] | None = None,
-                    audits: Mapping[str, tuple[Callable, Callable]] | None = None
+                    audits: Mapping[str, tuple[Callable, Callable]] | None = None,
+                    on_tool_call=None,
                     ) -> dict:
     """Answer one question through the provider-facing, ledgered coach path.
 
@@ -1080,7 +1081,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
             result = _answer_question_inner(ctx, question, as_of=as_of,
                                             ledger_path=ledger_path, history=history,
                                             capture=capture,
-                                            analyst_query_fn=analyst_query_fn)
+                                            analyst_query_fn=analyst_query_fn,
+                                            on_tool_call=on_tool_call)
         if attachments is not None:
             result = {**result, "attachments": list(result.get("attachments", []))
                       + list(attachments)}
@@ -1634,7 +1636,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           *, capture: list | None = None,
                           analyst_query_fn=None,
                           as_of: str | None = None,
-                          resolved_window=None) -> dict:
+                          resolved_window=None,
+                          on_tool_call=None) -> dict:
     """Gather facts, then ask for a template with one bounded repair retry."""
     from . import fact_template, llm
 
@@ -1651,7 +1654,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         tool_names=llm.COACH_TOOLS, claim_instructions=None,
         submit_tool=False, ledger_index=False, submit_repair=False,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
-        analyst_query_fn=analyst_query_fn)
+        analyst_query_fn=analyst_query_fn, on_tool_call=on_tool_call)
     gather_status = _ask_loop_outcome(gather_status_before,
                                       llm.last_loop_status())
     ledger = _read_ledger(ledger_path)
@@ -1704,7 +1707,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
         max_tokens=llm.ANSWER_MAX_TOKENS,
-        timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
+        timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
+        on_tool_call=on_tool_call)
     final_status = _ask_loop_outcome(final_status_before,
                                      llm.last_loop_status())
     template = str(raw or "").strip()
@@ -1896,7 +1900,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                            ledger_path: str | None = None,
                            history: list[dict[str, Any]] | None = None,
                            capture: list | None = None,
-                           analyst_query_fn=None) -> dict:
+                           analyst_query_fn=None,
+                           on_tool_call=None) -> dict:
     """The model-facing body of :func:`answer_question`; see its docstring."""
     from . import agents, llm
 
@@ -1964,7 +1969,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             return _answer_fact_template(
                 ctx, question, prompt, tool_schemas, ledger_path,
                 capture=capture, analyst_query_fn=analyst_query_fn,
-                as_of=as_of, resolved_window=resolved_window)
+                as_of=as_of, resolved_window=resolved_window,
+                on_tool_call=on_tool_call)
         # claim_instructions=None: ASK_CLAIM_INSTRUCTIONS is already in `prompt`,
         # and tool_loop's default would append the research block on top of it —
         # a second, contradicting schema (it permits a `$.arguments...` source
@@ -1978,7 +1984,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             claim_instructions=None, submit_tool=True,
             ledger_index=ledger_index, submit_repair=submit_repair,
             timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
-            analyst_query_fn=analyst_query_fn)
+            analyst_query_fn=analyst_query_fn, on_tool_call=on_tool_call)
         first_loop_status = _ask_loop_outcome(first_status_before,
                                               llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))
@@ -2049,7 +2055,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             claim_instructions=None, submit_tool=True,
             ledger_index=ledger_index, submit_repair=submit_repair,
             timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
-            analyst_query_fn=analyst_query_fn)
+            analyst_query_fn=analyst_query_fn, on_tool_call=on_tool_call)
         retry_loop_status = _ask_loop_outcome(retry_status_before,
                                               llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))

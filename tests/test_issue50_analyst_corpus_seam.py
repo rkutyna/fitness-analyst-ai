@@ -87,7 +87,8 @@ def test_no_corpus_keeps_source_closed_and_result_explicit(tmp_path):
     vault = tmp_path / "vault.db"
     _build_vault(vault)
     result = runner.run_analyst_code(
-        "assert 'cite' not in globals()\nconn.execute('select 1').fetchall()",
+        "assert 'cite' not in globals()\nrows = conn.execute('select count(*) from t').fetchall()\n"
+        "emit('probe', ['n'], ['count'], [[rows[0][0]]])",
         str(vault), str(tmp_path / "run"), LocalChannelExecutor())
     assert isinstance(result, runner.AnalystEnvelope)
     assert result.citation_ledger == {
@@ -105,7 +106,8 @@ def test_corpus_child_has_two_cites_one_vault_query_and_separate_ledgers(tmp_pat
         "first = cite('integrity check', 1)\n"
         "second = cite('built corpus', 1)\n"
         "assert first and second\n"
-        "conn.execute('select 1').fetchall()\n",
+        "rows = conn.execute('select count(*) from t').fetchall()\n"
+        "emit('probe', ['n'], ['count'], [[rows[0][0]]])\n",
         str(vault), str(tmp_path / "run"), LocalChannelExecutor(),
         corpus_path=str(corpus),
     )
@@ -152,7 +154,8 @@ def test_real_platform_sandbox_child_can_cite_and_query(tmp_path):
         "first = cite('integrity check', 1)\n"
         "second = cite('built corpus', 1)\n"
         "assert first and second\n"
-        "conn.execute('select 1').fetchall()\n",
+        "rows = conn.execute('select count(*) from t').fetchall()\n"
+        "emit('probe', ['n'], ['count'], [[rows[0][0]]])\n",
         str(vault), str(tmp_path / "run"), executor,
         corpus_path=str(corpus),
     )

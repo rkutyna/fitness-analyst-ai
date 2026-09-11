@@ -161,6 +161,10 @@ def _scripted_run_code(code, vault_path, run_dir, executor, *, limits=None):
 
 
 def _envelope_values(payload: dict) -> list[dict]:
+    # A refusal carries no tables; the harness must record that as an empty
+    # envelope rather than crash the whole batch on the first refused answer.
+    if not payload.get("tables"):
+        return []
     if "tables" not in payload:
         return []
     def as_date(value: int) -> str:

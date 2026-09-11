@@ -519,14 +519,24 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
     run_kwargs = {"limits": limits}
     if corpus_path is not None:
         run_kwargs["corpus_path"] = corpus_path
+
+    def _run_or_refuse_empty(code: str, attempt_dir: str) -> "Envelope | Refusal":
+        # A completion with no code in it -- a stalled provider that returned
+        # "", or a reply that was all prose -- used to run as EMPTY code: the
+        # child emitted nothing, the envelope had no table, and run_analyst
+        # returned 0 with "unverified" and no answer. Measured 2026-09-11 on a
+        # live batch. A missing answer is a refusal, retried under the syntax
+        # budget, never a success-shaped nothing.
+        if not code.strip():
+            return Refusal("EMPTY_COMPLETION: the model returned no code")
+        return run_code_fn(code, vault_path, attempt_dir, exec_obj, **run_kwargs)
     # Every attempt gets its own directory under run_dir. The executors create
     # code.py, profile.sb and runner.py EXCLUSIVELY (#20), so a repair attempt
     # written into the first attempt's directory failed with FileExistsError
     # on every real executor -- measured live 2026-09-11, the whole repair
     # loop dead since the exclusive create landed. The run record stays at
     # run_dir; the attempt directories sit beside it.
-    result: "Envelope | Refusal" = run_code_fn(
-        code1, vault_path, _attempt_dir(run_dir, 1), exec_obj, **run_kwargs)
+    result: "Envelope | Refusal" = _run_or_refuse_empty(code1, _attempt_dir(run_dir, 1))
 
     prompt2: str | None = None
     code2: str | None = None
@@ -548,7 +558,7 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
     MAX_SUBSTANTIVE_ATTEMPTS = 2     # the original "exactly one repair"
     attempts = 1
     while isinstance(result, Refusal):
-        syntax = result.reason.startswith("SYNTAX_ERROR")
+        syntax = result.reason.startswith(("SYNTAX_ERROR", "EMPTY_COMPLETION"))
         budget = MAX_SYNTAX_ATTEMPTS if syntax else MAX_SUBSTANTIVE_ATTEMPTS
         if attempts >= budget:
             break
@@ -557,8 +567,7 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
             corpus_configured=corpus_path is not None)
         code2 = extract_code(complete_fn(prompt2))
         code2_sha256 = hashlib.sha256(code2.encode("utf-8")).hexdigest()
-        result = run_code_fn(code2, vault_path, _attempt_dir(run_dir, attempts + 2),
-                             exec_obj, **run_kwargs)
+        result = _run_or_refuse_empty(code2, _attempt_dir(run_dir, attempts + 2))
         final_code = code2
         final_code_sha256 = code2_sha256
         attempts += 1

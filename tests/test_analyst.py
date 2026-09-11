@@ -471,3 +471,45 @@ def test_run_dir_under_home_is_refused_with_a_stated_reason(tmp_path, vault_path
             executor=executor, json_output=True, out=__import__("io").StringIO(),
         )
     assert not os.path.exists(home_run_dir)
+
+
+
+def test_empty_completion_is_a_refusal_not_a_success(tmp_path, vault_path):
+    """A model that returns no code must not produce rc 0 with no tables."""
+    import io
+    import json
+    from health_advisor import analyst as analyst_mod
+    from health_advisor import db
+
+    conn = db.connect(vault_path)
+    db.init_db(conn)
+    conn.close()
+    calls = []
+
+    def never_runs(code, vault, run_dir, executor, **kwargs):  # pragma: no cover - must not be reached
+        calls.append(code)
+        raise AssertionError("empty code must be refused before any executor runs")
+
+    out = io.StringIO()
+    rc = analyst_mod.run_analyst(
+        "q", vault_path, str(tmp_path / "run"),
+        complete_fn=lambda prompt: "   ", run_code_fn=never_runs,
+        executor=object(), json_output=True, out=out,
+    )
+    payload = json.loads(out.getvalue())
+    assert rc == 1
+    assert payload["refused"] is True
+    assert payload["reason"].startswith("EMPTY_COMPLETION")
+    assert calls == []
+
+
+def test_envelope_with_no_table_is_refused():
+    import json
+    from health_advisor import analyst_envelope as env
+
+    raw = json.dumps({"tables": []}).encode("utf-8")
+    result = env.validate(raw, run_id="r", question="q", code_sha256="c",
+                          vault_sha256="v", vault_version=0,
+                          ledger={"query_count": 1, "rows_read": 1, "tables_read": ["daily_metrics"]})
+    assert isinstance(result, env.Refusal)
+    assert "no table" in result.reason

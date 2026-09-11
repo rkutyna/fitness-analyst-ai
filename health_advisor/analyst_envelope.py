@@ -413,6 +413,12 @@ def _validate_payload(payload, *, run_id, question, code_sha256,
                             or not vault_tables):
         _refuse(f"emitted {len(tables)} numeric tables from "
                 f"{len(vault_tables)} vault tables and {rows_read} reads")
+    # An envelope with no table at all is not an answer. Without this, code
+    # that emitted nothing (an empty completion, a script that never reached
+    # emit) validated cleanly and rendered as a successful run with no
+    # content -- the success-shaped nothing measured 2026-09-11.
+    if not tables:
+        _refuse("emitted no table; an answer carries at least one numeric table")
 
     counts = {
         "rows": sum(t["row_count"] for t in tables),

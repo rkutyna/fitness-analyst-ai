@@ -53,6 +53,7 @@ from health_advisor.analyst_prompt import (
     schema_summary,
 )
 from health_advisor import analyst_envelope
+from health_advisor import analyst_crosscheck
 from health_advisor import analyst_sandbox
 from health_advisor.analyst_sandbox import RunLimits, default_executor
 
@@ -315,7 +316,8 @@ def render_provenance(**kwargs) -> str:
 def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
                      vault_version: int, code_sha256: str, record_path: str,
                      question: str, code: str, json_output: bool, out,
-                     citation_ledger: dict | None = None) -> None:
+                     citation_ledger: dict | None = None,
+                     verification: str) -> None:
     citation_ledger = citation_ledger or {
         "corpus_configured": False,
         "corpus_version": None,
@@ -324,6 +326,7 @@ def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
     if json_output:
         payload = {
             "question": question,
+            "verification": verification,
             "tables": [
                 {
                     "name": t["name"],
@@ -345,6 +348,12 @@ def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
         return
 
     print(f"Question: {question}", file=out)
+    print(file=out)
+    print(f"Verification: {verification}", file=out)
+    if verification == "cross_checked":
+        print("The declared standard quantity was recomputed from the vault and matches.", file=out)
+    else:
+        print("This table is unverified; read the model-written code before relying on it.", file=out)
     print(file=out)
     for table in envelope.tables:
         print(render_table(table), file=out)
@@ -368,11 +377,13 @@ def _print_envelope(envelope: Envelope, *, run_id: str, vault_sha256: str,
     print(code, file=out)
 
 
-def _print_refusal(refusal: Refusal, *, question: str, json_output: bool, out) -> None:
+def _print_refusal(refusal: Refusal, *, question: str, json_output: bool, out,
+                   verification: str = "unverified") -> None:
     remediation = refusal_guidance(refusal.reason)
     if json_output:
         payload = {
             "question": question,
+            "verification": verification,
             "remediation": remediation,
             **refusal.to_dict(),
         }
@@ -380,6 +391,11 @@ def _print_refusal(refusal: Refusal, *, question: str, json_output: bool, out) -
         return
     print(f"Question: {question}", file=out)
     print(file=out)
+    print(f"Verification: {verification}", file=out)
+    if verification == "refused_disagreement":
+        print("Refused: the declared quantity disagreed with the deterministic vault recomputation.", file=out)
+    else:
+        print("This result is unverified.", file=out)
     print(f"Refused: {refusal.reason}", file=out)
     if refusal.diagnostic is not None:
         print(f"Diagnostic: {refusal.diagnostic}", file=out)
@@ -390,24 +406,29 @@ def _print_refusal(refusal: Refusal, *, question: str, json_output: bool, out) -
 # The run record -- the provenance artifact. Parent-authored: only this
 # module writes it, and the model-written code never sees or touches it.
 # --------------------------------------------------------------------------- #
-def _result_to_record_dict(result: "Envelope | Refusal") -> dict:
+def _result_to_record_dict(result: "Envelope | Refusal", verification: str) -> dict:
     if isinstance(result, Refusal):
-        return result.to_dict()
-    return result.to_dict()
+        result_dict = result.to_dict()
+    else:
+        result_dict = result.to_dict()
+    result_dict["verification"] = verification
+    return result_dict
 
 
 def _write_run_record(run_dir: str, *, run_id: str, question: str,
                        prompt1: str, prompt2: str | None,
                        code1: str, code2: str | None,
                        result: "Envelope | Refusal", vault_sha256: str,
-                       vault_version: int, started_at: str, finished_at: str) -> Path:
+                       vault_version: int, started_at: str, finished_at: str,
+                       verification: str) -> Path:
     ledger = {} if isinstance(result, Refusal) else dict(result.ledger)
     record = {
         "run_id": run_id,
         "question": question,
         "prompts": {"initial": prompt1, "repair": prompt2},
         "code": {"initial": code1, "repair": code2},
-        "result": _result_to_record_dict(result),
+        "result": _result_to_record_dict(result, verification),
+        "verification": verification,
         "ledger": ledger,
         "vault_sha256": vault_sha256,
         "vault_user_version": vault_version,
@@ -508,16 +529,41 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
         final_code_sha256 = code2_sha256
         attempts += 1
 
+    # The child has finished and the envelope is already grammar-validated.
+    # Now, before either rendering or recording the answer, independently
+    # recompute any declared standard quantity from the vault.  A declaration
+    # is deliberately not trusted merely because it is syntactically valid.
+    verification = "unverified"
+    if isinstance(result, Envelope):
+        try:
+            check = analyst_crosscheck.cross_check(vault_path, result)
+            verification = check.verification
+            if verification == "refused_disagreement":
+                result = Refusal(
+                    "declared analyst quantity disagrees with deterministic "
+                    "vault recomputation: " + (check.reason or "unknown disagreement")
+                )
+        except Exception as exc:
+            # A failed oracle is not permission to render a number, but it is
+            # not a disagreement either: nothing was compared. Label it as
+            # unverified and refuse to render, keeping the exception type out
+            # of the user-facing reason (substrate detail, not evidence).
+            verification = "unverified"
+            result = Refusal("deterministic analyst cross-check could not "
+                             "complete; the result was not rendered")
+
     finished_at = _now_iso()
 
     record_path = _write_run_record(
         run_dir, run_id=run_id, question=question,
         prompt1=prompt1, prompt2=prompt2, code1=code1, code2=code2,
         result=result, vault_sha256=vault_sha256, vault_version=vault_version,
-        started_at=started_at, finished_at=finished_at)
+        started_at=started_at, finished_at=finished_at,
+        verification=verification)
 
     if isinstance(result, Refusal):
-        _print_refusal(result, question=question, json_output=json_output, out=out)
+        _print_refusal(result, question=question, json_output=json_output, out=out,
+                       verification=verification)
         return 1
 
     _print_envelope(
@@ -525,7 +571,8 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
         vault_version=vault_version, code_sha256=final_code_sha256,
         record_path=str(record_path), question=question, code=final_code,
         json_output=json_output, out=out,
-        citation_ledger=getattr(result, "citation_ledger", None))
+        citation_ledger=getattr(result, "citation_ledger", None),
+        verification=verification)
     return 0
 
 

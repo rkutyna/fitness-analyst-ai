@@ -273,6 +273,32 @@ Required result shapes:
 - one row per week for trend questions
 - one row per comparison group for outcome checks
 
+Deterministic quantity declaration (required when your result is one of these
+standard quantities): the table name is the declaration. Use exactly one of
+these grammar-safe names, and use the column shapes shown:
+- `jog_minutes_per_week`: `date_yyyymmdd`, `jog_minutes`. This declares
+  `analysis.impact_volume(conn, start, end, by="week")`.
+- `weekly_<metric>` (or `sleep_asleep_per_week`): `date_yyyymmdd`, `mean`.
+  This declares `weekly_series:<metric>` and the parent recomputes
+  `analysis.weekly_series(conn, metric, start, end)`. The metric must be in
+  the canonical catalog; `sleep_asleep_per_week` is the explicit sleep alias.
+- `bc_<metric>_<weeks>`: one row with `as_of_yyyymmdd`, and any applicable
+  `recent_mean`, `previous_mean`, `diff`, `mdc95` columns. This declares
+  `block_comparison:<metric>:<weeks>` and the parent recomputes
+  `analysis.block_comparison(conn, metric, weeks, as_of)`.
+- `block_structure`: one row per day with `date_yyyymmdd`,
+  `longest_block_min`, and `qualified_block_min`; use numeric 0 when the
+  deterministic result is no qualifying block. The parent recomputes the
+  longest-block structure from the day's workout windows.
+- `weekly_readiness`: one row with `date_yyyymmdd` and `score`; the parent
+  recomputes `analysis.weekly_readiness(conn, as_of)`.
+These six standard quantity families are the complete Python-owned vocabulary
+currently covered. A table that is not named by one of these declarations is
+still rendered, but is explicitly labelled `unverified`. A declared value is
+refused if the parent's recomputation differs by more than 0.1 in the
+published units (one displayed tenth, solely for rounding); do not use a
+declaration to make a novel quantity look standard.
+
 Performance facts from the measured 4.7 GB vault (13,900,746 records rows):
 - daily_metrics (65,677 rows) and workouts (805 rows): ~0.00 s to query.
 - records filtered by metric and date: 0.18 s.

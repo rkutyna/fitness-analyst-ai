@@ -360,3 +360,97 @@ def test_the_dial_is_reachable_by_a_correlation(tmp_path):
 def mx_series(conn):
     from health_advisor import metrics as mx
     return mx.series(conn, "longest_block_min", "2026-07-01", "2026-07-12")
+
+
+# --- #55: --backfill must revisit days with no sleep/wear record ------------
+# all_source_days(conn) alone (sleep-stage or heart_rate records) missed any
+# day whose only derived input is a workout, so a stored jog_minutes/
+# longest_block_min row there was never revisited by --backfill. backfill_days
+# is the ascending union of all_source_days, every workouts.local_date, and
+# every date already holding a row for any metric in DERIVED_METRICS.
+
+def test_backfill_corrects_a_dial_only_day(vault_path, conn):
+    """A day with a running workout and a stored jog_minutes row but no sleep
+    or wear record: invisible to all_source_days, so the bug never revisited
+    it. --backfill must now recompute it to match _dial_for_day."""
+    day = "2026-08-20"
+    _run_workout(conn, day, minutes=20)
+    # Strip the heart_rate samples _run_workout seeds alongside the workout:
+    # heart_rate is derive.WEAR_METRIC, and leaving it in would put this day
+    # in all_source_days for the wrong reason and defeat the test.
+    conn.execute("DELETE FROM records WHERE metric = 'heart_rate' AND local_date = ?",
+                (day,))
+    conn.commit()
+    dbmod.recompute_daily_metrics(conn, full=True)
+    assert day not in D.all_source_days(conn)   # the bug's own precondition
+
+    correct = D._dial_for_day(conn, day)["jog_minutes"]
+    D._upsert(conn, "jog_minutes", day, correct + 500.0)   # a wrong stored value
+    conn.commit()
+
+    D.main(["--backfill", "--db", str(vault_path)])
+
+    row = conn.execute(
+        "SELECT last FROM daily_metrics WHERE metric = 'jog_minutes' AND date = ?",
+        (day,)).fetchone()
+    assert row["last"] == pytest.approx(correct)
+
+
+def test_backfill_removes_a_dial_row_with_no_remaining_source(vault_path, conn):
+    """A jog_minutes row on a day with no workout and no source records at
+    all: the third leg of the union (a date already holding a derived-metric
+    row) must surface it so update_for_days can remove it, per its own
+    'absence writes no row' contract."""
+    day = "2026-08-21"
+    D._upsert(conn, "jog_minutes", day, 42.0)
+    conn.commit()
+
+    D.main(["--backfill", "--db", str(vault_path)])
+
+    row = conn.execute(
+        "SELECT last FROM daily_metrics WHERE metric = 'jog_minutes' AND date = ?",
+        (day,)).fetchone()
+    assert row is None
+
+
+def test_backfill_days_is_the_ascending_union(conn):
+    """Direct check of the helper's contract: sorted, and each leg pulls in a
+    day the others miss."""
+    sleep_day = "2026-07-05"      # leg 1: all_source_days
+    dial_day = "2026-08-20"       # leg 2: workouts.local_date
+    orphan_day = "2026-08-21"     # leg 3: a stray DERIVED_METRICS row
+    _seed_night(conn, sleep_day)
+    _run_workout(conn, dial_day, minutes=20)
+    conn.execute("DELETE FROM records WHERE metric = 'heart_rate' AND local_date = ?",
+                (dial_day,))
+    D._upsert(conn, "sleep_awakenings", orphan_day, 0.0)
+    conn.commit()
+
+    days = D.backfill_days(conn)
+
+    assert days == sorted(days)
+    assert {sleep_day, dial_day, orphan_day} <= set(days)
+
+
+def test_backfill_summary_counts_the_union(vault_path, conn, capsys):
+    """The printed `derived N metric-day rows over M days` must count
+    backfill_days's union, not all_source_days alone."""
+    dial_day = "2026-08-20"
+    _run_workout(conn, dial_day, minutes=20)
+    conn.execute("DELETE FROM records WHERE metric = 'heart_rate' AND local_date = ?",
+                (dial_day,))
+    conn.commit()
+    dbmod.recompute_daily_metrics(conn, full=True)
+    _seed_night(conn, "2026-07-10")
+    conn.commit()
+
+    D.main(["--backfill", "--db", str(vault_path)])
+    out = capsys.readouterr().out
+
+    conn2 = dbmod.connect(vault_path)
+    try:
+        expected_days = len(D.backfill_days(conn2))
+    finally:
+        conn2.close()
+    assert f"over {expected_days} days" in out
+    assert dial_day in D.backfill_days(conn)

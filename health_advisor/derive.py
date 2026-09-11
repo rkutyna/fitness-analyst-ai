@@ -383,6 +383,29 @@ def all_source_days(conn) -> list[str]:
     return [r[0] for r in rows]
 
 
+def backfill_days(conn) -> list[str]:
+    """Every local day a full `--backfill` must revisit, ascending (I2).
+
+    `all_source_days` alone misses days whose only derived inputs are
+    workouts (`_dial_for_day` reads `workouts`/`records`, not sleep or wear)
+    and days whose source records are gone entirely but a stale derived row
+    remains — `update_for_days` already deletes what it cannot recompute, so
+    surfacing that day here is enough to let it. The union is:
+
+    1. `all_source_days(conn)` — sleep-stage or wear records,
+    2. every `workouts.local_date`,
+    3. every date already holding a row for any metric in `DERIVED_METRICS`.
+    """
+    days = set(all_source_days(conn))
+    days.update(r[0] for r in conn.execute(
+        "SELECT DISTINCT local_date FROM workouts").fetchall())
+    ph = ",".join("?" * len(DERIVED_METRICS))
+    days.update(r[0] for r in conn.execute(
+        f"SELECT DISTINCT date FROM daily_metrics WHERE metric IN ({ph})",
+        DERIVED_METRICS).fetchall())
+    return sorted(days)
+
+
 def update_after_ingest(conn, days, source: str,
                         errors: list[str] | None = None) -> int:
     """Ingest-path wrapper: a derive bug must never fail an ingest request.
@@ -408,18 +431,18 @@ def update_after_ingest(conn, days, source: str,
         return 0
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     import argparse
     ap = argparse.ArgumentParser(description="Derive sleep-timing/wear daily metrics.")
     ap.add_argument("--backfill", action="store_true", help="derive all history")
     ap.add_argument("--db", required=True, help="path to the vault to derive into")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if not args.backfill:
         ap.error("nothing to do: pass --backfill (incremental runs happen at ingest)")
     conn = db.connect(args.db)
     try:
         db.init_db(conn)
-        days = all_source_days(conn)
+        days = backfill_days(conn)
         n = update_for_days(conn, days)
         conn.commit()
         print(f"derived {n} metric-day rows over {len(days)} days")

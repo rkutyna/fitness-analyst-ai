@@ -378,6 +378,7 @@ ASK_CAUSES = (
     "denied_available_figure",
     "withheld_available_figure",
     "contradicted_day_count",
+    "restated_unit",
     "no_data_yet",
 )
 
@@ -437,6 +438,7 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
                denied_available_figure: bool = False,
                withheld_eligible_figure: bool = False,
                contradicted_day_count: bool = False,
+               restated_unit: bool = False,
                no_data_yet: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
 
@@ -471,6 +473,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "denied_available_figure"
     if contradicted_day_count:
         return "contradicted_day_count"
+    if restated_unit:
+        return "restated_unit"
     if not verification.get("ok"):
         return "gate_refused"
     if judge_score is not None and judge_score < 70:
@@ -662,6 +666,7 @@ def _submit_repair_enabled() -> bool:
 
 _SPAN_SUPPRESS_MIN_FRACTION = 0.5
 _FACT_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")
+_FACT_TEMPLATE_TOKEN_RE = re.compile(r"\{([^{}]+)\}")
 _FACT_TEMPLATE_DIGIT_RE = re.compile(r"\d+")
 _REGENERATION_NUMBER_RE = re.compile(
     r"\d+(?:[.,:/-]\d+)*|\.\d+"
@@ -1205,6 +1210,89 @@ _WITHHELD_ELIGIBLE_FIGURE_REASON = "fact set withheld an eligible figure"
 # by the itemisation in the same sentence. The reason names that, and carries
 # the finding's own numbers so a refusal is auditable from the cause log alone.
 _CONTRADICTED_DAY_COUNT_REASON = "narration contradicts its own day itemisation"
+_RESTATED_UNIT_REASON = "narration restates a rendered unit"
+
+_RENDERED_UNIT_WORDS = {
+    "m": frozenset({"minute", "minutes", "min", "mins"}),
+    "min": frozenset({"minute", "minutes", "min", "mins"}),
+    "h": frozenset({"hour", "hours", "hr", "hrs"}),
+}
+_RENDERED_UNIT_TAIL_RE = re.compile(r"(?:\d+(?:\.\d+)?\s*)(min|m|h)\s*$",
+                                    re.IGNORECASE)
+
+
+def _rendered_unit(display: object) -> str | None:
+    """Return the unit carried by a Python-rendered duration display.
+
+    The formatter emits duration tails as ``m``, ``min``, or ``h``.  Matching
+    the complete display tail, rather than any unit-looking word, deliberately
+    leaves pace strings such as ``14 min/mi`` and clock strings alone.
+    """
+    if not isinstance(display, str):
+        return None
+    match = _RENDERED_UNIT_TAIL_RE.search(display.strip())
+    return match.group(1).lower() if match else None
+
+
+def _mark_restated_rendered_unit(verification: dict, *, text: str,
+                                 template: str,
+                                 facts: dict[str, dict]) -> bool:
+    """Refuse prose that repeats the unit already carried by a fact display.
+
+    This is intentionally a post-scan marker.  The structural template scan
+    owns digit placement; this marker owns the separate, rendered-display
+    defect where prose appends a unit word to a Python-owned figure.
+    """
+    if not verification.get("ok"):
+        return False
+    for match in _FACT_TEMPLATE_TOKEN_RE.finditer(template or ""):
+        key = match.group(1)
+        if key.startswith("advice:"):
+            continue
+        fact = (facts or {}).get(key)
+        if not isinstance(fact, dict):
+            continue
+        unit = _rendered_unit(fact.get("display"))
+        if unit is None:
+            continue
+        following = (template or "")[match.end():]
+        word_match = re.match(r"\s*([A-Za-z]+)\b", following)
+        if word_match is None:
+            continue
+        word = word_match.group(1).lower()
+        if word not in _RENDERED_UNIT_WORDS[unit]:
+            continue
+        verification.update({
+            "ok": False,
+            "grounded": False,
+            "reason": (f"{_RESTATED_UNIT_REASON}; placeholder {key!r} "
+                       f"renders {fact.get('display')!r}, followed by "
+                       f"{word!r}"),
+            "restated_unit": {
+                "key": key,
+                "display": fact.get("display"),
+                "unit": unit,
+                "word": word,
+            },
+        })
+        return True
+    return False
+
+
+def _strip_empty_paragraphs(text: str) -> str:
+    """Remove blank or punctuation-only paragraphs before publication.
+
+    A paragraph survives whenever it contains a Unicode word character.  This
+    keeps prose such as an underscore-bearing token intact while removing
+    whitespace and punctuation-only blocks, including a lone period.
+    """
+    if not isinstance(text, str):
+        return ""
+    paragraphs = re.split(r"\r?\n[ \t]*\r?\n", text)
+    return "\n\n".join(
+        paragraph for paragraph in paragraphs
+        if re.search(r"\w", paragraph, re.UNICODE)
+    )
 
 _RESULT_METADATA_KEYS = frozenset({
     "note", "start", "end", "limit", "truncated", "unit", "metric",
@@ -1770,8 +1858,11 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     }
     interpolated = fact_template.interpolate_template(
         template, facts, advice_quantities=advice_quantities)
+    if interpolated is not None:
+        interpolated = _strip_empty_paragraphs(interpolated)
+    rendered_text = interpolated if interpolated is not None else template
     denied_available_figure = _mark_denied_available_figure(
-        verification, question=question, text=interpolated or template,
+        verification, question=question, text=rendered_text,
         ledger=ledger,
         answer_has_asked_metric_figure=_template_has_asked_metric_figure(
             question, template, facts),
@@ -1780,7 +1871,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # count meets the days it itemises; the raw template still carries the
     # word-form counts, so check whichever string would reach the user.
     contradicted_day_count = _mark_contradicted_day_count(
-        verification, text=interpolated or template)
+        verification, text=rendered_text)
+    restated_unit = _mark_restated_rendered_unit(
+        verification, text=rendered_text, template=template, facts=facts)
     withheld_eligible_figure = _mark_withheld_eligible_figure(
         verification, withheld_fact_keys)
     verification["cause"] = _ask_cause(
@@ -1789,7 +1882,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           and bool(scan["advice_quantities"])),
         denied_available_figure=denied_available_figure,
         withheld_eligible_figure=withheld_eligible_figure,
-        contradicted_day_count=contradicted_day_count)
+        contradicted_day_count=contradicted_day_count,
+        restated_unit=restated_unit)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
@@ -1864,9 +1958,14 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     }
     retry_interpolated = fact_template.interpolate_template(
         retry_template, facts, advice_quantities=retry_advice_quantities)
+    if retry_interpolated is not None:
+        retry_interpolated = _strip_empty_paragraphs(retry_interpolated)
+    retry_rendered_text = (retry_interpolated
+                           if retry_interpolated is not None
+                           else retry_template)
     retry_denied_available_figure = _mark_denied_available_figure(
         retry_verification, question=question,
-        text=retry_interpolated or retry_template, ledger=ledger,
+        text=retry_rendered_text, ledger=ledger,
         answer_has_asked_metric_figure=_template_has_asked_metric_figure(
             question, retry_template, facts),
         facts=facts, resolved_window=resolved_window)
@@ -1874,7 +1973,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # exactly how an itemisation loses an entry the count still claims. Gating
     # attempt 1 alone would make one failed attempt the way past this gate.
     retry_contradicted_day_count = _mark_contradicted_day_count(
-        retry_verification, text=retry_interpolated or retry_template)
+        retry_verification, text=retry_rendered_text)
+    retry_restated_unit = _mark_restated_rendered_unit(
+        retry_verification, text=retry_rendered_text,
+        template=retry_template, facts=facts)
     retry_withheld_eligible_figure = _mark_withheld_eligible_figure(
         retry_verification, withheld_fact_keys)
     retry_verification["cause"] = _ask_cause(
@@ -1884,7 +1986,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           and bool(retry_scan["advice_quantities"])),
         denied_available_figure=retry_denied_available_figure,
         withheld_eligible_figure=retry_withheld_eligible_figure,
-        contradicted_day_count=retry_contradicted_day_count)
+        contradicted_day_count=retry_contradicted_day_count,
+        restated_unit=retry_restated_unit)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]
             and not retry_scan["advice_quantities"]):

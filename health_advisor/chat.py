@@ -15,6 +15,7 @@ published with a caveat.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,9 @@ from .context import VaultContext
 
 
 from . import deepdive_verify as _DV_VOCAB
+
+
+logger = logging.getLogger(__name__)
 
 ASK_CLAIM_INSTRUCTIONS = ("""
 
@@ -2370,6 +2374,7 @@ def append_turn(
     answers_turn_id: str | None = None,
     client_disconnected_at: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    after_commit: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Append one immutable turn and return it.
 
@@ -2389,6 +2394,12 @@ def append_turn(
             attachments=attachments,
         )
         conn.commit()
+        if client_disconnected_at is not None and after_commit is not None:
+            try:
+                after_commit(turn)
+            except Exception as exc:  # post-commit side effects are best effort
+                logger.warning("post-commit turn hook failed (%s)",
+                               type(exc).__name__)
         return turn
     except Exception:
         conn.rollback()

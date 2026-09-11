@@ -31,6 +31,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -53,6 +54,7 @@ from . import normalize as nz
 from . import vault
 from . import analyst_sandbox
 from . import analyst_corpus
+from . import push
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +300,116 @@ def _device_token_payload(raw: bytes) -> tuple[str, str]:
         raise HTTPException(status_code=422,
                             detail="environment must be sandbox or production")
     return token.strip(), environment
+
+
+def _device_token_for_delete(raw: bytes) -> str:
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"malformed device token payload: {exc}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422,
+                            detail="device token payload must be an object")
+    token = payload.get("device_token", payload.get("token"))
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(status_code=422,
+                            detail="device_token must be a non-empty string")
+    return token.strip()
+
+
+class _PushDispatcher:
+    """Queue one best-effort wake per committed disconnected turn."""
+
+    def __init__(self, sender) -> None:
+        self.sender = sender
+        self._queued: set[str] = set()
+        self._lock = threading.Lock()
+
+    def enqueue(self, turn: dict) -> bool:
+        turn_id = turn.get("id")
+        if (not isinstance(turn_id, str) or not turn_id.strip()
+                or turn.get("client_disconnected_at") is None
+                or turn.get("delivered_at") is not None):
+            return False
+        try:
+            eligible = self._eligible(turn_id)
+        except Exception as exc:
+            logger.warning("APNs push dispatch failed (%s)", type(exc).__name__)
+            return False
+        if not eligible:
+            return False
+        with self._lock:
+            if turn_id in self._queued:
+                return False
+            self._queued.add(turn_id)
+        threading.Thread(
+            target=self._deliver,
+            args=(turn_id,),
+            name="health-advisor-push",
+            daemon=True,
+        ).start()
+        return True
+
+    def _eligible(self, turn_id: str) -> bool:
+        conn = self._ctx.connect(read_only=True)
+        try:
+            row = conn.execute(
+                "SELECT client_disconnected_at, delivered_at "
+                "FROM conversation_turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+            return (row is not None and row["client_disconnected_at"] is not None
+                    and row["delivered_at"] is None)
+        finally:
+            conn.close()
+
+    def _deliver(self, turn_id: str) -> None:
+        try:
+            conn = self._ctx.connect(read_only=True)
+            try:
+                row = conn.execute(
+                    "SELECT client_disconnected_at, delivered_at "
+                    "FROM conversation_turns WHERE id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if (row is None or row["client_disconnected_at"] is None
+                        or row["delivered_at"] is not None):
+                    return
+                tokens = conn.execute(
+                    "SELECT token, apns_environment FROM device_tokens"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            for row in tokens:
+                token = row["token"]
+                try:
+                    if hasattr(self.sender, "send_with_status"):
+                        status = self.sender.send_with_status(
+                            token, turn_id, environment=row["apns_environment"])
+                    else:
+                        status = (200 if self.sender.send(token, turn_id)
+                                  else None)
+                except Exception as exc:  # push must never reach the request
+                    logger.warning("APNs push failed (%s)", type(exc).__name__)
+                    continue
+                if status == 410:
+                    self._remove_token(token)
+        except Exception as exc:  # schema/read/thread failures are best effort
+            logger.warning("APNs push dispatch failed (%s)", type(exc).__name__)
+
+    def _remove_token(self, token: str) -> None:
+        conn = self._ctx.connect()
+        try:
+            conn.execute("DELETE FROM device_tokens WHERE token = ?", (token,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def bind(self, ctx) -> "_PushDispatcher":
+        self._ctx = ctx
+        return self
 
 
 def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
@@ -964,7 +1076,9 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                analyst_executor_factory=analyst_sandbox.default_executor,
                analyst_corpus_path: str | None = None,
                ingest_guard: Callable[[], Response | None] | None = None,
-               health_extra: Callable[[], dict] | None = None) -> FastAPI:
+               health_extra: Callable[[], dict] | None = None,
+               apns_config: push.APNsConfig | None = None,
+               apns_sender=None) -> FastAPI:
     """One receiver bound to one user's vault.
 
     A factory rather than a module-level `app` because the vault has to be
@@ -974,6 +1088,17 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     llm.assert_backend_approved()
     app = FastAPI(title="Health Advisor Receiver")
     analyst_permit = asyncio.Semaphore(1)
+    if apns_sender is None and apns_config is not None:
+        apns_sender = push.APNsSender(
+            key_path=apns_config.key_path,
+            key_id=apns_config.key_id,
+            team_id=apns_config.team_id,
+            topic=apns_config.topic,
+            endpoint=apns_config.endpoint,
+        )
+    dispatcher = _PushDispatcher(apns_sender).bind(ctx) if apns_sender else None
+    app.state.apns_sender = apns_sender
+    app.state.apns_dispatcher = dispatcher
 
     @app.on_event("startup")
     def _ensure_db():
@@ -1020,6 +1145,20 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         finally:
             db_conn.close()
         return {"ok": True, "apns_environment": row["apns_environment"]}
+
+    @app.delete("/v1/push/register")
+    @app.delete("/v1/device-token")
+    def delete_device_token(raw: bytes = Depends(_raw_body),
+                            x_health_secret: str | None = Header(default=None)):
+        _require_ask_secret(x_health_secret)
+        token = _device_token_for_delete(raw)
+        db_conn = ctx.connect()
+        try:
+            db_conn.execute("DELETE FROM device_tokens WHERE token = ?", (token,))
+            db_conn.commit()
+        finally:
+            db_conn.close()
+        return {"ok": True}
 
     @app.post("/v1/analyst")
     async def analyst_route(request: Request, raw: bytes = Depends(_raw_body),
@@ -1170,6 +1309,9 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             answers_turn_id=question_turn["id"],
             client_disconnected_at=disconnected_at,
             attachments=result.get("attachments", attachments),
+            after_commit=(dispatcher.enqueue
+                          if dispatcher is not None
+                          and result.get("mode") != "fallback" else None),
         )
         # No "ok"/"status"/"cancelled" fields. They were literals — True,
         # "complete", False — under a docstring promising explicit completion
@@ -1218,6 +1360,16 @@ def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:
     )
     ap.add_argument("--corpus", default=None,
                     help="path to the read-only evidence corpus")
+    ap.add_argument("--apns-key", default=None,
+                    help="path to the APNs .p8 signing key")
+    ap.add_argument("--apns-key-id", default=None,
+                    help="APNs signing key id")
+    ap.add_argument("--apns-team-id", default=None,
+                    help="Apple developer team id")
+    ap.add_argument("--apns-topic", default=None,
+                    help="APNs bundle id")
+    ap.add_argument("--apns-endpoint", default=None,
+                    help="APNs HTTPS endpoint")
     args = ap.parse_args(argv)
     ctx = VaultContext.local(args.vault, user_id=args.user, writable=True)
     # Resolve this once at process startup. In particular, do not silently
@@ -1235,11 +1387,35 @@ def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:
     executor_factory = analyst_sandbox.default_executor
     if selected_executor == "transient":
         executor_factory = analyst_sandbox.TransientUnitExecutor
+    def _setting(argument: str | None, env_name: str) -> str | None:
+        return argument if argument is not None else os.environ.get(env_name)
+
+    apns_key = _setting(args.apns_key, "HA_APNS_KEY_PATH")
+    apns_key_id = _setting(args.apns_key_id, "HA_APNS_KEY_ID")
+    apns_team_id = _setting(args.apns_team_id, "HA_APNS_TEAM_ID")
+    apns_topic = _setting(args.apns_topic, "HA_APNS_TOPIC")
+    apns_endpoint = _setting(args.apns_endpoint, "HA_APNS_ENDPOINT")
+    apns_config = None
+    apns_values = (apns_key, apns_key_id, apns_team_id, apns_topic,
+                   apns_endpoint)
+    if any(apns_values) and not all(value and value.strip()
+                                    for value in apns_values):
+        logger.warning("APNs configuration is incomplete; proactive pushes "
+                       "remain disabled")
+    if all(value and value.strip() for value in apns_values):
+        try:
+            apns_config = push.APNsConfig(
+                key_path=Path(apns_key), key_id=apns_key_id,
+                team_id=apns_team_id, topic=apns_topic,
+                endpoint=apns_endpoint,
+            )
+        except ValueError as exc:
+            ap.error(str(exc))
     # Keep access logging disabled so request metadata cannot become a health-data
     # trail in the journal.
     uvicorn.run(app_factory(
         ctx, analyst_executor_factory=executor_factory,
-        analyst_corpus_path=corpus_path),
+        analyst_corpus_path=corpus_path, apns_config=apns_config),
                 host=args.host, port=args.port,
                 access_log=args.access_log, log_level="info")
     return 0

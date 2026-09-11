@@ -213,19 +213,39 @@ class APNsSender:
             team_id=self.config.team_id, issued_at=issued_at,
         )
 
-    def send(self, device_token: str, turn_id: str) -> bool:
-        """Attempt delivery, announcing and swallowing every push failure."""
+    def send_with_status(
+        self,
+        device_token: str,
+        turn_id: str,
+        *,
+        environment: str | None = None,
+    ) -> int | None:
+        """Attempt delivery and return its HTTP status, or ``None`` on error.
+
+        This is an additive seam for the receiver's token-retirement hook.
+        ``send`` below retains its original boolean API and failure handling.
+        """
         try:
             if not isinstance(device_token, str) or not device_token.strip():
                 raise ValueError("device token must be a non-empty string")
+            if environment is not None and environment not in APNS_ENVIRONMENTS:
+                raise ValueError("APNs environment must be sandbox or production")
             payload = build_answer_ready_payload(turn_id)
+            endpoint = self.config.endpoint
+            if environment in APNS_ENVIRONMENTS:
+                endpoint = (
+                    "https://api.sandbox.push.apple.com"
+                    if environment == "sandbox"
+                    else "https://api.push.apple.com"
+                )
             response = self._http_client.post(
-                f"{self.config.endpoint}/3/device/{device_token.strip()}",
+                f"{endpoint}/3/device/{device_token.strip()}",
                 headers={
                     "authorization": f"bearer {self.jwt()}",
                     "apns-topic": self.config.topic,
                     "apns-push-type": "alert",
                     "apns-priority": "10",
+                    "apns-collapse-id": turn_id,
                 },
                 content=json.dumps(
                     payload, separators=(",", ":"), ensure_ascii=True
@@ -234,8 +254,12 @@ class APNsSender:
             if not 200 <= response.status_code < 300:
                 logger.warning("APNs push failed with HTTP status %s",
                                response.status_code)
-                return False
-            return True
+            return response.status_code
         except Exception as exc:  # noqa: BLE001 - push is best effort by contract
             logger.warning("APNs push failed (%s)", type(exc).__name__)
-            return False
+            return None
+
+    def send(self, device_token: str, turn_id: str) -> bool:
+        """Attempt delivery, announcing and swallowing every push failure."""
+        status = self.send_with_status(device_token, turn_id)
+        return status is not None and 200 <= status < 300

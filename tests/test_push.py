@@ -173,6 +173,7 @@ def test_serialized_push_payload_contains_only_ready_signal_and_turn_id(tmp_path
     assert captured["headers"]["apns-topic"] == "com.example.HealthAdvisor"
     assert captured["headers"]["apns-push-type"] == "alert"
     assert captured["headers"]["apns-priority"] == "10"
+    assert captured["headers"]["apns-collapse-id"] == "turn-123"
     assert captured["headers"]["authorization"].startswith("bearer ")
 
 

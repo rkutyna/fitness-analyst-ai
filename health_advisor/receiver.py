@@ -54,7 +54,6 @@ from . import normalize as nz
 from . import vault
 from . import analyst_sandbox
 from . import analyst_corpus
-from . import deepdive_verify
 from . import push
 from . import ask_progress
 
@@ -1243,42 +1242,6 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         loop = asyncio.get_running_loop()
         attachments: list[dict] = []
 
-        citation_conn = None
-        citation_state = None
-        citation_version = None
-
-        def internal_citation(question: str, *, k=5, doc_id=None) -> dict:
-            """Retrieve parent-owned evidence without exposing its path."""
-            nonlocal citation_conn, citation_state, citation_version
-            if analyst_corpus_path is None:
-                return {"refused": True, "reason": "cite is unavailable"}
-            try:
-                if citation_conn is None:
-                    citation_conn = analyst_corpus.open_corpus(analyst_corpus_path)
-                    version_row = citation_conn.execute(
-                        "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
-                    ).fetchone()
-                    citation_version = int(version_row[0]) if version_row else None
-                    if citation_version is None:
-                        raise analyst_corpus.CiteRefusal(
-                            "corpus_version", "the corpus has no readable version")
-                    citation_state = analyst_corpus.CiteState()
-                passages = analyst_corpus.cite(
-                    citation_conn, question, k, state=citation_state, doc_id=doc_id)
-                return {
-                    "corpus_version": citation_version,
-                    "passages": [passage.as_dict() for passage in passages],
-                }
-            except analyst_corpus.CiteRefusal as exc:
-                return {"refused": True, "reason": exc.reason}
-            except (OSError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
-                return {"refused": True,
-                        "reason": f"cite failed: {type(exc).__name__}"}
-
-        def internal_citation_verify(prose: str, claims: list[dict]) -> dict:
-            return deepdive_verify.verify_citation_claims(
-                prose, claims, analyst_corpus_path)
-
         def internal_analyst_query(question: str) -> dict:
             """Run analyst from chat while sharing /v1/analyst's permit.
 
@@ -1371,21 +1334,12 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             "analyst_query_fn": internal_analyst_query,
             "attachments": attachments,
         }
-        if analyst_corpus_path is not None:
-            answer_kwargs.update({
-                "citation_fn": internal_citation,
-                "citation_verify_fn": internal_citation_verify,
-            })
         if progress_callback is not None:
             answer_kwargs["on_tool_call"] = progress_callback
         try:
-            try:
-                result = await asyncio.to_thread(
-                    chat.answer_question, ctx, payload["question"],
-                    **answer_kwargs)
-            finally:
-                if citation_conn is not None:
-                    citation_conn.close()
+            result = await asyncio.to_thread(
+                chat.answer_question, ctx, payload["question"],
+                **answer_kwargs)
         except BaseException:
             if progress_id is not None:
                 PROGRESS_REGISTRY.finish(progress_id, "error")

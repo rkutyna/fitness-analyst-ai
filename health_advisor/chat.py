@@ -88,6 +88,16 @@ tools supplied for this question and call at least one tool before answering.
     + _DV_VOCAB.workout_count_claim_metadata_sentence() + """
 """).strip()
 
+EVIDENCE_CITATION_INSTRUCTIONS = (
+    "EVIDENCE RETRIEVAL: the `cite` tool reaches published literature and "
+    "evidence, not the user's vault. When it is available, every evidence "
+    "claim must be supported by a returned passage and cited in the final "
+    "template with its exact `{cite:...}` slot key from the CLOSED FACT SET. "
+    "If retrieval returns no supporting passage, leave the evidence claim "
+    "unsourced behind the coaching-guidance label; never add a plausible or "
+    "remembered reference."
+)
+
 
 HISTORY_MAX_TURNS = 8
 HISTORY_MAX_CHARS_PER_TURN = 1200
@@ -1069,6 +1079,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                     capture: list | None = None,
                     accounting: dict | None = None,
                     analyst_query_fn=None,
+                    citation_fn=None,
+                    citation_verify_fn=None,
                     attachments: list[dict[str, Any]] | None = None,
                     audits: Mapping[str, tuple[Callable, Callable]] | None = None,
                     on_tool_call=None,
@@ -1109,6 +1121,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                                             ledger_path=ledger_path, history=history,
                                             capture=capture,
                                             analyst_query_fn=analyst_query_fn,
+                                            citation_fn=citation_fn,
+                                            citation_verify_fn=citation_verify_fn,
                                             on_tool_call=on_tool_call)
         if attachments is not None:
             result = {**result, "attachments": list(result.get("attachments", []))
@@ -1741,10 +1755,33 @@ def _unused_fact_prompt(facts: dict[str, dict], ledger: list[dict]) -> str:
     return "UNUSED FACTS: none"
 
 
+def _verify_citation_slots(template: str, rendered: str, scan: dict,
+                           facts: dict[str, dict], verify_fn) -> dict | None:
+    """Verify selected closed citation slots through the parent callback."""
+    claims = [
+        {"assertion": "retrieved evidence passage", "source": facts[key]["source"]}
+        for key in scan.get("citations", [])
+        if isinstance(facts.get(key), dict)
+        and isinstance(facts[key].get("source"), dict)
+    ]
+    if not claims:
+        return None
+    if verify_fn is None:
+        return {
+            "ok": False,
+            "reason": "citation verifier is unavailable on the chat path",
+            "citations": [], "citations_verified": 0,
+            "citations_total": len(claims),
+        }
+    return verify_fn(rendered, claims)
+
+
 def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           tool_schemas: list[dict], ledger_path: str,
                           *, capture: list | None = None,
                           analyst_query_fn=None,
+                          citation_fn=None,
+                          citation_verify_fn=None,
                           as_of: str | None = None,
                           resolved_window=None,
                           on_tool_call=None) -> dict:
@@ -1764,7 +1801,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         tool_names=llm.COACH_TOOLS, claim_instructions=None,
         submit_tool=False, ledger_index=False, submit_repair=False,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
-        analyst_query_fn=analyst_query_fn, on_tool_call=on_tool_call)
+        analyst_query_fn=analyst_query_fn, citation_fn=citation_fn,
+        on_tool_call=on_tool_call)
     gather_status = _ask_loop_outcome(gather_status_before,
                                       llm.last_loop_status())
     ledger = _read_ledger(ledger_path)
@@ -1774,6 +1812,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     facts = {
         **metric_facts,
         **fact_template.build_attachment_facts(ledger),
+        **fact_template.build_citation_facts(ledger),
     }
     cold_start_guidance = fact_template.cold_start_guidance(facts)
     final_prompt = (
@@ -1807,6 +1846,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "the recorded period, unless the wording is inside a supplied "
         "placeholder. "
         "If the facts do not support a figure, omit it.\n\n"
+        + (EVIDENCE_CITATION_INSTRUCTIONS + "\n\n"
+           if citation_fn is not None else "")
         + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
         + "USER QUESTION:\n" + question.strip() + "\n\n"
         "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
@@ -1861,6 +1902,21 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     if interpolated is not None:
         interpolated = _strip_empty_paragraphs(interpolated)
     rendered_text = interpolated if interpolated is not None else template
+    citation_verification = _verify_citation_slots(
+        template, rendered_text, scan, facts, citation_verify_fn)
+    if citation_verification is not None:
+        verification.update({
+            "citations": citation_verification.get("citations", []),
+            "citations_verified": citation_verification.get("citations_verified", 0),
+            "citations_total": citation_verification.get(
+                "citations_total", len(scan.get("citations", []))),
+        })
+        if not citation_verification.get("ok"):
+            verification.update({
+                "ok": False, "grounded": False,
+                "reason": citation_verification.get(
+                    "reason", "citation verification refused"),
+            })
     denied_available_figure = _mark_denied_available_figure(
         verification, question=question, text=rendered_text,
         ledger=ledger,
@@ -1886,11 +1942,16 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         restated_unit=restated_unit)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
-    has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
+    has_gathered_data = bool(facts) or _ledger_has_successful_data([
+        record for record in ledger
+        if isinstance(record, dict)
+        and record.get("tool_name") != llm.EVIDENCE_CITE_NAME
+    ])
     # An advice-carrying answer is substance, not empty-handedness — without
     # this, every advice-only coaching answer (#264) burns the single retry.
     empty_with_gathered_data = (
         verification["ok"] and not scan["placeholders"]
+        and not scan.get("citations")
         and not scan["advice_quantities"]
         and interpolated is not None and has_gathered_data
     )
@@ -1963,6 +2024,23 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     retry_rendered_text = (retry_interpolated
                            if retry_interpolated is not None
                            else retry_template)
+    retry_citation_verification = _verify_citation_slots(
+        retry_template, retry_rendered_text, retry_scan, facts,
+        citation_verify_fn)
+    if retry_citation_verification is not None:
+        retry_verification.update({
+            "citations": retry_citation_verification.get("citations", []),
+            "citations_verified": retry_citation_verification.get(
+                "citations_verified", 0),
+            "citations_total": retry_citation_verification.get(
+                "citations_total", len(retry_scan.get("citations", []))),
+        })
+        if not retry_citation_verification.get("ok"):
+            retry_verification.update({
+                "ok": False, "grounded": False,
+                "reason": retry_citation_verification.get(
+                    "reason", "citation verification refused"),
+            })
     retry_denied_available_figure = _mark_denied_available_figure(
         retry_verification, question=question,
         text=retry_rendered_text, ledger=ledger,
@@ -1990,6 +2068,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         restated_unit=retry_restated_unit)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]
+            and not retry_scan.get("citations")
             and not retry_scan["advice_quantities"]):
         grounded, reason = _empty_narration_is_grounded(
             ctx, retry_interpolated, as_of, question=question, ledger=ledger,
@@ -2026,6 +2105,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                            history: list[dict[str, Any]] | None = None,
                            capture: list | None = None,
                            analyst_query_fn=None,
+                           citation_fn=None,
+                           citation_verify_fn=None,
                            on_tool_call=None) -> dict:
     """The model-facing body of :func:`answer_question`; see its docstring."""
     from . import agents, llm
@@ -2081,9 +2162,14 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 + "Python will enforce this window on eligible tools; use the "
                 "returned result and this scope in the answer.\n\n")
     prompt += "USER QUESTION:\n" + question.strip()
+    if citation_fn is not None:
+        prompt += "\n\n" + EVIDENCE_CITATION_INSTRUCTIONS
     if not fact_template_enabled:
         prompt += "\n\n" + ASK_CLAIM_INSTRUCTIONS
-    tool_schemas = llm.tool_schemas(ctx, include=llm.COACH_TOOLS)
+    schema_kwargs = {"include": llm.COACH_TOOLS}
+    if citation_fn is not None:
+        schema_kwargs["citation_fn"] = citation_fn
+    tool_schemas = llm.tool_schemas(ctx, **schema_kwargs)
     # Both attempts run the same arm: a retry that saw a different prompt shape
     # than the draft it is fixing would not be measuring one thing.
     ledger_index = _ledger_index_enabled()
@@ -2094,6 +2180,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             return _answer_fact_template(
                 ctx, question, prompt, tool_schemas, ledger_path,
                 capture=capture, analyst_query_fn=analyst_query_fn,
+                citation_fn=citation_fn, citation_verify_fn=citation_verify_fn,
                 as_of=as_of, resolved_window=resolved_window,
                 on_tool_call=on_tool_call)
         # claim_instructions=None: ASK_CLAIM_INSTRUCTIONS is already in `prompt`,
@@ -2109,7 +2196,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             claim_instructions=None, submit_tool=True,
             ledger_index=ledger_index, submit_repair=submit_repair,
             timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
-            analyst_query_fn=analyst_query_fn, on_tool_call=on_tool_call)
+            analyst_query_fn=analyst_query_fn, citation_fn=citation_fn,
+            on_tool_call=on_tool_call)
         first_loop_status = _ask_loop_outcome(first_status_before,
                                               llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))
@@ -2180,7 +2268,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             claim_instructions=None, submit_tool=True,
             ledger_index=ledger_index, submit_repair=submit_repair,
             timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
-            analyst_query_fn=analyst_query_fn, on_tool_call=on_tool_call)
+            analyst_query_fn=analyst_query_fn, citation_fn=citation_fn,
+            on_tool_call=on_tool_call)
         retry_loop_status = _ask_loop_outcome(retry_status_before,
                                               llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))

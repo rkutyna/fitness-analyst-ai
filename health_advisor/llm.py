@@ -1418,9 +1418,12 @@ COACH_TOOLS = (
     "get_block_structure",
     "get_weekly_readiness", "get_benchmark_series", "get_monthly_running_power",
     "analyst_query",
+    "cite",
 )
 
 ANALYST_QUERY_NAME = "analyst_query"
+EVIDENCE_CITE_NAME = "cite"
+_CITE_QUERY_ALLOWED_RE = re.compile(r"[^\w\s_\-'’.,%/]+", re.UNICODE)
 _ANALYST_QUERY_SCHEMA = {
     "type": "function",
     "function": {
@@ -1429,6 +1432,28 @@ _ANALYST_QUERY_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_EVIDENCE_CITE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": EVIDENCE_CITE_NAME,
+        "description": (
+            "Retrieve published literature and evidence passages relevant to "
+            "the question. This reaches the evidence corpus, not the user's "
+            "health vault."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 5},
+                "doc_id": {"type": ["string", "null"]},
+            },
             "required": ["question"],
             "additionalProperties": False,
         },
@@ -1446,7 +1471,24 @@ def _analyst_tool(question: str, *, analyst_query_fn=None) -> dict:
     return analyst_query_fn(question.strip())
 
 
-def _registry(ctx, include=None, *, analyst_query_fn=None) -> dict:
+def _citation_tool(question: str, *, k=5, doc_id=None, citation_fn=None) -> dict:
+    """Dispatch evidence retrieval after removing model query syntax."""
+    if citation_fn is None:
+        return {"refused": True,
+                "reason": "cite is unavailable on this tool path"}
+    if not isinstance(question, str) or not question.strip():
+        return {"refused": True, "reason": "question must be a non-empty string"}
+    # The corpus API intentionally rejects FTS/query syntax. The chat model
+    # receives a natural-language question, so the tool boundary owns the
+    # lossy removal of punctuation such as the final question mark.
+    query = _CITE_QUERY_ALLOWED_RE.sub(" ", question).strip()
+    if not query:
+        return {"refused": True, "reason": "question has no searchable terms"}
+    return citation_fn(query, k=k, doc_id=doc_id)
+
+
+def _registry(ctx, include=None, *, analyst_query_fn=None,
+              citation_fn=None) -> dict:
     """{name: (callable, ollama_schema)} for one session's selected tools,
     sourced from real FastMCP tool objects so schemas can't drift from the
     signatures/docstrings.
@@ -1481,12 +1523,22 @@ def _registry(ctx, include=None, *, analyst_query_fn=None) -> dict:
                 question, analyst_query_fn=analyst_query_fn),
             _ANALYST_QUERY_SCHEMA,
         )
+    if EVIDENCE_CITE_NAME in selected and citation_fn is not None:
+        registry[EVIDENCE_CITE_NAME] = (
+            lambda question, k=5, doc_id=None: _citation_tool(
+                question, k=k, doc_id=doc_id, citation_fn=citation_fn),
+            _EVIDENCE_CITE_SCHEMA,
+        )
     return registry
 
 
-def tool_schemas(ctx, include=None) -> list[dict]:
+def tool_schemas(ctx, include=None, *, citation_fn=None) -> list[dict]:
     """Tool schemas for one provider-facing surface."""
-    return [schema for _, schema in _registry(ctx, include=include).values()]
+    if citation_fn is None:
+        registry = _registry(ctx, include=include)
+    else:
+        registry = _registry(ctx, include=include, citation_fn=citation_fn)
+    return [schema for _, schema in registry.values()]
 
 
 class ResearchResponse(str):
@@ -2129,6 +2181,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
               submit_repair: bool = False,
               submit_repair_budget: int = SUBMIT_ANSWER_REPAIR_BUDGET,
               analyst_query_fn=None,
+              citation_fn=None,
               on_tool_call=None,
               ) -> ResearchResponse:
     """Researcher path: let the model call the read tools in-process until it
@@ -2183,13 +2236,27 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
     if openai_dialect and not _openrouter_ready():
         return ResearchResponse()
     if analyst_query_fn is None:
-        base_registry = (_registry(ctx) if tool_names is None else
-                         _registry(ctx, include=tool_names))
+        if citation_fn is None:
+            base_registry = (_registry(ctx) if tool_names is None else
+                             _registry(ctx, include=tool_names))
+        else:
+            base_registry = (_registry(ctx, citation_fn=citation_fn)
+                             if tool_names is None else
+                             _registry(ctx, include=tool_names,
+                                       citation_fn=citation_fn))
     else:
-        base_registry = (_registry(ctx, analyst_query_fn=analyst_query_fn)
-                         if tool_names is None else
-                         _registry(ctx, include=tool_names,
-                                   analyst_query_fn=analyst_query_fn))
+        if citation_fn is None:
+            base_registry = (_registry(ctx, analyst_query_fn=analyst_query_fn)
+                             if tool_names is None else
+                             _registry(ctx, include=tool_names,
+                                       analyst_query_fn=analyst_query_fn))
+        else:
+            base_registry = (_registry(ctx, analyst_query_fn=analyst_query_fn,
+                                       citation_fn=citation_fn)
+                             if tool_names is None else
+                             _registry(ctx, include=tool_names,
+                                       analyst_query_fn=analyst_query_fn,
+                                       citation_fn=citation_fn))
     reg = _ledgered(base_registry, ledger_path)
     messages: list[dict] = [{"role": "user", "content": prompt}]
     if claim_instructions:

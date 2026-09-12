@@ -24,9 +24,11 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from collections import Counter
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 from health_advisor import analyst_corpus as ac
 from health_advisor import analyst_envelope, analyst_ledger, analyst_runner
@@ -94,6 +96,135 @@ def _build_test_corpus(path: Path) -> Path:
         read_only=False,
     )
     return path
+
+
+def _build_fused_guard_corpus(path: Path) -> Path:
+    """Build enough joined chunks for both fused candidate lists to be wide."""
+    entries = []
+    texts = []
+    for ix in range(300):
+        counts = (
+            1 + ix % 3,
+            1 + (ix // 3) % 5,
+            1 + (ix // 15) % 4,
+            1 + (ix // 60) % 3,
+            1 + (ix // 180) % 2,
+        )
+        terms = ("injury", "risk", "runners", "recovery", "training")
+        body = " ".join(
+            term for term, count in zip(terms, counts) for _ in range(count)
+        ) + " biomechanics evidence endurance context"
+        doc_id = f"guard-{ix:03d}"
+        entries.append({
+            "doc_id": doc_id,
+            "title": f"Fused guard document {ix}",
+            "authors": "Guard Author",
+            "year": 2026,
+            "doi": None,
+            "pmid": None,
+            "source_url": f"https://example.test/{doc_id}",
+            "retrieved_at": "2026-09-12T00:00:00Z",
+            "source_sha256": "0" * 64,
+            "text_sha256": sha256_text(body),
+            "license": "CC-BY-4.0",
+            "license_url": "https://creativecommons.org/licenses/by/4.0/",
+            "redistributable": 1,
+            "approver": "guard",
+            "approved_at": "2026-09-12",
+            "notes": None,
+        })
+        texts.append(body)
+    build_corpus(entries, texts, path, corpus_version=1, read_only=False)
+    return path
+
+
+@pytest.fixture()
+def fused_guard_corpus(tmp_path):
+    conn = ac.open_corpus(_build_fused_guard_corpus(tmp_path / "fused.db"))
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _independent_fused_oracle(corpus_conn, *, k=5):
+    """Compute the expected RRF order without calling retrieval rankers."""
+    query_terms = ("injury", "risk", "runners", "recovery", "training")
+    expression = " OR ".join(f'"{term}"' for term in query_terms)
+    lexical_rows = corpus_conn.execute(
+        "SELECT chunks.doc_id, chunks.chunk_ix, bm25(chunks) "
+        "FROM chunks JOIN docs d ON d.doc_id = chunks.doc_id "
+        "WHERE chunks MATCH ? ORDER BY bm25(chunks) ASC LIMIT 256",
+        (expression,),
+    ).fetchall()
+    assert len(lexical_rows) == 256
+    lexical_rank = {
+        (str(row[0]), int(row[1])): rank
+        for rank, row in enumerate(lexical_rows, 1)
+    }
+
+    rows = corpus_conn.execute(
+        "SELECT chunks.doc_id, chunks.chunk_ix, chunks.body "
+        "FROM chunks JOIN docs d ON d.doc_id = chunks.doc_id "
+        "ORDER BY chunks.doc_id, chunks.chunk_ix"
+    ).fetchall()
+    token_re = re.compile(r"\w+", re.UNICODE)
+    token_counts = [
+        Counter(match.group(0).casefold() for match in token_re.finditer(str(row[2])))
+        for row in rows
+    ]
+    vocabulary = {
+        token: column
+        for column, token in enumerate(sorted({
+            token for counts in token_counts for token in counts
+        }))
+    }
+    matrix = np.zeros((len(rows), len(vocabulary)), dtype=float)
+    document_frequency = np.zeros(len(vocabulary), dtype=float)
+    for row_ix, counts in enumerate(token_counts):
+        for token, count in counts.items():
+            column = vocabulary[token]
+            matrix[row_ix, column] = 1.0 + np.log(float(count))
+            document_frequency[column] += 1.0
+    idf = np.log((1.0 + len(rows)) / (1.0 + document_frequency)) + 1.0
+    matrix *= idf
+    _, singular_values, right_vectors = np.linalg.svd(
+        matrix, full_matrices=False)
+    rank = min(256, len(rows) - 1, len(vocabulary) - 1)
+    vectors = matrix @ right_vectors[:rank].T
+    norms = np.linalg.norm(vectors, axis=1)
+    vectors[norms > 0.0] /= norms[norms > 0.0, None]
+
+    query = np.zeros(len(vocabulary), dtype=float)
+    for term in query_terms:
+        for token in (match.group(0).casefold()
+                      for match in token_re.finditer(term)):
+            query[vocabulary[token]] += idf[vocabulary[token]]
+    latent = query @ right_vectors[:rank].T
+    latent /= np.linalg.norm(latent)
+    similarities = vectors @ latent
+    semantic = [
+        ((str(row[0]), int(row[1])), float(similarities[row_ix]))
+        for row_ix, row in enumerate(rows)
+    ]
+    semantic.sort(key=lambda item: (-item[1], item[0][0], item[0][1]))
+    semantic_rank = {
+        key: rank for rank, (key, _) in enumerate(semantic[:256], 1)
+    }
+
+    keys = set(lexical_rank) | set(semantic_rank)
+    fused = sorted(
+        keys,
+        key=lambda key: (
+            -(1.0 / (60 + lexical_rank[key]) if key in lexical_rank else 0.0)
+            - (1.0 / (60 + semantic_rank[key])
+               if key in semantic_rank else 0.0),
+            lexical_rank.get(key, 257),
+            semantic_rank.get(key, 257),
+            key[0], key[1],
+        ),
+    )
+    return fused[:k]
 
 
 @pytest.fixture()
@@ -529,37 +660,17 @@ def test_a_named_doc_filter_still_goes_through_match_and_the_caps(corpus):
 # 6. bm25 is negative; the sort must be ascending
 # --------------------------------------------------------------------------- #
 
-def test_reversed_sort_would_be_caught(corpus):
-    """`Done when` 6. THIS is the test that fails if the comparison flips.
-
-    ``bm25()`` in SQLite is NEGATIVE and more negative is better. A reversed
-    sort returns the *worst* matches while looking perfectly correct -- same
-    shape, same count, plausible spans -- so a test that only checks
-    monotonicity would pass under the flip. This one pins the returned set
-    against the true minima of a wide fetch, which a reversed sort cannot
-    satisfy.
-    """
-    query = LIVE_QUERIES[0]
-    expression = ac.build_match_expression(query)
-    wide = corpus.execute(
-        "SELECT chunks.doc_id, chunks.chunk_ix, bm25(chunks) "
-        "  FROM chunks JOIN docs d ON d.doc_id = chunks.doc_id "
-        " WHERE chunks MATCH ? ORDER BY bm25(chunks) ASC",
-        (expression,)).fetchall()
-    assert len(wide) > 5, "need a wide result for the comparison to bite"
-    assert wide[0][2] < 0, "bm25 is negative; this whole test assumes it"
-    assert wide[0][2] < wide[-1][2], "ascending means best first"
-
-    passages = ac.cite(corpus, query, k=5, state=ac.CiteState())
-    got = [(p.doc_id, p.chunk_ix) for p in passages]
-    best_five = [(row[0], int(row[1])) for row in wide[:5]]
-    worst_five = [(row[0], int(row[1])) for row in reversed(wide[-5:])]
-    assert got == best_five
-    assert got != worst_five, "a reversed sort would return exactly these"
-
-    scores = [p.score for p in passages]
-    assert scores == sorted(scores), "returned order must be ascending bm25"
-    assert scores[0] == min(row[2] for row in wide)
+def test_reversed_sort_would_be_caught(fused_guard_corpus):
+    """The default fused path must still expose a reversed lexical sort."""
+    expected = _independent_fused_oracle(fused_guard_corpus)
+    passages = ac.cite(
+        fused_guard_corpus,
+        "injury risk runners recovery training",
+        k=5,
+        state=ac.CiteState(),
+    )
+    got = [(passage.doc_id, passage.chunk_ix) for passage in passages]
+    assert got == expected
 
 
 def test_ascending_is_spelled_out_in_the_sql():

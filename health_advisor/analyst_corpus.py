@@ -64,6 +64,7 @@ import re
 import sqlite3
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -76,6 +77,7 @@ __all__ = [
     "CiteCaps",
     "CiteRefusal",
     "CiteState",
+    "EmbeddingIndex",
     "Passage",
     "build_match_expression",
     "child_source_with_cite",
@@ -440,14 +442,16 @@ class CiteState:
 class Passage:
     """One retrieved passage. Design S2.1's shape, verbatim.
 
-    ``score`` is bm25 and is present because ordering and the run record both
-    want it. It is **returned, never filtered on** -- see `cite`.
+    ``score`` is the lexical BM25 score when the passage matched FTS5. It is
+    ``None`` for a semantic-only hit because RRF is a private ordering signal,
+    not evidence that a passage supports a claim. It is **returned, never
+    filtered on** -- see `cite`.
     """
 
     doc_id: str
     chunk_ix: int
     span: str
-    score: float
+    score: float | None
     title: str | None = None
     authors: str | None = None
     year: int | None = None
@@ -467,6 +471,190 @@ class Passage:
 # --------------------------------------------------------------------------- #
 # Retrieval
 # --------------------------------------------------------------------------- #
+
+# The embedding index is deliberately a small, local LSA implementation rather
+# than a model dependency. The corpus is opened read-only and this index never
+# writes to it. Keeping these values here also makes the fallback boundary
+# explicit: a corpus with fewer chunks than the requested SVD rank stays
+# BM25-only rather than asking ``svds`` to factorise an invalid matrix.
+LSA_DIMENSIONS = 256
+RRF_K = 60
+RRF_CANDIDATES = 256
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _body_tokens(text: str) -> list[str]:
+    return [match.group(0).casefold() for match in _TOKEN_RE.finditer(text)]
+
+
+@dataclass
+class EmbeddingIndex:
+    """An in-memory TF-IDF/LSA index over the joined corpus chunks.
+
+    ``vectors`` are row-normalised document vectors in latent space and
+    ``components`` are the right singular vectors. ``fallback_reason`` is set
+    when the corpus is intentionally BM25-only (empty, too small, or not
+    factorisable). No retrieval score from this object is exposed as a
+    citation score.
+    """
+
+    chunk_keys: tuple[tuple[str, int], ...]
+    vectors: object | None
+    components: object | None
+    idf: object | None
+    vocabulary: dict[str, int]
+    dimensions: int
+    build_seconds: float
+    fallback_reason: str | None = None
+
+    @classmethod
+    def from_connection(cls, corpus_conn: sqlite3.Connection,
+                        *, dimensions: int = LSA_DIMENSIONS) -> "EmbeddingIndex":
+        started = time.perf_counter()
+        rows = corpus_conn.execute(
+            "SELECT chunks.doc_id, chunks.chunk_ix, chunks.body "
+            "FROM chunks JOIN docs d ON d.doc_id = chunks.doc_id "
+            "ORDER BY chunks.doc_id, chunks.chunk_ix"
+        ).fetchall()
+        keys = tuple((str(row[0]), int(row[1])) for row in rows)
+        bodies = [str(row[2] or "") for row in rows]
+
+        def fallback(reason: str) -> "EmbeddingIndex":
+            return cls(keys, None, None, None, {}, 0,
+                       time.perf_counter() - started, reason)
+
+        if not rows:
+            return fallback("empty_corpus")
+        if dimensions < 1 or len(rows) <= dimensions:
+            return fallback("fewer_chunks_than_svd_dimensions")
+
+        token_counts = [Counter(_body_tokens(body)) for body in bodies]
+        vocabulary = {
+            token: index
+            for index, token in enumerate(sorted({
+                token for counts in token_counts for token in counts
+            }))
+        }
+        if not vocabulary:
+            return fallback("no_indexable_terms")
+
+        # svds requires k < min(matrix.shape), so the number of terms is a
+        # second, independent degeneracy boundary.
+        rank = min(dimensions, len(rows) - 1, len(vocabulary) - 1)
+        if rank < 1:
+            return fallback("fewer_terms_than_svd_dimensions")
+
+        try:
+            import numpy as np
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.linalg import svds
+
+            document_frequency = np.zeros(len(vocabulary), dtype=np.int64)
+            sparse_rows: list[int] = []
+            sparse_cols: list[int] = []
+            sparse_data: list[float] = []
+            for row_ix, counts in enumerate(token_counts):
+                for token in counts:
+                    col_ix = vocabulary[token]
+                    document_frequency[col_ix] += 1
+                    sparse_rows.append(row_ix)
+                    sparse_cols.append(col_ix)
+                    sparse_data.append(1.0 + np.log(float(counts[token])))
+            idf = np.log((1.0 + len(rows)) /
+                         (1.0 + document_frequency)) + 1.0
+            matrix = csr_matrix((sparse_data, (sparse_rows, sparse_cols)),
+                                shape=(len(rows), len(vocabulary)))
+            matrix = matrix.multiply(idf).tocsr()
+
+            # random_state makes ARPACK's starting vector repeatable. The
+            # explicit sign convention is still required because singular
+            # vectors are mathematically sign-indeterminate.
+            u, singular_values, vt = svds(
+                matrix, k=rank, which="LM", return_singular_vectors=True,
+                random_state=0)
+            order = np.argsort(-singular_values, kind="stable")
+            u = u[:, order]
+            singular_values = singular_values[order]
+            vt = vt[order, :]
+            for component_ix in range(vt.shape[0]):
+                pivot = int(np.argmax(np.abs(vt[component_ix])))
+                if vt[component_ix, pivot] < 0:
+                    vt[component_ix] *= -1.0
+                    u[:, component_ix] *= -1.0
+            vectors = u * singular_values
+            norms = np.linalg.norm(vectors, axis=1)
+            nonzero = norms > 0.0
+            vectors[nonzero] /= norms[nonzero, None]
+            return cls(keys, vectors, vt, idf, vocabulary, rank,
+                       time.perf_counter() - started)
+        except (ImportError, ValueError, RuntimeError):
+            # Retrieval must remain a designed BM25-only answer if numerical
+            # factorisation is impossible for a particular corpus.
+            return fallback("svd_failed")
+
+    @property
+    def usable(self) -> bool:
+        return self.vectors is not None and self.components is not None
+
+    def rank(self, terms: list[str], *, limit: int,
+             doc_id: str | None = None) -> list[tuple[tuple[str, int], float]]:
+        """Return deterministic cosine ranking, never a citation score."""
+        if not self.usable:
+            return []
+        import numpy as np
+
+        counts = Counter(token for term in terms for token in _body_tokens(term))
+        query = np.zeros(len(self.vocabulary), dtype=float)
+        for token, count in counts.items():
+            col_ix = self.vocabulary.get(token)
+            if col_ix is not None:
+                query[col_ix] = (1.0 + np.log(float(count))) * self.idf[col_ix]
+        if not np.any(query):
+            return []
+        latent = query @ self.components.T
+        norm = float(np.linalg.norm(latent))
+        if norm == 0.0:
+            return []
+        similarities = (self.vectors @ (latent / norm)).tolist()
+        ranked = []
+        for ix, similarity in enumerate(similarities):
+            key = self.chunk_keys[ix]
+            if doc_id is not None and key[0] != doc_id:
+                continue
+            ranked.append((key, float(similarity)))
+        ranked.sort(key=lambda item: (-item[1], item[0][0], item[0][1]))
+        return ranked[:limit]
+
+
+# Cache keys include the immutable file's stat and corpus version. This keeps
+# the cache per process without persisting an index or serving an old index for
+# a replaced corpus at the same path.
+_EMBEDDING_CACHE: dict[tuple, EmbeddingIndex] = {}
+
+
+def _embedding_cache_key(corpus_conn: sqlite3.Connection) -> tuple:
+    try:
+        database = corpus_conn.execute("PRAGMA database_list").fetchone()
+        path = database[2] if database else ""
+        if path and path != ":memory:":
+            stat = Path(path).stat()
+            version = corpus_conn.execute(
+                "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
+            ).fetchone()
+            return ("path", str(Path(path).resolve()), stat.st_mtime_ns,
+                    stat.st_size, version[0] if version else None)
+    except (OSError, sqlite3.DatabaseError):
+        pass
+    return ("connection", id(corpus_conn))
+
+
+def _embedding_index(corpus_conn: sqlite3.Connection) -> EmbeddingIndex:
+    key = _embedding_cache_key(corpus_conn)
+    index = _EMBEDDING_CACHE.get(key)
+    if index is None:
+        index = EmbeddingIndex.from_connection(corpus_conn)
+        _EMBEDDING_CACHE[key] = index
+    return index
 
 # The INNER JOIN is the whole orphan defence -- see the comment in `cite`.
 #
@@ -493,6 +681,12 @@ SELECT chunks.doc_id, chunks.chunk_ix,
 
 _ORPHAN_PROBE = "SELECT 1 FROM chunks WHERE doc_id = ? LIMIT 1"
 _DOC_PROBE = "SELECT 1 FROM docs WHERE doc_id = ? LIMIT 1"
+_SELECT_SEMANTIC = """
+SELECT chunks.doc_id, chunks.chunk_ix, chunks.body,
+       d.title, d.authors, d.year, d.doi, d.pmid, d.license
+  FROM chunks JOIN docs d ON d.doc_id = chunks.doc_id
+ WHERE {where}
+"""
 
 
 def open_corpus(corpus_path: str | Path) -> sqlite3.Connection:
@@ -526,6 +720,9 @@ def open_corpus(corpus_path: str | Path) -> sqlite3.Connection:
             "corpus_integrity",
             f"integrity check found {orphan_count} chunk(s) without a docs row",
         )
+    # Build once while the corpus is opened. The index is in process memory;
+    # nothing is added to or written beside the read-only corpus file.
+    _embedding_index(corpus_conn)
     return corpus_conn
 
 
@@ -561,7 +758,8 @@ def _guard_doc_id(corpus_conn: sqlite3.Connection, doc_id) -> str:
 
 
 def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
-         state: CiteState, doc_id: str | None = None) -> list[Passage]:
+         state: CiteState, doc_id: str | None = None,
+         ranking: str = "rrf") -> list[Passage]:
     """Retrieve up to ``k`` passages for ``query``. Parent-side. No thresholds.
 
     **There is no score threshold and no parameter that accepts one**, and this
@@ -577,11 +775,13 @@ def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
     human (S6.3), which is why the span is returned and the score is not acted
     on.
 
+    By default the returned order is reciprocal-rank fusion (RRF) of the
+    ascending BM25 ranking and the local TF-IDF/LSA cosine ranking. RRF's
+    private ``1 / (RRF_K + rank)`` values are never placed in ``Passage.score``.
+    ``ranking="bm25"`` is an explicit compatibility and measurement path.
     ``bm25()`` in SQLite is NEGATIVE and more negative is better, so `_SELECT`
-    sorts ASC and ``result[0]`` is the best match. Reversing that silently
-    returns the *worst* matches while looking correct;
-    ``test_reversed_sort_would_be_caught`` is the assertion that fails if it
-    is flipped.
+    sorts ASC and ``result[0]`` is the best lexical match. Reversing that
+    silently returns the *worst* matches while looking correct.
 
     ``k`` is clamped to `CiteCaps.passages_per_call`, not refused -- a model
     asking for 50 gets 5, which is the cap doing its job rather than an error.
@@ -612,6 +812,10 @@ def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
             "bad_k", f"k is {k}; a retrieval returns at least one passage"))
     k = min(k, caps.passages_per_call)
 
+    if ranking not in {"rrf", "bm25"}:
+        raise _refuse(state, query, CiteRefusal(
+            "bad_ranking", "ranking must be 'rrf' or 'bm25'"))
+
     if state.calls >= caps.calls_per_run:
         raise _refuse(state, query, CiteRefusal(
             "call_cap",
@@ -625,22 +829,33 @@ def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
     except CiteRefusal as exc:
         raise _refuse(state, query, exc) from None
 
-    sql, params = _SELECT, [DEFAULT_SNIPPET_TOKENS, expression, k]
+    # A small corpus or an index with no query vocabulary intentionally takes
+    # the BM25-only path. It is also exposed as ranking="bm25" so a caller can
+    # measure before/after on one build.
+    index = _embedding_index(corpus_conn) if ranking == "rrf" else None
+    use_embedding = index is not None and index.usable
+    candidate_limit = max(k, RRF_CANDIDATES)
+    fetch_limit = candidate_limit if use_embedding else k
+    sql, params = _SELECT, [DEFAULT_SNIPPET_TOKENS, expression, fetch_limit]
     if target is not None:
         # Filtering inside the FTS5 scan, so the doc filter cannot be used to
         # walk the corpus: it still goes through MATCH, snippet() and the caps.
         sql = _SELECT.replace("WHERE chunks MATCH ?",
                               "WHERE chunks MATCH ? AND chunks.doc_id = ?")
-        params = [DEFAULT_SNIPPET_TOKENS, expression, target, k]
+        params = [DEFAULT_SNIPPET_TOKENS, expression, target, fetch_limit]
 
     rows = _execute_bounded(corpus_conn, sql, params, caps, state, query)
-
-    passages = [
-        Passage(doc_id=str(row[0]), chunk_ix=int(row[1]), span=row[2],
-                score=float(row[3]), title=row[4], authors=row[5],
-                year=row[6], doi=row[7], pmid=row[8], license=row[9])
-        for row in rows
-    ]
+    if use_embedding:
+        passages = _fuse_passages(
+            corpus_conn, rows, index, _terms(query, caps), target,
+            k, fetch_limit, caps, state)
+    else:
+        passages = [
+            Passage(doc_id=str(row[0]), chunk_ix=int(row[1]), span=row[2],
+                    score=float(row[3]), title=row[4], authors=row[5],
+                    year=row[6], doi=row[7], pmid=row[8], license=row[9])
+            for row in rows[:k]
+        ]
 
     # Both remaining run-level caps are checked BEFORE any of this call's
     # passages is admitted, so a call either lands whole or does not land.
@@ -669,9 +884,95 @@ def cite(corpus_conn: sqlite3.Connection, query: str, k: int = 5, *,
     state.passages_returned += len(passages)
     state.docs_cited = would_cite
     state.queries.append({"query": query, "expression": expression,
-                          "k": k, "doc_id": target, "returned": len(passages)})
+                          "k": k, "doc_id": target, "ranking": ranking,
+                          "returned": len(passages)})
     state.chunks_returned.extend([p.doc_id, p.chunk_ix] for p in passages)
     state.passages.extend(p.as_dict() for p in passages)
+    return passages
+
+
+def _semantic_span(body: str, terms: list[str]) -> str:
+    """Take a verbatim, bounded span from a semantic-only chunk.
+
+    A semantic hit need not contain the query's literal words, so SQLite's
+    ``snippet()`` cannot produce it. The span is still an exact body slice and
+    is bounded to the same 64-token contract as FTS5 snippets; it is not a
+    claim-support judgment.
+    """
+    matches = list(re.finditer(r"\S+", body))
+    if not matches:
+        return ""
+    query_tokens = set(token for term in terms for token in _body_tokens(term))
+    anchor = 0
+    for ix, match in enumerate(matches):
+        if match.group(0).strip(".,;:!?()[]{}\"'").casefold() in query_tokens:
+            anchor = ix
+            break
+    start = max(0, min(anchor - 16, len(matches) - 64))
+    end = min(len(matches), start + 64)
+    return body[matches[start].start():matches[end - 1].end()]
+
+
+def _fuse_passages(corpus_conn: sqlite3.Connection, bm25_rows: list,
+                   index: EmbeddingIndex, terms: list[str],
+                   target: str | None, k: int, candidate_limit: int,
+                   caps: CiteCaps, state: CiteState) -> list[Passage]:
+    """Fuse two ranked candidate lists while retaining lexical scores only."""
+    bm25_rank = {
+        (str(row[0]), int(row[1])): rank
+        for rank, row in enumerate(bm25_rows, start=1)
+    }
+    bm25_by_key = {
+        (str(row[0]), int(row[1])): row for row in bm25_rows
+    }
+    semantic = index.rank(terms, limit=candidate_limit, doc_id=target)
+    semantic_rank = {key: rank for rank, (key, _) in enumerate(semantic, 1)}
+    fused_keys = set(bm25_rank) | set(semantic_rank)
+    fused = sorted(
+        fused_keys,
+        key=lambda key: (
+            -(1.0 / (RRF_K + bm25_rank[key]) if key in bm25_rank else 0.0)
+            - (1.0 / (RRF_K + semantic_rank[key])
+               if key in semantic_rank else 0.0),
+            bm25_rank.get(key, candidate_limit + 1),
+            semantic_rank.get(key, candidate_limit + 1),
+            key[0], key[1],
+        ),
+    )[:k]
+
+    missing = [key for key in fused if key not in bm25_by_key]
+    semantic_by_key = {}
+    if missing:
+        where = " OR ".join(
+            "(chunks.doc_id = ? AND chunks.chunk_ix = ?)" for _ in missing)
+        params = [value for key in missing for value in key]
+        rows = _execute_bounded(
+            corpus_conn, _SELECT_SEMANTIC.format(where=where), params,
+            caps, state, "semantic candidate")
+        semantic_by_key = {
+            (str(row[0]), int(row[1])): row for row in rows
+        }
+
+    passages = []
+    for key in fused:
+        if key in bm25_by_key:
+            row = bm25_by_key[key]
+            passages.append(
+                Passage(doc_id=key[0], chunk_ix=key[1], span=row[2],
+                        score=float(row[3]), title=row[4], authors=row[5],
+                        year=row[6], doi=row[7], pmid=row[8], license=row[9]))
+            continue
+        row = semantic_by_key.get(key)
+        if row is None:
+            # This should only be possible if a corpus is mutated underneath a
+            # read connection. Do not manufacture a citation for a missing
+            # joined row.
+            continue
+        passages.append(
+            Passage(doc_id=key[0], chunk_ix=key[1],
+                    span=_semantic_span(str(row[2] or ""), terms), score=None,
+                    title=row[3], authors=row[4], year=row[5], doi=row[6],
+                    pmid=row[7], license=row[8]))
     return passages
 
 
@@ -787,9 +1088,10 @@ def serve_cite(payload: dict, corpus_conn, state: CiteState) -> dict:
             f"{str(query['__unencodable__'])[:40]}; cite() takes search "
             f"terms, and only a string can carry them")))
     k = payload.get("k", CITE_CAPS.passages_per_call)
+    ranking = payload.get("ranking", "rrf")
     try:
         passages = cite(corpus_conn, query, k, state=state,
-                        doc_id=payload.get("doc_id"))
+                        doc_id=payload.get("doc_id"), ranking=ranking)
     except CiteRefusal as exc:
         return _refusal_response(exc)
     return {"ok": True, "passages": [p.as_dict() for p in passages]}

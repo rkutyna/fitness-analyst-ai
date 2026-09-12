@@ -2744,8 +2744,8 @@ def run_audit(ctx: VaultContext, name: str, *, as_of: str | None = None,
     if as_of is None:
         conn = ctx.read_only()
         try:
-            row = conn.execute("SELECT MAX(date) FROM daily_metrics").fetchone()
-            as_of = row[0] if row and row[0] else _today(conn).isoformat()
+            from . import analysis
+            as_of = analysis._as_of(conn, None)
         finally:
             conn.close()
     battery, attachment_builder = audit_registry[audit_name]

@@ -11,6 +11,62 @@ from . import normalize as nz
 
 MAX_SERIES_POINTS = 400
 
+# Bump deliberately when a formula that writes a derived daily metric changes;
+# the derive backfill automatically revisits source-backed rows at the new
+# version. A bump triggers re-derivation, while source-less old rows remain
+# visible to the operator as unrecomputable rather than being deleted.
+DERIVED_FORMULA_VERSION = 2
+VERSIONED_DERIVED_METRICS = frozenset({
+    "sleep_bedtime", "sleep_wake_time", "sleep_midpoint",
+    "sleep_time_in_bed", "sleep_awakenings", "sleep_awake_longest",
+    "sleep_latency", "wear_hours", "sleep_midpoint_sd_28d",
+    "sleep_timing_interval_regularity", "hr_load_proxy",
+    "jog_minutes", "longest_block_min",
+})
+
+
+def current_daily_metrics_predicate(conn=None, metric_expr: str = "metric",
+                                    version_expr: str = "derived_version") -> str:
+    """SQL predicate for readable versioned rows.
+
+    A non-current, non-NULL stamp is stale and must stay out of reads.  NULL is
+    different: it is an old derived value whose inputs may be gone, so it is
+    served as legacy data and marked by the result that carries the figure.
+    """
+    quoted = ", ".join(repr(metric) for metric in VERSIONED_DERIVED_METRICS)
+    if conn is not None:
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(daily_metrics)")}
+        if "metric" not in columns:
+            # Tiny analytical probes used by compatibility tests are not vault
+            # tables and cannot express the version predicate.
+            return "1"
+        if "derived_version" not in columns:
+            # A vault with no version column cannot be migrated on a read-only
+            # open, so every derived row in it is unstampable -- which is the
+            # MOST unrecomputable case, not a reason to withhold.  The
+            # maintainer's decision (2026-09-12) is that such a row is served
+            # and marked: withholding it publishes a false absence, and on a
+            # real vault it empties ten years of history.  The select already
+            # synthesises ``NULL AS derived_version`` here, so every row
+            # reaches ``verification_status`` as legacy and is marked.
+            return "1"
+    return (f"({metric_expr} NOT IN ({quoted}) OR "
+            f"{version_expr} = {DERIVED_FORMULA_VERSION} OR "
+            f"{version_expr} IS NULL)")
+
+
+VERIFIED_STATUS = "verified"
+UNVERIFIED_LEGACY_STATUS = "unverified_legacy"
+
+
+def verification_status(metric: str, derived_version: int | None) -> str:
+    """Return the Python-owned status that travels with a derived figure."""
+    if metric not in VERSIONED_DERIVED_METRICS:
+        return VERIFIED_STATUS
+    return (VERIFIED_STATUS if derived_version == DERIVED_FORMULA_VERSION
+            else UNVERIFIED_LEGACY_STATUS)
+
 # Single definition of the watch-wear floor: a day counts as "worn" at or above
 # 12 hours of wear_hours (or the density proxy where wear_hours doesn't cover
 # it). analysis.py and correlate.py both compare daily wear against this same
@@ -644,13 +700,15 @@ def value_col(metric: str) -> str:
 
 def metric_exists(conn, metric: str) -> bool:
     return conn.execute(
-        "SELECT 1 FROM daily_metrics WHERE metric = ? LIMIT 1", (metric,)
+        "SELECT 1 FROM daily_metrics WHERE metric = ? AND "
+        + current_daily_metrics_predicate(conn) + " LIMIT 1", (metric,)
     ).fetchone() is not None
 
 
 def anchor_end(conn, metric: str) -> str | None:
     row = conn.execute(
-        "SELECT MAX(date) FROM daily_metrics WHERE metric = ?", (metric,)
+        "SELECT MAX(date) FROM daily_metrics WHERE metric = ? AND "
+        + current_daily_metrics_predicate(conn), (metric,)
     ).fetchone()
     return row[0] if row and row[0] else None
 
@@ -877,11 +935,21 @@ def zone_minutes(samples, window_end, thresholds,
     }
 
 
-def series(conn, metric, start_iso, end_iso):
+def series_rows(conn, metric, start_iso, end_iso):
     col = value_col(metric)
-    q = (f"SELECT date, {col} AS v, unit FROM daily_metrics "
-         f"WHERE metric = ? AND date BETWEEN ? AND ? AND {col} IS NOT NULL ORDER BY date")
-    rows = conn.execute(q, (metric, start_iso or "0000-01-01", end_iso)).fetchall()
+    columns = {row[1] for row in conn.execute(
+        "PRAGMA table_info(daily_metrics)")}
+    version_col = ("derived_version" if "derived_version" in columns
+                   else "NULL AS derived_version")
+    q = (f"SELECT date, {col} AS v, unit, {version_col} "
+         f"FROM daily_metrics "
+         f"WHERE metric = ? AND " + current_daily_metrics_predicate(conn) +
+         f" AND date BETWEEN ? AND ? AND {col} IS NOT NULL ORDER BY date")
+    return conn.execute(q, (metric, start_iso or "0000-01-01", end_iso)).fetchall()
+
+
+def series(conn, metric, start_iso, end_iso):
+    rows = series_rows(conn, metric, start_iso, end_iso)
     dates = [row["date"] for row in rows]
     vals = [row["v"] for row in rows]
     unit = rows[0]["unit"] if rows else nz.canonical_unit(metric, None)

@@ -192,7 +192,9 @@ from .metrics import (  # noqa: F401  — re-export
 def _as_of(conn, as_of: str | None) -> str:
     if as_of:
         return as_of
-    row = conn.execute("SELECT MAX(date) FROM daily_metrics").fetchone()
+    row = conn.execute(
+        "SELECT MAX(date) FROM daily_metrics WHERE "
+        + mx.current_daily_metrics_predicate(conn)).fetchone()
     return row[0] if row and row[0] else _today(conn).isoformat()
 
 
@@ -492,27 +494,42 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
     the instrument, not the athlete.
     """
     floor = metric_noise_floor(conn, metric, end)
-    days, vals, unit = mx.series(conn, metric, start, end)
-    weeks: dict[str, list[float]] = {}
-    for d, v in zip(days, vals):
+    rows = mx.series_rows(conn, metric, start, end)
+    unit = rows[0]["unit"] if rows else mx.nz.canonical_unit(metric, None)
+    weeks: dict[str, list[tuple[float, str]]] = {}
+    for row in rows:
+        d, v = row["date"], row["v"]
         day = date.fromisoformat(d)
         monday = (day - timedelta(days=day.weekday())).isoformat()
-        weeks.setdefault(monday, []).append(v)
+        weeks.setdefault(monday, []).append(
+            (v, mx.verification_status(metric, row["derived_version"])))
     out = []
     for monday in sorted(weeks):
-        vs = weeks[monday]
+        entries = weeks[monday]
+        vs = [v for v, _ in entries]
+        statuses = {status for _, status in entries}
+        if statuses == {mx.VERIFIED_STATUS}:
+            status = mx.VERIFIED_STATUS
+        elif statuses == {mx.UNVERIFIED_LEGACY_STATUS}:
+            status = mx.UNVERIFIED_LEGACY_STATUS
+        else:
+            status = "partially_unverified"
         week_end = (date.fromisoformat(monday) + timedelta(days=6)).isoformat()
-        out.append({
+        row = {
             "week_start": monday,
             "period": f"{monday}:{week_end}",
             "mean": mx.r(statistics.fmean(vs), 2),
             "n_days": len(vs),
             "unit": unit,
+            "verification_status": status,
             "sd_day": floor["sd_day"],
             "rho": floor["rho"],
             "mdc95": (mx.r(mdc95(floor["sd_day"], floor["rho"], len(vs)), 2)
                       if floor["sd_day"] is not None else None),
-        })
+        }
+        if mx.agg(metric) == "sum" or metric in {"jog_minutes", "longest_block_min"}:
+            row["total"] = mx.r(sum(vs), 2)
+        out.append(row)
     return out
 
 
@@ -681,7 +698,8 @@ def coverage(conn, as_of: str | None = None) -> list[dict]:
         col = mx.value_col(m)
         row = conn.execute(
             f"SELECT MIN(date) f, MAX(date) l, COUNT(*) n FROM daily_metrics "
-            f"WHERE metric = ? AND date <= ? AND {col} IS NOT NULL",
+            f"WHERE metric = ? AND " + mx.current_daily_metrics_predicate(conn) +
+            f" AND date <= ? AND {col} IS NOT NULL",
             (m, as_of)).fetchone()
         if not row or row["n"] == 0:
             out.append({"metric": m, "status": "missing", "n_days": 0,
@@ -691,12 +709,14 @@ def coverage(conn, as_of: str | None = None) -> list[dict]:
                         "behind": False})
             continue
         recent_n = conn.execute(
-            f"SELECT COUNT(*) FROM daily_metrics WHERE metric = ? AND date >= ? "
+            f"SELECT COUNT(*) FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn) + " AND date >= ? "
             f"AND date <= ? AND {col} IS NOT NULL",
             (m, cutoff, as_of)).fetchone()[0]
         last = row["l"]
         covers_as_of = conn.execute(
-            f"SELECT 1 FROM daily_metrics WHERE metric = ? AND date = ? "
+            f"SELECT 1 FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn) + " AND date = ? "
             f"AND {col} IS NOT NULL LIMIT 1", (m, as_of)).fetchone() is not None
         typical_gap = _coverage_typical_gap(conn, m, col, cadence_start, as_of)
         gap = (as_of_date - date.fromisoformat(last)).days
@@ -738,7 +758,9 @@ def _coverage_typical_gap(conn, metric: str, col: str,
     unscoped numbers.
     """
     rows = conn.execute(
-        f"SELECT date FROM daily_metrics WHERE metric = ? AND date BETWEEN ? AND ? "
+        f"SELECT date FROM daily_metrics WHERE metric = ? AND "
+        + mx.current_daily_metrics_predicate(conn) +
+        " AND date BETWEEN ? AND ? "
         f"AND {col} IS NOT NULL ORDER BY date", (metric, start, end)).fetchall()
     dates = [date.fromisoformat(r[0]) for r in rows]
     gaps = [(later - earlier).days for earlier, later in zip(dates, dates[1:])]
@@ -1170,7 +1192,8 @@ def _daily_load_rows(conn, metric, as_of, days):
     start = (date.fromisoformat(as_of) - timedelta(days=days - 1)).isoformat()
     col = mx.value_col(metric)
     rows = conn.execute(
-        f"SELECT date d, {col} v, count c FROM daily_metrics WHERE metric = ? "
+        f"SELECT date d, {col} v, count c FROM daily_metrics WHERE metric = ? AND "
+        + mx.current_daily_metrics_predicate(conn) + " "
         f"AND date BETWEEN ? AND ? AND {col} IS NOT NULL ORDER BY date",
         (metric, start, as_of)).fetchall()
     return [(r["d"], r["v"], r["c"]) for r in rows]
@@ -1214,7 +1237,8 @@ def _wear_reference(conn, metric, as_of, window=WEAR_REF_WINDOW_DAYS) -> float:
     """
     start = (date.fromisoformat(as_of) - timedelta(days=window - 1)).isoformat()
     counts = [r[0] for r in conn.execute(
-        "SELECT count FROM daily_metrics WHERE metric = ? AND date BETWEEN ? AND ? "
+        "SELECT count FROM daily_metrics WHERE metric = ? AND "
+        + mx.current_daily_metrics_predicate(conn) + " AND date BETWEEN ? AND ? "
         "AND count IS NOT NULL ORDER BY count", (metric, start, as_of)).fetchall()]
     if not counts:
         return 0.0
@@ -1226,7 +1250,8 @@ def _wear_hours_map(conn, start: str, end: str) -> dict[str, float]:
     """date -> hours the watch was worn, for the days that carry the signal."""
     col = mx.value_col(WEAR_HOURS_METRIC)
     return {r["d"]: r["v"] for r in conn.execute(
-        f"SELECT date d, {col} v FROM daily_metrics WHERE metric = ? "
+        f"SELECT date d, {col} v FROM daily_metrics WHERE metric = ? AND "
+        + mx.current_daily_metrics_predicate(conn) + " "
         f"AND date BETWEEN ? AND ? AND {col} IS NOT NULL",
         (WEAR_HOURS_METRIC, start, end)).fetchall()}
 
@@ -1240,7 +1265,8 @@ def _consolidated_days(conn, metric: str, start: str, end: str) -> set[str]:
     """
     try:
         return {r[0] for r in conn.execute(
-            "SELECT date FROM daily_metrics WHERE metric = ? "
+            "SELECT date FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn) + " "
             "AND date BETWEEN ? AND ? AND source_kind = 'apple_consolidated'",
             (metric, start, end)).fetchall()}
     except sqlite3.OperationalError:
@@ -1490,7 +1516,9 @@ def _is_cycling_type(workout_type: str | None) -> bool:
 
 
 def _all_metrics(conn):
-    rows = conn.execute("SELECT DISTINCT metric FROM daily_metrics").fetchall()
+    rows = conn.execute(
+        "SELECT DISTINCT metric FROM daily_metrics WHERE "
+        + mx.current_daily_metrics_predicate(conn)).fetchall()
     return [r["metric"] for r in rows]
 
 
@@ -1622,7 +1650,8 @@ def highlights(conn, as_of: str | None = None) -> list[dict]:
             continue
         col = mx.value_col(m)
         row = conn.execute(
-            f"SELECT date, MAX({col}) v FROM daily_metrics WHERE metric = ?",
+            f"SELECT date, MAX({col}) v FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn),
             (m,)).fetchone()
         if row and row["date"] and row["date"] >= recent_start:
             out.append({"metric": m, "kind": "all_time_high",

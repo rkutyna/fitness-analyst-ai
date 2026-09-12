@@ -73,7 +73,8 @@ def hr_rest_estimate(conn, as_of: str) -> float | None:
     correct — but note it also means a historical load recomputed today can
     differ slightly from the same day computed months ago."""
     rows = conn.execute(
-        "SELECT last FROM daily_metrics WHERE metric = 'resting_heart_rate' "
+        "SELECT last FROM daily_metrics WHERE metric = 'resting_heart_rate' AND "
+        + mx.current_daily_metrics_predicate(conn) + " "
         "AND date <= ? AND last IS NOT NULL ORDER BY date DESC LIMIT 60",
         (as_of,)).fetchall()
     vals = [r["last"] for r in rows][::-1]

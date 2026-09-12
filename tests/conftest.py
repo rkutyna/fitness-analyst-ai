@@ -10,6 +10,7 @@ import pytest
 
 from health_advisor import db as dbmod
 from health_advisor import mcp_server
+from health_advisor import metrics as mx
 from health_advisor import normalize as nz
 from health_advisor.context import VaultContext
 
@@ -37,10 +38,13 @@ def seed_metric(conn: sqlite3.Connection, metric: str, start: str,
     for i, v in enumerate(values):
         d = (d0 + timedelta(days=i)).isoformat()
         conn.execute(
-            "INSERT INTO daily_metrics (metric, date, count, sum, avg, min, max, last, unit) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO daily_metrics "
+            "(metric, date, count, sum, avg, min, max, last, unit, derived_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (metric, d, counts[i], v if col == "sum" else v,
-             v if col == "avg" else v, v, v, v, unit),
+             v if col == "avg" else v, v, v, v, unit,
+             mx.DERIVED_FORMULA_VERSION
+             if metric in mx.VERSIONED_DERIVED_METRICS else None),
         )
     conn.commit()
 

@@ -9,6 +9,7 @@ import pytest
 from health_advisor import db as dbmod
 from health_advisor import derive
 from health_advisor import derive as D
+from health_advisor import metrics as mx
 from health_advisor import normalize as nz
 
 
@@ -386,6 +387,9 @@ def test_backfill_corrects_a_dial_only_day(vault_path, conn):
 
     correct = D._dial_for_day(conn, day)["jog_minutes"]
     D._upsert(conn, "jog_minutes", day, correct + 500.0)   # a wrong stored value
+    conn.execute("UPDATE daily_metrics SET derived_version = ? "
+                 "WHERE metric = 'jog_minutes' AND date = ?",
+                 (mx.DERIVED_FORMULA_VERSION - 1, day))
     conn.commit()
 
     D.main(["--backfill", "--db", str(vault_path)])
@@ -396,13 +400,13 @@ def test_backfill_corrects_a_dial_only_day(vault_path, conn):
     assert row["last"] == pytest.approx(correct)
 
 
-def test_backfill_removes_a_dial_row_with_no_remaining_source(vault_path, conn):
-    """A jog_minutes row on a day with no workout and no source records at
-    all: the third leg of the union (a date already holding a derived-metric
-    row) must surface it so update_for_days can remove it, per its own
-    'absence writes no row' contract."""
+def test_backfill_preserves_a_dial_row_with_no_remaining_source(vault_path, conn):
+    """A jog_minutes row whose source is gone is reported, not deleted."""
     day = "2026-08-21"
     D._upsert(conn, "jog_minutes", day, 42.0)
+    conn.execute("UPDATE daily_metrics SET derived_version = ? "
+                 "WHERE metric = 'jog_minutes' AND date = ?",
+                 (mx.DERIVED_FORMULA_VERSION - 1, day))
     conn.commit()
 
     D.main(["--backfill", "--db", str(vault_path)])
@@ -410,7 +414,8 @@ def test_backfill_removes_a_dial_row_with_no_remaining_source(vault_path, conn):
     row = conn.execute(
         "SELECT last FROM daily_metrics WHERE metric = 'jog_minutes' AND date = ?",
         (day,)).fetchone()
-    assert row is None
+    assert row["last"] == 42.0
+    assert D.derived_version_report(conn)["unrecomputable"] == 1
 
 
 def test_backfill_days_is_the_ascending_union(conn):

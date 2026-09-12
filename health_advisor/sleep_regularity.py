@@ -124,7 +124,10 @@ def nights_from_db(conn, start: str, end: str):
         "SELECT b.date AS day, b.last AS bed, w.last AS wake "
         "  FROM daily_metrics b "
         "  JOIN daily_metrics w ON w.date = b.date AND w.metric = 'sleep_wake_time' "
-        " WHERE b.metric = 'sleep_bedtime' AND b.date BETWEEN ? AND ? "
+        " WHERE b.metric = 'sleep_bedtime' AND "
+        + mx.current_daily_metrics_predicate(conn, "b.metric", "b.derived_version") +
+        " AND " + mx.current_daily_metrics_predicate(conn, "w.metric", "w.derived_version") +
+        " AND b.date BETWEEN ? AND ? "
         " ORDER BY b.date", (start, end)).fetchall()
     return [(r["day"], r["bed"], r["wake"]) for r in rows
             if r["bed"] is not None and r["wake"] is not None]
@@ -170,7 +173,11 @@ def calibrate_against_stages(conn, start: str, end: str) -> dict:
         "  FROM daily_metrics b "
         "  JOIN daily_metrics w ON w.date = b.date AND w.metric = 'sleep_wake_time' "
         "  JOIN daily_metrics a ON a.date = b.date AND a.metric = 'sleep_asleep' "
-        " WHERE b.metric = 'sleep_bedtime' AND b.date BETWEEN ? AND ? "
+        " WHERE b.metric = 'sleep_bedtime' AND "
+        + mx.current_daily_metrics_predicate(conn, "b.metric", "b.derived_version") +
+        " AND " + mx.current_daily_metrics_predicate(conn, "w.metric", "w.derived_version") +
+        " AND " + mx.current_daily_metrics_predicate(conn, "a.metric", "a.derived_version") +
+        " AND b.date BETWEEN ? AND ? "
         " ORDER BY b.date", (start, end)).fetchall()
     pairs = []
     for r in rows:
@@ -203,7 +210,7 @@ def midpoint_variability(conn, start: str, end: str) -> dict:
     """Rolling 28-day SD of sleep_midpoint. Lower is more regular."""
     rows = conn.execute(
         "SELECT date, last AS v FROM daily_metrics "
-        "WHERE metric = 'sleep_midpoint' "
+        "WHERE metric = 'sleep_midpoint' AND " + mx.current_daily_metrics_predicate(conn) + " "
         "AND date > date(?, '-28 days') AND date <= ? "
         "AND last IS NOT NULL ORDER BY date", (start, end)).fetchall()
     if len(rows) < MIN_WINDOW_DAYS:
@@ -216,7 +223,7 @@ def midpoint_variability(conn, start: str, end: str) -> dict:
     for day in dates:
         window_rows = conn.execute(
             "SELECT last AS v FROM daily_metrics "
-            "WHERE metric = 'sleep_midpoint' "
+            "WHERE metric = 'sleep_midpoint' AND " + mx.current_daily_metrics_predicate(conn) + " "
             "AND date > date(?, '-28 days') AND date <= ? "
             "AND last IS NOT NULL ORDER BY date", (day, day)).fetchall()
         window = [r["v"] for r in window_rows]
@@ -320,6 +327,7 @@ def compliance_from_bedtimes(bedtimes) -> dict:
 def plan_compliance(conn, start: str, end: str) -> dict:
     """Report the inside-anchor, social-night, and past-limit bands."""
     rows = conn.execute(
-        "SELECT last AS v FROM daily_metrics WHERE metric = 'sleep_bedtime' "
-        "AND date BETWEEN ? AND ? AND last IS NOT NULL", (start, end)).fetchall()
+        "SELECT last AS v FROM daily_metrics WHERE metric = 'sleep_bedtime' AND "
+        + mx.current_daily_metrics_predicate(conn) +
+        " AND date BETWEEN ? AND ? AND last IS NOT NULL", (start, end)).fetchall()
     return compliance_from_bedtimes([r["v"] for r in rows])

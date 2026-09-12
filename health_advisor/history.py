@@ -133,7 +133,8 @@ def _history_series(conn, metric: str):
     col = mx.value_col(metric)
     rows = conn.execute(
         f"SELECT date, {col} AS v, unit FROM daily_metrics "
-        "WHERE metric = ? AND " + col + " IS NOT NULL ORDER BY date",
+        "WHERE metric = ? AND " + mx.current_daily_metrics_predicate(conn) +
+        " AND " + col + " IS NOT NULL ORDER BY date",
         (metric,),
     ).fetchall()
     if not rows:

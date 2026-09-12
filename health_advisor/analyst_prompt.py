@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from health_advisor import normalize
+from health_advisor import metrics as mx
 
 
 # These are the tables that can contribute data to a training analysis.  The
@@ -126,8 +127,9 @@ def schema_summary(conn: Any) -> str:
         metrics = [
             str(row[0])
             for row in conn.execute(
-                "SELECT DISTINCT metric FROM daily_metrics "
-                "WHERE metric IS NOT NULL ORDER BY metric"
+                "SELECT DISTINCT metric FROM daily_metrics WHERE "
+                + mx.current_daily_metrics_predicate(conn) +
+                " AND metric IS NOT NULL ORDER BY metric"
             )
         ]
         metric_text = ", ".join(metrics) or "(none)"

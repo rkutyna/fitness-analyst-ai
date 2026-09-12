@@ -17,6 +17,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
+from . import metrics as mx
+
 
 FUTURE_DAY = "future_day"
 SESSION_NOT_RECORDED = "session_not_recorded"
@@ -36,7 +38,9 @@ def gradeable_through(conn: sqlite3.Connection) -> date | None:
 
 def known_through(conn: sqlite3.Connection) -> date | None:
     """Return the latest local date represented by any daily metric."""
-    row = conn.execute("SELECT MAX(date) FROM daily_metrics").fetchone()
+    row = conn.execute(
+        "SELECT MAX(date) FROM daily_metrics WHERE "
+        + mx.current_daily_metrics_predicate(conn)).fetchone()
     return _date(row[0]) if row and row[0] is not None else None
 
 

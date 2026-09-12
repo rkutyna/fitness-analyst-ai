@@ -170,6 +170,9 @@ def _seed_wear_window(conn, *, wear_hours_on_consolidated_day: bool,
                 "max, last, unit) VALUES ('wear_hours', ?, 1, 18.0, 18.0, 18.0, "
                 "18.0, 18.0, 'h')", (day,))
         d += timedelta(days=1)
+    conn.execute("UPDATE daily_metrics SET derived_version = ? "
+                 "WHERE metric = 'wear_hours'",
+                 (mx.DERIVED_FORMULA_VERSION,))
     conn.commit()
     return analysis._daily_load_rows(conn, "step_count", WINDOW_END, 28)
 

@@ -1249,7 +1249,8 @@ def resolve_window(conn, metric: str, period, as_of: str | None = None) -> tuple
         # irregularly, so [end, end] is usually empty for them and a perfectly
         # true "latest value" claim was being rejected for want of data.
         row = conn.execute(
-            "SELECT MAX(date) FROM daily_metrics WHERE metric = ? AND date <= ?",
+            "SELECT MAX(date) FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn) + " AND date <= ?",
             (metric, end)).fetchone()
         if not row or not row[0]:
             return None
@@ -1309,7 +1310,8 @@ def series_values(conn, metric: str, start: str, end: str) -> dict:
     # real. The strict exact-field path above is unaffected.
     for row in conn.execute(
             "SELECT avg, min, max, last FROM daily_metrics "
-            "WHERE metric = ? AND date BETWEEN ? AND ?", (metric, start, end)):
+            "WHERE metric = ? AND " + mx.current_daily_metrics_predicate(conn) +
+            " AND date BETWEEN ? AND ?", (metric, start, end)):
         points.extend(float(v) for v in tuple(row) if isinstance(v, (int, float)))
     out["_points"] = points
     return out
@@ -1324,8 +1326,8 @@ def correlation_values(conn, metric: str, start: str, end: str) -> dict:
     if not mx.metric_exists(conn, metric):
         return out
     others = [r[0] for r in conn.execute(
-        "SELECT DISTINCT metric FROM daily_metrics WHERE metric NOT IN (?, 'wear_hours')",
-        (metric,))]
+        "SELECT DISTINCT metric FROM daily_metrics WHERE metric NOT IN (?, 'wear_hours') "
+        "AND " + mx.current_daily_metrics_predicate(conn), (metric,))]
     vals: list[float] = []
     for other in others:
         for lag in (0, 1):

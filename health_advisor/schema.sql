@@ -381,6 +381,9 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     -- `count` is the honest raw record count (0 when there are no raw samples),
     -- never a synthesised one. See db.apply_consolidated_totals.
     source_kind TEXT NOT NULL DEFAULT 'records',
+    -- NULL means this derived row predates formula version stamping. It is
+    -- deliberately not treated as current by any derived reader.
+    derived_version INTEGER,
     PRIMARY KEY (metric, date)
 );
 

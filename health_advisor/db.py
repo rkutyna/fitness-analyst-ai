@@ -115,7 +115,8 @@ _ADDED_COLUMNS = {
     # COLUMN, so every existing vault gains it — labelled 'records', which is
     # what every pre-D19 row actually is — on its next init_db.
     "daily_metrics": {"last": "REAL",
-                      "source_kind": "TEXT NOT NULL DEFAULT 'records'"},
+                      "source_kind": "TEXT NOT NULL DEFAULT 'records'",
+                      "derived_version": "INTEGER"},
     # Deletion lag is measurable only if the sample's date is captured at the
     # moment its row is deleted; every vault ingesting before this existed has
     # tombstones that cannot be back-filled. Additive so the live vault gains

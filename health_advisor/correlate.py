@@ -123,7 +123,8 @@ def _resolve_start(conn, metric_x: str, metric_y: str, lag_days: int,
     first = {}
     for metric in (metric_x, metric_y):
         row = conn.execute(
-            "SELECT MIN(date) FROM daily_metrics WHERE metric = ?", (metric,)
+            "SELECT MIN(date) FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn), (metric,)
         ).fetchone()
         if not row or row[0] is None:
             raise ValueError(
@@ -178,7 +179,8 @@ def scan(conn, target: str, start_iso: str, end_iso: str, lags=(0, 1)) -> list[d
     statistic is Spearman (robust); BH-FDR corrects all tests jointly.
     Sorted by |rho| desc. wear_hours is a coverage artifact, not a candidate."""
     rows = conn.execute(
-        "SELECT DISTINCT metric FROM daily_metrics WHERE metric NOT IN (?, 'wear_hours')",
+        "SELECT DISTINCT metric FROM daily_metrics WHERE metric NOT IN (?, 'wear_hours') "
+        "AND " + mx.current_daily_metrics_predicate(conn),
         (target,)).fetchall()
     tgroup = nz.CATALOG.get(target, {}).get("group")
     tests: list[dict] = []

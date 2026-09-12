@@ -8,9 +8,12 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, timedelta
 
+from . import metrics as mx
+
 def _first_date(conn: sqlite3.Connection, as_of: str) -> str | None:
     row = conn.execute(
-        "SELECT MIN(date) FROM daily_metrics WHERE date <= ?", (as_of,)
+        "SELECT MIN(date) FROM daily_metrics WHERE "
+        + mx.current_daily_metrics_predicate(conn) + " AND date <= ?", (as_of,)
     ).fetchone()
     return row[0] if row and row[0] else None
 
@@ -32,7 +35,8 @@ def _probe(conn: sqlite3.Connection, as_of: str, horizon: str,
         CREATE TABLE daily_metrics (
             metric TEXT NOT NULL, date TEXT NOT NULL, count INTEGER,
             sum REAL, avg REAL, min REAL, max REAL, last REAL, unit TEXT,
-            source_kind TEXT, PRIMARY KEY (metric, date)
+            source_kind TEXT, derived_version INTEGER,
+            PRIMARY KEY (metric, date)
         );
         CREATE TABLE workouts (workout_type TEXT, local_date TEXT);
         CREATE TABLE vault_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -44,18 +48,19 @@ def _probe(conn: sqlite3.Connection, as_of: str, horizon: str,
         # only the columns that exist and let the probe carry NULL for the rest.
         have = {row[1] for row in conn.execute("PRAGMA table_info(daily_metrics)")}
         wanted = ["metric", "date", "count", "sum", "avg", "min", "max", "last",
-                  "unit", "source_kind"]
+                  "unit", "source_kind", "derived_version"]
         select = ", ".join(c if c in have else f"NULL AS {c}" for c in wanted)
         rows = conn.execute(
             f"SELECT {select} "
-            f"FROM daily_metrics WHERE date <= ? AND metric IN ({marks}) "
+            f"FROM daily_metrics WHERE " + mx.current_daily_metrics_predicate(conn) +
+            f" AND date <= ? AND metric IN ({marks}) "
             "ORDER BY date, metric", (as_of, *sorted(metrics))
         ).fetchall()
     else:
         rows = []
     for row in rows:
         probe.execute(
-            "INSERT INTO daily_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO daily_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(row),
         )
     for row in conn.execute("SELECT workout_type, local_date FROM workouts"):
@@ -70,8 +75,11 @@ def _probe(conn: sqlite3.Connection, as_of: str, horizon: str,
     end = date.fromisoformat(horizon)
     for metric in metrics:
         latest = probe.execute(
-            "SELECT metric, date, count, sum, avg, min, max, last, unit, source_kind "
-            "FROM daily_metrics WHERE metric = ? ORDER BY date DESC LIMIT 1",
+            "SELECT metric, date, count, sum, avg, min, max, last, unit, source_kind, "
+            "derived_version "
+            "FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(probe) +
+            " ORDER BY date DESC LIMIT 1",
             (metric,),
         ).fetchone()
         if latest is None:
@@ -80,11 +88,11 @@ def _probe(conn: sqlite3.Connection, as_of: str, horizon: str,
         while d <= end:
             probe.execute(
                 "INSERT OR IGNORE INTO daily_metrics "
-                "(metric, date, count, sum, avg, min, max, last, unit, source_kind) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(metric, date, count, sum, avg, min, max, last, unit, source_kind, "
+                "derived_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (latest["metric"], d.isoformat(), latest["count"], latest["sum"],
                  latest["avg"], latest["min"], latest["max"], latest["last"],
-                 latest["unit"], latest["source_kind"]),
+                 latest["unit"], latest["source_kind"], latest["derived_version"]),
             )
             d += timedelta(days=1)
     probe.commit()
@@ -104,7 +112,8 @@ def _starts_on_day(conn: sqlite3.Connection, first: str, as_of: str,
         "training_load": set(A.ACWR_LOAD_METRICS) | {"wear_hours"},
         "correlate": {m for m in (metric_x, metric_y) if m},
         "movers": {row[0] for row in conn.execute(
-            "SELECT DISTINCT metric FROM daily_metrics WHERE date <= ?", (as_of,)
+            "SELECT DISTINCT metric FROM daily_metrics WHERE "
+            + mx.current_daily_metrics_predicate(conn) + " AND date <= ?", (as_of,)
         )},
     }[surface]
     probe = _probe(conn, as_of, horizon, needed)
@@ -237,7 +246,9 @@ def describe(conn: sqlite3.Connection, as_of: str,
                   "rhr": "resting_heart_rate"}[component]
         label = "HRV" if component == "hrv" else "resting HR"
         present = conn.execute(
-            "SELECT 1 FROM daily_metrics WHERE metric = ? AND date <= ? LIMIT 1",
+            "SELECT 1 FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn) +
+            " AND date <= ? LIMIT 1",
             (metric, as_of),
         ).fetchone() is not None
         condition = (f"no {label} source in this vault" if not present

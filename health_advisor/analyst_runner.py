@@ -30,6 +30,7 @@ from . import analyst_envelope as envelope
 from . import analyst_corpus
 from . import analyst_ledger as ledger
 from . import analyst_sandbox as sandbox
+from . import metrics as metric_defs
 from .corpus_build import check_corpus_integrity
 from .analyst_sandbox import _write_exclusive
 from . import normalize
@@ -807,6 +808,8 @@ def _service_query(sock: socket.socket, conn, max_rows: int,
             _send_frame(sock, {"ok": False, "error_type": "AnalystQueryError",
                                 "error": shape_reason})
             return True, shape_reason
+        if getattr(conn, "supports_derived_version", False):
+            sql = _current_daily_metrics_sql(sql)
         cursor = conn.execute(sql, params)
         rows = cursor.fetchmany(max_rows + 1)
         if len(rows) > max_rows:
@@ -835,6 +838,43 @@ def _high_fd(fd: int) -> int:
     duplicate = fcntl.fcntl(fd, fcntl.F_DUPFD, 10)
     os.close(fd)
     return duplicate
+
+
+def _current_daily_metrics_sql(sql: str) -> str:
+    """Read analyst queries through a current-only daily_metrics projection.
+
+    The child is intentionally given arbitrary SQL, so requiring every model
+    query to remember a version predicate would leave a correctness hole. The
+    parent wraps each direct FROM/JOIN occurrence while preserving its alias;
+    source-less stale rows therefore remain stored but cannot cross the query
+    channel as current data.
+    """
+    predicate = metric_defs.current_daily_metrics_predicate()
+    versioned = ", ".join(repr(metric)
+                           for metric in metric_defs.VERSIONED_DERIVED_METRICS)
+    projection = (
+        "(SELECT daily_metrics.*, CASE WHEN metric IN (" + versioned + ") "
+        "AND derived_version IS NULL THEN 'unverified_legacy' "
+        "ELSE 'verified' END AS verification_status "
+        f"FROM daily_metrics WHERE {predicate})"
+    )
+    reserved = {
+        "where", "join", "on", "order", "group", "limit", "having",
+        "left", "right", "inner", "outer", "cross", "full", "union",
+    }
+    pattern = re.compile(
+        r"\b(FROM|JOIN)\s+daily_metrics"
+        r"(?:(?:\s+AS)?\s+([A-Za-z_]\w*))?", re.IGNORECASE)
+
+    def replace(match):
+        alias = match.group(2)
+        if alias is not None and alias.lower() in reserved:
+            return (f"{match.group(1)} {projection} AS daily_metrics "
+                    f"{alias}")
+        return (f"{match.group(1)} {projection} AS "
+                f"{alias or 'daily_metrics'}")
+
+    return pattern.sub(replace, sql)
 
 
 def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,

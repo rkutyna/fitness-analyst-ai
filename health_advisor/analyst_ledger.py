@@ -424,6 +424,19 @@ class LedgeredConnection:
         """Return only the restricted parent-metadata compatibility handle."""
         return _ParentMetadataConnection(self)
 
+    @property
+    def supports_derived_version(self) -> bool:
+        """Whether the parent vault has the additive derived-row column."""
+        real_conn = _connection_for(self)
+        authorizer = _AUTHORIZERS[self]
+        real_conn.set_authorizer(None)
+        try:
+            columns = {row[1] for row in real_conn.execute(
+                "PRAGMA table_info(daily_metrics)")}
+        finally:
+            real_conn.set_authorizer(authorizer)
+        return "derived_version" in columns
+
     def __enter__(self) -> "LedgeredConnection":
         return self
 

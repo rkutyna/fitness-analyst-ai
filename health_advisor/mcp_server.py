@@ -268,7 +268,8 @@ def list_available_metrics(ctx: VaultContext) -> dict:
     try:
         rows = conn.execute(
             "SELECT metric, MIN(date) f, MAX(date) l, COUNT(*) n, MAX(unit) u "
-            "FROM daily_metrics GROUP BY metric ORDER BY metric"
+            "FROM daily_metrics WHERE " + mx.current_daily_metrics_predicate(conn) +
+            " GROUP BY metric ORDER BY metric"
         ).fetchall()
     finally:
         conn.close()
@@ -1485,6 +1486,7 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
 def _midpoint_series(conn, start: str, end: str):
     rows = conn.execute(
         "SELECT date, last AS v FROM daily_metrics WHERE metric = 'sleep_midpoint' "
+        "AND " + mx.current_daily_metrics_predicate(conn) + " "
         "AND date BETWEEN ? AND ? AND last IS NOT NULL ORDER BY date",
         (start, end)).fetchall()
     return [r["date"] for r in rows], [r["v"] for r in rows]
@@ -1675,7 +1677,8 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
             return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
         col = _value_col(metric)
         dm = conn.execute(
-            f"SELECT date, {col} v, unit FROM daily_metrics WHERE metric = ? "
+            f"SELECT date, {col} v, unit FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn) + " "
             f"ORDER BY date DESC LIMIT 1", (metric,)).fetchone()
         # Keep the raw sample on the same local day and with the same total
         # order as daily_metrics.last. Otherwise a last-valued metric could
@@ -1742,7 +1745,8 @@ def _corr_window(conn, metric_y: str, period: str) -> tuple[str, str]:
     start_iso, end_iso = _parse_period(period, anchor)
     if start_iso is None:  # 'all'
         start_iso = conn.execute(
-            "SELECT MIN(date) FROM daily_metrics WHERE metric = ?", (metric_y,)
+            "SELECT MIN(date) FROM daily_metrics WHERE metric = ? AND "
+            + mx.current_daily_metrics_predicate(conn), (metric_y,)
         ).fetchone()[0]
     return start_iso, end_iso
 
@@ -2220,6 +2224,9 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
       mean      the week's mean
       n_days    how many days it rests on. A mean of two days and a mean of
                 seven are not the same claim. Say which you have.
+      verification_status
+                ``verified`` or ``unverified_legacy``; this travels with each
+                week's figure and must be quoted with it.
       mdc95     the smallest week-to-week change that is NOT noise, given this
                 metric's own day-to-day variability and autocorrelation.
 
@@ -2230,6 +2237,10 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
     so the honest answer is "no change is measurable at this cadence", not a
     number. The returned `expected_training_effect_bpm` record carries this
     citation beside the literature figure.
+
+    The response-level ``status`` is ``verified``, ``unverified_legacy``, or
+    ``partially_unverified``. A NULL formula stamp is served as legacy data,
+    never silently dropped, and is always marked in the week carrying it.
 
     mdc95 is null when there is too little history to estimate a floor. A null
     floor means you cannot say whether a delta is real, not that it is.
@@ -2251,13 +2262,24 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
         floor = A.metric_noise_floor(conn, metric, end)
     finally:
         conn.close()
+    statuses = {row["verification_status"] for row in weeks}
+    if not statuses or statuses == {A.mx.VERIFIED_STATUS}:
+        status = A.mx.VERIFIED_STATUS
+    elif statuses == {A.mx.UNVERIFIED_LEGACY_STATUS}:
+        status = A.mx.UNVERIFIED_LEGACY_STATUS
+    else:
+        status = "partially_unverified"
     for row in weeks:
         _add_presentation(row, metric, row.get("period"), row.get("mean"),
                           field="mean")
-    return {"metric": metric, "start": start, "end": end,
+    result = {"metric": metric, "start": start, "end": end,
             "weeks": weeks, "count": len(weeks), "noise_floor": floor,
+            "status": status,
             "expected_training_effect_bpm": _literature_figure(
                 "expected_training_effect_bpm")}
+    if A.mx.agg(metric) == "sum" or metric in {"jog_minutes", "longest_block_min"}:
+        result["total"] = A.mx.r(sum(row["total"] for row in weeks), 1)
+    return result
 
 
 @tool

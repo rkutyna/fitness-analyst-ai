@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from . import db
+from . import metrics as mx
 from . import normalize as nz
 
 GAP_MERGE_MIN = 90.0   # sleep intervals closer than this merge into one session
@@ -248,13 +249,14 @@ def wear_hours(conn, day: str) -> float | None:
 
 def _upsert(conn, metric: str, day: str, value: float) -> None:
     conn.execute(
-        "INSERT INTO daily_metrics (metric, date, count, sum, avg, min, max, last, unit) "
-        "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO daily_metrics "
+        "(metric, date, count, sum, avg, min, max, last, unit, derived_version) "
+        "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(metric, date) DO UPDATE SET count=1, sum=excluded.sum, "
         "avg=excluded.avg, min=excluded.min, max=excluded.max, last=excluded.last, "
-        "unit=excluded.unit",
+        "unit=excluded.unit, derived_version=excluded.derived_version",
         (metric, day, value, value, value, value, value,
-         nz.canonical_unit(metric, None)))
+         nz.canonical_unit(metric, None), mx.DERIVED_FORMULA_VERSION))
 
 
 def _midpoint_sd_for_day(conn, day: str) -> float | None:
@@ -266,7 +268,8 @@ def _midpoint_sd_for_day(conn, day: str) -> float | None:
     """
     from . import sleep_regularity as sr
     rows = conn.execute(
-        "SELECT last FROM daily_metrics WHERE metric = 'sleep_midpoint' "
+        "SELECT last FROM daily_metrics WHERE metric = 'sleep_midpoint' AND "
+        + mx.current_daily_metrics_predicate(conn) + " "
         "AND date > date(?, '-28 days') AND date <= ? AND last IS NOT NULL "
         "ORDER BY date", (day, day)).fetchall()
     return sr.rolling_sd([r["last"] for r in rows])
@@ -279,7 +282,9 @@ def _interval_regularity_for_day(conn, day: str) -> float | None:
         "SELECT b.date AS day, b.last AS bed, w.last AS wake "
         "FROM daily_metrics b JOIN daily_metrics w "
         "ON w.date = b.date AND w.metric = 'sleep_wake_time' "
-        "WHERE b.metric = 'sleep_bedtime' "
+        "WHERE b.metric = 'sleep_bedtime' AND "
+        + mx.current_daily_metrics_predicate(conn, "b.metric", "b.derived_version") +
+        " AND " + mx.current_daily_metrics_predicate(conn, "w.metric", "w.derived_version") + " "
         "AND b.date > date(?, '-28 days') AND b.date <= ? "
         "AND b.last IS NOT NULL AND w.last IS NOT NULL ORDER BY b.date",
         (day, day)).fetchall()
@@ -329,8 +334,13 @@ def _dial_for_day(conn, day: str) -> dict:
 
 
 def update_for_days(conn, days) -> int:
-    """Recompute derived rows for the given local days. Idempotent; removes
-    derived rows that are no longer computable. Caller commits."""
+    """Recompute derived rows for the given local days. Caller commits.
+
+    A missing source deletes a row stamped with the current formula version:
+    that value is no longer supported by the vault. Rows predating version
+    stamping, and rows stamped with an older version, remain available for
+    explicit legacy handling and are reported by the version check.
+    """
     written = 0
     prepared = []
     for day in sorted(set(days)):
@@ -367,9 +377,21 @@ def update_for_days(conn, days) -> int:
         if load is not None:
             window[HR_LOAD_METRIC] = load
         for m in DERIVED_METRICS:
-            if m not in vals and m not in window:
-                conn.execute("DELETE FROM daily_metrics WHERE metric = ? AND date = ?",
-                             (m, day))
+            if m in vals or m in window:
+                continue
+            row = conn.execute(
+                "SELECT derived_version FROM daily_metrics "
+                "WHERE metric = ? AND date = ?",
+                (m, day),
+            ).fetchone()
+            # Python owns this decision. A current-stamped row that cannot be
+            # rebuilt is an unsupported claim and must disappear; NULL and
+            # older stamps are historical rows kept for legacy reporting.
+            if row and row["derived_version"] == mx.DERIVED_FORMULA_VERSION:
+                conn.execute(
+                    "DELETE FROM daily_metrics WHERE metric = ? AND date = ?",
+                    (m, day),
+                )
         for m, v in window.items():
             _upsert(conn, m, day, v)
     return written
@@ -404,6 +426,78 @@ def backfill_days(conn) -> list[str]:
         f"SELECT DISTINCT date FROM daily_metrics WHERE metric IN ({ph})",
         DERIVED_METRICS).fetchall())
     return sorted(days)
+
+
+def _source_exists_for_metric(conn, metric: str, day: str) -> bool:
+    """Whether the source required to recompute one derived row remains."""
+    if metric in (JOG_MINUTES_METRIC, BLOCK_METRIC, HR_LOAD_METRIC):
+        workout = conn.execute(
+            "SELECT 1 FROM workouts WHERE local_date = ? LIMIT 1", (day,)
+        ).fetchone() is not None
+        if not workout:
+            return False
+        required = {
+            JOG_MINUTES_METRIC: ("distance_walking_running", "step_count"),
+            BLOCK_METRIC: ("distance_walking_running",),
+            HR_LOAD_METRIC: (WEAR_METRIC,),
+        }[metric]
+        return all(
+            conn.execute(
+                "SELECT 1 FROM records WHERE metric = ? AND local_date = ? "
+                "LIMIT 1", (source_metric, day)
+            ).fetchone() is not None
+            for source_metric in required
+        )
+    if metric == "wear_hours":
+        source_metrics = (WEAR_METRIC,)
+    elif metric in SLEEP_METRICS:
+        source_metrics = _STAGE_METRICS
+    else:
+        # Rolling derived rows depend on other derived rows; use their raw
+        # sleep inputs as the conservative boundary for automatic repair.
+        source_metrics = _STAGE_METRICS
+    marks = ",".join("?" * len(source_metrics))
+    return conn.execute(
+        f"SELECT 1 FROM records WHERE metric IN ({marks}) AND local_date = ? "
+        "LIMIT 1", (*source_metrics, day)
+    ).fetchone() is not None
+
+
+def derived_version_report(conn) -> dict[str, int]:
+    """Count fresh, source-backed stale, and source-less stale rows."""
+    counts = {"fresh": 0, "stale": 0, "unrecomputable": 0}
+    marks = ",".join("?" * len(DERIVED_METRICS))
+    rows = conn.execute(
+        f"SELECT metric, date, derived_version FROM daily_metrics "
+        f"WHERE metric IN ({marks})", DERIVED_METRICS).fetchall()
+    for row in rows:
+        if row["derived_version"] == mx.DERIVED_FORMULA_VERSION:
+            counts["fresh"] += 1
+        elif _source_exists_for_metric(conn, row["metric"], row["date"]):
+            counts["stale"] += 1
+        else:
+            counts["unrecomputable"] += 1
+    return counts
+
+
+def rederive_stale(conn) -> dict[str, object]:
+    """Re-derive source-backed mismatches and report the before/after state."""
+    before = derived_version_report(conn)
+    stale_days = set()
+    for day in backfill_days(conn):
+        rows = conn.execute(
+            "SELECT metric, derived_version FROM daily_metrics WHERE date = ? "
+            "AND metric IN (" + ",".join("?" * len(DERIVED_METRICS)) + ")",
+            (day, *DERIVED_METRICS),
+        ).fetchall()
+        if any(row["derived_version"] != mx.DERIVED_FORMULA_VERSION
+               and _source_exists_for_metric(conn, row["metric"], day)
+               for row in rows):
+            stale_days.add(day)
+    written = update_for_days(conn, sorted(stale_days))
+    after = derived_version_report(conn)
+    return {"before": before, "after": after,
+            "rederived_days": len(stale_days), "written": written}
 
 
 def update_after_ingest(conn, days, source: str,
@@ -443,9 +537,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         db.init_db(conn)
         days = backfill_days(conn)
-        n = update_for_days(conn, days)
+        result = rederive_stale(conn)
+        n = result["written"]
         conn.commit()
         print(f"derived {n} metric-day rows over {len(days)} days")
+        print("version check before: " + ", ".join(
+            f"{key}={value}" for key, value in result["before"].items()))
+        print("version check after: " + ", ".join(
+            f"{key}={value}" for key, value in result["after"].items()))
     finally:
         conn.close()
 

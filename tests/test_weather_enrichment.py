@@ -408,3 +408,20 @@ def test_review_04_legacy_weather_rows_reconcile_without_or_with_route(tmp_path)
     assert conn.execute(
         "SELECT status, attempts FROM workout_weather_status WHERE workout_id = 2"
     ).fetchone()[:] == ("fetched", 1)
+
+
+def test_no_write_transaction_is_open_while_the_archive_is_called(tmp_path):
+    """The vault's write lock must never be held across a network call: the
+    receiver shares the file and gives up after its 30 s busy_timeout."""
+    conn = _seed_vault(tmp_path)
+    # Two route workouts on different days, so the second fetch follows the
+    # first workout's weather upsert and status write.
+    open_during_fetch = []
+
+    def fetch(lat, lon, day):
+        open_during_fetch.append(conn.in_transaction)
+        return _payload(day)
+
+    weather.enrich_workouts(conn, fetch=fetch, delay=lambda _seconds: None)
+    assert len(open_during_fetch) >= 2
+    assert open_during_fetch == [False] * len(open_during_fetch)

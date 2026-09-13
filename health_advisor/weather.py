@@ -374,6 +374,10 @@ def _store_status(conn, workout_id: int, status: str, checked_utc: str, attempts
         "checked_utc=excluded.checked_utc, attempts=excluded.attempts",
         (workout_id, status, checked_utc, attempts),
     )
+    # Commit each status at once. Left open, this write transaction would span the
+    # next workout's archive call (up to 30 s) and hold the vault's write lock
+    # against the receiver, whose busy_timeout is also 30 s.
+    conn.commit()
 
 
 def _fill_route_elevation(conn, *, dry_run: bool) -> int:

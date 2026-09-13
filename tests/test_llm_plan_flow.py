@@ -10,7 +10,7 @@ from health_advisor import llm
 PRO_MODEL = "deepseek/deepseek-v4-pro"
 FLASH_MODEL = "deepseek/deepseek-v4-flash-0731"
 PRO_PROVIDERS = "novita/fp8,deepinfra/fp8,parasail/fp8"
-DAILY_PROVIDERS = "coreweave/fp8,together,reka/fp4"
+DAILY_PROVIDERS = "coreweave/fp8,together,relace/fp4"
 
 
 @pytest.fixture(autouse=True)
@@ -46,7 +46,7 @@ def test_pro_pin_rejects_provider_only_approved_for_flash(monkeypatch):
     message = str(excinfo.value)
     assert "HA_PLAN_MODEL" in message
     assert "HA_PLAN_PROVIDERS" in message
-    assert "reka/fp4" in message
+    assert "relace/fp4" in message
 
 
 def test_plan_model_with_inherited_daily_pin_is_refused_from_environment(
@@ -66,7 +66,7 @@ def test_plan_model_with_inherited_daily_pin_is_refused_from_environment(
     message = str(excinfo.value)
     assert "HA_PLAN_MODEL" in message
     assert "HA_PLAN_PROVIDERS" in message
-    assert "reka/fp4" in message
+    assert "relace/fp4" in message
 
 
 def test_daily_and_plan_pairs_are_checked_with_plan_pin(monkeypatch):

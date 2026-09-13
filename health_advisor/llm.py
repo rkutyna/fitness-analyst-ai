@@ -402,6 +402,21 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
 # into placeholders. Its grounding held at 72/72 in that battery; re-check
 # that, not its speed, after any prompt or fact-template change.
 #
+# REMOVED 2026-09-13 — `reka/fp4`. Its endpoint stopped listing
+# `presence_penalty`, which `_openai_sampling` always sends, and with
+# `require_parameters: true` OpenRouter answers 404 "No endpoints found that can
+# handle the requested parameters" while the endpoint still serves plain
+# requests. A one-entry pin had nowhere to fail over to, so every completion
+# returned "". An endpoint admitted here must list every parameter the request
+# carries, not only the capability flags.
+#
+# ADMITTED 2026-09-13 — `nextbit/fp8` for this model (already approved for V4
+# Pro), replacing it. Probed on the engine's exact request shape: 200 on a plain
+# call, a 150-token cap returned exactly 150 completion tokens, and eight
+# requests at four concurrent returned eight 200s (median 3.3 s). It lists
+# `presence_penalty` and keeps `structured_outputs`. That is a probe, not the
+# six-arm battery: re-check grounding before making it the sole pin.
+#
 # NOT ADMITTED — `wafer/fast`, despite the highest published throughput
 # (159 tps), a full capability profile and 99.89% uptime. It IGNORES
 # `max_tokens`: a cap of 150 returned 7,709 completion tokens, 51.4x over,
@@ -411,7 +426,7 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
 APPROVED_OPENROUTER_PROVIDERS = {
     "deepseek/deepseek-v4-flash-0731": frozenset({
         "coreweave/fp8", "together", "parasail/fp8", "relace/fp4",
-        "reka/fp4"}),
+        "nextbit/fp8"}),
     "z-ai/glm-5.3-flash": frozenset({
         "baseten/fp8", "novita/fp8", "together"}),
     "deepseek/deepseek-v4-pro": frozenset({
@@ -438,7 +453,6 @@ OPENROUTER_PROVIDER_TAGS = {
     "CoreWeave": frozenset({"coreweave/fp8"}),
     "Together": frozenset({"together"}),
     "Relace": frozenset({"relace/fp4"}),
-    "Reka": frozenset({"reka/fp4"}),
 }
 
 # D15 (#138): the provider pin says who OpenRouter routes to. It says nothing

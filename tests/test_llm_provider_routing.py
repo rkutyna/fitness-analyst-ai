@@ -23,9 +23,9 @@ def _block(monkeypatch, pinned, floor=50):
 
 def test_order_and_only_are_both_the_pinned_list(monkeypatch):
     """Preference and boundary are the same set, so failover stays inside it."""
-    block = _block(monkeypatch, "reka/fp4,coreweave/fp8,together")
-    assert block["order"] == ["reka/fp4", "coreweave/fp8", "together"]
-    assert block["only"] == ["reka/fp4", "coreweave/fp8", "together"]
+    block = _block(monkeypatch, "nextbit/fp8,coreweave/fp8,together")
+    assert block["order"] == ["nextbit/fp8", "coreweave/fp8", "together"]
+    assert block["only"] == ["nextbit/fp8", "coreweave/fp8", "together"]
     # Order is a real preference: the pinned sequence is preserved verbatim
     # rather than sorted by speed or name.
     assert block["order"] == block["only"]
@@ -39,27 +39,27 @@ def test_fallbacks_stay_disabled_with_several_providers(monkeypatch):
     here. This is the assertion that fails if someone "enables failover" by
     flipping allow_fallbacks instead.
     """
-    block = _block(monkeypatch, "reka/fp4,coreweave/fp8,together")
+    block = _block(monkeypatch, "nextbit/fp8,coreweave/fp8,together")
     assert block["allow_fallbacks"] is False
 
 
 def test_hard_privacy_filters_are_always_present(monkeypatch):
     """D15 must not rest solely on this process's own allow-list."""
-    block = _block(monkeypatch, "reka/fp4")
+    block = _block(monkeypatch, "nextbit/fp8")
     assert block["zdr"] is True
     assert block["data_collection"] == "deny"
 
 
 def test_throughput_floor_is_published_as_a_p50_preference(monkeypatch):
-    block = _block(monkeypatch, "reka/fp4,together", floor=50)
+    block = _block(monkeypatch, "nextbit/fp8,together", floor=50)
     assert block["preferred_min_throughput"] == {"p50": 50}
 
 
 def test_throughput_floor_is_omitted_when_disabled(monkeypatch):
     """0 disables the preference without disturbing the boundary."""
-    block = _block(monkeypatch, "reka/fp4,together", floor=0)
+    block = _block(monkeypatch, "nextbit/fp8,together", floor=0)
     assert "preferred_min_throughput" not in block
-    assert block["only"] == ["reka/fp4", "together"]
+    assert block["only"] == ["nextbit/fp8", "together"]
     assert block["allow_fallbacks"] is False
 
 
@@ -71,8 +71,8 @@ def test_the_floor_never_widens_the_permitted_set(monkeypatch):
     filter or extend `only` would fail here.
     """
     for floor in (0, 50, 100_000):
-        block = _block(monkeypatch, "reka/fp4,coreweave/fp8", floor=floor)
-        assert block["only"] == ["reka/fp4", "coreweave/fp8"]
+        block = _block(monkeypatch, "nextbit/fp8,coreweave/fp8", floor=floor)
+        assert block["only"] == ["nextbit/fp8", "coreweave/fp8"]
         assert block["allow_fallbacks"] is False
 
 

@@ -220,9 +220,13 @@ def presentation_clock_parts(metric: str, value) -> tuple[int, int] | None:
 #
 # The band is on probation: >5% decoupling on two consecutive long runs sends
 # the qualification ceiling back to 150.
+#
+# That fired on 2026-09-13: +6.54% and +7.04% on consecutive flat long runs.
+# The qualification ceiling is 150 again and the easy band's top edge with it
+# (145-150); the session cap stays 160 and the test allowance 165.
 EASY_JOG_HR_MIN = 145.0
-EASY_JOG_HR_MAX = 155.0
-EASY_JOG_CEILING = 155.0
+EASY_JOG_HR_MAX = 150.0
+EASY_JOG_CEILING = 150.0
 JOG_SESSION_HR_CAP = 160
 TEST_BENCHMARK_HR_CAP = 165
 
@@ -320,7 +324,7 @@ BLOCK_BRIDGE_HR_MIN = 130.0    # bpm; same floor, and for the same reason
 # vault resolves to, so figures do not move when a vault has never declared
 # one; it is a default, not a personal parameter, and consumers that only
 # need the default read this name rather than a per-vault value.
-DEFAULT_BLOCK_QUALIFY_HR_MAX = 155.0
+DEFAULT_BLOCK_QUALIFY_HR_MAX = 150.0
 
 
 def block_qualify_hr_max(conn) -> float:

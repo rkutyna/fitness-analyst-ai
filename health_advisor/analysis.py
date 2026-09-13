@@ -311,7 +311,7 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
 
     best = reps[0] if reps else None
     if hr_ceiling is None:
-        hr_ceiling = 155.0  # legacy default for direct pure-function callers
+        hr_ceiling = 150.0  # legacy default for direct pure-function callers
     qualified = [r for r in reps
                  if r["mean_hr"] is not None and r["mean_hr"] <= hr_ceiling]
     return {

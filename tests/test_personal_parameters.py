@@ -93,4 +93,4 @@ def test_a_vault_without_vault_meta_resolves_both_legacy_defaults():
     assert vt.workout_source_arbitration_from(bare) is None
     assert vt.block_qualify_hr_max(bare) is None
     assert dbmod.workout_source_arbitration_cutoff(bare) == "2026-08-21"
-    assert mx.block_qualify_hr_max(bare) == 155.0
+    assert mx.block_qualify_hr_max(bare) == 150.0

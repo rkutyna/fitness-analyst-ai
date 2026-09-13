@@ -593,7 +593,8 @@ CREATE TABLE IF NOT EXISTS subjective (
 );
 
 -- ---------------------------------------------------------------------------
--- workout_weather: outdoor conditions during a workout, joined via its GPX.
+-- workout_weather: outdoor conditions during a workout, joined via its route
+-- start point (with a legacy GPX fallback).
 --
 -- WHY THIS EXISTS. Audit part 1 (2026-08-15) called the plan's heat claims
 -- "unmeasurable" and was wrong: workouts.route_ref points at a 1 Hz GPX, whose
@@ -633,6 +634,27 @@ CREATE TABLE IF NOT EXISTS workout_weather (
     fetched_utc   TEXT NOT NULL,        -- set even when readings are NULL (pending)
     PRIMARY KEY (workout_id, offset_min)
 );
+
+-- ---------------------------------------------------------------------------
+-- workout_weather_status: the durable result of the scheduled enrichment.
+--
+-- Exactly three outcomes are recorded per workout: fetched means every sample
+-- offset has a temperature, pending means an archive fetch ran but returned no
+-- usable temperature, and no_route means neither a matched packed route nor a
+-- readable legacy GPX was available. Attempts count archive fetches for that
+-- workout; no_route therefore has zero attempts. Keeping this separate from
+-- the sample rows makes a missing route explicit and avoids inferring state
+-- from nullable weather values.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS workout_weather_status (
+    workout_id  INTEGER PRIMARY KEY REFERENCES workouts(id) ON DELETE CASCADE,
+    status      TEXT NOT NULL CHECK (status IN ('fetched', 'pending', 'no_route')),
+    checked_utc TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workout_weather_status_status
+    ON workout_weather_status (status);
 
 -- Hand-entered jog minutes for sessions the watch cannot measure (F2-4).
 --

@@ -896,6 +896,7 @@ _COPY_ORDER = (
     "ingest_log",
     "subjective",
     "workout_weather",
+    "workout_weather_status",
     "manual_jog",
     "food_catalog",
     "benchmark",

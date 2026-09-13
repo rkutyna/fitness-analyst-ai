@@ -367,3 +367,19 @@ def test_review_04_empty_routes_are_counted_but_not_stored(vault, vault_path, mo
     finally:
         conn.close()
     assert "routes_empty=1" in detail
+
+
+def test_route_anchor_is_advanceable_and_route_deletion_is_handled():
+    """The phone's route pass sends an HKWorkoutRouteTypeIdentifier anchor. A
+    refused anchor is held by the client, so the backfill would re-send the
+    same first route forever; a route deletion noted as unknown would do the
+    same through the client's reading of `unhandled`."""
+    payload = _payload(routes=[_route()], deletions=[{
+        "hk_uuid": "gone-route", "type_identifier": "HKWorkoutRouteTypeIdentifier"}])
+    payload["anchors"] = [{"type_identifier": "HKWorkoutRouteTypeIdentifier",
+                           "from": None, "to": "anchor-token"}]
+    parsed = hk_parse.parse_payload(payload)
+    assert parsed["rejected_anchors"] == []
+    assert parsed["anchor_results"] == [{
+        "index": 0, "type_identifier": "HKWorkoutRouteTypeIdentifier", "accepted": True}]
+    assert not any("HKWorkoutRouteTypeIdentifier" in note for note in parsed["unhandled"])

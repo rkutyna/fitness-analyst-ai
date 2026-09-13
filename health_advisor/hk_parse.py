@@ -64,6 +64,9 @@ _ROUTE_POINT_FIELDS = frozenset({
 _ANCHOR_FIELDS = frozenset({"type_identifier", "from", "to"})
 _DELETION_FIELDS = frozenset({"hk_uuid", "type_identifier"})
 _HK_WORKOUT_TYPE_IDENTIFIER = "HKWorkoutTypeIdentifier"
+# Workout routes are HKSeriesType samples synced in their own anchored pass;
+# their anchor and deletions must be advanceable or the route backfill stalls.
+_HK_WORKOUT_ROUTE_TYPE_IDENTIFIER = "HKWorkoutRouteTypeIdentifier"
 
 # The one shared list of metrics for which the phone pulls Apple's
 # consolidated daily statistics.  The verifier imports this rather than
@@ -163,6 +166,7 @@ def _anchor_type_supported(type_identifier: str) -> bool:
         or type_identifier == nz.HK_SLEEP_TYPE_IDENTIFIER
         or type_identifier in nz.HK_CATEGORY
         or type_identifier == _HK_WORKOUT_TYPE_IDENTIFIER
+        or type_identifier == _HK_WORKOUT_ROUTE_TYPE_IDENTIFIER
     )
 
 
@@ -736,6 +740,7 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise PayloadError(f"payload.deletions[{i}] has invalid identity")
         if (deletion["type_identifier"] not in nz.HK_QUANTITY
                 and deletion["type_identifier"] != nz.HK_SLEEP_TYPE_IDENTIFIER
+                and deletion["type_identifier"] != _HK_WORKOUT_ROUTE_TYPE_IDENTIFIER
                 and deletion["type_identifier"] not in nz.HK_CATEGORY):
             unhandled.append(
                 f"deletions[{i}]: unknown type_identifier {deletion['type_identifier']!r}"

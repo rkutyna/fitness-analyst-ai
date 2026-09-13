@@ -525,6 +525,7 @@ def _health(ctx, corpus_path: str | None = None):
             # version" is a claim, and this is the check.
             "secret_source": SHARED_SECRET_SOURCE,
             "secret_reloads": _SECRET_FILE_RELOADS,
+            "workout_routes_supported": True,
             "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE,
             **_corpus_status(corpus_path)}
 
@@ -581,6 +582,7 @@ def _batch_span(parsed) -> tuple[str | None, str | None, int]:
     """(min local_date, max local_date, n) over all dated batch entries."""
     dates = [r["local_date"] for r in parsed.get("records", []) if r.get("local_date")]
     dates.extend(parsed.get("workout_dates", []))
+    dates.extend(parsed.get("route_dates", []))
     dates.extend(parsed.get("daily_total_dates", []))
     if not dates:
         return None, None, 0
@@ -689,6 +691,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     affected: set[tuple[str, str]] = set()
     rec_added = 0
     daily_totals_added = 0
+    routes_added = 0
+    routes_unmatched = 0
+    routes_empty = sum(
+        route["n_points"] == 0 for route in parsed["workout_routes"]
+    )
+    routes_deleted = 0
     deleted = 0
     tombstones_added = 0
     moved = 0
@@ -836,6 +844,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                      oldest["metric"] if oldest else None),
                 )
                 tombstones_added += 1
+                routes_deleted += conn.execute(
+                    "DELETE FROM workout_routes WHERE hk_route_uuid = ?",
+                    (uuid,),
+                ).rowcount
 
             # Filter tombstoned adds before constructing pairs. This matters
             # for a deletion of an unknown row followed by the same stale row:
@@ -903,6 +915,28 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
 
             workouts_added = db.insert_workouts(
                 conn, parsed["workouts"], report=_note_fragment)
+            # A workout may arrive after its route. Resolve old unmatched rows
+            # as well as routes in this batch, all inside the batch transaction.
+            db.attach_unmatched_workout_routes(conn)
+            route_rows = []
+            for route in parsed["workout_routes"]:
+                if route["n_points"] == 0:
+                    continue
+                tombstone = conn.execute(
+                    "SELECT 1 FROM hk_deletions WHERE hk_uuid = ?",
+                    (route["hk_route_uuid"],),
+                ).fetchone()
+                if tombstone is None:
+                    route_rows.append(route)
+            routes_added = db.insert_workout_routes(conn, route_rows)
+            db.attach_unmatched_workout_routes(conn)
+            routes_unmatched = sum(
+                conn.execute(
+                    "SELECT workout_id FROM workout_routes WHERE hk_route_uuid = ?",
+                    (route["hk_route_uuid"],),
+                ).fetchone()[0] is None
+                for route in route_rows
+            )
             # A workout changes which already-ingested distance samples survive
             # workout-window arbitration. Re-derive that sole workout-arbitrated
             # metric when a workout arrives after its samples; history before
@@ -956,6 +990,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                      parsed["batch_sequence"], parsed["batch_id"], db.utcnow_iso()),
                 )
 
+            route_detail = (
+                f"routes_seen={len(parsed['workout_routes'])} "
+                f"routes_added={routes_added} routes_unmatched={routes_unmatched} "
+                f"routes_empty={routes_empty} "
+                if parsed["routes_present"] else ""
+            )
             detail = (
                 f"records_seen={len(parsed['records'])} records_added={rec_added} "
                 f"workouts_seen={len(parsed['workouts'])} workouts_added={workouts_added} "
@@ -965,8 +1005,9 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 + f"deleted={deleted} tombstones={tombstones_added} "
                 f"daily_totals_seen={len(parsed['daily_totals'])} "
                 f"daily_totals_added={daily_totals_added} daily_pairs={dm} "
-                f"history_imported_through={history or '-'} "
-                f"batch_sequence={parsed['batch_sequence']}"
+                + route_detail
+                + f"history_imported_through={history or '-'} "
+                + f"batch_sequence={parsed['batch_sequence']}"
             )
             conn.execute(
                 "INSERT INTO commit_log (key, epoch, applied_at, detail) "
@@ -991,6 +1032,14 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         }
         if parsed["rejected_anchors"]:
             response["anchor_results"] = parsed["anchor_results"]
+        if parsed["routes_present"]:
+            response.update({
+                "routes_seen": len(parsed["workout_routes"]),
+                "routes_added": 0,
+                "routes_unmatched": 0,
+                "routes_empty": routes_empty,
+                "routes_deleted": 0,
+            })
         return JSONResponse(response)
 
     # This helper deliberately runs after the data/anchor commit: it is
@@ -1039,7 +1088,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             pass
     finally:
         derive_conn.close()
-    _dates = sorted({d for _, d in affected} | parsed["workout_dates"])
+    _dates = sorted({d for _, d in affected} | parsed["workout_dates"]
+                    | parsed["route_dates"])
     _trace("ingest-ok",
            batch_id=parsed["batch_id"], device=parsed.get("device_id"),
            records_seen=len(parsed["records"]), records_added=rec_added,
@@ -1067,6 +1117,14 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     }
     if parsed["rejected_anchors"]:
         response["anchor_results"] = parsed["anchor_results"]
+    if parsed["routes_present"]:
+        response.update({
+            "routes_seen": len(parsed["workout_routes"]),
+            "routes_added": routes_added,
+            "routes_unmatched": routes_unmatched,
+            "routes_empty": routes_empty,
+            "routes_deleted": routes_deleted,
+        })
     return JSONResponse(response)
 
 

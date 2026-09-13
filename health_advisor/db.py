@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import struct
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -109,6 +110,10 @@ _ADDED_COLUMNS = {
         "avg_heart_rate": "REAL",
         "max_heart_rate": "REAL",
         "hk_uuid": "TEXT",
+    },
+    "workout_routes": {
+        "workout_hk_uuid": "TEXT",
+        "source_name": "TEXT",
     },
     # source_kind is the D19 discriminator: which provenance the row's `sum`
     # currently carries. A constant DEFAULT is legal in SQLite's ALTER TABLE ADD
@@ -769,6 +774,45 @@ def workout_key(workout_type: str, start_utc: str, end_utc: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+ROUTE_POINT_ENCODING = "f32le-columns-v1"
+_ROUTE_POINT_FIELDS = ("t_offset_s", "altitude_m", "vertical_accuracy_m",
+                       "horizontal_accuracy_m")
+
+
+def pack_route_points(points: dict[str, Sequence[float]]) -> bytes:
+    """Pack route columns with a fixed-size bind (one BLOB per route)."""
+    lengths = {len(points[field]) for field in _ROUTE_POINT_FIELDS}
+    if len(lengths) != 1:
+        raise ValueError("route point arrays must have equal length")
+    n_points = lengths.pop()
+    if n_points > 20_000:
+        raise ValueError("route point count exceeds 20000")
+    return b"".join(
+        struct.pack(f"<{n_points}f", *points[field])
+        for field in _ROUTE_POINT_FIELDS
+    )
+
+
+def unpack_route_points(blob: bytes, n_points: int) -> dict[str, list[float]]:
+    """Decode the stored route BLOB; malformed/truncated blobs fail loudly."""
+    if n_points < 0 or n_points > 20_000:
+        raise ValueError("invalid route point count")
+    width = 4 * n_points
+    if len(blob) != width * len(_ROUTE_POINT_FIELDS):
+        raise ValueError("route point BLOB length does not match n_points")
+    return {
+        field: list(struct.unpack_from(f"<{n_points}f", blob, offset * width))
+        for offset, field in enumerate(_ROUTE_POINT_FIELDS)
+    }
+
+
+def decode_route_points(blob: bytes, encoding: str, n_points: int) -> dict[str, list[float]]:
+    """Decode a stored route after checking its declared representation."""
+    if encoding != ROUTE_POINT_ENCODING:
+        raise ValueError(f"unsupported route encoding: {encoding!r}")
+    return unpack_route_points(blob, n_points)
+
+
 def workout_event_key(workout_key: str, event_type: str, start_utc: str, duration_min) -> str:
     # duration is part of the key: concurrent segment streams can share a start
     # time (observed in real exports), differing only in duration.
@@ -1016,6 +1060,93 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
     conn.executemany(sql, rows)
     after = conn.execute("SELECT COALESCE(MAX(id), 0) FROM workouts").fetchone()[0]
     return after - before
+
+
+def _route_time(value: str, seconds: int) -> str:
+    return (datetime.fromisoformat(value) + timedelta(seconds=seconds)).isoformat()
+
+
+def _route_parent_id(conn: sqlite3.Connection, route: dict) -> int | None:
+    """Find a route's workout parent without loading or binding its points."""
+    source = route["source_name"]
+    if route.get("workout_hk_uuid"):
+        candidates = conn.execute(
+            "SELECT id, source FROM workouts WHERE hk_uuid = ?",
+            (route["workout_hk_uuid"],),
+        ).fetchall()
+        for candidate in candidates:
+            if candidate["source"] in (None, "", source):
+                return candidate["id"]
+        return None
+
+    candidates = conn.execute(
+        "SELECT id, start_utc, end_utc, source FROM workouts "
+        "WHERE start_utc <= ? AND end_utc >= ? "
+        "ORDER BY start_utc DESC, end_utc ASC",
+        (_route_time(route["start_utc"], 60),
+         _route_time(route["end_utc"], -60)),
+    ).fetchall()
+    for candidate in candidates:
+        workout_source = candidate["source"]
+        if workout_source not in (None, "") and source not in (None, "") \
+                and workout_source != source:
+            continue
+        return candidate["id"]
+    return None
+
+
+def insert_workout_routes(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
+    """Upsert packed routes, returning only newly-created route rows."""
+    sql = (
+        "INSERT INTO workout_routes "
+        "(workout_id, hk_route_uuid, start_utc, end_utc, n_points, "
+        " workout_hk_uuid, source_name, "
+        " start_lat_1dp, start_lon_1dp, encoding, points, ascent_m, descent_m, "
+        " method_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL) "
+        "ON CONFLICT(hk_route_uuid) DO UPDATE SET "
+        "workout_id = COALESCE(excluded.workout_id, workout_routes.workout_id), "
+        "workout_hk_uuid = excluded.workout_hk_uuid, "
+        "source_name = excluded.source_name, "
+        "start_utc = excluded.start_utc, end_utc = excluded.end_utc, "
+        "n_points = excluded.n_points, start_lat_1dp = excluded.start_lat_1dp, "
+        "start_lon_1dp = excluded.start_lon_1dp, encoding = excluded.encoding, "
+        "points = excluded.points"
+    )
+    added = 0
+    for route in rows:
+        existing = conn.execute(
+            "SELECT 1 FROM workout_routes WHERE hk_route_uuid = ?",
+            (route["hk_route_uuid"],),
+        ).fetchone()
+        parent_id = _route_parent_id(conn, route)
+        blob = pack_route_points(route["points"])
+        conn.execute(sql, (
+            parent_id, route["hk_route_uuid"], route["start_utc"],
+            route["end_utc"], route["n_points"], route.get("workout_hk_uuid"),
+            route["source_name"], route["start_lat_1dp"], route["start_lon_1dp"],
+            ROUTE_POINT_ENCODING, blob,
+        ))
+        if existing is None:
+            added += 1
+    return added
+
+
+def attach_unmatched_workout_routes(conn: sqlite3.Connection) -> int:
+    """Attach previously unmatched routes after a later workout ingest."""
+    attached = 0
+    rows = conn.execute(
+        "SELECT id, start_utc, end_utc, source_name, workout_hk_uuid "
+        "FROM workout_routes WHERE workout_id IS NULL"
+    ).fetchall()
+    for row in rows:
+        parent = _route_parent_id(conn, dict(row))
+        if parent is not None:
+            attached += conn.execute(
+                "UPDATE workout_routes SET workout_id = ? WHERE id = ? "
+                "AND workout_id IS NULL", (parent, row["id"])
+            ).rowcount
+    return attached
 
 
 # Reconciliation thresholds: how far the device summary may drift from the raw

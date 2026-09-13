@@ -244,6 +244,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workouts_hk_uuid
     ON workouts (hk_uuid) WHERE hk_uuid IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- workout_routes: HealthKit route telemetry without a per-point coordinate trace.
+-- Points are packed little-endian float32 columns; elevation derivation is a
+-- separate task, so the three derived columns remain NULL at ingest.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS workout_routes (
+    id              INTEGER PRIMARY KEY,
+    workout_id      INTEGER REFERENCES workouts(id) ON DELETE CASCADE,
+    hk_route_uuid   TEXT NOT NULL UNIQUE,
+    -- Retained wire metadata lets a route be matched when its workout arrives
+    -- in a later batch, without retaining any point-level location.
+    workout_hk_uuid TEXT,
+    source_name     TEXT,
+    start_utc       TEXT NOT NULL,
+    end_utc         TEXT NOT NULL,
+    n_points        INTEGER NOT NULL CHECK (n_points BETWEEN 1 AND 20000),
+    start_lat_1dp   REAL,
+    start_lon_1dp   REAL,
+    encoding        TEXT NOT NULL,
+    points          BLOB NOT NULL,
+    ascent_m        REAL,
+    descent_m       REAL,
+    method_version  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_workout_routes_workout
+    ON workout_routes (workout_id);
+
+-- ---------------------------------------------------------------------------
 -- workout_session_marks: append-only user corrections to session identity.
 --
 -- A device-recorded workout is never rewritten or deleted when a user says it

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from . import db
@@ -30,6 +31,7 @@ _TOP_FIELDS = frozenset({
     "protocol_version", "device", "app_version", "batch_id",
     "batch_sequence", "sent_at", "anchors", "samples", "deletions",
     "workouts", "daily_totals",
+    "workout_routes",
 })
 _DEVICE_FIELDS = frozenset({"id", "name", "model"})
 _SAMPLE_DEVICE_FIELDS = frozenset({"name", "model"})
@@ -51,6 +53,13 @@ _WORKOUT_FIELDS = frozenset({
 _DAILY_TOTAL_FIELDS = frozenset({
     "type_identifier", "local_date", "value", "unit", "interval",
     "state", "queried_at",
+})
+_ROUTE_FIELDS = frozenset({
+    "hk_route_uuid", "start", "end", "source_name", "workout_hk_uuid",
+    "start_lat_1dp", "start_lon_1dp", "points",
+})
+_ROUTE_POINT_FIELDS = frozenset({
+    "t_offset_s", "altitude_m", "vertical_accuracy_m", "horizontal_accuracy_m",
 })
 _ANCHOR_FIELDS = frozenset({"type_identifier", "from", "to"})
 _DELETION_FIELDS = frozenset({"hk_uuid", "type_identifier"})
@@ -543,6 +552,103 @@ def _parse_daily_total(total: dict, index: int, device_id: str,
     daily_total_dates.add(total["local_date"])
 
 
+def _rounded_coordinate(value: Any, field: str, index: int) -> float | None:
+    if value is None:
+        return None
+    number = _json_number(value)
+    if number is None:
+        raise PayloadError(f"payload.workout_routes[{index}].{field} must be a finite JSON number or null")
+    try:
+        decimal = Decimal(str(value))
+        rounded = decimal.quantize(Decimal("0.1"))
+    except (InvalidOperation, ValueError):
+        raise PayloadError(
+            f"payload.workout_routes[{index}].{field} must have at most 1 decimal place"
+        ) from None
+    if decimal != rounded:
+        raise PayloadError(
+            f"payload.workout_routes[{index}].{field} must have at most 1 decimal place"
+        )
+    if field == "start_lat_1dp" and not -90 <= number <= 90:
+        raise PayloadError(f"payload.workout_routes[{index}].{field} is out of range")
+    if field == "start_lon_1dp" and not -180 <= number <= 180:
+        raise PayloadError(f"payload.workout_routes[{index}].{field} is out of range")
+    return round(number, 1)
+
+
+def _parse_workout_route(route: dict, index: int, routes: list[dict],
+                         route_dates: set[str]) -> None:
+    required = ("hk_route_uuid", "start", "end", "source_name", "points")
+    missing = _required(route, required, f"workout_routes[{index}]")
+    if missing:
+        raise PayloadError(
+            f"payload.workout_routes[{index}] is missing required field(s): "
+            f"{', '.join(missing)}")
+    if not _text(route["hk_route_uuid"]) or not _text(route["source_name"]):
+        raise PayloadError(
+            f"payload.workout_routes[{index}] requires non-empty hk_route_uuid and source_name")
+    start_dt, end_dt = _parse_dt(route["start"]), _parse_dt(route["end"])
+    if start_dt is None or end_dt is None or end_dt < start_dt:
+        raise PayloadError(f"payload.workout_routes[{index}] has unparseable or inverted start/end")
+    if "workout_hk_uuid" in route and route["workout_hk_uuid"] is not None \
+            and not _text(route["workout_hk_uuid"]):
+        raise PayloadError(
+            f"payload.workout_routes[{index}].workout_hk_uuid must be a string or null")
+    start_lat = _rounded_coordinate(route.get("start_lat_1dp"), "start_lat_1dp", index)
+    start_lon = _rounded_coordinate(route.get("start_lon_1dp"), "start_lon_1dp", index)
+    if (start_lat is None) != (start_lon is None):
+        raise PayloadError(
+            f"payload.workout_routes[{index}] must provide both start coordinates or neither")
+
+    points = _mapping(route["points"], f"payload.workout_routes[{index}].points")
+    _reject_unknown(points, _ROUTE_POINT_FIELDS,
+                    f"payload.workout_routes[{index}].points")
+    missing = _required(
+        points,
+        ("t_offset_s", "altitude_m", "vertical_accuracy_m", "horizontal_accuracy_m"),
+        f"payload.workout_routes[{index}].points",
+    )
+    if missing:
+        raise PayloadError(
+            f"payload.workout_routes[{index}].points is missing required field(s): "
+            f"{', '.join(missing)}")
+    arrays: dict[str, list[float]] = {}
+    lengths = set()
+    for field in _ROUTE_POINT_FIELDS:
+        values = _list(points[field], f"payload.workout_routes[{index}].points.{field}")
+        if len(values) > 20_000:
+            raise PayloadError(f"payload.workout_routes[{index}] has more than 20000 points")
+        parsed_values: list[float] = []
+        for point_index, value in enumerate(values):
+            number = _json_number(value)
+            if number is None:
+                raise PayloadError(
+                    f"payload.workout_routes[{index}].points.{field}[{point_index}] "
+                    "must be a finite JSON number")
+            if field == "t_offset_s" and number < 0:
+                raise PayloadError(
+                    f"payload.workout_routes[{index}].points.t_offset_s[{point_index}] "
+                    "must be non-negative")
+            parsed_values.append(number)
+        arrays[field] = parsed_values
+        lengths.add(len(parsed_values))
+    if len(lengths) != 1:
+        raise PayloadError(f"payload.workout_routes[{index}].points arrays must have equal length")
+    n_points = lengths.pop()
+    routes.append({
+        "hk_route_uuid": route["hk_route_uuid"],
+        "start_utc": nz.to_utc_iso(start_dt),
+        "end_utc": nz.to_utc_iso(end_dt),
+        "source_name": route["source_name"],
+        "workout_hk_uuid": route.get("workout_hk_uuid"),
+        "start_lat_1dp": start_lat,
+        "start_lon_1dp": start_lon,
+        "points": arrays,
+        "n_points": n_points,
+    })
+    route_dates.add(nz.local_date_of(start_dt))
+
+
 def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Return canonical rows, advanceable anchors, and envelope IDs.
 
@@ -667,12 +773,25 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         f"payload.daily_totals[{i}]")
         _parse_daily_total(total, i, device["id"], daily_totals,
                            daily_total_dates, unhandled)
+    routes_present = "workout_routes" in envelope
+    routes_wire = _list(envelope.get("workout_routes", []),
+                        "payload.workout_routes")
+    parsed_routes: list[dict] = []
+    route_dates: set[str] = set()
+    for i, route in enumerate(routes_wire):
+        if not isinstance(route, dict):
+            raise PayloadError(f"payload.workout_routes[{i}] must be a JSON object")
+        _reject_unknown(route, _ROUTE_FIELDS, f"payload.workout_routes[{i}]")
+        _parse_workout_route(route, i, parsed_routes, route_dates)
     return {
         "records": records,
         "workouts": parsed_workouts,
         "workout_dates": workout_dates,
         "daily_totals": daily_totals,
         "daily_total_dates": daily_total_dates,
+        "workout_routes": parsed_routes,
+        "route_dates": route_dates,
+        "routes_present": routes_present,
         "pairs": pairs,
         "unhandled": unhandled,
         "rejections": unhandled.rejections,

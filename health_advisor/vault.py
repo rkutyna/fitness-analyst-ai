@@ -883,6 +883,9 @@ _COPY_ORDER = (
     "commit_log",
     "hk_deletions",
     "workouts",
+    # workout_routes references workouts.id and must follow its parent; copying
+    # the packed BLOB preserves route telemetry without introducing a trace.
+    "workout_routes",
     "records",
     "workout_events",
     "daily_metrics",

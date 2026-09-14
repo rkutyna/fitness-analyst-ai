@@ -24,7 +24,13 @@ HYSTERESIS_THRESHOLD_M = 3.0
 MIN_USED_POINTS = 10
 METRES_TO_FEET = 3.280839895013123
 
-__all__ = ["compute_elevation", "route_climb", "workout_climb"]
+# Bump when a matcher or ingest change can fill entries an earlier backfill
+# could not. Generation 1 was the original backfill; generation 2 adds the
+# UUID-to-overlap fallback for workouts stored without a UUID.
+WORKOUT_ELEVATION_BACKFILL_GENERATION = 2
+
+__all__ = ["compute_elevation", "route_climb", "workout_climb",
+           "WORKOUT_ELEVATION_BACKFILL_GENERATION"]
 
 
 def _timestamp(value: Any) -> float:

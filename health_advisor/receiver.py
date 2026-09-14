@@ -47,6 +47,7 @@ from .context import VaultContext
 from . import analysis
 from . import analyst
 from . import derive
+from . import elevation
 from . import hk_parse
 from . import lease
 from . import llm
@@ -517,7 +518,7 @@ def _health(ctx, corpus_path: str | None = None):
                             "ORDER BY id DESC LIMIT 1").fetchone()
     finally:
         conn.close()
-    return {"ok": True, "records": n,
+    payload = {"ok": True, "records": n,
             "last_ingest": dict(last) if last else None,
             "secret_required": bool(SHARED_SECRET),
             # Which path the secret came from — "file" or "env". Never the
@@ -529,6 +530,10 @@ def _health(ctx, corpus_path: str | None = None):
             "workout_elevation_supported": True,
             "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE,
             **_corpus_status(corpus_path)}
+    if payload["workout_elevation_supported"]:
+        payload["workout_elevation_backfill_generation"] = (
+            elevation.WORKOUT_ELEVATION_BACKFILL_GENERATION)
+    return payload
 
 
 def _ask_freshness(ctx, as_of: str | None) -> dict:

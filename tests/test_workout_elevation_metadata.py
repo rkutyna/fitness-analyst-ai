@@ -226,7 +226,12 @@ def test_issue_63_done_04_health_advertises_workout_elevation(vault, monkeypatch
     with _client(vault, monkeypatch) as client:
         response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["workout_elevation_supported"] is True
+    body = response.json()
+    assert body["workout_elevation_supported"] is True
+    assert body["workout_elevation_backfill_generation"] == (
+        elevation.WORKOUT_ELEVATION_BACKFILL_GENERATION)
+    assert isinstance(body["workout_elevation_backfill_generation"], int)
+    assert body["workout_elevation_backfill_generation"] >= 2
 
 
 def test_issue_63_done_05_workout_climb_prefers_device_then_route_then_none(vault):

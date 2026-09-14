@@ -299,6 +299,26 @@ def _decode_points(blob: bytes | bytearray | memoryview) -> tuple[list[float], .
                  for offset in range(4))
 
 
+def _window_samples(route_rows, start_utc: str,
+                    end_utc: str) -> list[tuple[float, float, float]]:
+    """Decode ``(start_utc, points)`` route rows into samples inside the window.
+
+    The window is half-open. Callers choose which routes to pass; this only
+    turns their packed points into ``(timestamp, altitude, accuracy)``.
+    """
+    window_start = _timestamp(start_utc)
+    window_end = _timestamp(end_utc)
+    samples: list[tuple[float, float, float]] = []
+    for route_start_utc, points in route_rows:
+        offsets, elevations, accuracies, _horizontal = _decode_points(points)
+        route_start = _timestamp(route_start_utc)
+        for offset, altitude, accuracy in zip(offsets, elevations, accuracies):
+            timestamp = route_start + offset
+            if window_start <= timestamp < window_end:
+                samples.append((timestamp, altitude, accuracy))
+    return samples
+
+
 def route_climb(conn: sqlite3.Connection, start_utc: str, end_utc: str) -> dict[str, Any]:
     """Compute elevation for route points in the half-open UTC window.
 
@@ -319,21 +339,12 @@ def route_climb(conn: sqlite3.Connection, start_utc: str, end_utc: str) -> dict[
     if present is None:
         return {"status": "no_route"}
 
-    window_start = _timestamp(start_utc)
-    window_end = _timestamp(end_utc)
     rows = conn.execute(
-        "SELECT start_utc, end_utc, encoding, points FROM workout_routes "
+        "SELECT start_utc, points FROM workout_routes "
         "WHERE start_utc < ? AND end_utc > ? ORDER BY start_utc",
         (end_utc, start_utc),
     ).fetchall()
-    samples: list[tuple[float, float, float]] = []
-    for row in rows:
-        offsets, elevations, accuracies, _horizontal = _decode_points(row[3])
-        route_start = _timestamp(row[0])
-        for offset, altitude, accuracy in zip(offsets, elevations, accuracies):
-            timestamp = route_start + offset
-            if window_start <= timestamp < window_end:
-                samples.append((timestamp, altitude, accuracy))
+    samples = _window_samples(rows, start_utc, end_utc)
     if not samples:
         return {"status": "no_route"}
     result = compute_elevation(samples)
@@ -369,21 +380,14 @@ def workout_climb(conn: sqlite3.Connection, workout_id: int) -> dict[str, Any]:
     ).fetchone()
     if present is None:
         return {"status": "no_elevation"}
-    window_start = _timestamp(row[0])
-    window_end = _timestamp(row[1])
-    samples: list[tuple[float, float, float]] = []
+    # Routes attached to this workout, not every route in its window: an
+    # unmatched route that merely overlaps is not this workout's evidence.
     route_rows = conn.execute(
-        "SELECT start_utc, encoding, points FROM workout_routes "
+        "SELECT start_utc, points FROM workout_routes "
         "WHERE workout_id = ? ORDER BY start_utc",
         (workout_id,),
     ).fetchall()
-    for route_row in route_rows:
-        offsets, elevations, accuracies, _horizontal = _decode_points(route_row[2])
-        route_start = _timestamp(route_row[0])
-        for offset, altitude, accuracy in zip(offsets, elevations, accuracies):
-            timestamp = route_start + offset
-            if window_start <= timestamp < window_end:
-                samples.append((timestamp, altitude, accuracy))
+    samples = _window_samples(route_rows, row[0], row[1])
     if not samples:
         return {"status": "no_elevation"}
     route = compute_elevation(samples)

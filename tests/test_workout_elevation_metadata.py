@@ -219,6 +219,14 @@ def test_issue_63_done_05_workout_climb_prefers_device_then_route_then_none(vaul
     assert elevation.workout_climb(conn, ids["device-workout"]) == {
         "ascended_m": 17.4, "descended_m": 8.2, "source": "device_metadata"
     }
+    # A direct insert that names no source still stores a labelled total, as
+    # the conflict path does; workout_climb alone cannot see the column.
+    stored = {
+        row["dedupe_key"]: row["elevation_source"]
+        for row in conn.execute("SELECT dedupe_key, elevation_source FROM workouts")
+    }
+    assert stored == {"device-workout": "device_metadata",
+                      "route-workout": None, "empty-workout": None}
     route_result = elevation.workout_climb(conn, ids["route-workout"])
     assert route_result["source"] == "route_estimate"
     assert route_result["ascended_m"] > 0

@@ -1076,6 +1076,13 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
             row.get("_elevation_fields_present", False)
             or row.get("elevation_ascended_m") is not None
             or row.get("elevation_descended_m") is not None)
+        # The INSERT writes elevation_source verbatim while the conflict path
+        # derives it, so derive it here too: a caller that supplies a device
+        # total without naming its source must not store an unlabelled total.
+        if (merged["elevation_source"] is None
+                and (merged["elevation_ascended_m"] is not None
+                     or merged["elevation_descended_m"] is not None)):
+            merged["elevation_source"] = "device_metadata"
         rows.append(merged)
     # Longest span first so one batch carrying a session and its fragments
     # resolves the same way whatever order they arrive in. list.sort is stable,

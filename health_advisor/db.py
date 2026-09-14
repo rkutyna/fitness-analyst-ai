@@ -1062,37 +1062,61 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
     return after - before
 
 
-def _route_time(value: str, seconds: int) -> str:
-    return (datetime.fromisoformat(value) + timedelta(seconds=seconds)).isoformat()
+def _normalise_source(value: str | None) -> str:
+    """Collapse whitespace for source-name comparisons."""
+    return " ".join((value or "").split())
 
 
 def _route_parent_id(conn: sqlite3.Connection, route: dict) -> int | None:
-    """Find a route's workout parent without loading or binding its points."""
-    source = route["source_name"]
+    """Find a route's workout parent without loading or binding its points.
+
+    A HealthKit UUID is authoritative. Legacy rows have no UUID, so choose the
+    candidate with the largest interval overlap, subject to both the route and
+    workout being at least 90% covered. Source names only break equal-overlap
+    ties: legacy exports may name a phone, add whitespace, or combine devices.
+    """
     if route.get("workout_hk_uuid"):
         candidates = conn.execute(
-            "SELECT id, source FROM workouts WHERE hk_uuid = ?",
+            "SELECT id FROM workouts WHERE hk_uuid = ? ORDER BY id LIMIT 1",
             (route["workout_hk_uuid"],),
         ).fetchall()
-        for candidate in candidates:
-            if candidate["source"] in (None, "", source):
-                return candidate["id"]
+        return candidates[0]["id"] if candidates else None
+
+    route_start = datetime.fromisoformat(route["start_utc"])
+    route_end = datetime.fromisoformat(route["end_utc"])
+    route_duration = (route_end - route_start).total_seconds()
+    if route_duration <= 0:
         return None
 
     candidates = conn.execute(
         "SELECT id, start_utc, end_utc, source FROM workouts "
-        "WHERE start_utc <= ? AND end_utc >= ? "
-        "ORDER BY start_utc DESC, end_utc ASC",
-        (_route_time(route["start_utc"], 60),
-         _route_time(route["end_utc"], -60)),
+        "WHERE start_utc < ? AND end_utc > ?",
+        (route["end_utc"], route["start_utc"]),
     ).fetchall()
+
+    route_source = _normalise_source(route.get("source_name"))
+    matches = []
     for candidate in candidates:
-        workout_source = candidate["source"]
-        if workout_source not in (None, "") and source not in (None, "") \
-                and workout_source != source:
+        workout_start = datetime.fromisoformat(candidate["start_utc"])
+        workout_end = datetime.fromisoformat(candidate["end_utc"])
+        workout_duration = (workout_end - workout_start).total_seconds()
+        if workout_duration <= 0:
             continue
-        return candidate["id"]
-    return None
+        overlap = (
+            min(route_end, workout_end) - max(route_start, workout_start)
+        ).total_seconds()
+        if (overlap < route_duration * 0.90
+                or overlap < workout_duration * 0.90):
+            continue
+        source_match = bool(
+            route_source
+            and route_source in _normalise_source(candidate["source"])
+        )
+        # Largest overlap wins. Source containment is only the tie-break;
+        # id makes fully indistinguishable legacy candidates deterministic.
+        matches.append((overlap, source_match, -candidate["id"], candidate["id"]))
+
+    return max(matches)[3] if matches else None
 
 
 def insert_workout_routes(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:

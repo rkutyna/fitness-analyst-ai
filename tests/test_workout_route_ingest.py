@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -85,6 +86,196 @@ def _set_history(vault_context, through):
     vault.set_history_imported_through(conn, through)
     conn.commit()
     conn.close()
+
+
+def _legacy_workout(uuid, start, end, source, workout_type="walking"):
+    duration_min = (
+        datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    ).total_seconds() / 60
+    return {
+        "workout_type": workout_type,
+        "start_utc": start,
+        "end_utc": end,
+        "local_date": start[:10],
+        "duration_min": duration_min,
+        "energy_kcal": None,
+        "distance_mi": None,
+        "unit_distance": None,
+        "source": source,
+        "dedupe_key": f"legacy-{uuid}",
+        "hk_uuid": None,
+    }
+
+
+def _db_route(uuid, start, end, source="Synthetic Watch"):
+    return {
+        "hk_route_uuid": uuid,
+        "start_utc": start,
+        "end_utc": end,
+        "source_name": source,
+        "workout_hk_uuid": None,
+        "start_lat_1dp": 0.0,
+        "start_lon_1dp": 0.0,
+        "n_points": 2,
+        "points": {
+            "t_offset_s": [0.0, 1.0],
+            "altitude_m": [100.0, 100.25],
+            "vertical_accuracy_m": [1.0, 1.0],
+            "horizontal_accuracy_m": [2.0, 2.0],
+        },
+    }
+
+
+def test_issue_61_done_01_legacy_source_shapes_attach(vault):
+    conn = vault.connect()
+    db.init_db(conn)
+    workouts = [
+        _legacy_workout(
+            "shape-a", "2026-01-02T10:00:00+00:00", "2026-01-02T10:30:00+00:00",
+            "Synthetic Phone ", "walking",
+        ),
+        _legacy_workout(
+            "shape-b", "2026-01-02T11:00:00+00:00", "2026-01-02T11:30:00+00:00",
+            "Synthetic Watch|Synthetic Phone ", "walking",
+        ),
+        _legacy_workout(
+            "shape-c", "2026-01-02T12:00:00+00:00", "2026-01-02T12:30:00+00:00",
+            "Synthetic Phone ", "hiking",
+        ),
+    ]
+    routes = [
+        _db_route("shape-a-route", "2026-01-02T10:00:00+00:00", "2026-01-02T10:30:00+00:00"),
+        _db_route("shape-b-route", "2026-01-02T11:00:00+00:00", "2026-01-02T11:30:00+00:00"),
+        _db_route("shape-c-route", "2026-01-02T12:00:00+00:00", "2026-01-02T12:30:00+00:00"),
+    ]
+    try:
+        db.insert_workouts(conn, workouts[:2])
+        db.insert_workout_routes(conn, routes[:2])
+        db.insert_workout_routes(conn, [routes[2]])
+        assert conn.execute(
+            "SELECT workout_id FROM workout_routes WHERE hk_route_uuid = ?",
+            ("shape-c-route",),
+        ).fetchone()[0] is None
+
+        db.insert_workouts(conn, [workouts[2]])
+        assert db.attach_unmatched_workout_routes(conn) == 1
+        attached = conn.execute(
+            "SELECT r.hk_route_uuid, w.workout_type "
+            "FROM workout_routes r JOIN workouts w ON w.id = r.workout_id "
+            "ORDER BY r.hk_route_uuid"
+        ).fetchall()
+        assert [(row[0], row[1]) for row in attached] == [
+            ("shape-a-route", "walking"),
+            ("shape-b-route", "walking"),
+            ("shape-c-route", "hiking"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_issue_61_done_02_early_route_start_overlaps_long_workout(vault):
+    conn = vault.connect()
+    db.init_db(conn)
+    route = _db_route(
+        "early-route", "2026-01-02T09:57:16+00:00", "2026-01-02T13:02:00+00:00",
+    )
+    workout = _legacy_workout(
+        "long-workout", "2026-01-02T10:00:00+00:00", "2026-01-02T13:02:00+00:00",
+        "Synthetic Phone ", "paddle_sports",
+    )
+    try:
+        db.insert_workout_routes(conn, [route])
+        db.insert_workouts(conn, [workout])
+        assert db.attach_unmatched_workout_routes(conn) == 1
+        assert conn.execute(
+            "SELECT workout_id FROM workout_routes WHERE hk_route_uuid = ?",
+            ("early-route",),
+        ).fetchone()[0] is not None
+    finally:
+        conn.close()
+
+
+def test_issue_61_done_03_route_without_90_percent_overlap_stays_unmatched(vault):
+    conn = vault.connect()
+    db.init_db(conn)
+    route = _db_route(
+        "unmatched-route", "2026-01-02T10:00:00+00:00", "2026-01-02T10:30:00+00:00",
+    )
+    workout = _legacy_workout(
+        "distant-workout", "2026-01-02T12:18:00+00:00", "2026-01-02T12:48:00+00:00",
+        "Synthetic Phone ",
+    )
+    try:
+        db.insert_workouts(conn, [workout])
+        db.insert_workout_routes(conn, [route])
+        assert db.attach_unmatched_workout_routes(conn) == 0
+        assert conn.execute(
+            "SELECT workout_id FROM workout_routes WHERE hk_route_uuid = ?",
+            ("unmatched-route",),
+        ).fetchone()[0] is None
+    finally:
+        conn.close()
+
+
+def test_issue_61_done_04_back_to_back_routes_are_order_independent(tmp_path):
+    workouts = [
+        _legacy_workout(
+            "run", "2026-01-02T09:00:00+00:00", "2026-01-02T09:35:00+00:00",
+            "Synthetic Phone ", "running",
+        ),
+        _legacy_workout(
+            "walk", "2026-01-02T09:37:30+00:00", "2026-01-02T10:19:30+00:00",
+            "Synthetic Phone ", "walking",
+        ),
+    ]
+    routes = [
+        _db_route("run-route", "2026-01-02T09:00:00+00:00", "2026-01-02T09:35:00+00:00"),
+        _db_route("walk-route", "2026-01-02T09:37:30+00:00", "2026-01-02T10:19:30+00:00"),
+    ]
+    expected = {"run-route": "running", "walk-route": "walking"}
+    for index, route_order in enumerate((routes, list(reversed(routes)))):
+        conn = db.connect(tmp_path / f"back-to-back-{index}.db")
+        db.init_db(conn)
+        try:
+            db.insert_workouts(conn, workouts)
+            db.insert_workout_routes(conn, route_order)
+            rows = conn.execute(
+                "SELECT r.hk_route_uuid, w.workout_type "
+                "FROM workout_routes r JOIN workouts w ON w.id = r.workout_id"
+            ).fetchall()
+            actual = {row[0]: row[1] for row in rows}
+            assert actual == expected
+        finally:
+            conn.close()
+
+
+def test_issue_61_source_contains_route_source_on_equal_overlap(vault):
+    conn = vault.connect()
+    db.init_db(conn)
+    route = _db_route(
+        "source-tie-route", "2026-01-02T10:00:00+00:00", "2026-01-02T10:30:00+00:00",
+    )
+    workouts = [
+        _legacy_workout(
+            "generic-source", "2026-01-02T09:59:30+00:00", "2026-01-02T10:30:30+00:00",
+            "Synthetic Phone ",
+        ),
+        _legacy_workout(
+            "matching-source", "2026-01-02T10:00:00+00:00", "2026-01-02T10:30:00+00:00",
+            "  Synthetic   Watch | Synthetic Phone ",
+        ),
+    ]
+    try:
+        db.insert_workouts(conn, workouts)
+        db.insert_workout_routes(conn, [route])
+        matched = conn.execute(
+            "SELECT w.dedupe_key FROM workout_routes r "
+            "JOIN workouts w ON w.id = r.workout_id "
+            "WHERE r.hk_route_uuid = ?", ("source-tie-route",),
+        ).fetchone()
+        assert matched[0] == "legacy-matching-source"
+    finally:
+        conn.close()
 
 
 def test_done_01_5400_route_round_trips(vault, vault_path, monkeypatch):

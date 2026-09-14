@@ -526,6 +526,7 @@ def _health(ctx, corpus_path: str | None = None):
             "secret_source": SHARED_SECRET_SOURCE,
             "secret_reloads": _SECRET_FILE_RELOADS,
             "workout_routes_supported": True,
+            "workout_elevation_supported": True,
             "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE,
             **_corpus_status(corpus_path)}
 
@@ -697,6 +698,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         route["n_points"] == 0 for route in parsed["workout_routes"]
     )
     routes_deleted = 0
+    workout_elevation_seen = 0
+    workout_elevation_matched = 0
+    workout_elevation_updated = 0
+    workout_elevation_unmatched = 0
     deleted = 0
     tombstones_added = 0
     moved = 0
@@ -915,6 +920,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
 
             workouts_added = db.insert_workouts(
                 conn, parsed["workouts"], report=_note_fragment)
+            elevation_counts = db.attach_workout_elevation(
+                conn, parsed["workout_elevation"])
+            workout_elevation_seen = elevation_counts["seen"]
+            workout_elevation_matched = elevation_counts["matched"]
+            workout_elevation_updated = elevation_counts["updated"]
+            workout_elevation_unmatched = elevation_counts["unmatched"]
             # A workout may arrive after its route. Resolve old unmatched rows
             # as well as routes in this batch, all inside the batch transaction.
             db.attach_unmatched_workout_routes(conn)
@@ -1005,6 +1016,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 + f"deleted={deleted} tombstones={tombstones_added} "
                 f"daily_totals_seen={len(parsed['daily_totals'])} "
                 f"daily_totals_added={daily_totals_added} daily_pairs={dm} "
+                + (f"workout_elevation_seen={workout_elevation_seen} "
+                   f"workout_elevation_updated={workout_elevation_updated} "
+                   f"workout_elevation_unmatched={workout_elevation_unmatched} "
+                   if parsed["workout_elevation_present"] else "")
                 + route_detail
                 + f"history_imported_through={history or '-'} "
                 + f"batch_sequence={parsed['batch_sequence']}"
@@ -1030,6 +1045,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             "daily_totals_seen": len(parsed["daily_totals"]),
             "unhandled": parsed["unhandled"][:20], **prior,
         }
+        if parsed["workout_elevation_present"]:
+            response.update({
+                "workout_elevation_seen": len(parsed["workout_elevation"]),
+                "workout_elevation_matched": 0,
+                "workout_elevation_updated": 0,
+                "workout_elevation_unmatched": 0,
+            })
         if parsed["rejected_anchors"]:
             response["anchor_results"] = parsed["anchor_results"]
         if parsed["routes_present"]:
@@ -1115,6 +1137,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         "unhandled": parsed["unhandled"][:20], "derived": derived,
         "derive_error": derive_errors[0] if derive_errors else None,
     }
+    if parsed["workout_elevation_present"]:
+        response.update({
+            "workout_elevation_seen": workout_elevation_seen,
+            "workout_elevation_matched": workout_elevation_matched,
+            "workout_elevation_updated": workout_elevation_updated,
+            "workout_elevation_unmatched": workout_elevation_unmatched,
+        })
     if parsed["rejected_anchors"]:
         response["anchor_results"] = parsed["anchor_results"]
     if parsed["routes_present"]:

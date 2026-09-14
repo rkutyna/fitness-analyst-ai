@@ -24,7 +24,7 @@ HYSTERESIS_THRESHOLD_M = 3.0
 MIN_USED_POINTS = 10
 METRES_TO_FEET = 3.280839895013123
 
-__all__ = ["compute_elevation", "route_climb"]
+__all__ = ["compute_elevation", "route_climb", "workout_climb"]
 
 
 def _timestamp(value: Any) -> float:
@@ -340,3 +340,57 @@ def route_climb(conn: sqlite3.Connection, start_utc: str, end_utc: str) -> dict[
     if result["n_used"] < MIN_USED_POINTS:
         return {"status": "too_few_points"}
     return result
+
+
+def workout_climb(conn: sqlite3.Connection, workout_id: int) -> dict[str, Any]:
+    """Read the authoritative climb for one workout.
+
+    Device totals win whenever either stored device value is present. Only a
+    workout with no device total falls back to the route-derived whole-window
+    estimate; a missing or unusable route has no elevation.
+    """
+    row = conn.execute(
+        "SELECT start_utc, end_utc, elevation_ascended_m, "
+        "elevation_descended_m, elevation_source "
+        "FROM workouts WHERE id = ?",
+        (workout_id,),
+    ).fetchone()
+    if row is None:
+        return {"status": "no_elevation"}
+    if row[2] is not None or row[3] is not None:
+        return {
+            "ascended_m": row[2],
+            "descended_m": row[3],
+            "source": "device_metadata",
+        }
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'workout_routes'"
+    ).fetchone()
+    if present is None:
+        return {"status": "no_elevation"}
+    window_start = _timestamp(row[0])
+    window_end = _timestamp(row[1])
+    samples: list[tuple[float, float, float]] = []
+    route_rows = conn.execute(
+        "SELECT start_utc, encoding, points FROM workout_routes "
+        "WHERE workout_id = ? ORDER BY start_utc",
+        (workout_id,),
+    ).fetchall()
+    for route_row in route_rows:
+        offsets, elevations, accuracies, _horizontal = _decode_points(route_row[2])
+        route_start = _timestamp(route_row[0])
+        for offset, altitude, accuracy in zip(offsets, elevations, accuracies):
+            timestamp = route_start + offset
+            if window_start <= timestamp < window_end:
+                samples.append((timestamp, altitude, accuracy))
+    if not samples:
+        return {"status": "no_elevation"}
+    route = compute_elevation(samples)
+    if route["n_used"] < MIN_USED_POINTS:
+        return {"status": "no_elevation"}
+    return {
+        "ascended_m": route["ascent_m"],
+        "descended_m": route["descent_m"],
+        "source": "route_estimate",
+    }

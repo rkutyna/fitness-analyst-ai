@@ -32,6 +32,7 @@ _TOP_FIELDS = frozenset({
     "batch_sequence", "sent_at", "anchors", "samples", "deletions",
     "workouts", "daily_totals",
     "workout_routes",
+    "workout_elevation",
 })
 _DEVICE_FIELDS = frozenset({"id", "name", "model"})
 _SAMPLE_DEVICE_FIELDS = frozenset({"name", "model"})
@@ -48,7 +49,12 @@ _SAMPLE_FIELDS = frozenset({
 _WORKOUT_FIELDS = frozenset({
     "hk_uuid", "workout_activity_type", "start", "end", "duration_min",
     "energy_kcal", "distance_mi", "avg_heart_rate", "max_heart_rate",
+    "elevation_ascended_m", "elevation_descended_m",
     "source_revision",
+})
+_WORKOUT_ELEVATION_FIELDS = frozenset({
+    "hk_uuid", "start", "end", "source_name",
+    "elevation_ascended_m", "elevation_descended_m",
 })
 _DAILY_TOTAL_FIELDS = frozenset({
     "type_identifier", "local_date", "value", "unit", "interval",
@@ -453,6 +459,22 @@ def _parse_workout(workout: dict, index: int, workouts: list[dict],
             return
         optional_numbers[field] = value
 
+    elevation_present = (
+        "elevation_ascended_m" in workout or
+        "elevation_descended_m" in workout
+    )
+    elevation_numbers: dict[str, float | None] = {}
+    for field in ("elevation_ascended_m", "elevation_descended_m"):
+        if field not in workout or workout[field] is None:
+            elevation_numbers[field] = None
+            continue
+        value = _json_number(workout[field])
+        if value is None or value < 0:
+            raise PayloadError(
+                f"payload.workouts[{index}].{field} must be a finite non-negative number or null"
+            )
+        elevation_numbers[field] = value
+
     start_utc, end_utc = nz.to_utc_iso(start_dt), nz.to_utc_iso(end_dt)
     workout_type = nz.workout_label(workout["workout_activity_type"])
     row = {
@@ -469,11 +491,73 @@ def _parse_workout(workout: dict, index: int, workouts: list[dict],
         "route_ref": None,
         "avg_heart_rate": optional_numbers["avg_heart_rate"],
         "max_heart_rate": optional_numbers["max_heart_rate"],
+        "elevation_ascended_m": None,
+        "elevation_descended_m": None,
+        "elevation_source": None,
         "dedupe_key": db.workout_key(workout_type, start_utc, end_utc),
         "hk_uuid": workout["hk_uuid"],
     }
+    if elevation_present:
+        row.update({
+            "elevation_ascended_m": elevation_numbers["elevation_ascended_m"],
+            "elevation_descended_m": elevation_numbers["elevation_descended_m"],
+            "elevation_source": (
+                "device_metadata"
+                if any(value is not None for value in elevation_numbers.values())
+                else None
+            ),
+        })
     workouts.append(row)
     workout_dates.add(row["local_date"])
+
+
+def _parse_workout_elevation(entry: dict, index: int,
+                             entries: list[dict]) -> None:
+    """Parse the strict, one-time workout elevation backfill section."""
+    _reject_unknown(entry, _WORKOUT_ELEVATION_FIELDS,
+                    f"payload.workout_elevation[{index}]")
+    missing = _required(
+        entry, ("hk_uuid", "start", "end", "source_name",
+                "elevation_ascended_m", "elevation_descended_m"),
+        f"workout_elevation[{index}]",
+    )
+    if missing:
+        raise PayloadError(
+            f"payload.workout_elevation[{index}] is missing required field(s): "
+            f"{', '.join(missing)}"
+        )
+    if entry["hk_uuid"] is not None and not _text(entry["hk_uuid"]):
+        raise PayloadError(
+            f"payload.workout_elevation[{index}].hk_uuid must be a string or null"
+        )
+    if not _text(entry["source_name"]):
+        raise PayloadError(
+            f"payload.workout_elevation[{index}].source_name must be a non-empty string"
+        )
+    start_dt, end_dt = _parse_dt(entry["start"]), _parse_dt(entry["end"])
+    if start_dt is None or end_dt is None or end_dt <= start_dt:
+        raise PayloadError(
+            f"payload.workout_elevation[{index}] has unparseable or inverted start/end"
+        )
+    values: dict[str, float | None] = {}
+    for field in ("elevation_ascended_m", "elevation_descended_m"):
+        value = entry[field]
+        if value is None:
+            values[field] = None
+            continue
+        number = _json_number(value)
+        if number is None or number < 0:
+            raise PayloadError(
+                f"payload.workout_elevation[{index}].{field} must be a finite non-negative number or null"
+            )
+        values[field] = number
+    entries.append({
+        "hk_uuid": entry["hk_uuid"],
+        "start_utc": nz.to_utc_iso(start_dt),
+        "end_utc": nz.to_utc_iso(end_dt),
+        "source_name": entry["source_name"],
+        **values,
+    })
 
 
 def _parse_daily_total(total: dict, index: int, device_id: str,
@@ -767,6 +851,17 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise PayloadError(f"payload.workouts[{i}] must be a JSON object")
         _reject_unknown(workout, _WORKOUT_FIELDS, f"payload.workouts[{i}]")
         _parse_workout(workout, i, parsed_workouts, workout_dates, unhandled)
+    workout_elevation_present = "workout_elevation" in envelope
+    workout_elevation_wire = _list(
+        envelope.get("workout_elevation", []), "payload.workout_elevation"
+    )
+    workout_elevation: list[dict] = []
+    for i, entry in enumerate(workout_elevation_wire):
+        if not isinstance(entry, dict):
+            raise PayloadError(
+                f"payload.workout_elevation[{i}] must be a JSON object"
+            )
+        _parse_workout_elevation(entry, i, workout_elevation)
     daily_totals_wire = _list(envelope.get("daily_totals", []),
                               "payload.daily_totals")
     daily_totals: list[dict] = []
@@ -792,6 +887,8 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "records": records,
         "workouts": parsed_workouts,
         "workout_dates": workout_dates,
+        "workout_elevation": workout_elevation,
+        "workout_elevation_present": workout_elevation_present,
         "daily_totals": daily_totals,
         "daily_total_dates": daily_total_dates,
         "workout_routes": parsed_routes,

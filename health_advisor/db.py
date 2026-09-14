@@ -110,6 +110,9 @@ _ADDED_COLUMNS = {
         "avg_heart_rate": "REAL",
         "max_heart_rate": "REAL",
         "hk_uuid": "TEXT",
+        "elevation_ascended_m": "REAL",
+        "elevation_descended_m": "REAL",
+        "elevation_source": "TEXT",
     },
     "workout_routes": {
         "workout_hk_uuid": "TEXT",
@@ -831,14 +834,17 @@ RECORD_COLS = (
 WORKOUT_COLS = (
     "workout_type", "start_utc", "end_utc", "local_date", "duration_min",
     "energy_kcal", "distance_mi", "unit_distance", "source", "route_ref",
-    "avg_heart_rate", "max_heart_rate", "dedupe_key", "hk_uuid",
+    "avg_heart_rate", "max_heart_rate", "elevation_ascended_m",
+    "elevation_descended_m", "elevation_source", "dedupe_key", "hk_uuid",
 )
 # New identity fields are optional until the HealthKit-direct ingest exists.
 _RECORD_OPTIONAL = (
     "hk_uuid", "hk_type_identifier", "source_revision_json", "hk_device_id",
 )
 # Optional workout columns default to NULL when a caller (e.g. backfill) omits them.
-_WORKOUT_OPTIONAL = ("route_ref", "avg_heart_rate", "max_heart_rate", "hk_uuid")
+_WORKOUT_OPTIONAL = ("route_ref", "avg_heart_rate", "max_heart_rate", "hk_uuid",
+                     "elevation_ascended_m", "elevation_descended_m",
+                     "elevation_source", "_elevation_fields_present")
 
 
 def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
@@ -1029,16 +1035,48 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
     sql = (
         "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
         "duration_min, energy_kcal, distance_mi, unit_distance, source, route_ref, "
-        "avg_heart_rate, max_heart_rate, dedupe_key, hk_uuid) "
+        "avg_heart_rate, max_heart_rate, elevation_ascended_m, "
+        "elevation_descended_m, elevation_source, dedupe_key, hk_uuid) "
         "VALUES (:workout_type, :start_utc, :end_utc, :local_date, :duration_min, "
         ":energy_kcal, :distance_mi, :unit_distance, :source, :route_ref, "
-        ":avg_heart_rate, :max_heart_rate, :dedupe_key, :hk_uuid) "
+        ":avg_heart_rate, :max_heart_rate, :elevation_ascended_m, "
+        ":elevation_descended_m, :elevation_source, :dedupe_key, :hk_uuid) "
         f"ON CONFLICT(dedupe_key) DO UPDATE SET {sets}, "
-        "source = COALESCE(NULLIF(source, ''), excluded.source)"
+        "source = COALESCE(NULLIF(source, ''), excluded.source), "
+        "elevation_ascended_m = CASE WHEN :_elevation_fields_present "
+        "THEN excluded.elevation_ascended_m ELSE elevation_ascended_m END, "
+        "elevation_descended_m = CASE WHEN :_elevation_fields_present "
+        "THEN excluded.elevation_descended_m ELSE elevation_descended_m END, "
+        "elevation_source = CASE WHEN :_elevation_fields_present THEN "
+        "CASE WHEN excluded.elevation_ascended_m IS NOT NULL "
+        "OR excluded.elevation_descended_m IS NOT NULL "
+        "THEN 'device_metadata' ELSE NULL END "
+        "ELSE elevation_source END "
+        "WHERE (duration_min IS NULL AND excluded.duration_min IS NOT NULL) "
+        "OR (energy_kcal IS NULL AND excluded.energy_kcal IS NOT NULL) "
+        "OR (distance_mi IS NULL AND excluded.distance_mi IS NOT NULL) "
+        "OR (unit_distance IS NULL AND excluded.unit_distance IS NOT NULL) "
+        "OR (route_ref IS NULL AND excluded.route_ref IS NOT NULL) "
+        "OR (avg_heart_rate IS NULL AND excluded.avg_heart_rate IS NOT NULL) "
+        "OR (max_heart_rate IS NULL AND excluded.max_heart_rate IS NOT NULL) "
+        "OR (hk_uuid IS NULL AND excluded.hk_uuid IS NOT NULL) "
+        "OR (NULLIF(source, '') IS NULL AND excluded.source IS NOT NULL) "
+        "OR (:_elevation_fields_present AND "
+        "(elevation_ascended_m IS NOT excluded.elevation_ascended_m "
+        "OR elevation_descended_m IS NOT excluded.elevation_descended_m "
+        "OR elevation_source IS NOT excluded.elevation_source))"
     )
     # Tolerate rows missing optional keys (backfill) and ignore transient extras
     # like route_points that aren't columns.
-    rows = [{**{k: None for k in _WORKOUT_OPTIONAL}, **r} for r in rows]
+    source_rows = list(rows)
+    rows = []
+    for row in source_rows:
+        merged = {**{k: None for k in _WORKOUT_OPTIONAL}, **row}
+        merged["_elevation_fields_present"] = bool(
+            row.get("_elevation_fields_present", False)
+            or row.get("elevation_ascended_m") is not None
+            or row.get("elevation_descended_m") is not None)
+        rows.append(merged)
     # Longest span first so one batch carrying a session and its fragments
     # resolves the same way whatever order they arrive in. list.sort is stable,
     # so equal spans keep the caller's order — and two rows of one type with
@@ -1067,34 +1105,36 @@ def _normalise_source(value: str | None) -> str:
     return " ".join((value or "").split())
 
 
-def _route_parent_id(conn: sqlite3.Connection, route: dict) -> int | None:
-    """Find a route's workout parent without loading or binding its points.
+def _workout_parent_id(conn: sqlite3.Connection, item: dict,
+                       *, uuid_key: str) -> int | None:
+    """Find a workout parent by UUID, then by the shared 90% overlap rule.
 
-    A HealthKit UUID is authoritative. Legacy rows have no UUID, so choose the
-    candidate with the largest interval overlap, subject to both the route and
-    workout being at least 90% covered. Source names only break equal-overlap
-    ties: legacy exports may name a phone, add whitespace, or combine devices.
+    The UUID and overlap arithmetic are shared by route and workout-elevation
+    attachment. A HealthKit UUID is authoritative. Legacy rows have no UUID,
+    so choose the candidate with the largest interval overlap, subject to both
+    sides being at least 90% covered. Source names only break equal-overlap
+    ties and are compared after whitespace normalization.
     """
-    if route.get("workout_hk_uuid"):
+    if item.get(uuid_key):
         candidates = conn.execute(
             "SELECT id FROM workouts WHERE hk_uuid = ? ORDER BY id LIMIT 1",
-            (route["workout_hk_uuid"],),
+            (item[uuid_key],),
         ).fetchall()
         return candidates[0]["id"] if candidates else None
 
-    route_start = datetime.fromisoformat(route["start_utc"])
-    route_end = datetime.fromisoformat(route["end_utc"])
-    route_duration = (route_end - route_start).total_seconds()
-    if route_duration <= 0:
+    item_start = datetime.fromisoformat(item["start_utc"])
+    item_end = datetime.fromisoformat(item["end_utc"])
+    item_duration = (item_end - item_start).total_seconds()
+    if item_duration <= 0:
         return None
 
     candidates = conn.execute(
         "SELECT id, start_utc, end_utc, source FROM workouts "
         "WHERE start_utc < ? AND end_utc > ?",
-        (route["end_utc"], route["start_utc"]),
+        (item["end_utc"], item["start_utc"]),
     ).fetchall()
 
-    route_source = _normalise_source(route.get("source_name"))
+    item_source = _normalise_source(item.get("source_name"))
     matches = []
     for candidate in candidates:
         workout_start = datetime.fromisoformat(candidate["start_utc"])
@@ -1103,20 +1143,61 @@ def _route_parent_id(conn: sqlite3.Connection, route: dict) -> int | None:
         if workout_duration <= 0:
             continue
         overlap = (
-            min(route_end, workout_end) - max(route_start, workout_start)
+            min(item_end, workout_end) - max(item_start, workout_start)
         ).total_seconds()
-        if (overlap < route_duration * 0.90
+        if (overlap < item_duration * 0.90
                 or overlap < workout_duration * 0.90):
             continue
         source_match = bool(
-            route_source
-            and route_source in _normalise_source(candidate["source"])
+            item_source
+            and item_source in _normalise_source(candidate["source"])
         )
         # Largest overlap wins. Source containment is only the tie-break;
         # id makes fully indistinguishable legacy candidates deterministic.
         matches.append((overlap, source_match, -candidate["id"], candidate["id"]))
 
     return max(matches)[3] if matches else None
+
+
+def _route_parent_id(conn: sqlite3.Connection, route: dict) -> int | None:
+    """Find a route's workout parent using the shared attachment rule."""
+    return _workout_parent_id(conn, route, uuid_key="workout_hk_uuid")
+
+
+def attach_workout_elevation(conn: sqlite3.Connection, rows: Iterable[dict]) -> dict[str, int]:
+    """Fill missing device elevation totals from the one-time backfill.
+
+    Each entry is matched by UUID or the same overlap rule as routes. The
+    per-column COALESCE is intentional: the workout pass is authoritative and
+    a backfill entry may never overwrite a value it already supplied.
+    """
+    seen = matched = updated = unmatched = 0
+    for row in rows:
+        seen += 1
+        parent_id = _workout_parent_id(conn, row, uuid_key="hk_uuid")
+        if parent_id is None:
+            unmatched += 1
+            continue
+        matched += 1
+        changed = conn.execute(
+            "UPDATE workouts SET "
+            "elevation_ascended_m = COALESCE(elevation_ascended_m, ?), "
+            "elevation_descended_m = COALESCE(elevation_descended_m, ?), "
+            "elevation_source = CASE WHEN "
+            "(elevation_ascended_m IS NULL AND ? IS NOT NULL) OR "
+            "(elevation_descended_m IS NULL AND ? IS NOT NULL) "
+            "THEN 'device_metadata' ELSE elevation_source END "
+            "WHERE id = ? AND "
+            "((elevation_ascended_m IS NULL AND ? IS NOT NULL) OR "
+            "(elevation_descended_m IS NULL AND ? IS NOT NULL))",
+            (row["elevation_ascended_m"], row["elevation_descended_m"],
+             row["elevation_ascended_m"], row["elevation_descended_m"],
+             parent_id, row["elevation_ascended_m"],
+             row["elevation_descended_m"]),
+        ).rowcount
+        updated += int(changed > 0)
+    return {"seen": seen, "matched": matched, "updated": updated,
+            "unmatched": unmatched}
 
 
 def insert_workout_routes(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:

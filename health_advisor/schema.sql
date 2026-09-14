@@ -234,6 +234,9 @@ CREATE TABLE IF NOT EXISTS workouts (
     route_ref       TEXT,                -- gpx filename if present (data/routes/)
     avg_heart_rate  REAL,                -- bpm, workout average
     max_heart_rate  REAL,                -- bpm, workout max
+    elevation_ascended_m  REAL,
+    elevation_descended_m REAL,
+    elevation_source      TEXT,
     dedupe_key      TEXT NOT NULL UNIQUE,
     hk_uuid         TEXT
 );

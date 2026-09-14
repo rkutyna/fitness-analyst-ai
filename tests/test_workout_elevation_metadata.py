@@ -157,6 +157,55 @@ def test_issue_63_done_02_backfill_fills_nulls_once_and_counts_unmatched(
     assert row["elevation_source"] == "device_metadata"
 
 
+@pytest.mark.parametrize("entry_uuid", ["AAAA-1111", None])
+def test_issue_63_done_02_uuid_and_legacy_entries_match_legacy_workout(
+    conn, entry_uuid
+):
+    db.insert_workouts(conn, [{
+        "workout_type": "running", "start_utc": "2030-01-05T15:00:00+00:00",
+        "end_utc": "2030-01-05T15:30:00+00:00", "local_date": "2030-01-05",
+        "duration_min": 30.0, "energy_kcal": None, "distance_mi": None,
+        "unit_distance": None, "source": "Watch", "dedupe_key": "oracle",
+        "hk_uuid": None,
+    }])
+
+    result = db.attach_workout_elevation(conn, [{
+        "hk_uuid": entry_uuid,
+        "start_utc": "2030-01-05T15:00:00+00:00",
+        "end_utc": "2030-01-05T15:30:00+00:00",
+        "source_name": "Watch",
+        "elevation_ascended_m": 10.0,
+        "elevation_descended_m": None,
+    }])
+
+    assert result == {
+        "seen": 1, "matched": 1, "updated": 1, "unmatched": 0,
+    }
+
+
+def test_issue_63_done_02_different_workout_uuid_stays_unmatched(conn):
+    db.insert_workouts(conn, [{
+        "workout_type": "running", "start_utc": "2030-01-05T15:00:00+00:00",
+        "end_utc": "2030-01-05T15:30:00+00:00", "local_date": "2030-01-05",
+        "duration_min": 30.0, "energy_kcal": None, "distance_mi": None,
+        "unit_distance": None, "source": "Watch", "dedupe_key": "other",
+        "hk_uuid": "BBBB-2222",
+    }])
+
+    result = db.attach_workout_elevation(conn, [{
+        "hk_uuid": "AAAA-1111",
+        "start_utc": "2030-01-05T15:00:00+00:00",
+        "end_utc": "2030-01-05T15:30:00+00:00",
+        "source_name": "Watch",
+        "elevation_ascended_m": 10.0,
+        "elevation_descended_m": None,
+    }])
+
+    assert result == {
+        "seen": 1, "matched": 0, "updated": 0, "unmatched": 1,
+    }
+
+
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
 def test_issue_63_done_03_invalid_backfill_elevation_is_payload_error(value):
     payload = _payload(

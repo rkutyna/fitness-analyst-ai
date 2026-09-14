@@ -278,6 +278,30 @@ def test_issue_61_source_contains_route_source_on_equal_overlap(vault):
         conn.close()
 
 
+def test_issue_61_uuid_route_attaches_to_legacy_workout(conn):
+    workout = _legacy_workout(
+        "legacy-route-parent", "2030-01-05T10:00:00+00:00",
+        "2030-01-05T10:30:00+00:00", "Synthetic Watch", "running",
+    )
+    route = _db_route(
+        "uuid-route-to-legacy", "2030-01-05T10:00:00+00:00",
+        "2030-01-05T10:30:00+00:00", "Synthetic Watch",
+    )
+    route["workout_hk_uuid"] = "AAAA-1111"
+
+    db.insert_workouts(conn, [workout])
+    db.insert_workout_routes(conn, [route])
+    legacy_id = conn.execute(
+        "SELECT id FROM workouts WHERE dedupe_key = ?",
+        (workout["dedupe_key"],),
+    ).fetchone()[0]
+
+    assert conn.execute(
+        "SELECT workout_id FROM workout_routes WHERE hk_route_uuid = ?",
+        ("uuid-route-to-legacy",),
+    ).fetchone()[0] == legacy_id
+
+
 def test_done_01_5400_route_round_trips(vault, vault_path, monkeypatch):
     route = _route(5400)
     with _client(vault, monkeypatch) as client:

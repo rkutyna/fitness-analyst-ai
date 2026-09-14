@@ -1118,16 +1118,26 @@ def _workout_parent_id(conn: sqlite3.Connection, item: dict,
 
     The UUID and overlap arithmetic are shared by route and workout-elevation
     attachment. A HealthKit UUID is authoritative. Legacy rows have no UUID,
-    so choose the candidate with the largest interval overlap, subject to both
-    sides being at least 90% covered. Source names only break equal-overlap
-    ties and are compared after whitespace normalization.
+    so a UUID miss may only fall back to those rows; UUID-less items retain the
+    normal overlap candidate set. Choose the candidate with the largest
+    interval overlap, subject to both sides being at least 90% covered. Source
+    names only break equal-overlap ties and are compared after whitespace
+    normalization.
     """
-    if item.get(uuid_key):
+    has_uuid = bool(item.get(uuid_key))
+    if has_uuid:
         candidates = conn.execute(
             "SELECT id FROM workouts WHERE hk_uuid = ? ORDER BY id LIMIT 1",
             (item[uuid_key],),
         ).fetchall()
-        return candidates[0]["id"] if candidates else None
+        if candidates:
+            return candidates[0]["id"]
+
+    # A UUID-bearing item may be from a newer ingest than the legacy workout
+    # row it describes. Only legacy rows are eligible for this fallback: a
+    # non-NULL UUID that differs from the item's UUID identifies another
+    # workout and must remain unmatched.
+    legacy_only = " AND hk_uuid IS NULL" if has_uuid else ""
 
     item_start = datetime.fromisoformat(item["start_utc"])
     item_end = datetime.fromisoformat(item["end_utc"])
@@ -1137,7 +1147,7 @@ def _workout_parent_id(conn: sqlite3.Connection, item: dict,
 
     candidates = conn.execute(
         "SELECT id, start_utc, end_utc, source FROM workouts "
-        "WHERE start_utc < ? AND end_utc > ?",
+        "WHERE start_utc < ? AND end_utc > ?" + legacy_only,
         (item["end_utc"], item["start_utc"]),
     ).fetchall()
 

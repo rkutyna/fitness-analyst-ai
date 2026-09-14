@@ -1245,3 +1245,38 @@ CREATE TABLE IF NOT EXISTS deepdive_traces (
     recorded_at  TEXT NOT NULL,
     PRIMARY KEY (run_date, mode)
 );
+
+-- A vault's own claims register: one row per authored claim, in authored order.
+-- A consumer imports it from its coaching documents so a request reads the
+-- register of the vault it is bound to, never a file shared by every vault.
+-- skipped_rows is the importer's count of unparseable source rows, repeated on
+-- each row because an import always writes the whole register at once.
+CREATE TABLE IF NOT EXISTS claims_register (
+    ordinal       INTEGER PRIMARY KEY CHECK (ordinal > 0),
+    claim         TEXT NOT NULL,
+    asserted_in   TEXT NOT NULL,
+    encoded_in    TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    last_verified TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    status_class  TEXT NOT NULL,
+    recheck       TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    source_mtime  TEXT,
+    skipped_rows  INTEGER NOT NULL DEFAULT 0 CHECK (skipped_rows >= 0),
+    imported_at   TEXT NOT NULL
+);
+
+-- The cross-review coaching agenda: items carried from one weekly review to the
+-- next. Distinct from review_agenda_items / review_agenda_decisions, which are
+-- scoped to the turns of one review conversation. An item that leaves the open
+-- section is kept as 'decided' history rather than deleted.
+CREATE TABLE IF NOT EXISTS coaching_review_agenda (
+    item_key    TEXT PRIMARY KEY,
+    ordinal     INTEGER NOT NULL CHECK (ordinal > 0),
+    item_text   TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('open', 'decided')),
+    decision    TEXT,
+    source      TEXT NOT NULL,
+    imported_at TEXT NOT NULL
+);

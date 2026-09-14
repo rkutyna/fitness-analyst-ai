@@ -88,6 +88,24 @@ def test_schema_sql_alone_brings_an_existing_vault_up_to_date(tmp_path):
     assert after > before
 
 
+@pytest.mark.parametrize("table", ["claims_register", "coaching_review_agenda"])
+def test_register_and_agenda_tables_reach_an_existing_vault(tmp_path, table):
+    """A vault that predates the register and agenda tables gains them on init."""
+    conn = sqlite3.connect(tmp_path / "vault.db")
+    conn.row_factory = sqlite3.Row
+    db.init_db(conn)
+    try:
+        conn.execute(f"DROP TABLE {table}")
+        conn.commit()
+        db.init_db(conn)
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+    assert table in names
+
+
 def test_plan_projections_keeps_its_provenance_check(tmp_path):
     """The declaration that survived is the one with the constraints.
 

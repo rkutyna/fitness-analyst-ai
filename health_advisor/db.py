@@ -1166,6 +1166,23 @@ def _workout_parent_id(conn: sqlite3.Connection, item: dict,
     return max(matches)[3] if matches else None
 
 
+def workout_for_window(conn: sqlite3.Connection, start_utc: str, end_utc: str, *,
+                       source_name: str | None = None) -> int | None:
+    """Return the workout matched to a window by the shared attachment rule.
+
+    The largest interval overlap wins, provided both the window and workout
+    are at least 90% covered; source name only breaks equal-overlap ties, and
+    ``None`` is returned when no candidate qualifies. This is the same matcher
+    used by route and workout-elevation attachment.
+    """
+    return _workout_parent_id(
+        conn,
+        {"start_utc": start_utc, "end_utc": end_utc,
+         "source_name": source_name},
+        uuid_key="workout_hk_uuid",
+    )
+
+
 def _route_parent_id(conn: sqlite3.Connection, route: dict) -> int | None:
     """Find a route's workout parent using the shared attachment rule."""
     return _workout_parent_id(conn, route, uuid_key="workout_hk_uuid")

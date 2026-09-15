@@ -228,6 +228,29 @@ MAX_BODY_BYTES = int(os.environ.get("HA_MAX_BODY_BYTES", str(256 * 1024 * 1024))
 ANALYST_INTERNAL_WAIT_SECONDS = 120.0
 
 
+class _PermitRelease:
+    """Release one shared analyst permit at most once.
+
+    The guard is deliberately independent of the asyncio event loop: a
+    worker-thread completion and any future timeout/cancellation path may race
+    while scheduling the release back onto that loop. Releasing a permit that
+    a newer analyst run owns is worse than retaining one, so only the first
+    caller may schedule it.
+    """
+
+    def __init__(self, release: Callable[[], None]) -> None:
+        self._release = release
+        self._lock = threading.Lock()
+        self._released = False
+
+    def once(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._release()
+
+
 def _secret_bytes(value: str | None) -> bytes | None:
     """Encode a presented header without letting malformed input escape."""
     if not isinstance(value, str):
@@ -427,7 +450,8 @@ class _PushDispatcher:
 
 def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
                  executor_factory=analyst_sandbox.default_executor,
-                 corpus_path: str | None = None):
+                 corpus_path: str | None = None,
+                 complete_timeout: int | float | None = None):
     """Run one analyst question and adapt the CLI JSON for HTTP.
 
     The sandbox is probed before ``run_analyst`` is called. That keeps an
@@ -468,7 +492,7 @@ def _run_analyst(ctx, question: str, *, complete_fn=None, run_code_fn=None,
             question, ctx.db_path, run_dir,
             complete_fn=complete_fn, run_code_fn=run_code_fn,
             executor=executor, json_output=True, out=output,
-            corpus_path=corpus_path)
+            corpus_path=corpus_path, complete_timeout=complete_timeout)
         payload = json.loads(output.getvalue())
         if exit_code == 0:
             payload["refused"] = False
@@ -1371,12 +1395,15 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 return {"refused": True,
                         "reason": f"analyst_query could not acquire its run permit: {exc}"}
 
+            permit_release = _PermitRelease(
+                lambda: loop.call_soon_threadsafe(analyst_permit.release))
             try:
                 response = _run_analyst(
                     ctx, question, complete_fn=analyst_complete_fn,
                     run_code_fn=analyst_run_code_fn,
                     executor_factory=analyst_executor_factory,
-                    corpus_path=analyst_corpus_path)
+                    corpus_path=analyst_corpus_path,
+                    complete_timeout=llm.TIMEOUT_ASK_TURN)
                 if response.status_code != 200:
                     detail = getattr(response, "body", b"")
                     try:
@@ -1415,7 +1442,13 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 return {"refused": True,
                         "reason": f"analyst_query failed: {type(exc).__name__}: {exc}"}
             finally:
-                loop.call_soon_threadsafe(analyst_permit.release)
+                # Do not add a whole-run wait here. An analyst run has two
+                # sequential model calls plus bounded sandbox work; the
+                # explicit timeout above is the bound for each provider call,
+                # and waiting again around the whole run would orphan a worker
+                # after a healthy two-call run. The worker owns the permit and
+                # releases it exactly once after its bounded run completes.
+                permit_release.once()
 
         progress_id = payload["progress_id"]
         progress_callback = None

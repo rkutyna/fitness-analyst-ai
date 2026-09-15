@@ -482,7 +482,8 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
                  complete_fn=None, run_code_fn: _AnalystRunner | None = None,
                  executor=None, limits: RunLimits | None = None,
                  json_output: bool = False, out=None,
-                 corpus_path: str | None = None) -> int:
+                 corpus_path: str | None = None,
+                 complete_timeout: int | float | None = None) -> int:
     """Run one analyst-mode question end to end. Returns a process exit code.
 
     ``complete_fn`` defaults to ``llm.complete``; ``run_code_fn`` defaults to
@@ -520,7 +521,16 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
     caps = _caps_for_prompt()
     prompt1 = build_analyst_prompt(
         question, schema, caps=caps, corpus_configured=corpus_path is not None)
-    code1 = extract_code(complete_fn(prompt1))
+    # The CLI leaves this unset so llm.complete keeps its analyst-sized
+    # default.  The /v1/ask seam supplies its own per-call deadline; keeping
+    # the timeout at this seam makes the initial and repair calls equally
+    # bounded without changing the direct /v1/analyst route.
+    def complete(prompt: str) -> str:
+        if complete_timeout is None:
+            return complete_fn(prompt)
+        return complete_fn(prompt, timeout=complete_timeout)
+
+    code1 = extract_code(complete(prompt1))
     code1_sha256 = hashlib.sha256(code1.encode("utf-8")).hexdigest()
 
     run_kwargs = {"limits": limits}
@@ -572,7 +582,7 @@ def run_analyst(question: str, vault_path: str, run_dir: str, *,
         prompt2 = build_repair_prompt(
             question, schema, caps, result.reason,
             corpus_configured=corpus_path is not None)
-        code2 = extract_code(complete_fn(prompt2))
+        code2 = extract_code(complete(prompt2))
         code2_sha256 = hashlib.sha256(code2.encode("utf-8")).hexdigest()
         result = _run_or_refuse_empty(code2, _attempt_dir(run_dir, attempts + 2))
         final_code = code2

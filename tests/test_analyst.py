@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 
 import pytest
 
@@ -269,6 +270,54 @@ def test_run_record_records_both_prompts_on_repair(tmp_path, vault_path):
     assert record["prompts"]["repair"] is not None
     assert refusal.reason in record["prompts"]["repair"]
     assert record["code"]["repair"] is not None
+
+
+def test_initial_and_repair_completions_receive_the_same_explicit_timeout(
+        tmp_path, vault_path):
+    """The ask seam can bound both model calls in one analyst run."""
+    refusal = Refusal("emitted 1 numeric tables from 0 vault tables and 0 reads")
+    envelope = _sample_envelope()
+    seen_timeouts = []
+    responses = iter([refusal, envelope])
+
+    def complete(prompt, **kwargs):
+        seen_timeouts.append(kwargs.get("timeout"))
+        return "```python\nemit('x', ... )\n```"
+
+    def run_code(code, vpath, run_dir, executor, *, limits=None):
+        return next(responses)
+
+    rc = analyst.run_analyst(
+        "q", vault_path, str(tmp_path / "run"), complete_fn=complete,
+        run_code_fn=run_code, executor=object(), out=io.StringIO(),
+        complete_timeout=37)
+
+    assert rc == 0
+    assert seen_timeouts == [37, 37]
+
+
+def test_two_slow_but_healthy_analyst_calls_are_not_cut_off_by_a_run_wait(
+        tmp_path, vault_path):
+    """Two calls just under their per-call bound still complete normally."""
+    refusal = Refusal("emitted 1 numeric tables from 0 vault tables and 0 reads")
+    envelope = _sample_envelope()
+    calls = []
+    outcomes = iter([refusal, envelope])
+    out = io.StringIO()
+
+    def complete(prompt, *, timeout):
+        calls.append(timeout)
+        time.sleep(0.03)  # longer than half the 0.05 test per-call bound
+        return "```python\nemit('x', ... )\n```"
+
+    rc = analyst.run_analyst(
+        "q", vault_path, str(tmp_path / "run"), complete_fn=complete,
+        run_code_fn=lambda *args, **kwargs: next(outcomes), executor=object(),
+        out=out, complete_timeout=0.05)
+
+    assert rc == 0
+    assert calls == [0.05, 0.05]
+    assert "resting_hr_by_week" in out.getvalue()
 
 
 # --------------------------------------------------------------------------- #

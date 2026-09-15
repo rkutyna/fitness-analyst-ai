@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 
 import httpx
 import pytest
@@ -230,6 +231,89 @@ def test_chat_analyst_wait_is_bounded_while_direct_run_holds_permit(
     refusal = json.loads(tool_message["content"])
     assert refusal["refused"] is True
     assert "timed out waiting" in refusal["reason"]
+
+
+def test_permit_release_guard_cannot_release_a_newer_run():
+    """A release race is idempotent, including if both paths call it."""
+    releases = []
+    guard = receiver._PermitRelease(lambda: releases.append(True))
+
+    first = threading.Thread(target=guard.once)
+    second = threading.Thread(target=guard.once)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert releases == [True]
+
+
+def test_timed_out_analyst_releases_permit_for_the_next_ask(
+        vault, monkeypatch):
+    """A failed analyst call is a refusal and does not poison the permit."""
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "secret")
+    timeouts = []
+    analyst_calls = {"count": 0}
+
+    def complete(prompt, *, timeout):
+        timeouts.append(timeout)
+        analyst_calls["count"] += 1
+        if analyst_calls["count"] == 1:
+            # Model the provider wrapper returning its deadline failure; the
+            # real llm.complete call uses the same timeout on its transport.
+            threading.Event().wait(0.02)
+            raise TimeoutError("provider timed out")
+        return "```python\nemit('resting_rate', rows)\n```"
+
+    app = receiver.create_app(
+        vault, analyst_complete_fn=complete, analyst_run_code_fn=
+        lambda *args, **kwargs: _envelope(),
+        analyst_executor_factory=lambda: "fake-executor")
+    bodies = []
+    model_calls = {"count": 0}
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        model_calls["count"] += 1
+        if model_calls["count"] % 2:
+            return httpx.Response(200, json=_model_tool_call(
+                "analyst_query", {"question": "resting rate"}))
+        return httpx.Response(200, json=_model_tool_call(
+            "submit_answer", {"text": "I found the table.", "claims": []}))
+
+    monkeypatch.setattr(llm, "_TRANSPORT", httpx.MockTransport(handler))
+    monkeypatch.setattr(chat, "_ask_judge", lambda *args, **kwargs: 100)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as client:
+            begin = asyncio.get_running_loop().time()
+            first = await client.post(
+                "/v1/ask", json={"question": "first"},
+                headers={"x-health-secret": "secret"})
+            first_elapsed = asyncio.get_running_loop().time() - begin
+
+            begin = asyncio.get_running_loop().time()
+            second = await client.post(
+                "/v1/ask", json={"question": "second"},
+                headers={"x-health-secret": "secret"})
+            elapsed = asyncio.get_running_loop().time() - begin
+        return first, second, first_elapsed, elapsed
+
+    first, second, first_elapsed, elapsed = asyncio.run(exercise())
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first_elapsed < 1.0
+    assert elapsed < 1.0
+    assert timeouts == [llm.TIMEOUT_ASK_TURN, llm.TIMEOUT_ASK_TURN]
+
+    first_tool = json.loads(bodies[1]["messages"][-1]["content"])
+    assert first_tool["refused"] is True
+    assert "timed out" in first_tool["reason"]
+    second_tool = json.loads(bodies[3]["messages"][-1]["content"])
+    second_tool.pop("_ledger")
+    assert second_tool == {"tables": _analyst_payload()["tables"]}
 
 
 def test_conversation_reload_returns_analyst_attachment_with_turn(vault):

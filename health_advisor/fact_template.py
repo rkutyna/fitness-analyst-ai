@@ -934,6 +934,30 @@ def scan_template(template: str, facts: dict[str, dict]) -> dict:
     }
 
 
+def conversational_violation(text: str,
+                             facts: dict[str, dict] | None = None) -> str:
+    """Return a reason a model-authored conversational reply is unsafe.
+
+    A conversational reply has no Python-owned facts, so it may contain no
+    digits, placeholders, advice slots, or vault metric names.  Reuse the
+    template scanner for the first three checks and the same metric vocabulary
+    used by advice slots for the last one; this keeps the two literal-content
+    exemptions from growing separate safety vocabularies.
+    """
+    text = text if isinstance(text, str) else ""
+    scan = scan_template(text, facts or {})
+    if not scan["ok"]:
+        return scan["reason"] or "empty conversational answer"
+    if _PLACEHOLDER_RE.search(text):
+        return "conversational answer contains a placeholder"
+    for metric in _advice_metric_names(facts):
+        words = re.escape(metric).replace(r"_", r"(?:[_ -]+)")
+        if re.search(r"(?<![\w])" + words + r"(?![\w])", text,
+                     re.IGNORECASE):
+            return "conversational answer references vault metric " + metric
+    return ""
+
+
 def template_refused(template: str, facts: dict[str, dict]) -> bool:
     """Return whether a template must be refused before interpolation."""
     return not scan_template(template, facts)["ok"]

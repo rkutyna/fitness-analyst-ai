@@ -1883,3 +1883,118 @@ def test_zero_advice_prose_without_a_ledger_still_falls_back(
     result = chat.answer_question(vault, "How is my training going?")
 
     assert result["mode"] == "fallback"
+
+
+DATA_QUESTIONS = (
+    "How far did I go on Saturday?",
+    "Was yesterday better than the day before?",
+    "Am I improving?",
+    "What's my best week so far?",
+    "Give me my numbers for last month",
+    "How much did I do last week?",
+    "Tell me about last Tuesday",
+    "Summarize the past 7 days",
+    "Did I improve since June?",
+    "What was my best effort?",
+    "How many did I do?",
+    "Is my resting rate coming down?",
+    "Am I ready for a hard one tomorrow?",
+)
+
+
+@pytest.mark.parametrize("question", DATA_QUESTIONS)
+def test_ordinary_data_questions_cannot_take_conversational_shape(question):
+    # Empty facts are the production no-ledger case. The closed allowlist must
+    # classify every ordinary question as data-bearing before any model reply
+    # can be considered conversational.
+    assert chat._question_is_data_request(question, facts={}) is True
+
+
+@pytest.mark.parametrize("message", (
+    "Hello!", "hi there", "thanks", "thank you", "ok", "got it",
+))
+def test_allowlisted_conversation_reuses_gather_reply_in_one_model_call(
+        monkeypatch, vault, message):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    calls = []
+
+    def loop(*args, **kwargs):
+        calls.append(args[0])
+        return "Hello! How can I help?"
+
+    monkeypatch.setattr(llm, "tool_schemas",
+                        lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", loop)
+
+    result = chat.answer_question(vault, message)
+
+    assert result["mode"] == "narration"
+    assert result["verification"]["cause"] == "conversational"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("reply", ("Hello there 7", "Hello, jog_minutes is ready"))
+def test_conversational_reply_with_digit_or_metric_is_refused(
+        monkeypatch, vault, reply):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    monkeypatch.setattr(llm, "tool_schemas",
+                        lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: reply)
+
+    result = chat.answer_question(vault, "Hello!")
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["reason"]
+
+
+def test_no_tool_data_question_with_figure_free_reply_falls_back_without_repair(
+        monkeypatch, vault):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    responses = iter([
+        "I do not have that information for you.",
+        "I do not have that information for you.",
+        "Try {advice:3 rounds}.",
+    ])
+    calls = []
+
+    def loop(*args, **kwargs):
+        calls.append(args[0])
+        return next(responses)
+
+    monkeypatch.setattr(llm, "tool_schemas",
+                        lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", loop)
+
+    result = chat.answer_question(vault, DATA_QUESTIONS[0])
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["reason"] == (
+        "ask answer has no tool-call ledger")
+    assert len(calls) == 2
+
+
+def test_malformed_advice_without_a_ledger_still_gets_one_repair(
+        monkeypatch, vault):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    responses = iter([
+        "",
+        "Try {advice:3 rounds after jog_minutes}.",
+        "Try {advice:3 rounds}.",
+    ])
+    calls = []
+
+    def loop(*args, **kwargs):
+        calls.append(args[0])
+        return next(responses)
+
+    monkeypatch.setattr(llm, "tool_schemas",
+                        lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", loop)
+
+    result = chat.answer_question(vault, "What should I add to my routine?")
+
+    assert result["mode"] == "narration"
+    assert result["verification"]["retry"] is True
+    assert result["verification"]["advice_quantities"] == ["3 rounds"]
+    assert len(calls) == 3

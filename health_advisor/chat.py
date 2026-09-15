@@ -396,6 +396,7 @@ def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],
 
 ASK_CAUSES = (
     "ok",
+    "conversational",
     "transport_failed",
     "backend_unavailable",
     "empty_gather",
@@ -476,6 +477,7 @@ def _mark_answer_truncated(verification: dict, status: dict) -> bool:
 
 def _ask_cause(verification: dict, *, ledger: list[dict],
                loop_outcomes: list[dict], judge_score: int | None = None,
+               conversational: bool = False,
                no_gather_needed: bool = False,
                denied_available_figure: bool = False,
                withheld_eligible_figure: bool = False,
@@ -508,6 +510,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "transport_failed"
     if answer_truncated or "answer_truncated" in families:
         return "answer_truncated"
+    if conversational and verification.get("ok"):
+        return "conversational"
     if no_gather_needed:
         return "no_gather_needed"
     if not ledger:
@@ -697,6 +701,38 @@ def _fact_template_enabled() -> bool:
     prose arm in succession.  Default OFF preserves the existing ask path.
     """
     return os.environ.get("HA_ASK_FACT_TEMPLATE", "0").strip() == "1"
+
+
+_CONVERSATIONAL_MESSAGE_RE = re.compile(
+    r"(?:hello(?: there)?|hi(?: there)?|hey(?: there)?|"
+    r"thanks?(?: a lot)?|thank you|ok(?:ay)?|got it|understood|"
+    r"sounds good|great|perfect)")
+
+
+def _question_is_data_request(question: str,
+                              facts: dict[str, dict] | None = None) -> bool:
+    """Return true unless the whole message matches the closed chat allowlist.
+
+    This is deliberately an allowlist, not a growing data-keyword blocklist:
+    a message receives the conversational exemption only when its complete
+    normalized shape is an explicit greeting, thanks, or acknowledgement.
+    Every other message is treated as potentially asking for data.
+    """
+    del facts  # Kept as an optional compatibility argument for callers/tests.
+    if not isinstance(question, str):
+        return True
+    normalized = re.sub(r"[\W_]+", " ", question.casefold()).strip()
+    return not bool(_CONVERSATIONAL_MESSAGE_RE.fullmatch(normalized))
+
+
+def _template_has_advice_span(template: str) -> bool:
+    """Whether a draft carries an advice span, including malformed ones."""
+    if not isinstance(template, str):
+        return False
+    return "{advice:" in template or any(
+        token.startswith("advice:")
+        for token in _FACT_TEMPLATE_TOKEN_RE.findall(template)
+    )
 
 
 def _submit_repair_enabled() -> bool:
@@ -1812,11 +1848,13 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # model select read-only tools; the final narration turn cannot add tools
     # or facts after Python closes this ledger snapshot.
     gather_status_before = llm.last_loop_status()
-    llm.tool_loop(
+    gather_raw = llm.tool_loop(
         prompt + "\n\nUse the read-only tools needed to answer the question. "
         "After gathering the data, return a brief acknowledgement without "
         "measurements; Python will discard it and supply the facts to the "
-        "narration turn.",
+        "narration turn. If the user's message is only a greeting, thanks, "
+        "or acknowledgement, answer that conversationally instead of using "
+        "a tool; Python will validate and may publish that reply directly.",
         ctx=ctx, tools=tool_schemas, think=True, ledger_path=ledger_path,
         tool_names=llm.COACH_TOOLS, claim_instructions=None,
         submit_tool=False, ledger_index=False, submit_repair=False,
@@ -1832,6 +1870,52 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         **metric_facts,
         **fact_template.build_attachment_facts(ledger),
     }
+
+    # The allowlist above is positive evidence that this turn requested no
+    # data. Reuse the gather reply only for that closed class; a data question
+    # can never become a conversational answer merely because no tool fired.
+    if not ledger and not _question_is_data_request(question, facts):
+        conversational_text = str(gather_raw or "").strip()
+        conversational_reason = fact_template.conversational_violation(
+            conversational_text, facts)
+        conversational_ok = (not conversational_reason
+                             and _status_outcome_family(gather_status) == "other")
+        conversational_verification = {
+            "ok": conversational_ok,
+            "grounded": conversational_ok,
+            "unsupported": [],
+            "reason": conversational_reason,
+            "figures_verified": 0,
+            "figures_total": 0,
+            "advice_quantities": [],
+            "tier_counts": {"path": 0, "metric": None},
+            "tier1_path_bound": 0,
+            "tier2_metric_recomputed": None,
+            "tool_calls": 0,
+            "judge_score": None,
+            "template_compliant": False,
+            "narration_counts_comparable": False,
+        }
+        conversational_verification["cause"] = _ask_cause(
+            conversational_verification, ledger=[],
+            loop_outcomes=[gather_status],
+            conversational=conversational_ok)
+        _record_attempt(capture, 1, conversational_text, None,
+                        conversational_verification, None, [])
+        if conversational_ok:
+            return {
+                "text": conversational_text,
+                "mode": "narration",
+                "tool_trace": [],
+                "verification": conversational_verification,
+            }
+        return {
+            "text": _fallback_answer(conversational_verification),
+            "mode": "fallback",
+            "tool_trace": [],
+            "verification": conversational_verification,
+        }
+
     cold_start_guidance = fact_template.cold_start_guidance(facts)
     final_prompt = (
         "You are writing the final answer to the user's question. Return a "
@@ -1944,6 +2028,25 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         restated_unit=restated_unit,
         answer_truncated=answer_truncated)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
+
+    if (
+        _question_is_data_request(question, facts)
+        and not verification["ok"]
+        and not ledger
+        and verification["reason"] == "ask answer has no tool-call ledger"
+        and not _ledger_has_successful_data(ledger)
+        and not _template_has_advice_span(template)
+    ):
+        # A no-tool data question has no evidence for a model-authored absence
+        # claim. Skip the hopeless repair, but retain repair for every draft
+        # carrying an advice span: #264 relies on that path for malformed
+        # advice-only answers to be rescued.
+        return {
+            "text": _fallback_answer(verification),
+            "mode": "fallback",
+            "tool_trace": ledger,
+            "verification": verification,
+        }
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
     # An advice-carrying answer is substance, not empty-handedness — without

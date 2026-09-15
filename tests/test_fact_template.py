@@ -480,3 +480,13 @@ def test_digit_free_advice_slot_unwraps_to_plain_prose_without_label():
     assert scan["advice_quantities"] == []
     assert advice == []
     assert rendered == "Keep up your current routine; the trend is stable."
+
+
+def test_conversational_violation_reuses_template_and_metric_guards():
+    assert fact_template.conversational_violation("Hello there", {}) == ""
+    assert "digit outside placeholder" in fact_template.conversational_violation(
+        "Hello there 7", {})
+    assert "vault metric jog_minutes" in fact_template.conversational_violation(
+        "Hello there, jog_minutes is ready", {})
+    assert "placeholder" in fact_template.conversational_violation(
+        "Hello {advice:keep going}", {})

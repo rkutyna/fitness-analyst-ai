@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pytest
+
 from health_advisor import chat
 from health_advisor import deepdive_verify as DV
 
@@ -142,3 +144,21 @@ def test_fallback_counts_unsupported_figures_and_never_repeats_them():
     assert "97" not in two and "14" not in two and "2 figures" in two
     assert "couldn't verify a grounded answer" not in rendered
     assert "numeric verification verdict passed" in rendered
+
+
+@pytest.mark.parametrize("reason, phrase", [
+    ("answer truncated", "truncated"),
+    ("digit outside placeholder", "digit outside"),
+    ("ask answer has no tool-call ledger", "no tool-call ledger"),
+    ("synthetic verification problem", "synthetic verification problem"),
+])
+def test_fallback_names_nonempty_verification_reasons(reason, phrase):
+    rendered = chat._fallback_answer({"reason": reason})
+    assert phrase in rendered
+    assert "numeric verification verdict was unavailable" not in rendered
+
+
+def test_fallback_does_not_copy_numeric_detail_from_unknown_reason():
+    rendered = chat._fallback_answer({"reason": "draft value 987.5 was rejected"})
+    assert "987.5" not in rendered
+    assert "a value" in rendered

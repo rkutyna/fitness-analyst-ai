@@ -99,7 +99,7 @@ def test_model_call_accounting_records_nested_usage(openrouter):
         abs=1e-6)
 
 
-def test_answer_cap_is_present_only_on_the_final_call(openrouter):
+def test_tool_and_answer_calls_have_distinct_bounded_envelopes(openrouter):
     bodies = []
 
     def handler(request):
@@ -111,11 +111,32 @@ def test_answer_cap_is_present_only_on_the_final_call(openrouter):
 
     llm.tool_loop("gather", ctx=None, tools=[{"name": "probe"}], max_turns=4)
     result = llm.tool_loop("final", ctx=None, tools=[],
-                           max_tokens=llm.ANSWER_MAX_TOKENS)
+                           max_tokens=llm.ANSWER_COMPLETION_MAX_TOKENS)
 
     assert str(result) == "done"
-    assert "max_tokens" not in bodies[0]
-    assert bodies[1]["max_tokens"] == llm.ANSWER_MAX_TOKENS
+    assert bodies[0]["max_tokens"] == llm.TOOL_LOOP_MAX_TOKENS
+    assert bodies[1]["max_tokens"] == llm.ANSWER_COMPLETION_MAX_TOKENS
+
+
+def test_answer_budget_leaves_the_measured_answer_headroom(openrouter, monkeypatch):
+    """The completion cap holds the measured answer maximum plus reasoning
+    headroom, and never replaces the global reasoning level on the wire."""
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_assistant("done"))
+
+    monkeypatch.setattr(llm, "OPENROUTER_REASONING", "low")
+    openrouter(handler)
+    llm.tool_loop(
+        "final", ctx=None, tools=[], max_tokens=llm.ANSWER_COMPLETION_MAX_TOKENS)
+
+    assert llm.ANSWER_MAX_TOKENS == 1620
+    assert llm.REASONING_HEADROOM_TOKENS == 4200
+    assert llm.ANSWER_COMPLETION_MAX_TOKENS == 5820
+    assert bodies[0]["max_tokens"] == 5820
+    assert bodies[0]["reasoning"] == {"effort": "low"}
 
 
 def test_length_finish_reason_is_accounted_and_surfaces_in_loop_status(openrouter):
@@ -137,6 +158,23 @@ def test_length_finish_reason_is_accounted_and_surfaces_in_loop_status(openroute
     assert str(result) == "partial"
     assert accounting.snapshot(require_nonzero=True)["model_calls"][0][
         "finish_reason"] == "length"
+    assert llm.last_loop_status()["outcome"] == "tool_loop_truncated"
+
+
+def test_empty_length_finish_is_still_a_named_truncation(openrouter):
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "length",
+            }],
+            "provider": "CoreWeave",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4200},
+        })
+
+    openrouter(handler)
+    assert str(llm.tool_loop(
+        "q", ctx=None, tools=[], max_tokens=llm.ANSWER_COMPLETION_MAX_TOKENS)) == ""
     assert llm.last_loop_status()["outcome"] == "tool_loop_truncated"
 
 

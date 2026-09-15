@@ -237,10 +237,22 @@ OPENROUTER_MODEL = os.environ.get("HA_OPENROUTER_MODEL")
 # plan pair at import while the daily pair can still be reassigned.
 PLAN_MODEL = os.environ.get("HA_PLAN_MODEL")
 
-# The 60-sample ask battery measured a 1,144.5-token median, a 4,151-token
-# p95, and a 5,365-token maximum for final calls. A 4,200-token ceiling sits
-# just above p95, bounding the observed tail without cutting typical answers.
-ANSWER_MAX_TOKENS = 4200
+# The wire `max_tokens` bounds COMPLETION tokens, and completion includes
+# reasoning (median 56 %). Retained captures measured the ANSWER alone at p95
+# 838 and max 1,620 tokens, so ANSWER_MAX_TOKENS is the answer that must
+# survive. Reasoning is not bounded separately on the wire: its level is the
+# one global `HA_OPENROUTER_REASONING` knob (`effort: low` in production), and
+# sending a reasoning token budget would replace that measured setting.
+# REASONING_HEADROOM_TOKENS is therefore headroom inside the completion cap,
+# not an enforced limit. Measured over 658 calls: no final or repair call
+# exceeded 5,820 completion tokens; the old 4,200 cap cut 8 of 193, and one
+# live repair with 4,216 reasoning tokens returned an empty answer.
+ANSWER_MAX_TOKENS = 1620
+REASONING_HEADROOM_TOKENS = 4200
+ANSWER_COMPLETION_MAX_TOKENS = ANSWER_MAX_TOKENS + REASONING_HEADROOM_TOKENS
+# Tool-wired turns were uncapped. The same envelope covers 464 of 465 measured
+# tool turns (p99 4,151); the one it cuts spent 43,001 reasoning tokens.
+TOOL_LOOP_MAX_TOKENS = ANSWER_COMPLETION_MAX_TOKENS
 
 
 def _read_openrouter_api_key_file(path: str) -> str:
@@ -2040,6 +2052,11 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
     ``think`` is not sent on this dialect. Raises on transport error or
     non-200; the loops own the degrade-to-empty contract.
     """
+    if tools:
+        # A tool turn used to omit the completion cap entirely, and one
+        # measured turn spent 43,001 reasoning tokens. Bound the whole
+        # completion; the reasoning level itself stays the global knob.
+        max_tokens = max_tokens or TOOL_LOOP_MAX_TOKENS
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": _payload_messages(messages),
@@ -2235,8 +2252,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
             if openai_dialect:
                 msg, _ = _openrouter_post(messages, tools=wire_tools, timeout=timeout,
                                           options=CREATIVE_OPTS,
-                                          max_tokens=(max_tokens
-                                                      if not wire_tools else None))
+                                          max_tokens=max_tokens)
             else:
                 payload = {
                     "model": MODEL,

@@ -290,6 +290,28 @@ def _fallback_answer(verification: dict | None = None) -> str:
 
     seed = "I couldn't verify a grounded answer to that question"
     if isinstance(verification, dict):
+        reason = str(verification.get("reason") or "").strip()
+        reason_labels = {
+            "answer truncated": "the answer was truncated before it was complete",
+            "digit outside placeholder": (
+                "the draft put a digit outside a Python-owned fact placeholder"),
+            "ask answer has no tool-call ledger": (
+                "the answer had no tool-call ledger"),
+        }
+        if reason:
+            if reason in reason_labels:
+                reason_text = reason_labels[reason]
+            else:
+                # Unknown reasons are useful diagnostics, but a reason may
+                # carry a draft-derived number. Never copy numeric literals or
+                # quoted draft text into the client-facing fallback.
+                safe_reason = re.sub(r"(?:[-+]?\d+(?:\.\d+)?)", "a value",
+                                     reason)
+                safe_reason = re.sub(r"[`\"']([^`\"']*)[`\"']", "a value",
+                                     safe_reason)
+                reason_text = f"the draft failed verification ({safe_reason})"
+        else:
+            reason_text = "the numeric verification verdict was unavailable"
         tokens = []
         for token in verification.get("unsupported") or []:
             token = str(token)
@@ -316,12 +338,16 @@ def _fallback_answer(verification: dict | None = None) -> str:
             count = len(tokens)
             noun = "one figure" if count == 1 else f"{count} figures"
             pronoun = "it" if count == 1 else "them"
+            verdict_detail = (f"the numeric verification verdict {numeric_status}; "
+                              if not (reason and numeric_status == "was unavailable")
+                              else "")
             seed = (f"I couldn't tie {noun} in my draft to your data, so I'm "
-                    f"not showing {pronoun}; the numeric verification verdict "
-                    f"{numeric_status}")
+                    f"not showing {pronoun}; {verdict_detail}{reason_text}")
         else:
             seed = (f"I couldn't verify the draft; the numeric verification "
-                    f"verdict {numeric_status}")
+                    f"verdict {numeric_status}; {reason_text}")
+        if reason and numeric_status == "was unavailable" and not tokens:
+            seed = (f"I couldn't verify the draft; {reason_text}")
     rendered = agents.render_fallback({
         "talking_points": [{
             "seed": seed
@@ -381,6 +407,7 @@ ASK_CAUSES = (
     "contradicted_day_count",
     "restated_unit",
     "no_data_yet",
+    "answer_truncated",
 )
 
 _BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
@@ -430,7 +457,21 @@ def _status_outcome_family(status: dict) -> str:
         return "transport_failed"
     if effective == "tool_loop_empty_answer":
         return "empty_gather"
+    if effective == "tool_loop_truncated":
+        return "answer_truncated"
     return "other"
+
+
+def _mark_answer_truncated(verification: dict, status: dict) -> bool:
+    """Make a length finish a Python-owned verification failure."""
+    if _status_outcome_family(status) != "answer_truncated":
+        return False
+    verification.update({
+        "ok": False,
+        "grounded": False,
+        "reason": "answer truncated",
+    })
+    return True
 
 
 def _ask_cause(verification: dict, *, ledger: list[dict],
@@ -440,7 +481,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
                withheld_eligible_figure: bool = False,
                contradicted_day_count: bool = False,
                restated_unit: bool = False,
-               no_data_yet: bool = False) -> str:
+               no_data_yet: bool = False,
+               answer_truncated: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
 
     ``judge_score`` is ``None`` when no judge ran — the fact-template arm
@@ -464,6 +506,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "backend_unavailable"
     if "transport_failed" in families:
         return "transport_failed"
+    if answer_truncated or "answer_truncated" in families:
+        return "answer_truncated"
     if no_gather_needed:
         return "no_gather_needed"
     if not ledger:
@@ -939,7 +983,8 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
 
 
 def _record_question(question: str, as_of: str | None, result: dict,
-                     accounting: dict | None = None) -> None:
+                     accounting: dict | None = None,
+                     attempt_1_reason: str | None = None) -> None:
     """Append one JSONL row per ask when ``HA_ASK_QUESTION_LOG`` names a file.
 
     Default OFF. Recording the user's questions is a data-collection decision,
@@ -983,6 +1028,7 @@ def _record_question(question: str, as_of: str | None, result: dict,
             "as_of": as_of,
             "mode": mode,
             "reason": verification.get("reason", ""),
+            "attempt_1_reason": attempt_1_reason or "",
             "figures_verified": verification.get("figures_verified", 0),
             "figures_total": verification.get("figures_total", 0),
             "elapsed_seconds": elapsed_seconds,
@@ -1095,6 +1141,9 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
     dict or the ``/v1/ask`` response shape.
     """
     from . import llm
+    question_capture = capture
+    if question_capture is None and os.environ.get("HA_ASK_QUESTION_LOG", "").strip():
+        question_capture = []
     with llm.model_call_accounting() as turn_accounting:
         audit_match = (_AUDIT_COMMAND_RE.match(question)
                        if isinstance(question, str) else None)
@@ -1108,7 +1157,7 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
         else:
             result = _answer_question_inner(ctx, question, as_of=as_of,
                                             ledger_path=ledger_path, history=history,
-                                            capture=capture,
+                                            capture=question_capture,
                                             analyst_query_fn=analyst_query_fn,
                                             on_tool_call=on_tool_call)
         if attachments is not None:
@@ -1117,7 +1166,14 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
         timing = turn_accounting.snapshot()
     if accounting is not None:
         accounting.update(timing)
-    _record_question(question, as_of, result, timing)
+    attempt_1_reason = ""
+    if question_capture:
+        first_attempt = next((entry for entry in question_capture
+                              if entry.get("attempt") == 1), None)
+        if first_attempt:
+            attempt_1_reason = str(
+                (first_attempt.get("verification") or {}).get("reason") or "")
+    _record_question(question, as_of, result, timing, attempt_1_reason)
     return result
 
 
@@ -1817,7 +1873,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         final_prompt, ctx=ctx, tools=[], think=True, ledger_path=ledger_path,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
-        max_tokens=llm.ANSWER_MAX_TOKENS,
+        max_tokens=llm.ANSWER_COMPLETION_MAX_TOKENS,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP,
         on_tool_call=on_tool_call)
     final_status = _ask_loop_outcome(final_status_before,
@@ -1875,6 +1931,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         verification, text=rendered_text)
     restated_unit = _mark_restated_rendered_unit(
         verification, text=rendered_text, template=template, facts=facts)
+    answer_truncated = _mark_answer_truncated(verification, final_status)
     withheld_eligible_figure = _mark_withheld_eligible_figure(
         verification, withheld_fact_keys)
     verification["cause"] = _ask_cause(
@@ -1884,7 +1941,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         denied_available_figure=denied_available_figure,
         withheld_eligible_figure=withheld_eligible_figure,
         contradicted_day_count=contradicted_day_count,
-        restated_unit=restated_unit)
+        restated_unit=restated_unit,
+        answer_truncated=answer_truncated)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
     has_gathered_data = bool(facts) or _ledger_has_successful_data(ledger)
@@ -1927,7 +1985,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         repair_prompt, ctx=ctx, tools=[], think=True, ledger_path=ledger_path,
         tool_names=[], claim_instructions=None, submit_tool=False,
         ledger_index=False, submit_repair=False,
-        max_tokens=llm.ANSWER_MAX_TOKENS,
+        max_tokens=llm.ANSWER_COMPLETION_MAX_TOKENS,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
     retry_status = _ask_loop_outcome(retry_status_before,
                                      llm.last_loop_status())
@@ -1978,6 +2036,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     retry_restated_unit = _mark_restated_rendered_unit(
         retry_verification, text=retry_rendered_text,
         template=retry_template, facts=facts)
+    retry_answer_truncated = _mark_answer_truncated(
+        retry_verification, retry_status)
     retry_withheld_eligible_figure = _mark_withheld_eligible_figure(
         retry_verification, withheld_fact_keys)
     retry_verification["cause"] = _ask_cause(
@@ -1988,7 +2048,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         denied_available_figure=retry_denied_available_figure,
         withheld_eligible_figure=retry_withheld_eligible_figure,
         contradicted_day_count=retry_contradicted_day_count,
-        restated_unit=retry_restated_unit)
+        restated_unit=retry_restated_unit,
+        answer_truncated=retry_answer_truncated)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]
             and not retry_scan["advice_quantities"]):
@@ -2147,11 +2208,14 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             resolved_window=resolved_window)
         contradicted_day_count = _mark_contradicted_day_count(
             verification, text=prose.strip())
+        answer_truncated = _mark_answer_truncated(
+            verification, first_loop_status)
         verification["cause"] = _ask_cause(
             verification, ledger=ledger, loop_outcomes=[first_loop_status],
             judge_score=score,
             denied_available_figure=denied_available_figure,
-            contradicted_day_count=contradicted_day_count)
+            contradicted_day_count=contradicted_day_count,
+            answer_truncated=answer_truncated)
         _record_attempt(capture, 1, prose.strip(), claims, verification, score,
                         ledger)
         first_attempt = {
@@ -2217,11 +2281,14 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             resolved_window=resolved_window)
         contradicted_day_count = _mark_contradicted_day_count(
             verification, text=prose.strip())
+        answer_truncated = _mark_answer_truncated(
+            verification, retry_loop_status)
         verification["cause"] = _ask_cause(
             verification, ledger=ledger, loop_outcomes=[retry_loop_status],
             judge_score=score,
             denied_available_figure=denied_available_figure,
-            contradicted_day_count=contradicted_day_count)
+            contradicted_day_count=contradicted_day_count,
+            answer_truncated=answer_truncated)
         _record_attempt(capture, 2, prose.strip(), claims, verification, score,
                         ledger)
         retry_attempt = {

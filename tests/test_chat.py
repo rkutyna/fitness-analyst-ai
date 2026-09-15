@@ -543,6 +543,38 @@ def test_fact_template_repair_budget_is_hard_limited_to_two_attempts(
     assert len(calls) == 3
 
 
+def test_truncated_empty_repair_has_reason_and_closed_cause(
+        monkeypatch, vault):
+    """A length-finished empty repair cannot become a generic gate refusal."""
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    ledger = _analyst_attachment_ledger()
+    calls = []
+
+    def tool_loop(prompt, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return "acknowledged"
+        llm._announce("tool_loop_truncated", "synthetic length finish")
+        return ""
+
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", tool_loop)
+
+    capture = []
+    result = chat.answer_question(vault, "What is in the synthetic table?",
+                                  capture=capture)
+
+    assert len(calls) == 3
+    assert result["mode"] == "fallback"
+    assert result["verification"]["reason"] == "answer truncated"
+    assert result["verification"]["cause"] == "answer_truncated"
+    assert "truncated" in result["text"]
+    assert "unavailable" not in result["text"]
+    assert [entry["verification"]["reason"] for entry in capture] == [
+        "answer truncated", "answer truncated"]
+
+
 def _analyst_attachment_ledger():
     return [{
         "sequence": 1,
@@ -1485,6 +1517,7 @@ def test_question_log_records_the_question_and_verdict_only(
     row = json.loads(lines[0])
     assert row["question"] == "How did I sleep?"
     assert row["mode"] == "fallback"
+    assert row["attempt_1_reason"] == "first failed"
     assert row["figures_verified"] == 1
     assert row["model_call_count"] == 2
     assert len(row["model_calls"]) == 2

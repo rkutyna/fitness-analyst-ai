@@ -148,6 +148,8 @@ _ADDED_COLUMNS = {
         "answers_turn_id": "TEXT",
         "client_disconnected_at": "TEXT",
         "delivered_at": "TEXT",
+        "progress_id": "TEXT",
+        "mode": "TEXT",
         "attachments_json": "TEXT",
     },
 }
@@ -232,8 +234,8 @@ def _migrate_conversation_turns_answers_constraint(conn: sqlite3.Connection) -> 
     """Rebuild old conversation_turns without losing its append-only log.
 
     This is deliberately separate from additive column migrations: changing a
-    CHECK constraint is a table migration. The replacement keeps the same ten
-    columns and all existing values, then the canonical schema recreates the
+    CHECK constraint is a table migration. The replacement keeps all known
+    columns and existing values, then the canonical schema recreates the
     triggers with the new opposite-role rule.
     """
     if not _conversation_turns_need_migration(conn):
@@ -243,7 +245,7 @@ def _migrate_conversation_turns_answers_constraint(conn: sqlite3.Connection) -> 
     copied = (
         "id", "conversation_id", "sequence", "role", "content", "created_at",
         "supersedes_turn_id", "answers_turn_id", "client_disconnected_at",
-        "delivered_at",
+        "delivered_at", "progress_id", "mode",
         "attachments_json",
     )
     expressions = [name if name in columns else "NULL" for name in copied]
@@ -277,6 +279,8 @@ def _migrate_conversation_turns_answers_constraint(conn: sqlite3.Connection) -> 
                     REFERENCES conversation_turns(id) ON DELETE RESTRICT,
                 client_disconnected_at TEXT,
                 delivered_at TEXT,
+                progress_id TEXT,
+                mode TEXT CHECK (mode IS NULL OR mode IN ('narration', 'fallback', 'status')),
                 attachments_json TEXT,
                 UNIQUE (conversation_id, sequence),
                 CHECK (supersedes_turn_id IS NULL OR supersedes_turn_id <> id),

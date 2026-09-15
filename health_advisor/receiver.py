@@ -1284,9 +1284,12 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             analyst_permit.release()
 
     @app.get("/v1/ask/undelivered")
-    def undelivered_route(x_health_secret: str | None = Header(default=None)):
+    def undelivered_route(
+            progress_id: str | None = None,
+            x_health_secret: str | None = Header(default=None)):
+        """Return only the disconnected answer keyed to this ask, if any."""
         _require_ask_secret(x_health_secret)
-        return chat.get_undelivered_turn(ctx) or {}
+        return chat.get_undelivered_turn(ctx, progress_id=progress_id) or {}
 
     @app.post("/v1/ask/delivered")
     def delivered_route(raw: bytes = Depends(_raw_body),
@@ -1318,7 +1321,9 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         The route observes disconnect state after the blocking model/tool work
         completes, while that work runs off the event loop. The response
         carries explicit completion/provenance fields rather than hiding the
-        turn's latency behind a fire-and-forget acknowledgement.
+        turn's latency behind a fire-and-forget acknowledgement. The assistant
+        turn stores the request's ``progress_id`` and its narration/fallback/status
+        recovery mode at insertion.
         """
         _require_ask_secret(x_health_secret)
         payload = _ask_payload(raw)
@@ -1438,10 +1443,15 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             raise
         try:
             disconnected_at = db.utcnow_iso() if await request.is_disconnected() else None
+            stored_mode = (result["mode"]
+                           if result["mode"] in {"narration", "fallback", "status"}
+                           else "fallback")
             chat.append_turn(
                 ctx, conversation_id, "assistant", result["text"],
                 answers_turn_id=question_turn["id"],
                 client_disconnected_at=disconnected_at,
+                progress_id=progress_id,
+                mode=stored_mode,
                 attachments=result.get("attachments", attachments),
                 after_commit=(dispatcher.enqueue
                               if dispatcher is not None

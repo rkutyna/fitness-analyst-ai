@@ -94,7 +94,8 @@ HISTORY_MAX_CHARS_PER_TURN = 1200
 _HISTORY_TRUNCATION_MARKER = " ...[truncated]"
 
 _TURN_COLUMNS = (
-    "answers_turn_id", "client_disconnected_at", "delivered_at", "attachments_json",
+    "answers_turn_id", "client_disconnected_at", "delivered_at", "progress_id",
+    "mode", "attachments_json",
 )
 
 
@@ -2351,7 +2352,9 @@ def append_question_and_history(
 
     The transaction makes the history snapshot and the question's sequence one
     operation. This is the boundary that prevents two overlapping asks from
-    pairing a later answer with the wrong question.
+    pairing a later answer with the wrong question. The returned user turn
+    carries NULL recovery metadata; those fields are populated only on the
+    assistant turn created for an ask.
     """
     if not conversation_id.strip():
         raise ValueError("conversation_id must be a non-empty string")
@@ -2379,18 +2382,19 @@ def append_question_and_history(
             "created_at": created_at, "supersedes_turn_id": None,
             "answers_turn_id": None, "client_disconnected_at": None,
             "delivered_at": None,
+            "progress_id": None, "mode": None,
             "attachments": [],
         }
         conn.execute(
             "INSERT INTO conversation_turns "
             "(id, conversation_id, sequence, role, content, created_at, "
             "supersedes_turn_id, answers_turn_id, client_disconnected_at, "
-            "delivered_at, "
-            "attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "delivered_at, progress_id, mode, attachments_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(turn[field] for field in (
                 "id", "conversation_id", "sequence", "role", "content",
                 "created_at", "supersedes_turn_id", "answers_turn_id",
-                "client_disconnected_at", "delivered_at",
+                "client_disconnected_at", "delivered_at", "progress_id", "mode",
             )) + (json.dumps(turn["attachments"], ensure_ascii=False),),
         )
         conn.execute(
@@ -2416,6 +2420,8 @@ def _append_turn_locked(
     turn_id: str | None = None,
     answers_turn_id: str | None = None,
     client_disconnected_at: str | None = None,
+    progress_id: str | None = None,
+    mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Append one immutable turn on a connection the caller already owns.
@@ -2428,6 +2434,10 @@ def _append_turn_locked(
     turn and a review projection row together so the pair cannot straddle a
     process death. The ``MAX(sequence) + 1`` computation lives here alone —
     a second copy of it would be a correctness bug, not a style problem.
+
+    ``progress_id`` and ``mode`` are insert-time assistant metadata. The mode
+    is limited to ``narration``, ``fallback`` or ``status``; neither field can be updated
+    after insertion.
     """
     if not conversation_id.strip():
         raise ValueError("conversation_id must be a non-empty string")
@@ -2445,6 +2455,12 @@ def _append_turn_locked(
         )
     if client_disconnected_at is not None and role != "assistant":
         raise ValueError("client_disconnected_at is only valid for assistant turns")
+    if progress_id is not None and role != "assistant":
+        raise ValueError("progress_id is only valid for assistant turns")
+    if mode is not None and role != "assistant":
+        raise ValueError("mode is only valid for assistant turns")
+    if mode is not None and mode not in {"narration", "fallback", "status"}:
+        raise ValueError("mode must be narration, fallback or status")
     if not _has_table(conn, "conversations") or not _has_table(
         conn, "conversation_turns"
     ):
@@ -2473,18 +2489,20 @@ def _append_turn_locked(
         "answers_turn_id": answers_turn_id,
         "client_disconnected_at": client_disconnected_at,
         "delivered_at": None,
+        "progress_id": progress_id,
+        "mode": mode,
         "attachments": list(attachments or []),
     }
     conn.execute(
         "INSERT INTO conversation_turns "
         "(id, conversation_id, sequence, role, content, created_at, "
         "supersedes_turn_id, answers_turn_id, client_disconnected_at, "
-        "delivered_at, "
-        "attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "delivered_at, progress_id, mode, attachments_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         tuple(turn[field] for field in (
             "id", "conversation_id", "sequence", "role", "content",
             "created_at", "supersedes_turn_id", "answers_turn_id",
-            "client_disconnected_at", "delivered_at",
+            "client_disconnected_at", "delivered_at", "progress_id", "mode",
         )) + (json.dumps(turn["attachments"], ensure_ascii=False),),
     )
     conn.execute(
@@ -2504,13 +2522,17 @@ def append_turn(
     turn_id: str | None = None,
     answers_turn_id: str | None = None,
     client_disconnected_at: str | None = None,
+    progress_id: str | None = None,
+    mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     after_commit: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Append one immutable turn and return it.
 
     ``supersedes_turn_id`` records a correction as a new event. The old turn
-    remains readable and is never updated or deleted.
+    remains readable and is never updated or deleted. For an assistant ask,
+    ``progress_id`` and ``mode`` are stored at insertion; mode is
+    ``narration``, ``fallback`` or ``status`` and both fields remain immutable.
     """
     conn = ctx.connect()
     try:
@@ -2522,6 +2544,7 @@ def append_turn(
             supersedes_turn_id=supersedes_turn_id, turn_id=turn_id,
             answers_turn_id=answers_turn_id,
             client_disconnected_at=client_disconnected_at,
+            progress_id=progress_id, mode=mode,
             attachments=attachments,
         )
         conn.commit()
@@ -2550,20 +2573,31 @@ def list_turns(ctx: VaultContext, conversation_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
-def get_undelivered_turn(ctx: VaultContext) -> dict[str, Any] | None:
-    """Return the oldest disconnected assistant answer not yet delivered."""
+def get_undelivered_turn(
+    ctx: VaultContext, progress_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the undelivered answer for ``progress_id``, or no answer.
+
+    Recovery is intentionally keyed: a missing ``progress_id`` never selects
+    a legacy or otherwise unrelated disconnected turn. Legacy rows with a
+    NULL key therefore remain unreachable through this recovery API.
+    """
     conn = ctx.read_only()
     try:
         if not _has_table(conn, "conversation_turns"):
             return None
         columns = {row["name"] for row in conn.execute(
             "PRAGMA table_info(conversation_turns)")}
-        if "delivered_at" not in columns:
+        if "delivered_at" not in columns or "progress_id" not in columns:
+            return None
+        if progress_id is None:
             return None
         row = conn.execute(
             f"SELECT {_turn_select(conn)} FROM conversation_turns "
             "WHERE role = 'assistant' AND client_disconnected_at IS NOT NULL "
-            "AND delivered_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1"
+            "AND delivered_at IS NULL AND progress_id = ? "
+            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            (progress_id,),
         ).fetchone()
         return _decode_turn_attachments(dict(row)) if row is not None else None
     finally:

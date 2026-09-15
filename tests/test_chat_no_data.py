@@ -79,6 +79,7 @@ def test_receiver_records_the_deterministic_answer_turn(monkeypatch, vault):
     turns = chat.list_turns(vault, body["conversation_id"])
     assert [turn["role"] for turn in turns] == ["user", "assistant"]
     assert turns[1]["content"] == body["text"]
+    assert turns[1]["mode"] == "status"
 
 
 def test_no_data_cause_is_closed_and_accepted_by_cause_helper():

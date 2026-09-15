@@ -174,7 +174,8 @@ def test_vault_context_opens_pre_79_conversation_turns(tmp_path):
     finally:
         conn.close()
 
-    assert {"answers_turn_id", "client_disconnected_at"} <= columns
+    assert {"answers_turn_id", "client_disconnected_at", "progress_id",
+            "mode"} <= columns
     assert turn["content"] == "legacy"
 
 

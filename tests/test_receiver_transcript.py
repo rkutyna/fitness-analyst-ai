@@ -83,9 +83,14 @@ def test_disconnect_is_recorded_as_an_event_and_derived_from_rendering(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
-                "/v1/ask", json={"question": "question with disconnect"},
+                "/v1/ask", json={"question": "question with disconnect",
+                                 "progress_id": "disconnect-progress"},
                 headers={"x-health-secret": "ask-secret"})
-        return response
+            recovered = await client.get(
+                "/v1/ask/undelivered",
+                params={"progress_id": "disconnect-progress"},
+                headers={"x-health-secret": "ask-secret"})
+        return response, recovered
 
     # The endpoint asks Request.is_disconnected() after the answer. This is an
     # async callable, matching Starlette's interface.
@@ -93,11 +98,17 @@ def test_disconnect_is_recorded_as_an_event_and_derived_from_rendering(
         return True
 
     monkeypatch.setattr(receiver.Request, "is_disconnected", _disconnected)
-    response = asyncio.run(exercise())
+    response, recovered = asyncio.run(exercise())
     assert response.status_code == 200
     conversation_id = response.json()["conversation_id"]
     turns = chat.list_turns(vault, conversation_id)
     answer = next(turn for turn in turns if turn["role"] == "assistant")
     assert answer["client_disconnected_at"]
+    assert answer["progress_id"] == "disconnect-progress"
+    assert answer["mode"] == "fallback"
+    assert recovered.status_code == 200
+    assert recovered.json()["id"] == answer["id"]
+    assert recovered.json()["progress_id"] == "disconnect-progress"
+    assert recovered.json()["mode"] == "fallback"
     assert "undelivered" not in answer
     assert "ASSISTANT: answer not observed by the client" not in chat._render_history(turns)

@@ -88,6 +88,8 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
         REFERENCES conversation_turns(id) ON DELETE RESTRICT,
     client_disconnected_at TEXT,
     delivered_at        TEXT,
+    progress_id         TEXT,
+    mode                TEXT CHECK (mode IS NULL OR mode IN ('narration', 'fallback', 'status')),
     attachments_json    TEXT,
     UNIQUE (conversation_id, sequence),
     CHECK (supersedes_turn_id IS NULL OR supersedes_turn_id <> id),
@@ -115,6 +117,8 @@ WHEN NOT (
     AND OLD.supersedes_turn_id IS NEW.supersedes_turn_id
     AND OLD.answers_turn_id IS NEW.answers_turn_id
     AND OLD.client_disconnected_at IS NEW.client_disconnected_at
+    AND OLD.progress_id IS NEW.progress_id
+    AND OLD.mode IS NEW.mode
     AND OLD.attachments_json IS NEW.attachments_json
     AND OLD.delivered_at IS NULL
     AND NEW.delivered_at IS NOT NULL

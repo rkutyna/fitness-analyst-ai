@@ -29,6 +29,7 @@ TOOL_PROGRESS_PHRASES = {
     "get_intraday": "reading your within-day pattern…",
     "get_hr_zones": "checking your heart-rate zones…",
     "list_workouts": "reading your workouts…",
+    "get_workout_coverage": "checking route and weather coverage…",
     "get_workout_segments": "checking your workout segments…",
     "get_impact_volume": "reading your training volume…",
     "get_sleep_regularity": "checking your sleep regularity…",

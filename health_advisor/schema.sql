@@ -235,7 +235,9 @@ CREATE TABLE IF NOT EXISTS workouts (
     distance_mi     REAL,                -- miles (matches records distance unit)
     unit_distance   TEXT,
     source          TEXT,
-    route_ref       TEXT,                -- gpx filename if present (data/routes/)
+    -- Legacy export/backfill GPX filename only; the live HealthKit path never
+    -- writes this column. Live route presence is workout_routes.workout_id.
+    route_ref       TEXT,
     avg_heart_rate  REAL,                -- bpm, workout average
     max_heart_rate  REAL,                -- bpm, workout max
     elevation_ascended_m  REAL,

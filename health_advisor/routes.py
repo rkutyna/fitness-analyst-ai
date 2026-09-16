@@ -1,6 +1,9 @@
-"""Write workout GPS routes to GPX files on disk. The receiver payload carries
-the actual track points (unlike the backfill, which only had a path reference),
-so we persist them as standard GPX and store the filename in workouts.route_ref."""
+"""Write legacy workout GPS routes to GPX files on disk.
+
+The live HealthKit path stores packed route telemetry in ``workout_routes``;
+this compatibility helper is not part of that ingest path. Callers that retain
+its returned filename may store it in the legacy ``workouts.route_ref`` column.
+"""
 from __future__ import annotations
 
 import re
@@ -19,7 +22,7 @@ def _filename(workout: dict) -> str:
 
 def write_gpx(workout: dict, routes_dir: str | Path = DEFAULT_ROUTES_DIR) -> str | None:
     """Write the workout's route_points to a GPX file; return the filename
-    (stored as route_ref) or None when there's no route."""
+    (for legacy route_ref compatibility) or None when there's no route."""
     pts = workout.get("route_points") or []
     if not pts:
         return None

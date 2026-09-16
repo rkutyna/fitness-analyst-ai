@@ -488,6 +488,8 @@ def _parse_workout(workout: dict, index: int, workouts: list[dict],
         "unit_distance": "mi" if "distance_mi" in workout
         and workout["distance_mi"] is not None else None,
         "source": revision["source_name"],
+        # The live path stores packed route telemetry in workout_routes. The
+        # retired export/backfill path may still populate the legacy route_ref.
         "route_ref": None,
         "avg_heart_rate": optional_numbers["avg_heart_rate"],
         "max_heart_rate": optional_numbers["max_heart_rate"],

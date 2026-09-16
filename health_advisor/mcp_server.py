@@ -731,8 +731,10 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             start = (date.fromisoformat(end) - timedelta(days=89)).isoformat()
         rows = conn.execute(
             "SELECT w.local_date, w.workout_type, w.duration_min, w.energy_kcal, "
-            "w.distance_mi, w.route_ref, w.avg_heart_rate, w.max_heart_rate, "
+            "w.distance_mi, w.avg_heart_rate, w.max_heart_rate, "
             "w.start_utc, w.end_utc, w.dedupe_key "
+            ", EXISTS (SELECT 1 FROM workout_routes AS wr "
+            "WHERE wr.workout_id = w.id) AS has_route "
             f"FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? AND {active} "
             "ORDER BY start_utc DESC LIMIT ?", (start, end, limit)).fetchall()
         total = conn.execute(
@@ -775,7 +777,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             "max_heart_rate": _r(r["max_heart_rate"], 0),
             "start_time_local": _local_hhmm(r["start_utc"], local_timezone),
             "end_time_local": _local_hhmm(r["end_utc"], local_timezone),
-            "has_route": bool(r["route_ref"]),
+            "has_route": bool(r["has_route"]),
             "n_segments": n_segments.get(r["dedupe_key"], 0),
         })
         out.append(row)
@@ -796,6 +798,120 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             f"range — this is NOT the whole range. Raise 'limit' (max "
             f"{MAX_WORKOUTS}) or narrow the dates before counting or totalling.")
     return res
+
+
+@tool
+def get_workout_coverage(ctx: VaultContext, start: str, end: str) -> dict:
+    """Reconcile route and weather coverage for an inclusive local-date window.
+
+    This is a separate tool because it answers a cross-table coverage question,
+    not the one-metric ingest question answered by ``get_ingest_diagnostics``.
+    ``workouts`` counts unmarked sessions, ``with_route`` counts sessions with
+    a matched ``workout_routes`` row, and ``with_weather`` counts sessions whose
+    weather status is ``fetched``. The nested ``weather_status`` split retains
+    the distinction between ``no_route``, ``pending``, and ``fetched``; a
+    status row is not silently promoted to weather data.
+
+    ``unmatched_routes`` counts route rows without a workout parent whose UTC
+    start date falls in the window. Route rows have no local-date column, so
+    their UTC start date is the only stored window key for this diagnostic.
+
+    A vault with no ``workout_routes`` table returns ``status: "unavailable"``:
+    that question cannot be asked of that shape. A vault that HAS the table and
+    no rows in it is answered normally, with ``with_route: 0`` and a
+    ``route_status`` string naming the absence — a new vault genuinely has no
+    routes yet, which is a fact about the data and not a gap in the instrument.
+    ``route_status`` also separates the two zeros a caller would otherwise
+    confuse: no routes anywhere, against routes in the vault but none on these
+    workouts. Dates must be explicit YYYY-MM-DD.
+    """
+    if err := _bad_dates(start=start, end=end):
+        return {"error": err}
+    conn = ctx.read_only()
+    try:
+        has_routes_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'workout_routes'"
+        ).fetchone() is not None
+        if not has_routes_table:
+            return {
+                "status": "unavailable", "start": start, "end": end,
+                "reason": "workout_routes_table_missing",
+                "detail": (
+                    "the vault has no workout_routes table, so route coverage "
+                    "cannot be measured"
+                ),
+            }
+        route_rows = conn.execute(
+            "SELECT COUNT(*) FROM workout_routes"
+        ).fetchone()[0]
+
+        active = db.workout_mark_condition(conn, "w")
+        has_weather_status = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'workout_weather_status'"
+        ).fetchone() is not None
+        if has_weather_status:
+            summary = conn.execute(
+                "SELECT COUNT(*) AS workouts, "
+                "COUNT(CASE WHEN EXISTS ("
+                "  SELECT 1 FROM workout_routes AS r WHERE r.workout_id = w.id"
+                ") THEN 1 END) AS with_route, "
+                "COUNT(CASE WHEN s.status = 'fetched' THEN 1 END) AS with_weather, "
+                "COUNT(CASE WHEN s.status = 'no_route' THEN 1 END) AS no_route, "
+                "COUNT(CASE WHEN s.status = 'pending' THEN 1 END) AS pending, "
+                "COUNT(CASE WHEN s.status = 'fetched' THEN 1 END) AS fetched "
+                "FROM workouts AS w "
+                "LEFT JOIN workout_weather_status AS s ON s.workout_id = w.id "
+                f"WHERE w.local_date BETWEEN ? AND ? AND {active}",
+                (start, end),
+            ).fetchone()
+        else:
+            summary = conn.execute(
+                "SELECT COUNT(*) AS workouts, "
+                "COUNT(CASE WHEN EXISTS ("
+                "  SELECT 1 FROM workout_routes AS r WHERE r.workout_id = w.id"
+                ") THEN 1 END) AS with_route "
+                "FROM workouts AS w "
+                f"WHERE w.local_date BETWEEN ? AND ? AND {active}",
+                (start, end),
+            ).fetchone()
+        unmatched = conn.execute(
+            "SELECT COUNT(*) FROM workout_routes AS r "
+            "WHERE r.workout_id IS NULL "
+            "AND substr(r.start_utc, 1, 10) BETWEEN ? AND ?",
+            (start, end),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    if not has_weather_status:
+        weather_status = {
+            "status": "unavailable",
+            "reason": "workout_weather_status_table_missing",
+            "detail": (
+                "the vault has no workout_weather_status table, so weather "
+                "status coverage cannot be measured"
+            ),
+        }
+        with_weather = None
+    else:
+        weather_status = {
+            "no_route": summary["no_route"],
+            "pending": summary["pending"],
+            "fetched": summary["fetched"],
+        }
+        with_weather = summary["with_weather"]
+    return {
+        "status": "ok", "start": start, "end": end,
+        "workouts": summary["workouts"],
+        "with_route": summary["with_route"],
+        "with_weather": with_weather,
+        "unmatched_routes": unmatched,
+        "route_status": ("no routes ingested yet" if route_rows == 0
+                         else "routes present in the vault"),
+        "weather_status": weather_status,
+    }
 
 
 MAX_SEGMENTS = 120

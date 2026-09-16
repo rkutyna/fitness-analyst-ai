@@ -7,7 +7,8 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from health_advisor import db, hk_parse, receiver, vault
+from health_advisor import db, hk_parse, mcp_server, receiver, vault
+from health_advisor.context import VaultContext
 
 
 DEVICE = {"id": "synthetic-device", "name": "synthetic-phone", "model": "synthetic-model"}
@@ -582,6 +583,157 @@ def test_review_04_empty_routes_are_counted_but_not_stored(vault, vault_path, mo
     finally:
         conn.close()
     assert "routes_empty=1" in detail
+
+
+def test_issue_71_list_workouts_reports_route_from_hk_ingest(
+    vault, monkeypatch
+):
+    """The live HealthKit path stores route truth outside the retired export column."""
+    with _client(vault, monkeypatch) as client:
+        response = client.post(
+            "/v1/ingest",
+            json=_payload(
+                workouts=[_workout(uuid="route-backed-workout")],
+                routes=[_route(
+                    uuid="route-backed-route",
+                    workout_hk_uuid="route-backed-workout",
+                )],
+                batch_id="route-backed-batch",
+            ),
+        )
+    assert response.status_code == 200, response.text
+
+    listed = mcp_server.build_tools(vault)["list_workouts"](
+        start="2026-01-02", end="2026-01-02"
+    )
+    assert listed["workouts"][0]["has_route"] is True
+
+
+def test_issue_71_legacy_route_ref_without_route_row_is_not_a_route(conn, tools):
+    """A legacy export filename cannot promise readable live route telemetry."""
+    workout = _legacy_workout(
+        "legacy-route-ref", "2026-01-02T10:00:00+00:00",
+        "2026-01-02T10:30:00+00:00", SOURCE,
+    )
+    workout["route_ref"] = "retired-export.gpx"
+    db.insert_workouts(conn, [workout])
+    conn.commit()
+
+    listed = tools.list_workouts(start="2026-01-02", end="2026-01-02")
+    assert listed["workouts"][0]["has_route"] is False
+
+
+def test_issue_71_coverage_matches_hand_written_sql(conn, tools):
+    """Route and weather coverage is one reconciliation answer, not two guesses."""
+    workouts = [
+        _legacy_workout(
+            "coverage-matched", "2026-01-02T10:00:00+00:00",
+            "2026-01-02T10:30:00+00:00", SOURCE,
+        ),
+        _legacy_workout(
+            "coverage-pending", "2026-01-02T11:00:00+00:00",
+            "2026-01-02T11:30:00+00:00", SOURCE,
+        ),
+        _legacy_workout(
+            "coverage-legacy", "2026-01-02T12:00:00+00:00",
+            "2026-01-02T12:30:00+00:00", SOURCE,
+        ),
+    ]
+    workouts[2]["route_ref"] = "retired-export-only.gpx"
+    db.insert_workouts(conn, workouts)
+    db.insert_workout_routes(conn, [
+        _db_route(
+            "coverage-matched-route", "2026-01-02T10:00:00+00:00",
+            "2026-01-02T10:30:00+00:00",
+        ),
+        _db_route(
+            "coverage-unmatched-route", "2026-01-02T15:00:00+00:00",
+            "2026-01-02T15:30:00+00:00",
+        ),
+    ])
+    conn.executemany(
+        "INSERT INTO workout_weather_status "
+        "(workout_id, status, checked_utc, attempts) VALUES "
+        "((SELECT id FROM workouts WHERE dedupe_key = ?), ?, ?, ?)",
+        [
+            ("legacy-coverage-matched", "fetched", "2026-01-02T16:00:00Z", 1),
+            ("legacy-coverage-pending", "pending", "2026-01-02T16:00:00Z", 1),
+            ("legacy-coverage-legacy", "no_route", "2026-01-02T16:00:00Z", 0),
+        ],
+    )
+    conn.commit()
+
+    hand = conn.execute(
+        "SELECT COUNT(*) AS workouts, "
+        "COUNT(CASE WHEN EXISTS ("
+        "  SELECT 1 FROM workout_routes r WHERE r.workout_id = w.id"
+        ") THEN 1 END) AS with_route, "
+        "COUNT(CASE WHEN s.status = 'fetched' THEN 1 END) AS with_weather, "
+        "COUNT(CASE WHEN s.status = 'no_route' THEN 1 END) AS no_route, "
+        "COUNT(CASE WHEN s.status = 'pending' THEN 1 END) AS pending, "
+        "COUNT(CASE WHEN s.status = 'fetched' THEN 1 END) AS fetched "
+        "FROM workouts w LEFT JOIN workout_weather_status s "
+        "ON s.workout_id = w.id "
+        "WHERE w.local_date BETWEEN ? AND ?",
+        ("2026-01-02", "2026-01-02"),
+    ).fetchone()
+    hand_unmatched = conn.execute(
+        "SELECT COUNT(*) FROM workout_routes "
+        "WHERE workout_id IS NULL AND substr(start_utc, 1, 10) BETWEEN ? AND ?",
+        ("2026-01-02", "2026-01-02"),
+    ).fetchone()[0]
+    expected = {
+        "workouts": hand["workouts"],
+        "with_route": hand["with_route"],
+        "with_weather": hand["with_weather"],
+        "unmatched_routes": hand_unmatched,
+        "weather_status": {
+            "no_route": hand["no_route"],
+            "pending": hand["pending"],
+            "fetched": hand["fetched"],
+        },
+    }
+
+    actual = tools.get_workout_coverage("2026-01-02", "2026-01-02")
+    assert {key: actual[key] for key in expected if key != "weather_status"} == {
+        key: expected[key] for key in expected if key != "weather_status"
+    }
+    assert actual["weather_status"] == expected["weather_status"]
+    assert actual["route_status"] == "routes present in the vault"
+    assert len({actual["workouts"], actual["with_route"],
+                 actual["with_weather"], actual["unmatched_routes"]}) > 1
+
+
+def test_issue_71_coverage_distinguishes_missing_route_table(tmp_path):
+    path = tmp_path / "pre-route-vault.db"
+    sqlite3.connect(path).close()
+    ctx = VaultContext.local(path, user_id="test", writable=False)
+
+    out = mcp_server.build_tools(ctx)["get_workout_coverage"](
+        "2026-01-02", "2026-01-02"
+    )
+
+    assert out["status"] == "unavailable"
+    assert out["reason"] == "workout_routes_table_missing"
+
+
+def test_issue_71_empty_route_table_is_answered_not_refused(tmp_path):
+    """A table with no rows is a real answer: no routes yet, said in a string."""
+    path = tmp_path / "empty-route-vault.db"
+    empty = db.connect(path)
+    db.init_db(empty)
+    empty.close()
+    ctx = VaultContext.local(path, user_id="test", writable=False)
+
+    out = mcp_server.build_tools(ctx)["get_workout_coverage"](
+        "2026-01-02", "2026-01-02"
+    )
+
+    assert out["status"] == "ok"
+    assert out["workouts"] == 0
+    assert out["with_route"] == 0
+    assert out["unmatched_routes"] == 0
+    assert out["route_status"] == "no routes ingested yet"
 
 
 def test_route_anchor_is_advanceable_and_route_deletion_is_handled():

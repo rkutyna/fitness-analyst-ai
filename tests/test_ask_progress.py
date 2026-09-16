@@ -162,7 +162,7 @@ def test_exception_turn_ends_error(monkeypatch, vault):
 
 def test_vocabulary_is_complete_and_carries_no_figure_or_placeholder():
     names = {fn.__name__ for fn in mcp_server._TOOLS}
-    assert len(names) == 32
+    assert len(names) == 33
     assert set(ask_progress.TOOL_PROGRESS_PHRASES) == names
     for phrase in ask_progress.TOOL_PROGRESS_PHRASES.values():
         assert not any(character.isdigit() for character in phrase)

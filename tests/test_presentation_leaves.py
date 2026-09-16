@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -10,7 +11,9 @@ from health_advisor import deepdive_verify as DV
 from health_advisor import fact_template
 from health_advisor import mcp_server
 from health_advisor import metrics as mx
+from health_advisor import normalize
 from health_advisor.context import VaultContext
+from health_advisor.numeric_tokens import NUM_RE
 from tests.conftest import seed_metric
 
 
@@ -22,7 +25,84 @@ def test_formatter_handles_both_duration_families_and_all_hour_origins():
     assert mx.format_presentation("sleep_wake_time", 7.173) == "7:10 AM"
     assert mx.format_presentation("sleep_midpoint_sd_28d", 1.019) == "± 1 h 01 m"
     assert mx.format_presentation("wear_hours", 20.0) == "20 h"
-    assert mx.format_presentation("sleep_timing_interval_regularity", 89.0) is None
+    assert mx.format_presentation("sleep_timing_interval_regularity", 89.0) == "89"
+
+
+def test_catalog_coverage_records_the_20_of_92_baseline_and_new_split():
+    """The pre-change 20/72 gap is pinned beside the post-change 92/0 split."""
+    legacy_duration_clock = frozenset({
+        "apple_exercise_time", "apple_stand_time", "jog_minutes",
+        "longest_block_min", "mindful_minutes", "sleep_asleep",
+        "sleep_awake", "sleep_awake_longest", "sleep_bedtime", "sleep_core",
+        "sleep_deep", "sleep_in_bed", "sleep_latency", "sleep_midpoint",
+        "sleep_midpoint_sd_28d", "sleep_rem", "sleep_time_in_bed",
+        "sleep_wake_time", "time_in_daylight", "wear_hours",
+    })
+    catalog = set(normalize.known_metrics())
+    assert len(catalog) == 92
+    assert (len(legacy_duration_clock),
+            len(catalog - legacy_duration_clock)) == (20, 72)
+
+    covered = {
+        metric for metric in catalog
+        if any(mx.format_presentation(metric, 12345.6789, field=field)
+               is not None for field in mx._PRESENTATION_FIELDS)
+    }
+    assert (len(covered), len(catalog - covered)) == (92, 0)
+
+    # Every catalog field is exercised. A raw-string mutation of any renderer
+    # group exposes more than the two-decimal presentation contract.
+    for metric in sorted(catalog):
+        for field in mx._PRESENTATION_FIELDS:
+            rendered = mx.format_presentation(
+                metric, 12345.6789, field=field)
+            if rendered is None:
+                continue
+            for token in re.findall(r"-?[\d,]+(?:\.\d+)?", rendered):
+                decimals = token.split(".", 1)[1] if "." in token else ""
+                assert len(decimals) <= mx.PRESENTATION_MAX_DECIMALS
+
+
+def test_numeric_groups_round_without_a_unit_and_preserve_the_owned_number():
+    """The display is the NUMERAL only; the unit selects precision, nothing more.
+
+    The live defect read "Your longest run on record is 7.45228 miles." — the
+    word "miles" is the model's, around the published figure. Appending the
+    catalog unit here would render "7.45 mi miles", and for storage units it
+    puts vault vocabulary into prose: "Your rate is 60 count/min."
+    """
+    samples = (
+        ("distance_walking_running", 7.45228, "7.45", 0.0051),
+        ("distance_cycling", 12.3456789, "12.35", 0.0051),
+        ("resting_heart_rate", 52.37, "52", 0.5),
+        ("step_count", 12345, "12,345", 0.5),
+        ("body_mass", 164.25, "164.2", 0.051),
+    )
+    for metric, value, expected, tolerance in samples:
+        rendered = mx.format_presentation(metric, value)
+        assert rendered == expected
+        # No unit suffix, ever, for these groups: the whole string must parse
+        # as one number. Durations and clocks are the deliberate exception and
+        # are pinned separately above.
+        assert rendered.replace(",", "").lstrip("+-").replace(".", "", 1).isdigit()
+        token = NUM_RE.findall(rendered)[0]
+        assert float(token.replace(",", "")) == pytest.approx(
+            value, abs=tolerance)
+
+
+def test_unknown_metrics_and_non_unit_fields_stay_unrendered():
+    assert mx.format_presentation("not_in_catalog", 12.345) is None
+    for field in mx._NON_UNIT_PRESERVING_FIELDS:
+        assert mx.format_presentation(
+            "distance_walking_running", 12.345, field=field) is None
+
+
+def test_numeric_tokens_bind_unit_suffixes_and_grouped_thousands():
+    assert NUM_RE.findall("7.45 mi") == ["7.45"]
+    assert NUM_RE.findall("52 bpm") == ["52"]
+    assert NUM_RE.findall("12,345 steps") == ["12,345"]
+    for rendered in ("7.45 mi", "52 count/min", "12,345 count"):
+        assert len(NUM_RE.findall(rendered)) == 1
 
 
 def test_mcp_presentation_leaf_reaches_the_ledger_and_is_claimable(conn, tools):

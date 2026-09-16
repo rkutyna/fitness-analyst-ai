@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote
 
 from . import claim_contract as _CLAIM_CONTRACT
 from . import deepdive_verify as _verify
+from . import metrics
 from . import normalize
 
 
@@ -366,6 +367,30 @@ def _unit_for(entry: dict, units: dict[str, str]) -> str:
     return normalize.canonical_unit(str(entry["metric"]), None)
 
 
+def _display_value(value, *, metric: str | None = None,
+                   unit: str | None = None, field: str | None = None,
+                   signed: bool = False) -> str:
+    """Return the one published display string for a numeric fact.
+
+    Metric facts use the canonical renderer. Attachment facts have explicit
+    table units but no canonical metric, so they use the shared unit renderer.
+    A non-unit-preserving metric field deliberately remains unitless. Numeric
+    values with no applicable renderer still get deterministic rounding rather
+    than Python's float repr; the owned ``value`` is never changed.
+    """
+    if metric is not None:
+        rendered = metrics.format_presentation(metric, value, field=field or "value")
+        if rendered is not None:
+            return rendered
+        signed = signed or field in metrics._SIGNED_UNIT_PRESERVING_FIELDS
+    elif unit:
+        rendered = metrics.format_unit_value(value, unit, signed=signed)
+        if rendered is not None:
+            return rendered
+    rendered = metrics.format_numeric(value, signed=signed)
+    return rendered if rendered is not None else str(value)
+
+
 def _same_scope(left: dict, right: dict) -> bool:
     return (left.get("metric") == right.get("metric")
             and _period_identity(left.get("period"))
@@ -478,7 +503,7 @@ def _cold_start_entries(entries: list[dict], *, sequence=None) -> list[tuple[str
                 "period": None,
                 "value": entry["value"],
                 "unit": None,
-                "display": str(entry["value"]),
+                "display": _display_value(entry["value"]),
                 "source": {"sequence": sequence,
                            "path": leaf_path},
             }))
@@ -674,7 +699,9 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
         if presentation is None:
             presentation = _presentation_for(entry, presentations)
         if presentation is None:
-            display = str(entry["value"])
+            display = _display_value(
+                entry["value"], metric=entry["metric"],
+                unit=_unit_for(entry, units), field=entry["field"])
         else:
             display = presentation["value"]
         resolved_candidates.append((key, {
@@ -733,7 +760,8 @@ def _key_order(rows) -> str | None:
 def build_attachment_facts(ledger: list[dict]) -> dict[str, dict]:
     """Build closed facts for analyst table cells and deterministic trends.
 
-    Cell values and units are copied verbatim from the table.  For numeric
+    Cell values and units are copied from the table. Numeric displays use the
+    shared unit renderer. For numeric
     columns with at least two rows and a strictly monotonic key column,
     ``first``, ``last``, and ``delta`` are Python-owned values computed
     oldest-to-newest, while ``direction`` is the constant ``increased``,
@@ -793,7 +821,8 @@ def build_attachment_facts(ledger: list[dict]) -> dict[str, dict]:
                         "row": row[0],
                         "value": row[column_index],
                         "unit": units[column_index],
-                        "display": str(row[column_index]),
+                        "display": _display_value(
+                            row[column_index], unit=units[column_index]),
                         "source": {"sequence": record.get("sequence"),
                                    "path": path},
                     }))
@@ -834,7 +863,8 @@ def build_attachment_facts(ledger: list[dict]) -> dict[str, dict]:
                         "trend": stat,
                         "value": value,
                         "unit": unit,
-                        "display": str(value),
+                        "display": _display_value(
+                            value, unit=unit, signed=(stat == "delta")),
                         "source": trend_source,
                     }))
 

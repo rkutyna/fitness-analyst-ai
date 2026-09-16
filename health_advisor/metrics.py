@@ -4,6 +4,7 @@ All functions are pure given a connection; callers manage the connection."""
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import math
 
 import numpy as np
 
@@ -109,6 +110,87 @@ _PRESENTATION_FIELDS = (_UNIT_PRESERVING_FIELDS
                         | _SIGNED_UNIT_PRESERVING_FIELDS
                         | _NON_UNIT_PRESERVING_FIELDS)
 
+# Numeric presentation is intentionally a small, explicit policy rather than
+# a call to ``str(float)``. The stored value remains the source of truth; these
+# precisions only decide what a person sees and what the model copies.
+# Lengths get two decimals because sub-hundredth distances are not useful in
+# narration, rates/counts/energy get whole units, masses get one decimal, and
+# percentages get one decimal. All other catalogued units retain two decimals
+# until a metric-specific policy earns a different choice.
+PRESENTATION_MAX_DECIMALS = 2
+_UNIT_PRESENTATION_DECIMALS = {
+    "count": 0,
+    "count/min": 0,
+    "drinks": 0,
+    "%": 1,
+    "kcal": 0,
+    "lb": 1,
+    "g": 1,
+    "mg": 0,
+}
+_LENGTH_UNITS = frozenset({"m", "km", "cm", "mm", "in", "ft", "mi"})
+
+
+def _number(value: float, decimals: int, *, signed: bool = False) -> str:
+    """Render a finite number with grouping and no insignificant zeroes."""
+    sign = ""
+    if signed:
+        sign = "+" if value > 0 else "-" if value < 0 else ""
+        value = abs(value)
+    rendered = f"{value:,.{decimals}f}"
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return sign + rendered
+
+
+def format_numeric(value, *, decimals: int = PRESENTATION_MAX_DECIMALS,
+                   signed: bool = False) -> str | None:
+    """Render a finite number for a fallback that has no unit metadata."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return _number(numeric, decimals, signed=signed)
+
+
+def format_unit_value(value, unit: str, *, signed: bool = False) -> str | None:
+    """Render a numeric value at the precision its unit deserves.
+
+    The unit selects the PRECISION and is deliberately not appended to the
+    result. Two measurements say why:
+
+    * The live defect this fixes read *"Your longest run on record is
+      7.45228 miles."* — the word "miles" is the model's, written around the
+      published figure. A display of ``"7.45 mi"`` would have produced
+      "7.45 mi miles".
+    * Appending the catalog unit produces storage vocabulary in prose. With
+      the suffix in place, `test_fact_template_repair_prompt_carries_exact_digit_refusal`
+      narrated *"Your rate is 60 count/min."* — a person says "60 bpm".
+      `count`, `count/min` and `mL/min·kg` are how the vault stores a unit,
+      not how anyone reads one.
+
+    Attachment tables are the same story from the other side: the unit is
+    already in the column header, so repeating it in every cell is noise —
+    which is what `test_attachment_facts_publish_verbatim_cells_and_python_trends`
+    means by "verbatim".
+
+    Durations and clocks keep their own suffixes ("35 min", "7 h 20 m") in
+    :func:`format_presentation` because a duration is not a plain number; the
+    unit there is part of the notation, not a label after it.
+    """
+    if not isinstance(unit, str) or not unit:
+        return None
+    if unit in _LENGTH_UNITS:
+        decimals = 2
+    else:
+        decimals = _UNIT_PRESENTATION_DECIMALS.get(
+            unit, PRESENTATION_MAX_DECIMALS)
+    return format_numeric(value, decimals=decimals, signed=signed)
+
 
 def format_presentation(metric: str, value, *, clock_24: bool = False,
                         compact: bool = False, field: str = "value") -> str | None:
@@ -122,12 +204,16 @@ def format_presentation(metric: str, value, *, clock_24: bool = False,
     """
     if field not in _PRESENTATION_FIELDS or field in _NON_UNIT_PRESERVING_FIELDS:
         return None
+    if metric != "duration_min" and metric not in nz.CATALOG:
+        return None
     signed_field = field in _SIGNED_UNIT_PRESERVING_FIELDS
     if value is None or isinstance(value, bool):
         return None
     try:
         value = float(value)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
         return None
 
     def duration(total_minutes: float, prefix: str = "") -> str:
@@ -163,7 +249,8 @@ def format_presentation(metric: str, value, *, clock_24: bool = False,
     elif metric in _MIDNIGHT_CLOCK_METRICS:
         total = int(value * 60) % (24 * 60)
     else:
-        return None
+        return format_unit_value(
+            value, nz.CATALOG[metric]["unit"], signed=signed_field)
     hour24, minute = divmod(total, 60)
     sign = ""
     if signed_field:

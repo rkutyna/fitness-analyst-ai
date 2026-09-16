@@ -5,15 +5,18 @@ import json
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from health_advisor import chat
+from health_advisor import analysis
 from health_advisor import db as dbmod
 from health_advisor import deepdive_verify as DV
 from health_advisor import fact_template
 from health_advisor import llm
+from health_advisor import vault as vaultmod
 from health_advisor.context import VaultContext, VaultOwnershipError
 from tests.conftest import seed_metric
 
@@ -33,15 +36,91 @@ def test_first_question_prompt_is_unchanged_without_history(monkeypatch, vault,
 
     chat.answer_question(vault, "How am I doing?")
 
+    today, horizon = chat._ask_calendar_dates(vault, None)
     expected = (
         "You are the user's personal health coach. Answer the user's question "
         "directly and honestly using the supplied read-only health tools. Call "
         "the most relevant tool(s), check their scope and caveats, and do not "
         "invent a number, metric, activity, or period. If the data cannot answer "
-        "the question, say so without guessing.\n\nUSER QUESTION:\n"
-        "How am I doing?\n\n" + chat.ASK_CLAIM_INSTRUCTIONS
+        "the question, say so without guessing.\n\n"
+        + chat._render_ask_calendar_dates((today, horizon))
+        + "\n\nUSER QUESTION:\nHow am I doing?\n\n"
+        + chat.ASK_CLAIM_INSTRUCTIONS
     )
     assert prompts[0] == expected
+
+
+def test_ask_prompt_states_as_of_without_calendar_phrase(monkeypatch, vault,
+                                                         conn):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    prompts = []
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda prompt, **kwargs: prompts.append(prompt) or "")
+
+    assert chat._calendar_window_config(
+        vault, "How am I doing?", "2026-02-03")[1] is None
+    chat.answer_question(vault, "How am I doing?", as_of="2026-02-03")
+
+    assert "CURRENT DATE AND MOST RECENT DAY WITH DATA: 2026-02-03." in prompts[0]
+
+
+def test_no_calendar_phrase_path_states_dates_in_fact_template_prompt(
+        monkeypatch, vault, conn):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    prompts = []
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda prompt, **kwargs: prompts.append(prompt) or "")
+
+    chat.answer_question(vault, "How am I doing?", as_of="2026-02-03")
+
+    assert "CURRENT DATE AND MOST RECENT DAY WITH DATA: 2026-02-03." in prompts[0]
+    assert "PYTHON-RESOLVED CALENDAR WINDOW:" not in prompts[0]
+
+
+def test_ask_prompt_states_vault_today_and_as_of_once_when_equal_or_different(
+        monkeypatch, vault, conn):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2099, 4, 10, tzinfo=tz)
+
+    vaultmod.set_local_timezone(conn, "UTC")
+    seed_metric(conn, "step_count", "2099-04-03", [1])
+    monkeypatch.setattr(analysis, "datetime", FrozenDateTime)
+    prompts = []
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda prompt, **kwargs: prompts.append(prompt) or "")
+
+    chat.answer_question(vault, "How am I doing?")
+    chat.answer_question(vault, "How am I doing?", as_of="2099-04-03")
+
+    assert "CURRENT DATE: 2099-04-10." in prompts[0]
+    assert "most recent day with data in this vault is 2099-04-03." in prompts[0]
+    assert prompts[2].count("2099-04-03") == 1
+    assert "CURRENT DATE AND MOST RECENT DAY WITH DATA: 2099-04-03." in prompts[2]
+
+
+def test_resolved_calendar_window_prompt_text_is_unchanged(
+        monkeypatch, vault, conn):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    prompts = []
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda prompt, **kwargs: prompts.append(prompt) or "")
+
+    chat.answer_question(
+        vault, "How did I do on 2099-04-03?", as_of="2099-04-10")
+
+    expected = (
+        "PYTHON-RESOLVED CALENDAR WINDOW: the phrase '2099-04-03' means the "
+        "inclusive window 2099-04-03 through 2099-04-03. Python will enforce "
+        "this window on eligible tools; use the returned result and this scope "
+        "in the answer.\n\n"
+    )
+    assert expected in prompts[0]
 
 
 def test_fact_template_flag_zero_keeps_the_existing_prose_path(

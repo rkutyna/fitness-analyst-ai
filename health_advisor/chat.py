@@ -223,10 +223,12 @@ def _window_override_path(ledger_path: str) -> str:
     return os.fspath(ledger_path) + ".window_override.json"
 
 
-def _ask_calendar_today(ctx: VaultContext, as_of: str | None) -> date:
-    """Use the exact as-of horizon published by the tools for calendar math."""
+def _ask_calendar_dates(ctx: VaultContext,
+                        as_of: str | None) -> tuple[date, date]:
+    """Return the prompt's current date and the tools' as-of horizon."""
     if as_of is not None:
-        return date.fromisoformat(as_of)
+        horizon = date.fromisoformat(as_of)
+        return horizon, horizon
     from . import analysis
 
     # Some prompt-only unit tests use an uninitialized context because their
@@ -237,23 +239,36 @@ def _ask_calendar_today(ctx: VaultContext, as_of: str | None) -> date:
         empty = sqlite3.connect(":memory:")
         try:
             empty.execute("CREATE TABLE daily_metrics (date TEXT)")
-            return date.fromisoformat(analysis._as_of(empty, None))
+            today = analysis._today(empty)
+            horizon = date.fromisoformat(analysis._as_of(empty, None))
+            return today, horizon
         finally:
             empty.close()
 
     conn = ctx.read_only()
     try:
-        return date.fromisoformat(analysis._as_of(conn, None))
+        today = analysis._today(conn)
+        horizon = date.fromisoformat(analysis._as_of(conn, None))
+        return today, horizon
     finally:
         conn.close()
 
 
+def _ask_calendar_today(ctx: VaultContext, as_of: str | None) -> date:
+    """Use the exact as-of horizon published by the tools for calendar math."""
+    return _ask_calendar_dates(ctx, as_of)[1]
+
+
 def _calendar_window_config(ctx: VaultContext, question: str,
-                            as_of: str | None) -> tuple[dict, Any]:
+                            as_of: str | None, *,
+                            calendar_dates: tuple[date, date] | None = None
+                            ) -> tuple[dict, Any]:
     """Resolve one question once and serialize the wrapper's instructions."""
     from .calendar_window import CalendarWindow, resolve_window
 
-    resolved = resolve_window(question, _ask_calendar_today(ctx, as_of))
+    horizon = (calendar_dates[1] if calendar_dates is not None
+               else _ask_calendar_today(ctx, as_of))
+    resolved = resolve_window(question, horizon)
     if resolved is None:
         return {"status": "none", "reason": "no_calendar_phrase"}, None
     if isinstance(resolved, tuple):
@@ -273,6 +288,23 @@ def _calendar_window_config(ctx: VaultContext, question: str,
             "by_hint": resolved.by_hint,
         },
     }, resolved
+
+
+def _render_ask_calendar_dates(calendar_dates: tuple[date, date]) -> str:
+    """Tell the model which date is current and where unqualified periods end."""
+    today, horizon = calendar_dates
+    if today == horizon:
+        return (
+            f"CURRENT DATE AND MOST RECENT DAY WITH DATA: {today}. "
+            "Unless the user names a period, \"recent\", \"lately\" and "
+            "\"how has it been\" end at that date, not at some earlier date."
+        )
+    return (
+        f"CURRENT DATE: {today}. The most recent day with data in this vault "
+        f"is {horizon}. Unless the user names a period, \"recent\", \"lately\" "
+        "and \"how has it been\" end at the most recent day with data in this "
+        "vault, not at some earlier date."
+    )
 
 
 def _write_window_override(path: str, config: dict) -> None:
@@ -2225,8 +2257,9 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         os.close(fd)
         ledger_path = temp_path
 
+    calendar_dates = _ask_calendar_dates(ctx, as_of)
     window_config, resolved_window = _calendar_window_config(
-        ctx, question, as_of)
+        ctx, question, as_of, calendar_dates=calendar_dates)
     window_sidecar_path = _window_override_path(ledger_path)
     _write_window_override(window_sidecar_path, window_config)
 
@@ -2244,6 +2277,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         prompt += rendered_history + "\n\n"
     if rendered_facts:
         prompt += rendered_facts + "\n\n"
+    prompt += _render_ask_calendar_dates(calendar_dates) + "\n\n"
     fact_template_enabled = _fact_template_enabled()
     if resolved_window is not None:
         if isinstance(resolved_window, tuple):

@@ -10,6 +10,7 @@ import base64
 import os
 import struct
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import hashes
@@ -18,7 +19,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
-VERSION = 1
+VERSION = 1  # Framing is signaled by CONTENT_TYPE; no byte range is reserved as a discriminator.
+CONTENT_TYPE = "application/x-ha-d23"
 HKDF_SALT = b"ha-d23-body-aead-v1"
 INFO_REQUEST = b"ha/d23/v1/body/request"
 INFO_RESPONSE = b"ha/d23/v1/body/response"
@@ -57,6 +59,16 @@ class DerivedKeys:
         raise KeyError(direction)
 
 
+@dataclass(frozen=True)
+class _DerivedMaterial:
+    keys: DerivedKeys
+    key_id: str
+
+
+_DERIVED_CACHE_LIMIT = 4
+_DERIVED_CACHE: OrderedDict[bytes, _DerivedMaterial] = OrderedDict()
+
+
 def _secret_bytes(secret: str) -> bytes:
     return secret.strip().encode("utf-8")
 
@@ -67,19 +79,38 @@ def _hkdf(secret: str, info: bytes, length: int) -> bytes:
     ).derive(_secret_bytes(secret))
 
 
+def _derived_material(secret: str) -> _DerivedMaterial:
+    """Return cached derivations keyed by the exact trimmed secret bytes."""
+    secret_b = _secret_bytes(secret)
+    material = _DERIVED_CACHE.get(secret_b)
+    if material is not None:
+        _DERIVED_CACHE.move_to_end(secret_b)
+        return material
+
+    material = _DerivedMaterial(
+        keys=DerivedKeys(
+            request=_hkdf(secret, INFO_REQUEST, KEY_BYTES),
+            response=_hkdf(secret, INFO_RESPONSE, KEY_BYTES),
+        ),
+        key_id=base64.urlsafe_b64encode(
+            _hkdf(secret, INFO_KEY_ID, KEY_ID_BYTES)
+        ).decode("ascii").rstrip("="),
+    )
+    _DERIVED_CACHE[secret_b] = material
+    _DERIVED_CACHE.move_to_end(secret_b)
+    while len(_DERIVED_CACHE) > _DERIVED_CACHE_LIMIT:
+        _DERIVED_CACHE.popitem(last=False)
+    return material
+
+
 def derive_keys(secret: str) -> DerivedKeys:
     """Derive the request and response AES-256 keys from ``secret``."""
-    return DerivedKeys(
-        request=_hkdf(secret, INFO_REQUEST, KEY_BYTES),
-        response=_hkdf(secret, INFO_RESPONSE, KEY_BYTES),
-    )
+    return _derived_material(secret).keys
 
 
 def key_id(secret: str) -> str:
     """Return the unpadded base64url identifier for ``secret``."""
-    return base64.urlsafe_b64encode(
-        _hkdf(secret, INFO_KEY_ID, KEY_ID_BYTES)
-    ).decode("ascii").rstrip("=")
+    return _derived_material(secret).key_id
 
 
 def _field(value: str | bytes, *, ascii_only: bool = False) -> bytes:
@@ -135,15 +166,16 @@ def seal(secret: str, direction: str, method: str, target: str | bytes,
 
 
 def open_(secret: str, direction: str, method: str, target: str | bytes,
-          wire: bytes, now_ms: int | None = None) -> bytes:
+          wire: bytes, now_ms: int | None = None, *,
+          require_version: bool = False) -> bytes:
     """Open a D23 envelope, checking version, length, skew, then its tag."""
     if not wire:
         raise D23Error("d23_missing")
     if wire[0] != VERSION:
-        # A clear JSON/text body is a missing envelope, not an unsupported
-        # binary envelope version. This keeps the refusal useful while still
-        # giving an actual version-shaped wire (for example 0x02) d23_version.
-        if wire[0] < 0x20 or wire[0] > 0x7e:
+        # The ASGI layer supplies the content type before asking for a strict
+        # envelope parse. Preserve the primitive's historical clear-text
+        # refusal for direct callers that have no such framing signal.
+        if require_version or wire[0] < 0x20 or wire[0] > ord("~"):
             raise D23Error("d23_version")
         raise D23Error("d23_missing")
     if len(wire) < HEADER_BYTES + TAG_BYTES:

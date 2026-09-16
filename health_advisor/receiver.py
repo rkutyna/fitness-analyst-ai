@@ -1223,11 +1223,23 @@ class _D23BodyTooLarge(Exception):
 class D23BodyAEADApp:
     """Raw ASGI body encryption around a fully constructed receiver app."""
 
-    def __init__(self, app, secret: str, mode: str, ctx=None):
+    _OWN_ATTRS = frozenset({
+        "_OWN_ATTRS", "app", "secret_for_request", "mode", "ctx",
+        "routes", "protected_routes",
+    })
+
+    def __init__(self, app, secret_for_request: Callable[[], str], mode: str,
+                 ctx=None):
         self.app = app
-        self.secret = secret
+        self.secret_for_request = secret_for_request
         self.mode = mode
         self.ctx = ctx
+
+    def __setattr__(self, name, value):
+        if name in type(self)._OWN_ATTRS:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.app, name, value)
 
     @property
     def routes(self):
@@ -1263,6 +1275,14 @@ class D23BodyAEADApp:
             if key.lower() == name:
                 return value
         return None
+
+    @classmethod
+    def _has_d23_content_type(cls, scope: dict) -> bool:
+        value = cls._header(cls._headers(scope), b"content-type")
+        if value is None:
+            return False
+        media_type = value.decode("latin-1").split(";", 1)[0].strip()
+        return media_type.lower() == body_aead.CONTENT_TYPE
 
     @classmethod
     def _body_expected(cls, scope: dict, body: bytes) -> bool:
@@ -1316,7 +1336,7 @@ class D23BodyAEADApp:
                     b"transfer-encoding"}
         result = [(key, value) for key, value in headers
                   if key.lower() not in excluded]
-        result.extend(((b"content-type", b"application/octet-stream"),
+        result.extend(((b"content-type", body_aead.CONTENT_TYPE.encode("ascii")),
                        (b"content-length", str(length).encode("ascii"))))
         return result
 
@@ -1332,6 +1352,8 @@ class D23BodyAEADApp:
         request_receive = receive
 
         if not exempt:
+            secret = self.secret_for_request()
+            has_d23_content_type = self._has_d23_content_type(scope)
             max_wire = (MAX_BODY_BYTES + body_aead.HEADER_BYTES + body_aead.TAG_BYTES
                         if self.mode == "required" else None)
             try:
@@ -1344,27 +1366,25 @@ class D23BodyAEADApp:
                 return
             if request_body is None:
                 return
-            if self._body_expected(scope, request_body):
-                first = request_body[0] if request_body else None
-                looks_like_wire = (first is not None and
-                                   (first == body_aead.VERSION or
-                                    first < 0x20 or first > 0x7e))
-                if looks_like_wire:
-                    try:
-                        request_body = body_aead.open_(
-                            self.secret, "request", scope["method"].upper(),
-                            target, request_body
-                        )
-                    except body_aead.D23Error as exc:
-                        await self._refusal(send, exc.code)
-                        return
-                    encrypted_request = True
-                elif self.mode == "required":
-                    await self._refusal(send, "d23_missing")
+            if has_d23_content_type:
+                if request_body is None:
                     return
+                try:
+                    request_body = body_aead.open_(
+                        secret, "request", scope["method"].upper(),
+                        target, request_body, require_version=True
+                    )
+                except body_aead.D23Error as exc:
+                    await self._refusal(send, exc.code)
+                    return
+                encrypted_request = True
             elif self.mode == "required" and scope.get("method", "").upper() != "GET":
                 await self._refusal(send, "d23_missing")
                 return
+            elif self._body_expected(scope, request_body):
+                # In off mode, and for a body-bearing GET in required mode,
+                # an unframed body is passed through exactly as received.
+                pass
 
             request_receive = self._replayed_receive(request_body)
             if encrypted_request:
@@ -1407,7 +1427,7 @@ class D23BodyAEADApp:
         if should_seal:
             plaintext = b"".join(response_body)
             sealed = body_aead.seal(
-                self.secret, "response", scope["method"].upper(), target,
+                secret, "response", scope["method"].upper(), target,
                 plaintext, time.time_ns() // 1_000_000
             )
             output_start = dict(start)
@@ -1450,8 +1470,11 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                ingest_guard: Callable[[], Response | None] | None = None,
                health_extra: Callable[[], dict] | None = None,
                apns_config: push.APNsConfig | None = None,
-               apns_sender=None) -> D23BodyAEADApp:
+               apns_sender=None,
+               secret_for_request: Callable[[], str] = _shared_secret_for_request) -> D23BodyAEADApp:
     """One receiver bound to one user's vault.
+
+    Returns an ASGI app whose `.app` is the completed FastAPI instance.
 
     A factory rather than a module-level `app` because the vault has to be
     chosen by the caller. The route body stays a module-level function taking
@@ -1459,7 +1482,6 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     """
     llm.assert_backend_approved()
     mode = _d23_mode()
-    secret = _shared_secret_for_request()
     app = FastAPI(title="Health Advisor Receiver", docs_url=None,
                   redoc_url=None, openapi_url=None)
     analyst_permit = asyncio.Semaphore(1)
@@ -1771,7 +1793,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     # Deliberately wrap the completed FastAPI result at raw ASGI level. This
     # outer placement covers Starlette's ServerErrorMiddleware, including its
     # generated 500 body, as well as every route wired above.
-    return D23BodyAEADApp(app, secret, mode, ctx)
+    return D23BodyAEADApp(app, secret_for_request, mode, ctx)
 
 
 def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:

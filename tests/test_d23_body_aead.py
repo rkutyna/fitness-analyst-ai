@@ -113,7 +113,7 @@ def test_health_docs_and_generated_500(monkeypatch, vault):
             assert client.get(path).status_code == 404
         failed = client.get("/test/boom")
     assert failed.status_code == 500
-    assert failed.headers["content-type"].startswith("application/octet-stream")
+    assert failed.headers["content-type"].startswith(body_aead.CONTENT_TYPE)
     assert int(failed.headers["content-length"]) == len(failed.content)
     opened = body_aead.open_("d23-test-secret", "response", "GET", b"/test/boom",
                              failed.content)
@@ -141,7 +141,10 @@ def test_off_accepts_clear_and_encrypted_bodies(monkeypatch, vault):
             b"sealed payload", time.time_ns() // 1_000_000,
             nonce=b"0123456789ab",
         )
-        sealed_response = client.post("/test/echo", content=encrypted)
+        sealed_response = client.post(
+            "/test/echo", content=encrypted,
+            headers={"content-type": body_aead.CONTENT_TYPE},
+        )
     assert plain_response.status_code == 200
     assert plain_response.content == clear
     assert sealed_response.status_code == 200
@@ -171,7 +174,10 @@ def test_required_round_trip_matches_plain_route(monkeypatch, vault):
             "d23-test-secret", "request", "POST", b"/test/echo", b"round trip",
             time.time_ns() // 1_000_000,
         )
-        response = client.post("/test/echo", content=request_wire)
+        response = client.post(
+            "/test/echo", content=request_wire,
+            headers={"content-type": body_aead.CONTENT_TYPE},
+        )
     assert response.status_code == 200
     assert body_aead.open_("d23-test-secret", "response", "POST",
                            b"/test/echo", response.content) == plain_response.content
@@ -186,6 +192,140 @@ def test_required_get_without_body_is_passed_then_response_is_sealed(monkeypatch
     assert body_aead.open_("d23-test-secret", "response", "GET",
                            b"/v1/ask/progress?progress_id=missing",
                            response.content)
+
+
+def test_required_bodyless_post_without_envelope_is_missing(monkeypatch, vault):
+    app = _app(monkeypatch, vault, "required")
+    with TestClient(app) as client:
+        response = client.post(
+            "/test/echo", content=b"",
+            headers={"content-length": "0"},
+        )
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"error": "d23_missing"}}
+
+
+def test_required_accepts_sealed_empty_post(monkeypatch, vault):
+    app = _app(monkeypatch, vault, "required")
+    wire = body_aead.seal(
+        "d23-test-secret", "request", "POST", b"/test/echo", b"",
+        time.time_ns() // 1_000_000,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/test/echo", content=wire,
+            headers={"content-type": body_aead.CONTENT_TYPE},
+        )
+    assert response.status_code == 200
+    assert body_aead.open_("d23-test-secret", "response", "POST",
+                           b"/test/echo", response.content) == b""
+
+
+def test_secret_rotation_uses_new_secret_per_request(monkeypatch, vault):
+    monkeypatch.setenv("HA_D23_MODE", "required")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "old-d23-test-secret")
+    current = {"value": "old-d23-test-secret"}
+    app = receiver.create_app(vault, secret_for_request=lambda: current["value"])
+
+    async def echo(request: Request):
+        return Response(await request.body(), media_type="application/octet-stream")
+
+    app.app.add_api_route("/test/echo", echo, methods=["POST"])
+
+    def wire(secret: str, plaintext: bytes) -> bytes:
+        return body_aead.seal(
+            secret, "request", "POST", b"/test/echo", plaintext,
+            time.time_ns() // 1_000_000,
+        )
+
+    old_wire = wire(current["value"], b"old")
+    old_key_id = body_aead.key_id(current["value"])
+    with TestClient(app) as client:
+        assert client.post(
+            "/test/echo", content=old_wire,
+            headers={"content-type": body_aead.CONTENT_TYPE},
+        ).status_code == 200
+
+        current["value"] = "new-d23-test-secret"
+        assert body_aead.key_id(current["value"]) != old_key_id
+        refused = client.post(
+            "/test/echo", content=old_wire,
+            headers={"content-type": body_aead.CONTENT_TYPE},
+        )
+        opened = client.post(
+            "/test/echo", content=wire(current["value"], b"new"),
+            headers={"content-type": body_aead.CONTENT_TYPE},
+        )
+    assert refused.status_code == 400
+    assert refused.json() == {"detail": {"error": "d23_decrypt"}}
+    assert body_aead.open_(current["value"], "response", "POST",
+                           b"/test/echo", opened.content) == b"new"
+
+
+def test_off_passes_gzip_and_json_bodies_untouched(monkeypatch, vault):
+    app = _app(monkeypatch, vault, "off")
+
+    async def echo(request: Request):
+        return Response(await request.body(), media_type="application/octet-stream")
+
+    app.app.add_api_route("/test/raw", echo, methods=["POST"])
+    gzip_body = b"\x1f\x8b\x08\x00not-an-envelope"
+    json_body = b'{"plain":true}'
+    with TestClient(app) as client:
+        gzip_response = client.post("/test/raw", content=gzip_body)
+        json_response = client.post(
+            "/test/raw", content=json_body,
+            headers={"content-type": "application/json; charset=utf-8"},
+        )
+    assert gzip_response.content == gzip_body
+    assert json_response.content == json_body
+
+
+def test_required_sealed_body_with_json_content_type_is_missing(monkeypatch, vault):
+    app = _app(monkeypatch, vault, "required")
+    wire = body_aead.seal(
+        "d23-test-secret", "request", "POST", b"/test/echo", b"payload",
+        time.time_ns() // 1_000_000,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/test/echo", content=wire,
+            headers={"content-type": "application/json"},
+        )
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"error": "d23_missing"}}
+
+
+@pytest.mark.parametrize("mode", ["off", "required"])
+def test_d23_content_type_wrong_version_is_refused(monkeypatch, vault, mode):
+    app = _app(monkeypatch, vault, mode)
+    wire = body_aead.seal(
+        "d23-test-secret", "request", "POST", b"/test/echo", b"payload",
+        time.time_ns() // 1_000_000,
+    )
+    wrong_version = bytes([2]) + wire[1:]
+    with TestClient(app) as client:
+        response = client.post(
+            "/test/echo", content=wrong_version,
+            headers={"content-type": "APPLICATION/X-HA-D23; charset=binary"},
+        )
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"error": "d23_version"}}
+
+
+@pytest.mark.parametrize("mode", ["off", "required"])
+def test_health_is_plaintext_json_in_both_modes(monkeypatch, vault, mode):
+    app = _app(monkeypatch, vault, mode)
+    with TestClient(app) as client:
+        response = client.get("/health")
+    assert response.status_code == 200
+    assert isinstance(response.json(), dict)
+
+
+def test_attribute_assignment_proxies_to_fastapi(monkeypatch, vault):
+    app = _app(monkeypatch, vault, "off")
+    app.some_new_attr = 1
+    assert app.app.some_new_attr == 1
 
 
 @pytest.mark.parametrize("case", [

@@ -76,21 +76,24 @@ and excludes the query, so binding it alone would give ``/v1/today?date=A`` and
 ``?date=B`` the same AAD. Build it from ``raw_path`` (or ``root_path + path``
 percent-encoded the same way) and the raw ``query_string``.
 
-Skew window: 600 seconds either side. THE SCOUTING NOTE'S DERIVATION IS WRONG
-AND THE NUMBER SURVIVES ANYWAY. It argued 10 minutes from a measured 364-second
-``/v1/ask``, but that 364 s is server processing: it happens after the request
-timestamp has already been checked and before the response is stamped, so it
-never enters the budget in either direction. What does enter is body transfer
-plus clock drift. An ingest page is around 8 MiB by the client's own estimate;
-at 200 kbit/s that is 335 s of upload before the receiver sees the first byte
-of the envelope, which a 300-second window would refuse. The failure of a
-too-tight window is the expensive one: a refused ingest makes the client
-withhold its HealthKit anchor and the sync stalls with no error anyone sees. A
-too-loose one buys a replay window against an adversary who already holds the
-ciphertext, where an ingest replay is idempotent by the dedupe identity and an
-ask replay re-asks a question whose answer is still unreadable. So: 600.
+Skew window: 600 seconds either side. Its budget is body transfer plus clock
+drift, not the measured 364-second ``/v1/ask`` server-processing interval. That
+processing happens after the request timestamp is checked and before the
+response is stamped, so it enters neither direction's budget. An ingest page is
+around 8 MiB by the client's own estimate; at 200 kbit/s that is 335 s of
+upload before the receiver sees the first byte of the envelope, which a
+300-second window would refuse. The failure of a too-tight window is the
+expensive one: a refused ingest makes the client withhold its HealthKit anchor
+and the sync stalls with no error anyone sees. A too-loose one buys a replay
+window against an adversary who already holds the ciphertext, where an ingest
+replay is idempotent by the dedupe identity and an ask replay re-asks a
+question whose answer is still unreadable. So: 600.
 
 Symmetric, because a phone clock can be fast as well as slow.
+
+Mutation criterion: changing one byte of ``INFO_REQUEST`` turns every ``ok``
+case in the request direction red; response-direction ``ok`` cases are not
+affected by that request-direction mutation.
 """
 from __future__ import annotations
 
@@ -106,6 +109,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 VERSION = 1
+CONTENT_TYPE = "application/x-ha-d23"
 HKDF_SALT = b"ha-d23-body-aead-v1"
 INFO_REQUEST = b"ha/d23/v1/body/request"
 INFO_RESPONSE = b"ha/d23/v1/body/response"
@@ -424,6 +428,7 @@ def build_document() -> dict:
             "and exposes an injectable nonce only to its tests.",
         ],
         "version": VERSION,
+        "content_type": CONTENT_TYPE,
         "algorithm": "AES-256-GCM",
         "kdf": "HKDF-SHA256",
         "hkdf_salt_b64": b64(HKDF_SALT),

@@ -11,6 +11,7 @@
     "and exposes an injectable nonce only to its tests."
   ],
   "version": 1,
+  "content_type": "application/x-ha-d23",
   "algorithm": "AES-256-GCM",
   "kdf": "HKDF-SHA256",
   "hkdf_salt_b64": "aGEtZDIzLWJvZHktYWVhZC12MQ==",

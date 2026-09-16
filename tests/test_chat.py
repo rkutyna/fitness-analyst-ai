@@ -1948,6 +1948,57 @@ def test_conversational_reply_with_digit_or_metric_is_refused(
     assert result["verification"]["reason"]
 
 
+@pytest.mark.parametrize("reply", ("Hello there 7", "Hello, jog_minutes is ready"))
+def test_refused_conversational_reply_reports_its_own_cause_not_empty_gather(
+        monkeypatch, vault, reply):
+    """#69 item 5: a conversational reply that fails its OWN check must be
+    distinguishable from a data question whose gather came back empty.
+
+    Both leave the ledger empty, so before this the refused reply fell
+    through to the ``not ledger`` branch and reported ``empty_gather`` —
+    "the model gathered nothing when it should have". Here the model
+    correctly gathered nothing; an empty ledger is the precondition of the
+    conversational path, not a fault in it. A client maps causes to
+    user-facing sentences and cannot tell the two apart.
+    """
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", lambda *args, **kwargs: reply)
+
+    result = chat.answer_question(vault, "Hello!")
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["cause"] == "conversational_refused"
+    assert result["verification"]["cause"] != "empty_gather"
+    assert "conversational_refused" in chat.ASK_CAUSES
+
+
+def test_accepted_and_refused_conversational_causes_are_distinct(
+        monkeypatch, vault):
+    """The two conversational outcomes must not collapse onto one cause.
+
+    Pinned as a pair so a change that makes every conversational turn report
+    ``conversational`` — which would restore #69 defect 2 in the opposite
+    direction, hiding a refusal behind the success label — goes red.
+    """
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: "Hello! How can I help?")
+    accepted = chat.answer_question(vault, "Hello!")
+
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: "Hello! Your jog_minutes await.")
+    refused = chat.answer_question(vault, "Hello!")
+
+    assert accepted["mode"] == "narration"
+    assert refused["mode"] == "fallback"
+    assert accepted["verification"]["cause"] == "conversational"
+    assert refused["verification"]["cause"] == "conversational_refused"
+    assert accepted["verification"]["cause"] != refused["verification"]["cause"]
+
+
 def test_no_tool_data_question_with_figure_free_reply_falls_back_without_repair(
         monkeypatch, vault):
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")

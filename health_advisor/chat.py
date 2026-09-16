@@ -399,6 +399,7 @@ ASK_CAUSES = (
     "conversational",
     "transport_failed",
     "backend_unavailable",
+    "conversational_refused",
     "empty_gather",
     "gate_refused",
     "no_gather_needed",
@@ -500,6 +501,14 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
     ``withheld_eligible_figure`` is a publisher-integrity refusal from the
     independent fact-set completeness walk. It outranks answer-level denial
     because the missing publication is the more fundamental event.
+
+    ``conversational`` means the turn took the conversational path at all —
+    not that it succeeded there. A turn that did splits on its own
+    verification into ``conversational`` and ``conversational_refused``, and
+    never reports ``empty_gather``: an empty ledger is the *precondition* of
+    that path, not a fault in it (#69). The loop-outcome causes above still
+    outrank both, so a conversational turn whose gather never reached a model
+    still reports ``transport_failed`` or ``backend_unavailable``.
     """
     if no_data_yet:
         return "no_data_yet"
@@ -510,8 +519,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "transport_failed"
     if answer_truncated or "answer_truncated" in families:
         return "answer_truncated"
-    if conversational and verification.get("ok"):
-        return "conversational"
+    if conversational:
+        return "conversational" if verification.get("ok") else "conversational_refused"
     if no_gather_needed:
         return "no_gather_needed"
     if not ledger:
@@ -1896,10 +1905,17 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             "template_compliant": False,
             "narration_counts_comparable": False,
         }
+        # `True` unconditionally: the flag says this turn TOOK the
+        # conversational path, not that it succeeded on it. Passing
+        # `conversational_ok` here made a refused conversational reply fall
+        # through to the `not ledger` branch and report `empty_gather` —
+        # which means "the model gathered nothing when it should have",
+        # the exact opposite of what happened (#69, defect 2). A client
+        # mapping causes to user-facing sentences cannot tell those apart.
         conversational_verification["cause"] = _ask_cause(
             conversational_verification, ledger=[],
             loop_outcomes=[gather_status],
-            conversational=conversational_ok)
+            conversational=True)
         _record_attempt(capture, 1, conversational_text, None,
                         conversational_verification, None, [])
         if conversational_ok:

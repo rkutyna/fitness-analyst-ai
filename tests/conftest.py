@@ -111,6 +111,16 @@ def _ncbi_contact(monkeypatch):
     monkeypatch.setenv("HA_NCBI_EMAIL", "tests@example.org")
 
 
+@pytest.fixture(autouse=True)
+def _d23_legacy_test_mode(monkeypatch):
+    """Keep pre-D23 unit tests explicit without weakening production startup.
+
+    D23 itself tests the unset and invalid values by removing this per-test
+    default before constructing an app.
+    """
+    monkeypatch.setenv("HA_D23_MODE", "off")
+
+
 @pytest.fixture
 def vault_path(tmp_path):
     """This test's vault file — the same path `conn` and `vault` use, so a test

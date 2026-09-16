@@ -32,7 +32,9 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from urllib.parse import quote
 from pathlib import Path
 
 from typing import Callable
@@ -57,6 +59,7 @@ from . import analyst_sandbox
 from . import analyst_corpus
 from . import push
 from . import ask_progress
+from . import body_aead
 
 logger = logging.getLogger(__name__)
 
@@ -1200,13 +1203,254 @@ def _require_ingest_secret(x_health_secret: str | None, *, request: Request | No
         state.ingest_secret_checked = True
 
 
+def _d23_mode() -> str:
+    """Return the explicitly configured body-encryption mode."""
+    mode = os.environ.get("HA_D23_MODE")
+    if mode in {"required", "off"}:
+        return mode
+    state = "unset" if mode is None else f"set to invalid value {mode!r}"
+    raise RuntimeError(
+        "D23 body encryption refuses to start: HA_D23_MODE is "
+        f"{state}; set it to 'required' or 'off'."
+    )
+
+
+class _D23BodyTooLarge(Exception):
+    def __init__(self, nbytes: int):
+        self.nbytes = nbytes
+
+
+class D23BodyAEADApp:
+    """Raw ASGI body encryption around a fully constructed receiver app."""
+
+    def __init__(self, app, secret: str, mode: str, ctx=None):
+        self.app = app
+        self.secret = secret
+        self.mode = mode
+        self.ctx = ctx
+
+    @property
+    def routes(self):
+        return self.app.routes
+
+    @property
+    def protected_routes(self):
+        return tuple(route for route in self.app.routes
+                     if getattr(route, "path", None) != "/health")
+
+    def __getattr__(self, name):
+        return getattr(self.app, name)
+
+    @staticmethod
+    def _target(scope: dict) -> bytes:
+        raw_path = scope.get("raw_path")
+        if raw_path is None:
+            decoded_path = scope.get("root_path", "") + scope.get("path", "")
+            raw_path = quote(
+                decoded_path, safe="/:@-._~!$&'()*+,;="
+            ).encode("ascii")
+        query = scope.get("query_string", b"")
+        return raw_path + (b"?" + query if query else b"")
+
+    @staticmethod
+    def _headers(scope: dict) -> list[tuple[bytes, bytes]]:
+        return list(scope.get("headers", []))
+
+    @staticmethod
+    def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
+        name = name.lower()
+        for key, value in headers:
+            if key.lower() == name:
+                return value
+        return None
+
+    @classmethod
+    def _body_expected(cls, scope: dict, body: bytes) -> bool:
+        if body:
+            return True
+        declared = cls._header(cls._headers(scope), b"content-length")
+        if declared is not None:
+            try:
+                return int(declared) > 0
+            except ValueError:
+                return True
+        return scope.get("method", "").upper() != "GET"
+
+    @staticmethod
+    async def _read_body(receive, max_bytes: int | None = None):
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return None
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise _D23BodyTooLarge(total)
+            chunks.append(chunk)
+            if not message.get("more_body", False):
+                return b"".join(chunks)
+
+    @staticmethod
+    def _replayed_receive(body: bytes):
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                # Starlette probes receive() after consuming a body when it
+                # checks whether the client disconnected. A synthetic
+                # disconnect here would mark every buffered request as lost.
+                return {"type": "http.request", "body": b"", "more_body": False}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return receive
+
+    @staticmethod
+    def _sealed_headers(headers: list[tuple[bytes, bytes]], length: int):
+        excluded = {b"content-length", b"content-type", b"content-encoding",
+                    b"transfer-encoding"}
+        result = [(key, value) for key, value in headers
+                  if key.lower() not in excluded]
+        result.extend(((b"content-type", b"application/octet-stream"),
+                       (b"content-length", str(length).encode("ascii"))))
+        return result
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        target = self._target(scope)
+        exempt = scope.get("path") == "/health"
+        request_body = None
+        encrypted_request = False
+        request_receive = receive
+
+        if not exempt:
+            max_wire = (MAX_BODY_BYTES + body_aead.HEADER_BYTES + body_aead.TAG_BYTES
+                        if self.mode == "required" else None)
+            try:
+                request_body = await self._read_body(receive, max_wire)
+            except _D23BodyTooLarge as exc:
+                if self.ctx is not None:
+                    _log_reject(self.ctx, "body too large", exc.nbytes)
+                await self._status_refusal(send, 413,
+                                            f"body too large: {exc.nbytes} bytes")
+                return
+            if request_body is None:
+                return
+            if self._body_expected(scope, request_body):
+                first = request_body[0] if request_body else None
+                looks_like_wire = (first is not None and
+                                   (first == body_aead.VERSION or
+                                    first < 0x20 or first > 0x7e))
+                if looks_like_wire:
+                    try:
+                        request_body = body_aead.open_(
+                            self.secret, "request", scope["method"].upper(),
+                            target, request_body
+                        )
+                    except body_aead.D23Error as exc:
+                        await self._refusal(send, exc.code)
+                        return
+                    encrypted_request = True
+                elif self.mode == "required":
+                    await self._refusal(send, "d23_missing")
+                    return
+            elif self.mode == "required" and scope.get("method", "").upper() != "GET":
+                await self._refusal(send, "d23_missing")
+                return
+
+            request_receive = self._replayed_receive(request_body)
+            if encrypted_request:
+                scope = dict(scope)
+                headers = [(key, value) for key, value in self._headers(scope)
+                           if key.lower() not in {b"content-length", b"content-type"}]
+                headers.extend(((b"content-type", b"application/octet-stream"),
+                                (b"content-length", str(len(request_body)).encode("ascii"))))
+                scope["headers"] = headers
+
+        messages: list[dict] = []
+        response_body: list[bytes] = []
+
+        async def capture(message):
+            if message["type"] == "http.response.body":
+                response_body.append(message.get("body", b""))
+            messages.append(message)
+
+        pending_error = None
+        try:
+            await self.app(scope, request_receive, capture)
+        except BaseException as exc:  # ServerErrorMiddleware sends before re-raising.
+            pending_error = exc
+
+        if not messages:
+            if pending_error is not None:
+                raise pending_error
+            return
+
+        start = next((message for message in messages
+                      if message["type"] == "http.response.start"), None)
+        if start is None:
+            for message in messages:
+                await send(message)
+            if pending_error is not None:
+                raise pending_error
+            return
+
+        should_seal = not exempt and (self.mode == "required" or encrypted_request)
+        if should_seal:
+            plaintext = b"".join(response_body)
+            sealed = body_aead.seal(
+                self.secret, "response", scope["method"].upper(), target,
+                plaintext, time.time_ns() // 1_000_000
+            )
+            output_start = dict(start)
+            output_start["headers"] = self._sealed_headers(
+                list(start.get("headers", [])), len(sealed)
+            )
+            await send(output_start)
+            await send({"type": "http.response.body", "body": sealed,
+                        "more_body": False})
+        else:
+            for message in messages:
+                await send(message)
+
+        if pending_error is not None:
+            raise pending_error
+
+    @staticmethod
+    async def _refusal(send, code: str):
+        body = json.dumps({"detail": {"error": code}},
+                          separators=(",", ":")).encode("utf-8")
+        await send({"type": "http.response.start", "status": 400,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode("ascii"))]})
+        await send({"type": "http.response.body", "body": body,
+                    "more_body": False})
+
+    @staticmethod
+    async def _status_refusal(send, status: int, detail: str):
+        body = json.dumps({"detail": detail}, separators=(",", ":")).encode("utf-8")
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode("ascii"))]})
+        await send({"type": "http.response.body", "body": body,
+                    "more_body": False})
+
+
 def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                analyst_executor_factory=analyst_sandbox.default_executor,
                analyst_corpus_path: str | None = None,
                ingest_guard: Callable[[], Response | None] | None = None,
                health_extra: Callable[[], dict] | None = None,
                apns_config: push.APNsConfig | None = None,
-               apns_sender=None) -> FastAPI:
+               apns_sender=None) -> D23BodyAEADApp:
     """One receiver bound to one user's vault.
 
     A factory rather than a module-level `app` because the vault has to be
@@ -1214,7 +1458,10 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     `ctx` first; only the FastAPI wiring lives in here.
     """
     llm.assert_backend_approved()
-    app = FastAPI(title="Health Advisor Receiver")
+    mode = _d23_mode()
+    secret = _shared_secret_for_request()
+    app = FastAPI(title="Health Advisor Receiver", docs_url=None,
+                  redoc_url=None, openapi_url=None)
     analyst_permit = asyncio.Semaphore(1)
     if apns_sender is None and apns_config is not None:
         apns_sender = push.APNsSender(
@@ -1521,7 +1768,10 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         # status literal that a client could mistake for delivery.
         return response
 
-    return app
+    # Deliberately wrap the completed FastAPI result at raw ASGI level. This
+    # outer placement covers Starlette's ServerErrorMiddleware, including its
+    # generated 500 body, as well as every route wired above.
+    return D23BodyAEADApp(app, secret, mode, ctx)
 
 
 def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:

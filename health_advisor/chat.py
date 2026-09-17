@@ -2801,6 +2801,25 @@ def get_undelivered_turn(
     Recovery is intentionally keyed: a missing ``progress_id`` never selects
     a legacy or otherwise unrelated disconnected turn. Legacy rows with a
     NULL key therefore remain unreachable through this recovery API.
+
+    The key is the whole of the authority, and deliberately so. This
+    selection also required ``client_disconnected_at IS NOT NULL`` until
+    #75 — a safety that belonged to the *unkeyed* fetch it replaced, which
+    returned the vault's oldest stranded answer and so needed some evidence
+    that an answer had in fact been stranded. Keyed, that clause selects
+    nothing extra, and it costs availability wherever an intermediary sits
+    between the client and this process: a CDN tunnel holds its own
+    connection to the origin open for the whole request, so the ask route's
+    ``await request.is_disconnected()`` is False, the column is never
+    written, and no keyed fetch can ever match. Measured against a
+    deployment behind one — the answer was stored under the caller's own
+    ``progress_id`` and was unreachable, while the identical client and
+    gesture against the origin port recovered it.
+
+    The column is still written, and still means what it meant: an observed
+    transport event, used by ``_render_history`` to keep an answer the user
+    never saw out of the model's view of the conversation. Only the
+    recovery selection stops depending on it.
     """
     conn = ctx.read_only()
     try:
@@ -2814,7 +2833,7 @@ def get_undelivered_turn(
             return None
         row = conn.execute(
             f"SELECT {_turn_select(conn)} FROM conversation_turns "
-            "WHERE role = 'assistant' AND client_disconnected_at IS NOT NULL "
+            "WHERE role = 'assistant' "
             "AND delivered_at IS NULL AND progress_id = ? "
             "ORDER BY created_at ASC, id ASC LIMIT 1",
             (progress_id,),

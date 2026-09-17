@@ -50,6 +50,54 @@ def test_get_returns_a_disconnected_undelivered_turn(vault, monkeypatch):
     assert body["mode"] == "narration"
 
 
+def test_get_returns_a_keyed_turn_the_transport_never_reported_lost(
+        vault, monkeypatch):
+    """#75: an intermediary can hide the disconnect; the key still finds it.
+
+    A CDN tunnel holds its own connection to the origin open for the whole
+    request, so the ask route's ``is_disconnected()`` is False and
+    ``client_disconnected_at`` is never written — while the client that
+    actually went away is asking for exactly this ``progress_id``. Keyed
+    recovery must not depend on a transport signal the deployment can
+    swallow. Mutation: restore ``client_disconnected_at IS NOT NULL`` to the
+    selection and this goes red while every other case here stays green.
+    """
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+    conversation = chat.create_conversation(vault, conversation_id="tunnelled")
+    question = chat.append_turn(vault, conversation["id"], "user", "q")
+    answer = chat.append_turn(
+        vault, conversation["id"], "assistant", "answer",
+        answers_turn_id=question["id"],
+        client_disconnected_at=None,
+        progress_id="tunnelled-progress", mode="narration")
+
+    with TestClient(receiver.create_app(vault)) as client:
+        keyed = client.get(
+            "/v1/ask/undelivered",
+            params={"progress_id": "tunnelled-progress"}, headers=HEADERS)
+        unkeyed = client.get("/v1/ask/undelivered", headers=HEADERS)
+        wrong_key = client.get(
+            "/v1/ask/undelivered",
+            params={"progress_id": "someone-elses"}, headers=HEADERS)
+        marked = client.post(
+            "/v1/ask/delivered", json={"turn_id": answer["id"]}, headers=HEADERS)
+        after = client.get(
+            "/v1/ask/undelivered",
+            params={"progress_id": "tunnelled-progress"}, headers=HEADERS)
+
+    assert keyed.status_code == 200, keyed.text
+    body = keyed.json()
+    assert body["id"] == answer["id"]
+    assert body["client_disconnected_at"] is None
+    assert body["progress_id"] == "tunnelled-progress"
+    assert body["mode"] == "narration"
+    # The key is the whole of the authority, so the two ways of not having
+    # it must still select nothing.
+    assert (unkeyed.json(), wrong_key.json()) == ({}, {})
+    assert marked.status_code == 200, marked.text
+    assert after.json() == {}
+
+
 def test_get_does_not_return_a_delivered_turn(vault, monkeypatch):
     monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
     conversation = chat.create_conversation(vault, conversation_id="recover-two")

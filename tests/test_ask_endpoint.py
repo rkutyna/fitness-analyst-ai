@@ -453,3 +453,94 @@ def test_the_response_carries_no_fabricated_completion_fields(
     assert body["mode"] == "fallback"
     assert body["conversation_id"]
     assert "verification" in body and "provenance" in body
+
+
+def test_conversation_route_returns_verbatim_answers_modes_and_unlinked_turns(
+        monkeypatch, vault):
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+    conversation = chat.create_conversation(vault, conversation_id="route-shape")
+    fallback = chat.append_turn(
+        vault, conversation["id"], "assistant", "  answer\nwith space  ",
+        mode="fallback")
+    question = chat.append_turn(
+        vault, conversation["id"], "user", "stored question")
+    linked = chat.append_turn(
+        vault, conversation["id"], "assistant", "linked answer",
+        answers_turn_id=question["id"], attachments=[{"kind": "note"}])
+    unlinked = chat.append_turn(
+        vault, conversation["id"], "assistant", "unlinked answer")
+
+    with TestClient(receiver.create_app(vault)) as client:
+        response = client.get("/v1/conversation", headers={
+            "x-health-secret": "ask-secret"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["next_before"] is None
+    by_id = {turn["turn_id"]: turn for turn in body["turns"]}
+    assert by_id[fallback["id"]]["answer"] == "  answer\nwith space  "
+    assert by_id[fallback["id"]]["mode"] == "fallback"
+    assert by_id[fallback["id"]]["question"] is None
+    assert by_id[unlinked["id"]]["question"] is None
+    assert by_id[unlinked["id"]]["mode"] is None
+    assert by_id[linked["id"]]["question"] == "stored question"
+    assert by_id[linked["id"]]["attachments"] == [{"kind": "note"}]
+    assert set(by_id[fallback["id"]]) == {
+        "turn_id", "conversation_id", "asked_at", "answered_at",
+        "question", "answer", "mode", "delivered_at", "attachments",
+    }
+
+
+def test_conversation_route_auth_matches_undelivered(monkeypatch, vault):
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+
+    with TestClient(receiver.create_app(vault)) as client:
+        missing = client.get("/v1/conversation")
+        wrong = client.get(
+            "/v1/conversation", headers={"x-health-secret": "wrong-secret"})
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+
+
+def test_empty_conversation_route_has_no_cursor(monkeypatch, vault):
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+
+    with TestClient(receiver.create_app(vault)) as client:
+        response = client.get(
+            "/v1/conversation", headers={"x-health-secret": "ask-secret"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"turns": [], "next_before": None}
+
+
+def test_conversation_route_cursor_walk_returns_each_turn_once(monkeypatch, vault):
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+    conversation = chat.create_conversation(vault, conversation_id="route-pages")
+    written = []
+    for index in range(5):
+        question = chat.append_turn(
+            vault, conversation["id"], "user", f"question-{index}")
+        written.append(chat.append_turn(
+            vault, conversation["id"], "assistant", f"answer-{index}",
+            answers_turn_id=question["id"]))
+
+    seen = []
+    before = None
+    with TestClient(receiver.create_app(vault)) as client:
+        while True:
+            response = client.get(
+                "/v1/conversation",
+                params={"limit": 2, **({"before": before} if before else {})},
+                headers={"x-health-secret": "ask-secret"})
+            assert response.status_code == 200, response.text
+            body = response.json()
+            page_ids = [turn["turn_id"] for turn in body["turns"]]
+            seen.extend(page_ids)
+            if body["next_before"] is None:
+                break
+            before = body["next_before"]
+
+    assert len(seen) == 5
+    assert len(set(seen)) == 5
+    assert set(seen) == {turn["id"] for turn in written}

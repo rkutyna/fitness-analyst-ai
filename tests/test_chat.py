@@ -924,6 +924,7 @@ def test_chat_reads_empty_vault_without_conversation_tables(tmp_path):
     assert chat.list_conversations(ctx) == []
     assert chat.get_conversation(ctx, "missing") is None
     assert chat.list_turns(ctx, "missing") == []
+    assert chat.list_recent_turns(ctx, limit=20) == []
     with pytest.raises(KeyError, match=r"unknown conversation: missing"):
         chat.append_turn(ctx, "missing", "user", "hello")
 
@@ -1053,6 +1054,117 @@ def test_superseded_turn_stays_in_store_but_not_rendered(vault):
     rendered = chat._render_history(stored)
     assert "USER: old question" not in rendered
     assert "USER: replacement question" in rendered
+
+
+def _recent_pair(vault, conversation_id, question, answer, **kwargs):
+    question_turn = chat.append_turn(
+        vault, conversation_id, "user", question)
+    return chat.append_turn(
+        vault, conversation_id, "assistant", answer,
+        answers_turn_id=question_turn["id"], **kwargs)
+
+
+def _insert_recent_pair(conn, conversation_id, index, question_at, answer_at):
+    question_id = f"question-{index}"
+    answer_id = f"answer-{index}"
+    conn.execute(
+        "INSERT INTO conversation_turns "
+        "(id, conversation_id, sequence, role, content, created_at, "
+        "answers_turn_id, delivered_at, mode, attachments_json) "
+        "VALUES (?, ?, ?, 'user', ?, ?, NULL, NULL, NULL, '[]')",
+        (question_id, conversation_id, index * 2 + 1,
+         f"question-{index}", question_at),
+    )
+    conn.execute(
+        "INSERT INTO conversation_turns "
+        "(id, conversation_id, sequence, role, content, created_at, "
+        "answers_turn_id, delivered_at, mode, attachments_json) "
+        "VALUES (?, ?, ?, 'assistant', ?, ?, ?, NULL, NULL, '[]')",
+        (answer_id, conversation_id, index * 2 + 2,
+         f"answer-{index}", answer_at, question_id),
+    )
+    conn.commit()
+    return {"id": answer_id, "question_id": question_id}
+
+
+def test_list_recent_turns_returns_newest_first(vault, conn):
+    conversation = chat.create_conversation(vault, conversation_id="recent-order")
+    written = [
+        _insert_recent_pair(
+            conn, conversation["id"], i,
+            f"2026-01-01T00:00:{i * 2 + 1:02d}+00:00",
+            f"2026-01-01T00:00:{i * 2 + 2:02d}+00:00")
+        for i in range(3)
+    ]
+
+    recent = chat.list_recent_turns(vault, limit=3)
+
+    assert [turn["turn_id"] for turn in recent] == [
+        written[2]["id"], written[1]["id"], written[0]["id"]
+    ]
+    assert [turn["question"] for turn in recent] == [
+        "question-2", "question-1", "question-0"
+    ]
+
+
+def test_list_recent_turns_paging_terminates_without_repeating(vault, conn):
+    conversation = chat.create_conversation(vault, conversation_id="recent-pages")
+    written = [
+        _insert_recent_pair(
+            conn, conversation["id"], i,
+            f"2026-01-02T00:00:{i * 2 + 1:02d}+00:00",
+            f"2026-01-02T00:00:{i * 2 + 2:02d}+00:00")
+        for i in range(5)
+    ]
+
+    seen = []
+    before = None
+    while True:
+        page = chat.list_recent_turns(vault, limit=2, before=before)
+        seen.extend(turn["turn_id"] for turn in page)
+        if len(page) < 2:
+            break
+        before = page[-1]["turn_id"]
+
+    assert seen == [turn["id"] for turn in reversed(written)]
+    assert len(set(seen)) == 5
+    assert set(seen) == {turn["id"] for turn in written}
+
+
+def test_list_recent_turns_tie_on_created_at_still_pages(vault, conn):
+    conversation = chat.create_conversation(vault, conversation_id="recent-tie")
+    first = _insert_recent_pair(
+        conn, conversation["id"], 1,
+        "2026-01-03T00:00:01+00:00", "2026-01-03T00:00:02+00:00")
+    second = _insert_recent_pair(
+        conn, conversation["id"], 2,
+        "2026-01-03T00:00:03+00:00", "2026-01-03T00:00:02+00:00")
+
+    first_page = chat.list_recent_turns(vault, limit=1)
+    second_page = chat.list_recent_turns(
+        vault, limit=1, before=first_page[-1]["turn_id"])
+
+    assert {first_page[0]["turn_id"], second_page[0]["turn_id"]} == {
+        first["id"], second["id"]
+    }
+    assert first_page[0]["turn_id"] != second_page[0]["turn_id"]
+
+
+def test_list_recent_turns_unknown_before_is_empty(vault):
+    conversation = chat.create_conversation(vault, conversation_id="recent-unknown")
+    _recent_pair(vault, conversation["id"], "question", "answer")
+
+    assert chat.list_recent_turns(vault, limit=20, before="missing-turn") == []
+
+
+def test_list_recent_turns_clamps_limit(vault):
+    conversation = chat.create_conversation(vault, conversation_id="recent-limit")
+    for index in range(101):
+        chat.append_turn(vault, conversation["id"], "assistant", f"answer-{index}")
+
+    assert len(chat.list_recent_turns(vault, limit=0)) == 1
+    assert len(chat.list_recent_turns(vault, limit=-1)) == 1
+    assert len(chat.list_recent_turns(vault, limit=10_000)) == 100
 
 
 ASK_LEDGER_FIXTURE = (Path(__file__).parent

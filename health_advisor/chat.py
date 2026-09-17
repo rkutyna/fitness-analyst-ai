@@ -2793,6 +2793,74 @@ def list_turns(ctx: VaultContext, conversation_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
+def list_recent_turns(
+    ctx: VaultContext, *, limit: int, before: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return stored assistant answers, newest first, across the vault."""
+    limit = max(1, min(100, limit))
+    conn = ctx.read_only()
+    try:
+        if not _has_table(conn, "conversation_turns"):
+            return []
+
+        # Keep the read compatible with vaults from before each additive turn
+        # column existed. The subqueries give both sides of the join the same
+        # stable shape as _turn_rows without asking SQLite for absent columns.
+        selected = _turn_select(conn)
+        turns = f"(SELECT {selected} FROM conversation_turns)"
+        before_order: tuple[str, str] | None = None
+        if before is not None:
+            before_row = conn.execute(
+                f"SELECT created_at, id FROM {turns} "
+                "WHERE role = 'assistant' AND id = ?",
+                (before,),
+            ).fetchone()
+            if before_row is None:
+                return []
+            before_order = (before_row["created_at"], before_row["id"])
+
+        predicates = ["a.role = 'assistant'"]
+        parameters: list[Any] = []
+        if before_order is not None:
+            created_at, turn_id = before_order
+            predicates.append(
+                "(a.created_at < ? OR "
+                "(a.created_at = ? AND a.id < ?))"
+            )
+            parameters.extend([created_at, created_at, turn_id])
+
+        rows = conn.execute(
+            "SELECT a.id AS turn_id, a.conversation_id, "
+            "q.created_at AS asked_at, a.created_at AS answered_at, "
+            "q.content AS question, a.content AS answer, a.mode, "
+            "a.delivered_at, a.attachments_json "
+            f"FROM {turns} AS a LEFT JOIN {turns} AS q "
+            "ON q.id = a.answers_turn_id "
+            f"WHERE {' AND '.join(predicates)} "
+            "ORDER BY a.created_at DESC, a.id DESC LIMIT ?",
+            (*parameters, limit),
+        ).fetchall()
+
+        recent = []
+        for row in rows:
+            turn = {
+                "turn_id": row["turn_id"],
+                "conversation_id": row["conversation_id"],
+                "asked_at": row["asked_at"],
+                "answered_at": row["answered_at"],
+                "question": row["question"],
+                "answer": row["answer"],
+                "mode": row["mode"],
+                "delivered_at": row["delivered_at"],
+                "attachments_json": row["attachments_json"],
+            }
+            _decode_turn_attachments(turn)
+            recent.append(turn)
+        return recent
+    finally:
+        conn.close()
+
+
 def get_undelivered_turn(
     ctx: VaultContext, progress_id: str | None = None,
 ) -> dict[str, Any] | None:

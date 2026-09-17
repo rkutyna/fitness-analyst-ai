@@ -1585,6 +1585,18 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         _require_ask_secret(x_health_secret)
         return chat.get_undelivered_turn(ctx, progress_id=progress_id) or {}
 
+    @app.get("/v1/conversation")
+    def conversation_route(
+            limit: int = 20, before: str | None = None,
+            x_health_secret: str | None = Header(default=None)):
+        _require_ask_secret(x_health_secret)
+        effective_limit = max(1, min(100, limit))
+        turns = chat.list_recent_turns(
+            ctx, limit=effective_limit, before=before)
+        next_before = (
+            turns[-1]["turn_id"] if len(turns) == effective_limit else None)
+        return {"turns": turns, "next_before": next_before}
+
     @app.post("/v1/ask/delivered")
     def delivered_route(raw: bytes = Depends(_raw_body),
                         x_health_secret: str | None = Header(default=None)):

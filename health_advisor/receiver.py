@@ -1315,18 +1315,19 @@ class D23BodyAEADApp:
                 return b"".join(chunks)
 
     @staticmethod
-    def _replayed_receive(body: bytes):
+    def _replayed_receive(body: bytes, original_receive):
         sent = False
 
         async def receive():
             nonlocal sent
-            if sent:
-                # Starlette probes receive() after consuming a body when it
-                # checks whether the client disconnected. A synthetic
-                # disconnect here would mark every buffered request as lost.
-                return {"type": "http.request", "body": b"", "more_body": False}
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
+            if not sent:
+                sent = True
+                # The first call replays the buffered body. Every later call
+                # is the client's own signal, so it can reach the route. A
+                # synthetic post-body request would hide disconnect; a
+                # synthetic disconnect would mark every buffered request lost.
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await original_receive()
 
         return receive
 
@@ -1386,7 +1387,7 @@ class D23BodyAEADApp:
                 # an unframed body is passed through exactly as received.
                 pass
 
-            request_receive = self._replayed_receive(request_body)
+            request_receive = self._replayed_receive(request_body, receive)
             if encrypted_request:
                 scope = dict(scope)
                 headers = [(key, value) for key, value in self._headers(scope)

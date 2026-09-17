@@ -1,6 +1,7 @@
 """D23 body-AEAD contract and receiver-boundary tests."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -77,6 +78,89 @@ def _app(monkeypatch, vault, mode: str):
 
     app.app.add_api_route("/test/echo", echo, methods=["POST"])
     return app
+
+
+def _disconnect_scope():
+    return {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/test/disconnect",
+        "raw_path": b"/test/disconnect",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-length", b"16")],
+    }
+
+
+def _body_then_disconnect(calls=None):
+    messages = [
+        {"type": "http.request", "body": b"0123456789abcdef",
+         "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():
+        if calls is not None:
+            calls.append(len(calls) + 1)
+        return messages.pop(0)
+
+    return receive
+
+
+async def _disconnect_probe(scope, receive, send):
+    request = Request(scope, receive)
+    await request.body()
+    disconnected = await request.is_disconnected()
+    result = b"true" if disconnected else b"false"
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-length", str(len(result)).encode())]})
+    await send({"type": "http.response.body", "body": result,
+                "more_body": False})
+
+
+async def _run_disconnect_probe(app, receive=None):
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    await app(_disconnect_scope(), receive or _body_then_disconnect(), send)
+    return next(message["body"] for message in sent
+                if message["type"] == "http.response.body")
+
+
+def test_disconnect_reaches_route_with_or_without_body_layer():
+    bare = asyncio.run(_run_disconnect_probe(_disconnect_probe))
+    wrapped = receiver.D23BodyAEADApp(
+        _disconnect_probe, lambda: "d23-test-secret", "off")
+    behind_layer = asyncio.run(_run_disconnect_probe(wrapped))
+    assert bare == b"true"
+    assert behind_layer == b"true"
+
+
+def test_buffered_body_is_cached_for_a_second_request_read():
+    observed = []
+    source_calls = []
+
+    async def handler(scope, receive, send):
+        request = Request(scope, receive)
+        first = await request.body()
+        second = await request.body()
+        observed.append((first, second))
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-length", b"0")]})
+        await send({"type": "http.response.body", "body": b"",
+                    "more_body": False})
+
+    wrapped = receiver.D23BodyAEADApp(
+        handler, lambda: "d23-test-secret", "off")
+    asyncio.run(asyncio.wait_for(
+        _run_disconnect_probe(wrapped, _body_then_disconnect(source_calls)),
+        timeout=1))
+    assert observed == [(b"0123456789abcdef", b"0123456789abcdef")]
+    assert source_calls == [1]
 
 
 def test_route_coverage_is_the_completed_router(monkeypatch, vault):

@@ -290,9 +290,50 @@ def _calendar_window_config(ctx: VaultContext, question: str,
     }, resolved
 
 
-def _render_ask_calendar_dates(calendar_dates: tuple[date, date]) -> str:
-    """Tell the model which date is current and where unqualified periods end."""
+def _ask_calendar_today_is_declared(ctx: VaultContext,
+                                   as_of: str | None) -> bool:
+    """Say whether the prompt's current date came from a zone we can name.
+
+    #439: ``analysis._today`` falls back to the HOST date when the vault
+    declares no ``local_timezone``, and every host this project deploys to
+    runs UTC — so between 20:00 and 23:59 in a UTC-4 zone that date is already
+    tomorrow, for four hours every evening, invisibly.  An explicit ``as_of``
+    is not a clock reading at all and is always trustworthy.
+    """
+    if as_of is not None:
+        return True
+    if not os.path.exists(ctx.db_path):
+        return False
+    conn = ctx.read_only()
+    try:
+        return vault.local_timezone(conn) is not None
+    finally:
+        conn.close()
+
+
+def _render_ask_calendar_dates(calendar_dates: tuple[date, date],
+                               today_is_declared: bool = True) -> str:
+    """Tell the model which date is current and where unqualified periods end.
+
+    #439 Done-when 5.  When the vault declares no timezone the current date is
+    the host's, whose zone the reader cannot know — so it is **withheld** rather
+    than annotated, and only the most recent day with data is stated.  That
+    half is unaffected by the defect: it comes from ``MAX(date)`` in
+    ``daily_metrics``, which is a date and not a clock.  Withholding a figure
+    we cannot vouch for is the same rule the withheld-answer card follows; a
+    bare date whose zone is unknowable is what made this silent for four hours
+    of every evening.  A vault that declares its zone renders exactly as before,
+    and every standing vault does — ``deploy/bootstrap.py`` refuses to create
+    one without a zone.
+    """
     today, horizon = calendar_dates
+    if not today_is_declared:
+        return (
+            f"MOST RECENT DAY WITH DATA: {horizon}. "
+            "Unless the user names a period, \"recent\", \"lately\" and "
+            "\"how has it been\" end at that date, not at some earlier date. "
+            "This vault declares no timezone, so no current date is stated."
+        )
     if today == horizon:
         return (
             f"CURRENT DATE AND MOST RECENT DAY WITH DATA: {today}. "
@@ -2277,7 +2318,9 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         prompt += rendered_history + "\n\n"
     if rendered_facts:
         prompt += rendered_facts + "\n\n"
-    prompt += _render_ask_calendar_dates(calendar_dates) + "\n\n"
+    prompt += _render_ask_calendar_dates(
+        calendar_dates,
+        _ask_calendar_today_is_declared(ctx, as_of)) + "\n\n"
     fact_template_enabled = _fact_template_enabled()
     if resolved_window is not None:
         if isinstance(resolved_window, tuple):

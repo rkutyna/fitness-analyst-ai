@@ -5,7 +5,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -29,6 +29,19 @@ def _seed_model_path_vault(conn):
 
 def test_first_question_prompt_is_unchanged_without_history(monkeypatch, vault,
                                                             conn):
+    # #439: this vault declares its zone, as every deployed vault does since
+    # `deploy/bootstrap.py` began refusing to create one without it. An
+    # undeclared vault deliberately renders a DIFFERENT line — the current date
+    # is withheld rather than stated in an unknowable zone — and that case has
+    # its own test below. Without this the expectation here would silently be
+    # measuring the undeclared branch.
+    #
+    # The commit is load-bearing and is the whole trap: `ctx.read_only()` opens
+    # its OWN connection, so an uncommitted write on the `conn` fixture is
+    # invisible to the code under test. Elsewhere in this file a following
+    # `seed_metric` happens to commit and hides that; here nothing would.
+    vaultmod.set_local_timezone(conn, "America/New_York")
+    conn.commit()
     prompts = []
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
     monkeypatch.setattr(llm, "tool_loop",
@@ -2240,3 +2253,112 @@ def test_malformed_advice_without_a_ledger_still_gets_one_repair(
     assert result["verification"]["retry"] is True
     assert result["verification"]["advice_quantities"] == ["3 rounds"]
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# #439: the vault's zone, not the host's, decides the prompt's current date.
+#
+# `analysis._today` reads `vault.local_timezone` and falls back to the HOST
+# date.  Every host this project deploys to runs UTC, so for the four hours
+# between 20:00 and midnight in a UTC-4 zone the fallback is already tomorrow
+# — the exact window in which the evening review runs and a user asks
+# questions.  It is invisible for the other twenty hours, which is why it
+# needs a frozen clock rather than an observation.
+#
+# The instant below is 2026-09-18T03:30Z, which is 2026-09-17 23:30 in
+# America/New_York (EDT, UTC-4).  The local date and the UTC date differ, so
+# every assertion here can tell them apart.
+_LATE_EVENING_UTC = datetime(2026, 9, 18, 3, 30, tzinfo=timezone.utc)
+_LOCAL_DATE = "2026-09-17"
+_UTC_DATE = "2026-09-18"
+
+
+class _FrozenDateTime(datetime):
+    """A real instant, converted honestly into whichever zone is asked for."""
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return _LATE_EVENING_UTC.replace(tzinfo=None)
+        return _LATE_EVENING_UTC.astimezone(tz)
+
+
+class _FrozenUTCHostDate(date):
+    """`date.today()` on a UTC host at that instant — the fallback's answer."""
+
+    @classmethod
+    def today(cls):
+        return cls(2026, 9, 18)
+
+
+def _freeze_late_evening(monkeypatch):
+    monkeypatch.setattr(analysis, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(analysis, "date", _FrozenUTCHostDate)
+
+
+def _capture_ask_prompt(monkeypatch, vault):
+    prompts = []
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda prompt, **kwargs: prompts.append(prompt) or "")
+    chat.answer_question(vault, "How am I doing?")
+    return prompts[0]
+
+
+def test_ask_prompt_states_the_declared_local_date_late_in_the_evening(
+        monkeypatch, vault, conn):
+    """Done-when 3: 23:30 in a UTC-4 zone states the LOCAL date."""
+    vaultmod.set_local_timezone(conn, "America/New_York")
+    seed_metric(conn, "step_count", _LOCAL_DATE, [1])
+    conn.commit()  # ctx.read_only() opens its own connection — see above.
+    _freeze_late_evening(monkeypatch)
+
+    prompt = _capture_ask_prompt(monkeypatch, vault)
+
+    assert f"CURRENT DATE AND MOST RECENT DAY WITH DATA: {_LOCAL_DATE}." in prompt
+    # The whole point: the UTC date is tomorrow and must appear nowhere.
+    # Mutation (Done-when 4): drop the set_local_timezone call above and this
+    # line is what goes red, because the fallback publishes 2026-09-18.
+    assert _UTC_DATE not in prompt
+
+
+def test_ask_prompt_withholds_a_current_date_when_the_vault_declares_no_zone(
+        monkeypatch, vault, conn):
+    """Done-when 5: an undeclared vault gets no bare, unknowable date.
+
+    The decision recorded on #439: a date we cannot vouch for is WITHHELD
+    rather than annotated — the same rule the withheld-answer card follows.
+    The as-of half is unaffected by the defect (it is MAX(date), not a clock)
+    and is still published, so the model keeps an anchor for unqualified
+    periods.
+    """
+    assert vaultmod.local_timezone(conn) is None
+    seed_metric(conn, "step_count", _LOCAL_DATE, [1])
+    conn.commit()
+    _freeze_late_evening(monkeypatch)
+
+    prompt = _capture_ask_prompt(monkeypatch, vault)
+
+    assert f"MOST RECENT DAY WITH DATA: {_LOCAL_DATE}." in prompt
+    assert "CURRENT DATE" not in prompt
+    assert "This vault declares no timezone, so no current date is stated." in prompt
+    # The host's UTC date is the value being withheld; it must not leak.
+    assert _UTC_DATE not in prompt
+
+
+def test_an_explicit_as_of_still_states_a_current_date_without_a_zone(
+        monkeypatch, vault, conn):
+    """An as-of is not a clock reading, so #439 does not reach it."""
+    assert vaultmod.local_timezone(conn) is None
+    seed_metric(conn, "step_count", _LOCAL_DATE, [1])
+    conn.commit()
+    _freeze_late_evening(monkeypatch)
+    prompts = []
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda prompt, **kwargs: prompts.append(prompt) or "")
+
+    chat.answer_question(vault, "How am I doing?", as_of=_LOCAL_DATE)
+
+    assert (f"CURRENT DATE AND MOST RECENT DAY WITH DATA: {_LOCAL_DATE}."
+            in prompts[0])

@@ -235,3 +235,71 @@ def test_reattribution_never_touches_a_non_sleep_record(conn, nights):
     assert conn.execute(
         "SELECT local_date FROM records WHERE dedupe_key = 'hr-key'"
     ).fetchone()[0] == "2026-07-13"
+
+
+# --- the maximum-duration guard (#433) -------------------------------------
+
+def test_a_session_longer_than_the_maximum_is_marked_not_clamped():
+    # One malformed session must not smuggle an impossible figure into a daily
+    # total. The contract is a STATUS with a designed answer: the span is not
+    # clamped to MAX_SESSION_HOURS, the session is not dropped, and its end
+    # date (the attribution date) is unchanged.
+    ivs = [D.Interval(datetime(2026, 3, 1, 20, 0), datetime(2026, 3, 1, 21, 0), "sleep_in_bed"),
+           D.Interval(datetime(2026, 3, 1, 20, 0), datetime(2026, 3, 3, 6, 0), "sleep_in_bed")]
+    sessions = D.sleep_sessions(ivs)
+    assert len(sessions) == 1
+    ses = sessions[0]
+    assert ses.status == "over_max"
+    assert ses.end == datetime(2026, 3, 3, 6, 0)      # not clamped
+    assert ses.end_date == "2026-03-03"               # not re-attributed
+    assert len(ses.members) == 2                      # not dropped
+    # The timing answer refuses the day rather than emitting an impossible one.
+    refused = D.compute_sleep_timing(ivs, "2026-03-03")
+    assert refused == {"status": "over_max"}          # legible, not silence
+    # A consumer can tell the refused night from a night with no sleep data:
+    # refusal is a status-bearing answer, absence is None.
+    assert D.compute_sleep_timing([], "2026-03-03") is None
+    assert refused is not None
+
+
+def test_an_ordinary_session_carries_no_status():
+    # The inverted mutation: a guard that fires unconditionally would pass the
+    # over-max test and be strictly worse than no guard. An ordinary night must
+    # be untouched — no status at all.
+    ivs = [D.Interval(datetime(2026, 4, 1, 22, 30), datetime(2026, 4, 2, 6, 0), "sleep_asleep")]
+    ses = D.sleep_sessions(ivs)[0]
+    assert ses.status is None
+    out = D.compute_sleep_timing(ivs, "2026-04-02")
+    assert out is not None
+    assert "status" not in out                        # nothing to report
+    assert out["sleep_time_in_bed"] == 7.5 * 60         # 7.5 h, intact
+
+
+def test_a_session_of_exactly_the_maximum_is_not_marked():
+    # The threshold is >, not >=: a 24 h span is already the longest
+    # day-crossing envelope in the series and must not become a false positive.
+    ivs = [D.Interval(datetime(2026, 5, 1, 0, 0), datetime(2026, 5, 2, 0, 0), "sleep_in_bed")]
+    assert D.sleep_sessions(ivs)[0].status is None
+
+
+def test_the_guard_only_marks_reattribution_never_drops_or_moves(conn):
+    # reattribute_sleep rebuilds sessions to move samples across dates. A
+    # marked session must still be attributed by the session rule: the guard
+    # does not drop it from the move set, and does not re-date it elsewhere.
+    _seed(conn, [
+        {"metric": "sleep_asleep", "value": 60.0, "unit": "min",
+         "start_utc": "2026-06-01T22:00:00+00:00", "end_utc": "2026-06-01T23:00:00+00:00",
+         "start_local": "2026-06-01 22:00:00", "local_date": "2026-06-01",
+         "source": "test", "origin": "synthetic", "dedupe_key": "overmax-1"},
+        {"metric": "sleep_in_bed", "value": 30.0 * 60, "unit": "min",
+         "start_utc": "2026-06-01T22:00:00+00:00", "end_utc": "2026-06-03T04:00:00+00:00",
+         "start_local": "2026-06-01 22:00:00", "local_date": "2026-06-01",
+         "source": "test", "origin": "synthetic", "dedupe_key": "overmax-2"},
+    ])
+    moves = D.reattribute_sleep(conn, "2026-06-01", "2026-06-03")
+    session = D.sleep_sessions(D._reattribution_window(conn, "2026-06-01", "2026-06-03"))[0]
+    assert session.status == "over_max"
+    # The session is still sessionised and still reported by end date: the
+    # member whose local_date disagrees with the session end still moves there.
+    assert moves
+    assert session.end_date == "2026-06-03"

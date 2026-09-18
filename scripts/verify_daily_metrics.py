@@ -550,7 +550,11 @@ def derived_diffs(conn, limit: int, days: list[str]) -> list[dict]:
     holes = ",".join("?" * len(DERIVED_METRICS))
     out: list[dict] = []
     for day in days:
-        want = derive.compute_sleep_timing(derive._sleep_intervals(conn, day), day) or {}
+        timing = derive.compute_sleep_timing(derive._sleep_intervals(conn, day), day)
+        # `status` is the max-session guard's REFUSAL answer (#433), not a metric:
+        # daily_metrics is purely numeric and holds no such row, so comparing against
+        # it would report a phantom discrepancy on exactly the days the guard refused.
+        want = {k: v for k, v in (timing or {}).items() if k != "status"}
         wh = derive.wear_hours(conn, day)
         if wh is not None:
             want["wear_hours"] = wh

@@ -23,6 +23,16 @@ GAP_MERGE_MIN = 90.0   # sleep intervals closer than this merge into one session
 MIN_AWAKE_MIN = 1.0    # awake segments shorter than this aren't awakenings
 WEAR_METRIC = "heart_rate"
 
+# A sleep session longer than 24 h cannot be one night. The value is never
+# clamped, dropped or re-attributed - the session is only MARKED, and the daily
+# timing answer is refused (published as the status "over_max", and absent
+# from the numeric daily_metrics) so an impossible figure never reaches a
+# daily total. Below 24 h the long sessions are enveloping in-bed spans that
+# merge scattered stages during a single night, not real nights themselves;
+# 24 h is the one gap a single real night cannot cross, so it is the honest
+# maximum.
+MAX_SESSION_HOURS = 24.0
+
 SLEEP_METRICS = ("sleep_bedtime", "sleep_wake_time", "sleep_midpoint",
                  "sleep_time_in_bed", "sleep_awakenings", "sleep_awake_longest",
                  "sleep_latency")
@@ -57,10 +67,18 @@ class Interval:
 
 @dataclass
 class Session:
-    """One merged sleep episode: its members, its span, and the date it ends on."""
+    """One merged sleep episode: its members, its span, and the date it ends on.
+
+    `status` is the guard's designed answer: "over_max" when the span exceeds
+    MAX_SESSION_HOURS (more than one night in a single merged episode is a
+    malformed measurement, not a long night). It is a mark, never a
+    correction: the session is not clamped, dropped, or re-attributed to a
+    different date.
+    """
     members: list[Interval]
     start: datetime
     end: datetime
+    status: str | None = None
 
     @property
     def end_date(self) -> str:
@@ -72,30 +90,50 @@ def sleep_sessions(intervals: list[Interval],
     """Merge intervals into episodes, splitting wherever the gap exceeds
     `gap_min`. Extracted so attribution and timing cannot drift apart: the
     session boundaries that decide which DATE a sample belongs to are the same
-    boundaries that decide what the night's bedtime and wake time are."""
+    boundaries that decide what the night's bedtime and wake time are.
+
+    Every session longer than MAX_SESSION_HOURS carries status "over_max".
+    The guard only marks: it never splits, clamps, drops or re-attributes,
+    so the session-boundary rule (attribution by session) holds exactly for
+    the statuses too."""
     if not intervals:
         return []
     ivs = sorted(intervals, key=lambda i: i.start)
-    out = [Session([ivs[0]], ivs[0].start, ivs[0].end)]
+    out = [Session([ivs[0]], ivs[0].start, ivs[0].end,
+                   _session_status(ivs[0].start, ivs[0].end))]
     for it in ivs[1:]:
         # `end` is the running MAX, not the previous member's end: an enveloping
         # in_bed span must not be closed by a shorter stage that ends inside it.
         if (it.start - out[-1].end).total_seconds() / 60 > gap_min:
-            out.append(Session([it], it.start, it.end))
+            out.append(Session([it], it.start, it.end,
+                               _session_status(it.start, it.end)))
         else:
             out[-1].members.append(it)
             out[-1].end = max(out[-1].end, it.end)
+            out[-1].status = _session_status(out[-1].start, out[-1].end)
     return out
+
+
+def _session_status(start: datetime, end: datetime) -> str | None:
+    """The designed answer for an impossible sleep span: mark, never clamp."""
+    if (end - start).total_seconds() / 3600 > MAX_SESSION_HOURS:
+        return "over_max"
+    return None
 
 
 def compute_sleep_timing(intervals: list[Interval], day: str) -> dict | None:
     """Timing metrics for one wake-day. The main sleep session is the longest
     run of intervals after merging gaps <= GAP_MERGE_MIN (naps fall outside).
-    Returns None when there are no intervals."""
+    Returns None when there are no intervals — no sleep recorded, absence.
+    Returns {"status": "over_max"} when the main session carries an impossible
+    span — a refusal with a designed answer, never silence, so a consumer can
+    tell a night that was refused from a night that was never recorded."""
     if not intervals:
         return None
     sessions = sleep_sessions(intervals)
     ses = max(sessions, key=lambda s: (s.end - s.start).total_seconds())
+    if ses.status == "over_max":
+        return {"status": ses.status}
     main, start, end = ses.members, ses.start, ses.end
     midnight = datetime.fromisoformat(day)          # 00:00 of the wake day
     if start >= midnight + timedelta(hours=12):   # main session starts after wake-day noon:
@@ -340,11 +378,17 @@ def update_for_days(conn, days) -> int:
     that value is no longer supported by the vault. Rows predating version
     stamping, and rows stamped with an older version, remain available for
     explicit legacy handling and are reported by the version check.
+
+    daily_metrics is purely numeric, so the guard's refusal ("status":
+    "over_max") is never written as a row: the refused day simply has no
+    timing rows, exactly like a day the guard refuses today — while the
+    refusal itself stays legible in compute_sleep_timing's answer.
     """
     written = 0
     prepared = []
     for day in sorted(set(days)):
-        vals = compute_sleep_timing(_sleep_intervals(conn, day), day) or {}
+        timing = compute_sleep_timing(_sleep_intervals(conn, day), day)
+        vals = {k: v for k, v in (timing or {}).items() if k != "status"}
         wh = wear_hours(conn, day)
         if wh is not None:
             vals["wear_hours"] = wh

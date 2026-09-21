@@ -186,6 +186,7 @@ from .metrics import (  # noqa: F401  — re-export
     IMPACT_BUCKET_SECONDS, IMPACT_JOG_HR_MIN, IMPACT_JOG_HR_PACE_MAX,
     IMPACT_IMPLAUSIBLE_PACE_MIN, IMPACT_JOG_CADENCE_MIN,
     IMPACT_JOG_PACE_MAX, IMPACT_WALK_PACE_MAX,
+    IMPACT_CADENCE_PLAUSIBLE_MAX, BLOCK_EFFORT_CADENCE_MIN,
 )
 
 
@@ -213,26 +214,44 @@ def _bucket_index(bucket_start_utc: str) -> int:
 
 
 def _is_jog_bucket(b: dict) -> bool:
-    """Pace-only, and it DELIBERATELY differs from metrics' canonical is_jog.
+    """Three signals, any one of which makes a bucket count as jogging:
 
-    Do not "unify" this with `metrics.impact_bucket_rows`'s is_jog. The volume
-    rule is cadence >= IMPACT_JOG_CADENCE_MIN inside any workout window. Block
-    structure does not use that classification: it remains pace-only, and a
-    16-18 min/mi bucket at high HR is a *bridge* (see _is_bridge_bucket), which
-    maintains continuity without being counted as jog.
+    1. Running gait: canonical `is_jog` (cadence >= IMPACT_JOG_CADENCE_MIN inside
+       a workout window) AND cadence plausible (present and
+       <= IMPACT_CADENCE_PLAUSIBLE_MAX). Without the ceiling a glitch cadence
+       from a mis-scaled step sample would count as running despite being
+       physically impossible.
+    2. Jog pace, not vetoed: pace within the jog lane
+       (IMPACT_IMPLAUSIBLE_PACE_MIN..IMPACT_JOG_PACE_MAX) UNLESS the heart rate
+       is KNOWN and below IMPACT_JOG_HR_MIN. A missing HR must NOT veto:
+       absence of a reading is not evidence of walking, and many older
+       sessions have no HR at all.
+    3. Effort-confirmed near-running gait: cadence is plausible AND
+       >= BLOCK_EFFORT_CADENCE_MIN AND heart rate is known AND >= IMPACT_JOG_HR_MIN.
+       This is the stride signal plus effort: a tired bucket sitting just under
+       the 140 gait line at an obvious running heart rate IS running.
 
-    Measured 2026-08-26 over the five most recent running sessions: 795 buckets,
-    canonical is_jog = 436, this predicate = 368, **68 disagreements — and all
-    68 are bridge buckets.** Zero unexplained. The two rules answer different
-    questions and agree everywhere the questions coincide.
-
-    scripts/luna_audit.sh reported this divergence as duplicate implementation
-    of one computation. It is not, and the measurement above is why. Making them
-    identical would move 22.7 jog-minutes across those five sessions into the
-    block rule, which governs the ramp.
+    Each signal fails somewhere the others do not. Cadence is the gait signal:
+    an incline treadmill walk shows a slow-jog pace AND running-effort HR while
+    its cadence (~95-110) plainly says walking. HR confirms a slow or fatigued
+    stride just under the gait line. HR also vetoes a false pace: a treadmill
+    can report a fast pace while the person walks at a walking heart rate.
     """
-    p = b.get("pace_min_per_mi")
-    return p is not None and mx.IMPACT_IMPLAUSIBLE_PACE_MIN <= p <= mx.IMPACT_JOG_PACE_MAX
+    cadence = b.get("cadence_spm")
+    pace = b.get("pace_min_per_mi")
+    hr = b.get("hr")
+    cadence_plausible = (cadence is not None
+                         and cadence <= mx.IMPACT_CADENCE_PLAUSIBLE_MAX)
+
+    if b.get("is_jog") and cadence_plausible:
+        return True
+    if (pace is not None
+            and mx.IMPACT_IMPLAUSIBLE_PACE_MIN <= pace <= mx.IMPACT_JOG_PACE_MAX
+            and not (hr is not None and hr < mx.IMPACT_JOG_HR_MIN)):
+        return True
+    return (cadence_plausible
+            and cadence >= mx.BLOCK_EFFORT_CADENCE_MIN
+            and hr is not None and hr >= mx.IMPACT_JOG_HR_MIN)
 
 
 def _is_bridge_bucket(b: dict) -> bool:

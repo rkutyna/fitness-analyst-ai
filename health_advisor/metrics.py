@@ -356,9 +356,22 @@ IMPACT_IMPLAUSIBLE_PACE_MIN = 5.0  # min/mi; faster than this is not human trave
 # the largest single stream instead, which is the same "one device wins"
 # principle the distance stream applies through workout arbitration.
 IMPACT_JOG_CADENCE_MIN = 140.0  # steps/min; walk/run gait transition; six oracles land within a minute of it
+# A cadence above this is a sensor/aggregation glitch: the same step-total
+# misread that once produced a four-figure spm (see above) must not count as
+# running in ANY lane. Real human cadence does not reach 250 spm, so every
+# consumer — the volume SQL below and the block predicate — reads this one
+# name rather than a second literal.
+IMPACT_CADENCE_PLAUSIBLE_MAX = 250.0  # steps/min; glitch ceiling, not a gait threshold
 # Retained for the separate block bridge predicate; not an impact-volume lane.
 IMPACT_JOG_HR_PACE_MAX = 18.0  # min/mi; block bridge's slow-bucket ceiling
 IMPACT_JOG_HR_MIN = 130.0      # bpm; block bridge's slow-bucket floor
+
+# Effort-confirmed near-running gait: the block dial's third lane. A bucket
+# sitting just under the 140 gait line at a running heart rate IS running —
+# a tired stride, not a walk — but only when its cadence is present, plausible,
+# and close enough to the gait line for HR to be confirming rather than
+# contradicting.
+BLOCK_EFFORT_CADENCE_MIN = 130.0  # steps/min; floor for the HR-confirmed lane
 
 # --- the bridge rule: how a bucket is classified, item 3 ----------------------
 # A continuous jog is not a continuous chain of <=16 min/mi buckets. GPS drops a
@@ -645,6 +658,7 @@ def impact_bucket_rows(conn, window_predicate: str,
                             ) THEN 1 ELSE 0 END AS in_workout,
                  CASE WHEN b.mi <= ?
                             AND s.cadence_spm >= ?
+                            AND s.cadence_spm <= {IMPACT_CADENCE_PLAUSIBLE_MAX}
                             AND EXISTS (
                                   SELECT 1 FROM {workout_source} w
                                    WHERE {workout_active_condition}

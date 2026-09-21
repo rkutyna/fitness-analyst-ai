@@ -1926,10 +1926,14 @@ def test_retry_feedback_reports_a_failed_claim_with_its_field_hint():
     assert "50.1" not in rendered
 
 
-def test_retry_feedback_says_the_leaf_is_unlabelled_when_no_metric_hint():
-    """The verifier reports actual_metric=None for a leaf no metric key labels.
+def test_retry_feedback_says_the_value_is_unlabelled_when_no_metric_hint():
+    """The verifier reports actual_metric=None for a value no metric key labels.
     Echoing that as "metric is None" would invite `metric: null`; the model is
-    told to omit the slot and cite the path instead."""
+    told to omit the slot and cite the path instead.
+
+    #469: this sentence used to say "leaf" — internal vocabulary a model
+    turn paraphrased straight into a user-visible answer. It says "value"
+    now, and the model-facing text must stay free of that jargon."""
     for failure in ({"ok": False, "claimed": 3.04, "actual_metric": None,
                      "reason": "claim metric does not match ledger field"},
                     {"ok": False, "claimed": 3.04,
@@ -1937,9 +1941,10 @@ def test_retry_feedback_says_the_leaf_is_unlabelled_when_no_metric_hint():
         rendered = chat._retry_feedback(
             {"ok": False, "reason": "claim metric does not match ledger field",
              "unsupported": [], "verdict": {"numbers": [failure]}})
-        assert ("That leaf carries no metric; omit metric and cite the exact "
+        assert ("That value carries no metric; omit metric and cite the exact "
                 "path.") in rendered
         assert "None" not in rendered
+        assert "leaf" not in rendered.lower()
 
     labelled = chat._retry_feedback({
         "ok": False, "reason": "claim metric does not match ledger field",
@@ -1948,8 +1953,9 @@ def test_retry_feedback_says_the_leaf_is_unlabelled_when_no_metric_hint():
             {"ok": False, "claimed": 3.04, "actual_metric": "jog_minutes",
              "reason": "claim metric does not match ledger field"}]},
     })
-    assert "That leaf's metric is 'jog_minutes'." in labelled
+    assert "That value's metric is 'jog_minutes'." in labelled
     assert "carries no metric" not in labelled
+    assert "leaf" not in labelled.lower()
 
 
 def test_the_retry_prompt_names_the_leftover_token(monkeypatch, vault, conn):

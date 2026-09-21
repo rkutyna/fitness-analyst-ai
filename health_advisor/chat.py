@@ -641,9 +641,9 @@ def _ask_judge(question: str, prose: str, verification: dict) -> int:
 _RETRY_REPAIR_INSTRUCTIONS = (
     "For every number listed above, do one of two things: file a correct claim "
     "— copy the exact field name published at the path, cite the true row index "
-    "of the row you actually read, and omit `metric` unless the leaf's own "
+    "of the row you actually read, and omit `metric` unless the value's own "
     "field is that series' value — or REMOVE the number from your text. A "
-    "figure that has no published leaf behind it and fits no listed operation "
+    "figure that has no published value behind it and fits no listed operation "
     "must be removed, not restated."
 )
 
@@ -698,13 +698,13 @@ def _retry_feedback(verification: dict) -> str:
             sentence += f" The field at that path is {str(actual_field)!r}."
         actual_metric = number.get("actual_metric")
         if actual_metric:
-            sentence += f" That leaf's metric is {str(actual_metric)!r}."
+            sentence += f" That value's metric is {str(actual_metric)!r}."
         elif failure.startswith("claim metric does not match"):
             # The verifier reports actual_metric=None for a leaf no metric key
             # labels — a workout row, or any unlabelled result leaf. Saying
             # "metric is None" invites the model to file `metric: null`; the
             # path is what it must cite instead.
-            sentence += (" That leaf carries no metric; omit metric and cite "
+            sentence += (" That value carries no metric; omit metric and cite "
                          "the exact path.")
         parts.append(sentence)
 
@@ -1911,8 +1911,9 @@ def _unused_fact_prompt(facts: dict[str, dict], ledger: list[dict]) -> str:
                 + names)
     names = _successful_tool_names(ledger)
     if names:
-        return ("UNUSED GATHERED DATA (the closed fact set has no citable "
-                "metric leaves for it):\n- " + "\n- ".join(names))
+        return ("UNUSED GATHERED DATA (these ran but gave no figure you may "
+                "quote; do not mention them, or this limitation, to the "
+                "user):\n- " + "\n- ".join(names))
     return "UNUSED FACTS: none"
 
 

@@ -23,6 +23,7 @@ from . import normalize
 _KEY_SEPARATOR = "|"
 _KEY_PART_RE = re.compile(r"^(metric|period|field)=(.*)$")
 _ATTACHMENT_KEY_PART_RE = re.compile(r"^(table|column|row|trend)=(.*)$")
+_WORKOUT_KEY_PART_RE = re.compile(r"^(workout|field)=(.*)$")
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\}")
 _ADVICE_PREFIX = "advice:"
 _COLD_START_FIELDS = frozenset({
@@ -318,6 +319,39 @@ def parse_attachment_trend_key(key: str) -> tuple[str, str, str] | None:
     if values["trend"] not in {"first", "last", "delta", "direction"}:
         return None
     return values["table"], values["column"], values["trend"]
+
+
+def workout_fact_key(workout: str, field: str) -> str:
+    """Return a key for one field of a single workout session.
+
+    A workout is not a metric series (it has no ``metric``/``period`` pair to
+    key on), so its identity is the tool-reported session date instead --
+    the one identifier every run-answering tool already returns.
+    """
+    if not str(workout).strip() or not str(field).strip():
+        raise ValueError("workout and field are required")
+    enc = lambda value: quote(str(value), safe="-_.~:")
+    return _KEY_SEPARATOR.join((
+        "fact", "workout=" + enc(workout), "field=" + enc(field),
+    ))
+
+
+def parse_workout_fact_key(key: str) -> tuple[str, str] | None:
+    """Parse a key made by :func:`workout_fact_key`, or return ``None``."""
+    if not isinstance(key, str):
+        return None
+    parts = key.split(_KEY_SEPARATOR)
+    if len(parts) != 3 or parts[0] != "fact":
+        return None
+    values = {}
+    for part in parts[1:]:
+        match = _WORKOUT_KEY_PART_RE.match(part)
+        if not match:
+            return None
+        values[match.group(1)] = unquote(match.group(2))
+    if set(values) != {"workout", "field"}:
+        return None
+    return values["workout"], values["field"]
 
 
 def _path_parts(path: str) -> list[str | int]:
@@ -867,6 +901,227 @@ def build_attachment_facts(ledger: list[dict]) -> dict[str, dict]:
                             value, unit=unit, signed=(stat == "delta")),
                         "source": trend_source,
                     }))
+
+    return _publish_unambiguous(candidates)
+
+
+# Tools that answer "how was my run/workout" questions but return
+# per-session rows with no metric/period identity (health_advisor#469). Each
+# entry below maps a raw JSON field on that tool's result to the published
+# workout-fact field name and the unit Python recorded for it.
+#
+# Two fields deliberately do NOT come from every tool that could name them:
+#
+# * ``avg_heart_rate`` comes only from ``get_block_structure``'s per-session
+#   ``avg_hr_session`` (one decimal place, computed by
+#   ``metrics.session_hr_figures`` from the same stored value
+#   ``list_workouts`` also reports, but rounded to zero decimals there). Two
+#   tools naming the same physical reading at different rounding depths are
+#   not "the same value" to :func:`_publish_unambiguous` -- they read as a
+#   conflict and the fact is withheld entirely. Picking the one precise
+#   source avoids manufacturing that conflict.
+# * ``get_briefing``'s ``workout_focus`` restates ``duration_min`` and
+#   distance at a coarser rounding than ``list_workouts`` for the same
+#   reason, so this module does not republish them from there -- doing so
+#   would withhold the more precise ``list_workouts`` figure whenever both
+#   tools ran. ``workout_focus`` is kept in the allowlist below (a caller
+#   that only ran that one tool should still be able to extend this table)
+#   but contributes nothing today.
+_WORKOUT_TOOLS = frozenset({
+    "list_workouts", "get_run_form", "get_block_structure", "get_briefing",
+})
+_WORKOUT_ROW_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("duration_min", "duration_min", "min"),
+    ("max_heart_rate", "max_heart_rate", "bpm"),
+    ("distance_mi", "distance_mi", "mi"),
+    ("distance_km", "distance_km", "km"),
+)
+
+
+def _workout_identity(date, workout_type, start_time=None) -> str | None:
+    """One workout's identity: its date and type, plus its start time only
+    when that is needed to tell two same-type sessions on the same date
+    apart (health_advisor#469 follow-up).
+
+    A day is routinely a run AND a walk (or a ride) -- 14 of 17 run days in
+    one measured stretch also carried another workout -- so ``date`` alone
+    collides constantly and :func:`_publish_unambiguous` would then withhold
+    every field on that day as an unresolved conflict. ``date + type`` is
+    the floor. It is also what every one of the four run-answering tools can
+    name: ``get_run_form`` only ever describes a running session,
+    ``get_block_structure``'s ``sessions`` and ``get_briefing``'s
+    ``workout_focus`` each carry their own ``workout_type`` -- so two tools
+    naming the SAME single workout of a type on a day publish under the SAME
+    key without needing a start time at all, and duration from one tool
+    joins heart rate from another. Only ``list_workouts`` can return more
+    than one workout of the same type on the same date (two walks, or two
+    runs); only there is a start time added, and only for the rows that
+    actually collide -- see the ambiguity check in the ``list_workouts``
+    branch below.
+    """
+    if not date or not workout_type:
+        return None
+    parts = [str(date), str(workout_type)]
+    if start_time:
+        parts.append(str(start_time))
+    return "|".join(parts)
+
+
+def _workout_candidate(workout: str | None, field: str, value, unit: str, *,
+                       sequence, path: str) -> tuple[str, dict] | None:
+    if workout is None or not str(workout).strip():
+        return None
+    if value is None or isinstance(value, bool) or not isinstance(
+            value, (int, float)):
+        return None
+    key = workout_fact_key(workout, field)
+    return key, {
+        "key": key,
+        "workout": workout,
+        "field": field,
+        "value": value,
+        "unit": unit,
+        "display": _display_value(value, unit=unit),
+        "source": {"sequence": sequence, "path": path},
+    }
+
+
+def _workout_row_candidates(row: dict, workout: str | None, *, sequence,
+                            path_prefix: str) -> list[tuple[str, dict]]:
+    """Duration/distance/max-heart-rate fields shared by workout rows."""
+    if not isinstance(row, dict) or workout is None:
+        return []
+    out = []
+    for raw_field, out_field, unit in _WORKOUT_ROW_FIELDS:
+        candidate = _workout_candidate(
+            workout, out_field, row.get(raw_field), unit,
+            sequence=sequence, path=f"{path_prefix}.{raw_field}")
+        if candidate is not None:
+            out.append(candidate)
+    return out
+
+
+def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
+    """Build closed facts for the run-answering tools' per-session numbers.
+
+    ``list_workouts``, ``get_run_form``, ``get_block_structure``, and
+    ``get_briefing``'s workout focus each describe one workout session, not a
+    metric series, so their numbers cannot carry a ``(metric, period)``
+    identity and :func:`build_fact_set` excludes them by design. This
+    publishes an allowlisted set of their fields instead, keyed by the
+    workout's own identity (:func:`_workout_identity` --
+    date, type, and a start time only where two sessions of one type share a
+    date) -- duration, distance, max heart rate, the session's own
+    jog-minute count, and the longest continuous running block, wherever a
+    call actually returned one. A field a tool did not return for a session
+    is simply absent, never invented. Duplicate reports of the same
+    workout/field publish only when their values agree, exactly as
+    :func:`build_fact_set` handles duplicates -- see the module-level
+    comment above ``_WORKOUT_TOOLS`` for the two fields this withholds by
+    deliberate design, not by accident.
+
+    Keying by date alone made any day with a second workout -- a walk beside
+    the run, most days -- collide every field on that day into one withheld
+    identity (health_advisor#469 follow-up). Type is what tells them apart.
+
+    ``session_jog_minutes`` (from ``get_run_form``) is named apart from the
+    vault's canonical ``jog_minutes`` metric on purpose: it counts jog
+    buckets under ``running_form``'s own halves-comparison rule, which is a
+    different classification from the one behind the published metric
+    series (``get_impact_volume``), and the two can disagree. Publishing it
+    under the metric's name would assert an agreement Python has not
+    checked.
+    """
+    if not isinstance(ledger, list):
+        return {}
+
+    candidates: list[tuple[str, dict]] = []
+    for record in ledger:
+        if (not isinstance(record, dict) or record.get("result_elided")
+                or record.get("tool_name") not in _WORKOUT_TOOLS):
+            continue
+        result = record.get("result")
+        if not isinstance(result, dict):
+            continue
+        tool_name = record["tool_name"]
+        sequence = record.get("sequence")
+
+        if tool_name == "list_workouts":
+            rows = result.get("workouts")
+            if not isinstance(rows, list):
+                continue
+            # Only list_workouts can return more than one session of the
+            # same type on the same date (two walks, two runs); add a start
+            # time to break that tie, and only for the rows that need it, so
+            # a day's single run still keys identically to what
+            # get_run_form/get_block_structure/get_briefing publish for it.
+            type_counts: dict[tuple, int] = {}
+            for row in rows:
+                if isinstance(row, dict):
+                    dkey = (row.get("date"), row.get("type"))
+                    type_counts[dkey] = type_counts.get(dkey, 0) + 1
+            for row_index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                dkey = (row.get("date"), row.get("type"))
+                start_time = (row.get("start_time_local")
+                             if type_counts.get(dkey, 0) > 1 else None)
+                workout = _workout_identity(
+                    row.get("date"), row.get("type"), start_time)
+                candidates.extend(_workout_row_candidates(
+                    row, workout, sequence=sequence,
+                    path_prefix=f"$.result.workouts[{row_index}]"))
+
+        elif tool_name == "get_run_form":
+            if result.get("mode") != "session" or not result.get("found"):
+                continue
+            # get_run_form only ever describes a running session.
+            workout = _workout_identity(result.get("date"), "running")
+            efficiency = result.get("efficiency_change")
+            if isinstance(efficiency, dict) and efficiency.get("status") == "ok":
+                candidate = _workout_candidate(
+                    workout, "session_jog_minutes",
+                    efficiency.get("jog_minutes"), "min", sequence=sequence,
+                    path="$.result.efficiency_change.jog_minutes")
+                if candidate is not None:
+                    candidates.append(candidate)
+
+        elif tool_name == "get_block_structure":
+            day = result.get("day")
+            sessions = result.get("sessions")
+            sessions = sessions if isinstance(sessions, list) else []
+            # The day-level "best across sessions" fields belong to exactly
+            # one session's type; only safe to name when that is unambiguous
+            # (one session that day). A multi-session day withholds these
+            # two rather than guessing whose block it was.
+            if len(sessions) == 1 and isinstance(sessions[0], dict):
+                solo_workout = _workout_identity(
+                    day, sessions[0].get("workout_type"))
+                for raw_field, unit in (("longest_block_min", "min"),
+                                        ("qualified_block_min", "min")):
+                    candidate = _workout_candidate(
+                        solo_workout, raw_field, result.get(raw_field), unit,
+                        sequence=sequence, path=f"$.result.{raw_field}")
+                    if candidate is not None:
+                        candidates.append(candidate)
+            for session_index, session in enumerate(sessions):
+                if not isinstance(session, dict):
+                    continue
+                workout = _workout_identity(day, session.get("workout_type"))
+                candidate = _workout_candidate(
+                    workout, "avg_heart_rate",
+                    session.get("avg_hr_session"), "bpm",
+                    sequence=sequence,
+                    path=f"$.result.sessions[{session_index}]"
+                         ".avg_hr_session")
+                if candidate is not None:
+                    candidates.append(candidate)
+
+        elif tool_name == "get_briefing":
+            # See the module-level comment above _WORKOUT_TOOLS: this tool's
+            # only numeric fields duplicate list_workouts at a coarser
+            # rounding, so nothing from it is republished here today.
+            continue
 
     return _publish_unambiguous(candidates)
 

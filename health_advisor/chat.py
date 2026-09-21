@@ -638,6 +638,14 @@ def _ask_judge(question: str, prose: str, verification: dict) -> int:
         return 0
 
 
+_WORKOUT_FACT_PLACEHOLDER_TEXT = (
+    "{fact|workout=...|field=...} for one workout session's own numbers "
+    "(duration, distance, heart rate, its longest running block). Each "
+    "workout is named by its date and its type (running, walking, and so "
+    "on), not by a metric, so a day's run and its walk are always separate "
+    "keys; a start time is added only when the same day had two workouts "
+    "of that same type."
+)
 _RETRY_REPAIR_INSTRUCTIONS = (
     "For every number listed above, do one of two things: file a correct claim "
     "— copy the exact field name published at the path, cite the true row index "
@@ -1952,6 +1960,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     facts = {
         **metric_facts,
         **fact_template.build_attachment_facts(ledger),
+        **fact_template.build_workout_facts(ledger),
     }
 
     # The allowlist above is positive evidence that this turn requested no
@@ -2014,7 +2023,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "as the complete key wrapped in curly braces and nothing else: "
         "{fact|metric=...|period=...|field=...} for ledger facts, "
         "{fact|table=...|column=...|row=...} for analyst table cells, "
-        "{fact|table=...|column=...|trend=...} for computed trends. Copy each "
+        "{fact|table=...|column=...|trend=...} for computed trends, "
+        + _WORKOUT_FACT_PLACEHOLDER_TEXT + " "
+        "Copy each "
         "key character-for-character from the CLOSED FACT SET below — a key "
         "outside braces, bolded, or quoted is not a placeholder and will be "
         "refused. When a date or period name belongs in prose, use "

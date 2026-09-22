@@ -1552,6 +1552,8 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
 
     'midpoint_variability' is the rolling 28-day SD of sleep midpoint in hours
     — lower is more regular, and it is the cleanest week-to-week signal here.
+    Its 'latest_window' is the span of nights the latest SD was computed from;
+    'start'/'end' above echo the request and are not the span of the data.
     'cosinor' separates the seasonal swing from linear drift: read
     'drift_hours_per_year' as bedtime creep with the seasonal component removed.
     'plan_compliance' reports three configured bedtime bands: nights inside
@@ -1589,9 +1591,14 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
                         "published SRI values."),
         }
         midpoint = out.get("midpoint_variability") or {}
-        leaf = mx.presentation_leaf(
-            "sleep_midpoint_sd_28d", f"{start}:{end}",
+        # The leaf's period is the window the value measures, never the query
+        # window: an unset start is an all-of-history sentinel, and its period
+        # label reached a refusal as the span of the user's data (#357).
+        window = midpoint.get("latest_window") or {}
+        leaf = (mx.presentation_leaf(
+            "sleep_midpoint_sd_28d", f"{window['start']}:{window['end']}",
             midpoint.get("latest_sd_hours"), field="latest_sd_hours")
+            if window.get("start") and window.get("end") else None)
         if leaf is not None:
             midpoint["presentation"] = leaf
         return out

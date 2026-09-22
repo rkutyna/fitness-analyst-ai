@@ -222,7 +222,7 @@ def midpoint_variability(conn, start: str, end: str) -> dict:
     out = []
     for day in dates:
         window_rows = conn.execute(
-            "SELECT last AS v FROM daily_metrics "
+            "SELECT date, last AS v FROM daily_metrics "
             "WHERE metric = 'sleep_midpoint' AND " + mx.current_daily_metrics_predicate(conn) + " "
             "AND date > date(?, '-28 days') AND date <= ? "
             "AND last IS NOT NULL ORDER BY date", (day, day)).fetchall()
@@ -230,10 +230,18 @@ def midpoint_variability(conn, start: str, end: str) -> dict:
         sd = rolling_sd(window)
         if sd is not None:
             out.append({"date": day, "sd_hours": mx.r(sd, 3)})
+            latest_window = {"start": window_rows[0]["date"], "end": day}
     if not out:
         return {"status": "insufficient_window",
                 "reason": "no window reached the minimum day count", "days": []}
+    # The nights the latest SD was actually computed from. It is NOT the query
+    # window: with no arguments the tool asks from its all-of-history default,
+    # and a period built from that default was labelled for the model as
+    # "from <that default> to <end>", which a refusal then stated as the span
+    # of the user's data (#357). This window starts at the first night of the
+    # 28-day window that holds a midpoint, so it never precedes the record.
     return {"status": "ok", "days": out, "latest_sd_hours": out[-1]["sd_hours"],
+            "latest_window": latest_window,
             "field_metrics": {"latest_sd_hours": "sleep_midpoint_sd_28d"}}
 
 

@@ -25,7 +25,21 @@ RECORDED_MENUS = (
     "load (ACWR)",
 )
 
-MUST_ADMIT = RECORDED_MENUS + (
+# Recorded on the live battery after the first version of this rule
+# (2026-09-22, 6 greetings x 6 samples): the four replies it still refused.
+# All four are capability menus. Which span fired, before the clause fix:
+#   A "How training's been going" (bullet heading)   -> shape 1
+#   B "How your recent training load ... are trending" -> shape 1
+#   C "— how your training's been going"             -> shape 1
+#   D "a goal you're working toward"                 -> shape 2
+LIVE_MENUS = (
+    "Hi there! 👋 Great to see you.\n\nI'm your personal health coach, and I've got access to all your health and activity data — workouts, heart rate, sleep, training load, running form, and more.\n\nWhat would you like to dig into today? A few things I can help with:\n\n- **How training's been going** — recent workouts, running form, training load (ACWR)\n- **Recovery & readiness** — how ready you are for a hard session\n- **Sleep** — timing regularity, quality trends\n- **Heart rate trends** — resting HR, zones, recovery\n- **Running power & benchmarks** — whether easy running is getting cheaper month to month\n\nOr if you've got a specific question — \"how has my last month of running been?\", \"am I recovered enough to push hard today?\", \"what's my sleep regularity been like?\" — just ask and I'll pull the numbers.",
+    "Hi there! 👋 Great to see you. I'm your health coach, and I can help you dig into your training, recovery, sleep, nutrition, and overall trends from your wearable data.\n\nWhat would you like to look at today? For example, I can check:\n- How your recent training load and recovery are trending\n- Your running form and jogging volume\n- Sleep regularity and timing\n- Heart rate zones on a specific workout\n- A meal's calories and macros\n\nJust let me know what's on your mind!",
+    "Hello! 👋 I'm here to help with your health and training questions. What would you like to know — how your training's been going, your recovery or readiness, sleep, running form, or something else? Just let me know and I'll dig into the data.",
+    "Hello! 👋 Great to see you. I'm your health coach, and I've got full access to your health data — training load, sleep, heart rate, running form, and more.\n\nWhenever you're ready, just ask me anything, like:\n\n- **\"How has my training been this week?\"**\n- **\"Am I overtraining or recovering well?\"**\n- **\"How's my sleep regularity?\"**\n- **\"What did my last run look like?\"**\n\nOr tell me a goal you're working toward and I'll help you track it. What would you like to dig into today? 😊",
+)
+
+MUST_ADMIT = RECORDED_MENUS + LIVE_MENUS + (
     # The hard two: "your <metric>" in a capability sense.
     "Hi! I can help you look at your sleep, heart rate, runs and training "
     "plan. What would you like to know?",
@@ -50,6 +64,9 @@ WORDLESS_CLAIMS = (
     "You've been running more this week.",
     "Your heart rate looks normal.",
     "You hit a new personal best on your run.",
+    "You're running more lately.",
+    # The indirect-question exemption needs the wh-word to OPEN the clause.
+    "I noticed how your sleep improved.",
 )
 MUST_REFUSE = NUMBER_WORD_CLAIMS + DIGIT_CLAIMS + WORDLESS_CLAIMS
 

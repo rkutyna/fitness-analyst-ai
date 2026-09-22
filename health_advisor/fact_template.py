@@ -157,17 +157,29 @@ def number_words(text: str, facts: dict[str, dict] | None = None) -> list[str]:
 #      verb: "you ran", "you've been running", "you usually", "you're
 #      recovering". "You're welcome", "would you like" and "if you want" are
 #      admitted; a conditional or wh- lead ("if you slept badly", "what you
-#      decided") states a hypothetical, not a fact.
+#      decided") states a hypothetical, not a fact. A progressive aimed at a
+#      goal ("a goal you're working toward") is an intention and is admitted.
 #   3. Praise for a recorded result: "great job", "well done", "personal
 #      best", "new record". Congratulation presupposes the result happened.
+#
+# Shapes 1 and 2 are read one CLAUSE at a time (split at . ! ? ; : , brackets,
+# line breaks and dashes), and a clause that OPENS with how/what/whether/if/
+# when/which/why/where is an indirect question or a hypothetical and is
+# skipped: "- How your recent training load is trending" and "what would you
+# like to know — how your training's been going" offer a topic. Measured
+# 2026-09-22 on the live battery: all four replies still refused after the
+# first version of this rule were capability menus, three of them this shape.
+# The lead must open the clause; "I noticed how your sleep improved" is still
+# refused. Quoted example questions and sentences ending in "?" are NOT
+# exempt: neither fired on the recorded set, and "Did you know your resting
+# heart rate dropped?" is a claim in question form.
 #
 # Digits and number words stay refused unconditionally, through
 # ``scan_template`` and ``number_words``, before any of this runs. This is a
 # closed pattern list and it fails open on shapes it does not name ("You run
 # more on weekends"); the bias is toward refusing, because a refused greeting
 # costs a fallback card and a fabricated claim costs the user's trust. It is
-# used on the conversational
-# path ONLY: ledger-backed narration asserts facts by design, through
+# used on the conversational path ONLY: ledger-backed narration asserts facts by design, through
 # placeholders, and is governed by ``scan_template`` alone.
 _ASSERT_VERBS = (
     r"(?:is|was|are|were|has|have|had|looks?|looked|looking|seems?|seemed|"
@@ -199,10 +211,19 @@ _USER_ACTION_RE = re.compile(
     r"felt|held|lost|won|tend|seem|" + _NOT_PAST + r"[a-z]{2,}ed)"
     # progressive or state: you're recovering / you are on track
     r"|(?:['’]re|\s+are)\s+(?:(?:really|clearly|definitely|still|now)\s+)?"
-    r"(?:[a-z]+ing|on\s+track|ahead|behind|in\s+(?:good|great|solid)\s+shape|"
+    # An -ing verb aimed at a goal ("a goal you're working toward", "what
+    # you're training for") states an intention, not a measurement.
+    r"(?:[a-z]+ing(?![\w])(?!\s+(?:toward|towards|for|to|at|on)\b)|"
+    r"on\s+track|ahead|behind|in\s+(?:good|great|solid)\s+shape|"
     r"recovered|fitter|faster|stronger)"
     r")(?![\w])",
     re.IGNORECASE)
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;:,()\n\u2014\u2013]+|\s-\s")
+_CLAUSE_MARKUP_RE = re.compile(r"^[\s*#>\"'\u201c\u201d\u2022-]+")
+_INDIRECT_QUESTION_LEADS = frozenset({
+    "how", "what", "whether", "if", "when", "whenever", "which", "why",
+    "where", "whatever", "unless",
+})
 _PRAISE_RE = re.compile(
     r"\b(?:(?:great|good|nice|awesome|amazing|excellent)\s+job|well\s+done|"
     r"congrat\w*|personal\s+(?:best|record)|new\s+(?:best|record|pb|pr))\b",
@@ -229,12 +250,18 @@ def conversational_assertion(text: str,
     refused.
     """
     text = (text if isinstance(text, str) else "").replace("\u2019", "'")
-    if _data_subject_re(facts).search(text):
-        return ("conversational answer makes the user data the subject of "
-                "a statement")
-    for match in _USER_ACTION_RE.finditer(text):
-        if (match.group("lead") or "").lower() not in _HYPOTHETICAL_LEADS:
-            return "conversational answer states something the user did"
+    subject_re = _data_subject_re(facts)
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        clause = _CLAUSE_MARKUP_RE.sub("", clause)
+        first = re.match(r"[a-z]+", clause, re.IGNORECASE)
+        if first and first.group(0).lower() in _INDIRECT_QUESTION_LEADS:
+            continue
+        if subject_re.search(clause):
+            return ("conversational answer makes the user data the subject "
+                    "of a statement")
+        for match in _USER_ACTION_RE.finditer(clause):
+            if (match.group("lead") or "").lower() not in _HYPOTHETICAL_LEADS:
+                return "conversational answer states something the user did"
     if _PRAISE_RE.search(text):
         return "conversational answer praises a recorded result"
     return ""

@@ -482,11 +482,15 @@ def test_digit_free_advice_slot_unwraps_to_plain_prose_without_label():
     assert rendered == "Keep up your current routine; the trend is stable."
 
 
-def test_conversational_violation_reuses_template_and_metric_guards():
+def test_conversational_violation_reuses_template_and_assertion_guards():
     assert fact_template.conversational_violation("Hello there", {}) == ""
     assert "digit outside placeholder" in fact_template.conversational_violation(
         "Hello there 7", {})
-    assert "vault metric jog_minutes" in fact_template.conversational_violation(
+    # #69 item 3: a metric named as a topic is admitted; a metric as the
+    # subject of a statement is refused.
+    assert fact_template.conversational_violation(
+        "Hello there, ask me about jog_minutes", {}) == ""
+    assert "subject of a statement" in fact_template.conversational_violation(
         "Hello there, jog_minutes is ready", {})
     assert "placeholder" in fact_template.conversational_violation(
         "Hello {advice:keep going}", {})

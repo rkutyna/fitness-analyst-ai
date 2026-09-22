@@ -60,6 +60,186 @@ def _advice_violation(content: str, facts: dict[str, dict] | None) -> str:
     return ""
 
 
+# --- Number words (#49) -------------------------------------------------------
+#
+# A digit outside a placeholder is refused, so a model told twice that digits
+# are forbidden has one obvious evasion: spell the figure. "You ran twelve
+# miles" and "fifty-two beats per minute" carry exactly the claim "12" and
+# "52" would, and nothing grounds them. This closed, Python-owned list gives
+# the spelled forms the digit treatment, in prose outside slots only.
+#
+# What is deliberately NOT in it, and why:
+#   * "one" alone. It is a pronoun far more often than a count ("one of the
+#     best", "the one you asked about", "no one"). It counts only when a unit
+#     or count noun follows it ("one mile", "one more run").
+#   * "first" and "second". "First," opens sentences and "second" is a unit
+#     and a rank; both are overwhelmingly non-quantitative. "third" onwards
+#     carry a count or a date ("your third run", "on the twelfth").
+#   * "once", "a couple", "a few", "several". Vague quantifiers state no
+#     figure a reader could check.
+#   * "half" alone ("half-marathon" is an event, "the second half of the
+#     week" a window). It counts in "and a half" and "half a/an <noun>".
+# Known metric spellings are removed before the scan, as the shared numeric
+# tokenizer's contract requires of callers with a closed name vocabulary:
+# "six minute walk test distance" names a metric, it does not state a six.
+_CARDINAL_WORDS = (
+    "zero", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty",
+    "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "hundreds",
+    "thousand", "thousands", "million", "dozen", "dozens", "twice", "thrice",
+)
+_ORDINAL_WORDS = (
+    "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+    "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
+    "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth",
+    "thirtieth", "fortieth", "fiftieth", "sixtieth", "seventieth",
+    "eightieth", "ninetieth", "hundredth", "thousandth",
+)
+_COUNT_NOUNS = (
+    r"(?:mile|kilometer|kilometre|km|minute|min|hour|hr|second|sec|day|"
+    r"night|week|month|year|run|jog|walk|ride|session|workout|rep|set|lap|"
+    r"step|beat|bpm|pound|lb|kilogram|kg|percent|point|time)s?"
+)
+_NUMBER_WORD_RE = re.compile(
+    r"(?<![\w-])(?:"
+    + "|".join(sorted(_CARDINAL_WORDS + _ORDINAL_WORDS, key=len,
+                      reverse=True))
+    + r")(?![\w])"
+    r"|(?<![\w-])one\s+(?:(?:more|extra|full|whole|single|hard|easy|long|"
+    r"short|quick|rest|last)\s+)?" + _COUNT_NOUNS + r"(?![\w])"
+    r"|\band\s+a\s+half\b|(?<![\w-])half\s+an?\s+[a-z]+",
+    re.IGNORECASE)
+_ZERO_IN_RE = re.compile(r"\bzero\s+in\b", re.IGNORECASE)
+
+
+def _metric_spelling_patterns(facts: dict[str, dict] | None) -> list[str]:
+    """Regex spellings of every metric name, ``_`` matching space or hyphen."""
+    return [re.escape(metric).replace(r"_", r"(?:[_ -]+)")
+            for metric in _advice_metric_names(facts)]
+
+
+def number_words(text: str, facts: dict[str, dict] | None = None) -> list[str]:
+    """Return the spelled-number spans in *text*, in order (#49).
+
+    Callers pass prose with placeholders already removed. Public so the
+    repair prompt can name the offending spans, exactly as it does digits.
+    """
+    scan = text or ""
+    for words in _metric_spelling_patterns(facts):
+        scan = re.sub(r"(?<![\w])" + words + r"(?![\w])", " ", scan,
+                      flags=re.IGNORECASE)
+    scan = _ZERO_IN_RE.sub(" ", scan)
+    return [match.group(0) for match in _NUMBER_WORD_RE.finditer(scan)]
+
+
+# --- Conversational assertions (#69 item 3) -------------------------------------
+#
+# A conversational reply (no ledger, no tool call, allowlisted message) is
+# exempt from numeric verification because it states nothing about the vault.
+# The rule that enforced that used to refuse any canonical metric spelling.
+# Measured on the deployed shape (#69, 36 samples) it refused 7 replies and
+# all 7 were capability menus ("ask me about sleep, heart rate, training
+# load"), while "You ran twelve miles on Saturday." passed because it named no
+# canonical spelling. Naming a metric is not the risk; asserting a fact about
+# the user's data is. A claim needs a subject and a predicate, so this rule
+# refuses the three shapes a claim about the user takes:
+#
+#   1. The user's data is the SUBJECT of a statement: "your", a metric
+#      spelling, a data noun ("sleep", "training") or a recent-time reference
+#      ("last night", "this week"), then up to five words with no punctuation,
+#      then a stative, change or reporting verb ("is", "has", "looks",
+#      "dropped", "improving"). "Your sleep was better" is refused; "ask me
+#      about your sleep, heart rate or runs" is admitted, because the comma
+#      ends the phrase before any verb arrives: the metric is a topic on
+#      offer, not a subject.
+#   2. The user is the subject of a past, perfect, habitual or progressive
+#      verb: "you ran", "you've been running", "you usually", "you're
+#      recovering". "You're welcome", "would you like" and "if you want" are
+#      admitted; a conditional or wh- lead ("if you slept badly", "what you
+#      decided") states a hypothetical, not a fact.
+#   3. Praise for a recorded result: "great job", "well done", "personal
+#      best", "new record". Congratulation presupposes the result happened.
+#
+# Digits and number words stay refused unconditionally, through
+# ``scan_template`` and ``number_words``, before any of this runs. This is a
+# closed pattern list and it fails open on shapes it does not name ("You run
+# more on weekends"); the bias is toward refusing, because a refused greeting
+# costs a fallback card and a fabricated claim costs the user's trust. It is
+# used on the conversational
+# path ONLY: ledger-backed narration asserts facts by design, through
+# placeholders, and is governed by ``scan_template`` alone.
+_ASSERT_VERBS = (
+    r"(?:is|was|are|were|has|have|had|looks?|looked|looking|seems?|seemed|"
+    r"appears?|appeared|remains?|remained|stays?|stayed|improved|improves|"
+    r"improving|dropped|drops|dropping|rose|rises|rising|fell|falls|falling|"
+    r"increased|increasing|decreased|decreasing|declined|declining|climbed|"
+    r"climbing|dipped|spiked|jumped|trended|trending|went\s+(?:up|down)|"
+    r"came\s+(?:up|down|in)|shows?|showed|suggests?|suggested|indicates?|"
+    r"indicated|averaged|peaked|hit|reached|topped|got|gets|getting)"
+)
+_DATA_NOUNS = (
+    r"sleep|recovery|training|readiness|fitness|progress|pace|mileage|"
+    r"volume|hrv|last\s+night|yesterday|today|this\s+(?:week|morning|month)"
+)
+_HYPOTHETICAL_LEADS = frozenset({
+    "if", "when", "whenever", "whether", "what", "whatever", "unless", "once",
+    "how",
+})
+_NOT_PAST = r"(?!(?:need|feed|seed|speed|proceed|exceed|succeed)\b)"
+_USER_ACTION_RE = re.compile(
+    r"(?:\b(?P<lead>[a-z]+)\s+)?\byou(?:"
+    # perfect: you've been / you have logged / you had run
+    r"(?:['’]ve|\s+have|\s+had|['’]d)\s+(?:been|done|gone|got|gotten|had|"
+    r"made|run|slept|hit|set|kept|" + _NOT_PAST + r"[a-z]{2,}ed)"
+    # simple past or habitual, with an optional frequency/stance adverb
+    r"|\s+(?:(?:usually|often|always|typically|generally|consistently|"
+    r"regularly|rarely|never|clearly|really|just|also|definitely)\s+)?"
+    r"(?:ran|slept|hit|did|were|was|went|got|rode|swam|beat|made|took|kept|"
+    r"felt|held|lost|won|tend|seem|" + _NOT_PAST + r"[a-z]{2,}ed)"
+    # progressive or state: you're recovering / you are on track
+    r"|(?:['’]re|\s+are)\s+(?:(?:really|clearly|definitely|still|now)\s+)?"
+    r"(?:[a-z]+ing|on\s+track|ahead|behind|in\s+(?:good|great|solid)\s+shape|"
+    r"recovered|fitter|faster|stronger)"
+    r")(?![\w])",
+    re.IGNORECASE)
+_PRAISE_RE = re.compile(
+    r"\b(?:(?:great|good|nice|awesome|amazing|excellent)\s+job|well\s+done|"
+    r"congrat\w*|personal\s+(?:best|record)|new\s+(?:best|record|pb|pr))\b",
+    re.IGNORECASE)
+
+
+def _data_subject_re(facts: dict[str, dict] | None) -> re.Pattern:
+    heads = "|".join(["your", _DATA_NOUNS] + _metric_spelling_patterns(facts))
+    return re.compile(
+        r"(?<![\w])(?:" + heads + r")(?![\w])"
+        r"(?:\s+\w[\w-]*){0,5}?"
+        r"(?:\s+" + _ASSERT_VERBS + r"|['’]s\s+(?:been|looking|trending|"
+        r"improving|dropping|getting|up|down))(?![\w])",
+        re.IGNORECASE)
+
+
+def conversational_assertion(text: str,
+                             facts: dict[str, dict] | None = None) -> str:
+    """Return why *text* asserts something about the user's data, or ``""``.
+
+    The three refused shapes and the reasoning are in the comment block above
+    ``_ASSERT_VERBS``. In short: a metric named as a topic on offer is
+    admitted; the user or the user's data as the subject of a statement is
+    refused.
+    """
+    text = (text if isinstance(text, str) else "").replace("\u2019", "'")
+    if _data_subject_re(facts).search(text):
+        return ("conversational answer makes the user data the subject of "
+                "a statement")
+    for match in _USER_ACTION_RE.finditer(text):
+        if (match.group("lead") or "").lower() not in _HYPOTHETICAL_LEADS:
+            return "conversational answer states something the user did"
+    if _PRAISE_RE.search(text):
+        return "conversational answer praises a recorded result"
+    return ""
+
+
 def _period_token(period) -> str:
     if isinstance(period, str):
         return "s:" + period
@@ -1224,10 +1404,15 @@ def conversational_violation(text: str,
     """Return a reason a model-authored conversational reply is unsafe.
 
     A conversational reply has no Python-owned facts, so it may contain no
-    digits, placeholders, advice slots, or vault metric names.  Reuse the
-    template scanner for the first three checks and the same metric vocabulary
-    used by advice slots for the last one; this keeps the two literal-content
-    exemptions from growing separate safety vocabularies.
+    digits, number words, placeholders or advice slots (``scan_template`` and
+    ``number_words``, unconditionally), and it may not assert anything about
+    the user's data (``conversational_assertion``).
+
+    It MAY name a metric. The previous rule refused any canonical metric
+    spelling; measured on the deployed shape (#69) that refused seven
+    capability menus out of seven refusals and admitted "You ran twelve miles
+    on Saturday.", because the risk is a claim, and a claim is a subject plus
+    a predicate, not a noun. See ``conversational_assertion``.
     """
     text = text if isinstance(text, str) else ""
     scan = scan_template(text, facts or {})
@@ -1235,12 +1420,12 @@ def conversational_violation(text: str,
         return scan["reason"] or "empty conversational answer"
     if _PLACEHOLDER_RE.search(text):
         return "conversational answer contains a placeholder"
-    for metric in _advice_metric_names(facts):
-        words = re.escape(metric).replace(r"_", r"(?:[_ -]+)")
-        if re.search(r"(?<![\w])" + words + r"(?![\w])", text,
-                     re.IGNORECASE):
-            return "conversational answer references vault metric " + metric
-    return ""
+    # Checked here, not only in scan_template: whether ledger-backed
+    # narration refuses number words is #49's decision, and this exemption
+    # must not depend on it. A reply that states nothing states no "twelve".
+    if number_words(text, facts):
+        return "number word outside placeholder"
+    return conversational_assertion(text, facts)
 
 
 def template_refused(template: str, facts: dict[str, dict]) -> bool:

@@ -368,6 +368,9 @@ def _fallback_answer(verification: dict | None = None) -> str:
             "answer truncated": "the answer was truncated before it was complete",
             "digit outside placeholder": (
                 "the draft put a digit outside a Python-owned fact placeholder"),
+            "number word outside placeholder": (
+                "the draft spelled a number outside a Python-owned fact "
+                "placeholder"),
             "ask answer has no tool-call ledger": (
                 "the answer had no tool-call ledger"),
         }

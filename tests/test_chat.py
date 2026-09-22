@@ -2199,7 +2199,7 @@ def test_accepted_and_refused_conversational_causes_are_distinct(
     accepted = chat.answer_question(vault, "Hello!")
 
     monkeypatch.setattr(llm, "tool_loop",
-                        lambda *args, **kwargs: "Hello! Your jog_minutes await.")
+                        lambda *args, **kwargs: "Hello! Your jog_minutes are up.")
     refused = chat.answer_question(vault, "Hello!")
 
     assert accepted["mode"] == "narration"

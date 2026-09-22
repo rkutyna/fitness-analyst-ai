@@ -169,8 +169,11 @@ def number_words(text: str, facts: dict[str, dict] | None = None) -> list[str]:
 # like to know — how your training's been going" offer a topic. Measured
 # 2026-09-22 on the live battery: all four replies still refused after the
 # first version of this rule were capability menus, three of them this shape.
-# The lead must open the clause; "I noticed how your sleep improved" is still
-# refused. Quoted example questions and sentences ending in "?" are NOT
+# The lead must open the clause (after and/or/but), or follow a base-form
+# verb of looking or helping (see _CAPABILITY_QUESTION_RE); "I noticed how
+# your sleep improved" is still refused. A second live round (n=72) left
+# four menus refused on exactly those two gaps plus "your data whenever you
+# are", which is why subordinators also open a clause. Quoted example questions and sentences ending in "?" are NOT
 # exempt: neither fired on the recorded set, and "Did you know your resting
 # heart rate dropped?" is a claim in question form.
 #
@@ -220,6 +223,26 @@ _USER_ACTION_RE = re.compile(
     re.IGNORECASE)
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?;:,()\n\u2014\u2013]+|\s-\s")
 _CLAUSE_MARKUP_RE = re.compile(r"^[\s*#>\"'\u201c\u201d\u2022-]+")
+# A subordinator with its own subject opens a new clause: "your data
+# whenever you are" is not "your data ... are". It must be followed by
+# you/I/we, so "your sleep when traveling was worse" is still one clause.
+# "as" is left out: "as good as" and "as of" are not subordinators.
+_SUBORDINATOR_SPLIT_RE = re.compile(
+    r"\s+(?=(?:whenever|when|because|while|until|once|since|although|"
+    r"though)\s+(?:you|i|we)\b)", re.IGNORECASE)
+_LEADING_CONJUNCTION_RE = re.compile(r"^(?:(?:and|or|but|so|plus)\s+)+",
+                                     re.IGNORECASE)
+# An indirect question offered as a capability: a BASE-FORM verb of looking
+# or helping, then how/what/whether/which ("I could check how your training
+# has been going", "want to check in on how training's been going"). Only
+# the words before the wh-word are then read. Base forms only, so "I checked
+# how your sleep has been" is not an offer; and no "see"/"notice"/"show"/
+# "tell": "I noticed how your sleep improved" is an observation, and "I can
+# show you how your sleep improved" presupposes the improvement.
+_CAPABILITY_QUESTION_RE = re.compile(
+    r"\b(?:check|look|explore|review|dig|find|understand|help|compare|"
+    r"track|know|ask)\b[^.?!]*?"
+    r"\b(?P<wh>how|what|whether|which)\b", re.IGNORECASE)
 _INDIRECT_QUESTION_LEADS = frozenset({
     "how", "what", "whether", "if", "when", "whenever", "which", "why",
     "where", "whatever", "unless",
@@ -251,11 +274,17 @@ def conversational_assertion(text: str,
     """
     text = (text if isinstance(text, str) else "").replace("\u2019", "'")
     subject_re = _data_subject_re(facts)
-    for clause in _CLAUSE_SPLIT_RE.split(text):
-        clause = _CLAUSE_MARKUP_RE.sub("", clause)
+    clauses = [part for chunk in _CLAUSE_SPLIT_RE.split(text)
+               for part in _SUBORDINATOR_SPLIT_RE.split(chunk)]
+    for clause in clauses:
+        clause = _LEADING_CONJUNCTION_RE.sub(
+            "", _CLAUSE_MARKUP_RE.sub("", clause))
         first = re.match(r"[a-z]+", clause, re.IGNORECASE)
         if first and first.group(0).lower() in _INDIRECT_QUESTION_LEADS:
             continue
+        offer = _CAPABILITY_QUESTION_RE.search(clause)
+        if offer:
+            clause = clause[:offer.start("wh")]
         if subject_re.search(clause):
             return ("conversational answer makes the user data the subject "
                     "of a statement")

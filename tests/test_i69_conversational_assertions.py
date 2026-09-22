@@ -39,7 +39,19 @@ LIVE_MENUS = (
     "Hello! 👋 Great to see you. I'm your health coach, and I've got full access to your health data — training load, sleep, heart rate, running form, and more.\n\nWhenever you're ready, just ask me anything, like:\n\n- **\"How has my training been this week?\"**\n- **\"Am I overtraining or recovering well?\"**\n- **\"How's my sleep regularity?\"**\n- **\"What did my last run look like?\"**\n\nOr tell me a goal you're working toward and I'll help you track it. What would you like to dig into today? 😊",
 )
 
-MUST_ADMIT = RECORDED_MENUS + LIVE_MENUS + (
+# Second live round (n=72): the four menus still refused, and what fired:
+#   E "your data whenever you are"               -> subordinator not a split
+#   F "want to check in on how training's been"  -> wh-word after an offer verb
+#   G "I could check how your recent training has" -> same
+#   H "your training and wellness data whenever you are" -> as E
+LIVE_MENUS_2 = (
+    "Hi there! 👋 Great to see you.\n\nI'm here as your health coach, ready to dig into your data whenever you are. I can look at things like your training load, recovery readiness, sleep regularity, running form, heart-rate zones, weekly jog volume, and more — and help you make sense of what the numbers mean for your plan.\n\nWhat would you like to explore today?",
+    "Hi there! 👋 Great to see you. I'm here as your health coach whenever you're ready.\n\n— want to check in on how training's been going, look at your recovery or sleep, review a recent run, or dig into anything specific? Just let me know what you'd like to look at.",
+    "Hello! 👋\n\nI'm here and ready to help with your health and training data. I can look into things like your workouts, running form, heart rate, sleep, training load, readiness, and more.\n\nWhat would you like to know? For example, I could check how your recent training has been going, how your running form looks, or how your sleep and recovery are trending. Just let me know what you'd like to dig into!",
+    "Hello! 👋 I'm here as your health coach, ready to dig into your training and wellness data whenever you are.\n\nJust let me know what you'd like to look at — whether it's how your running volume and form are trending, your recovery and readiness, sleep regularity, heart-rate zones on a recent session, or anything else. I'll pull the relevant numbers and give you an honest read on what they mean.\n\nWhat would you like to explore?",
+)
+
+MUST_ADMIT = RECORDED_MENUS + LIVE_MENUS + LIVE_MENUS_2 + (
     # The hard two: "your <metric>" in a capability sense.
     "Hi! I can help you look at your sleep, heart rate, runs and training "
     "plan. What would you like to know?",
@@ -67,6 +79,11 @@ WORDLESS_CLAIMS = (
     "You're running more lately.",
     # The indirect-question exemption needs the wh-word to OPEN the clause.
     "I noticed how your sleep improved.",
+    "I can show you how your sleep improved.",
+    "Your sleep when traveling was worse.",
+    # Live round 2: about the message, not the vault, but "your X was" is the
+    # shape; refusing it costs one fallback card.
+    "Hi! I'm ready to help. I notice your message was mostly instructions rather than a specific question — just let me know what you'd like to look into (training load, sleep, running form, recovery, nutrition, anything else), and I'll pull the relevant data and give you a straight answer. What's on your mind?",
 )
 MUST_REFUSE = NUMBER_WORD_CLAIMS + DIGIT_CLAIMS + WORDLESS_CLAIMS
 

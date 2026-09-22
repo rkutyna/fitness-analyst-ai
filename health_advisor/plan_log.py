@@ -7,6 +7,7 @@ it while projecting a week and never updates one of its rows in place.
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -129,7 +130,13 @@ def _read_spans(conn) -> list[WeekSpan]:
     ).fetchone()
     if present is None:
         return []
-    rows = conn.execute("SELECT * FROM plan_week_log ORDER BY week_start").fetchall()
+    factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM plan_week_log ORDER BY week_start").fetchall()
+    finally:
+        conn.row_factory = factory
     return [_span_from_row(row) for row in rows]
 
 
@@ -374,18 +381,25 @@ def _declared_end(row: Mapping[str, Any]) -> date | None:
     return date.fromisoformat(raw) if raw else None
 
 
-def week_spans(ctx: VaultContext) -> list[WeekSpan]:
-    """Every stored week's day span, ordered by start."""
-    if not isinstance(ctx, VaultContext):
-        raise TypeError("week_spans requires a VaultContext")
-    conn = ctx.read_only()
+def week_spans(source: VaultContext | sqlite3.Connection) -> list[WeekSpan]:
+    """Every stored week's day span, ordered by start.
+
+    ``source`` is a vault context, or an open connection a caller already
+    holds (it is only read, and its row factory is restored).
+    """
+    if isinstance(source, sqlite3.Connection):
+        return _read_spans(source)
+    if not isinstance(source, VaultContext):
+        raise TypeError("week_spans requires a VaultContext or sqlite3.Connection")
+    conn = source.read_only()
     try:
         return _read_spans(conn)
     finally:
         conn.close()
 
 
-def week_containing(ctx: VaultContext, day: date | str) -> WeekSpan | None:
+def week_containing(source: VaultContext | sqlite3.Connection,
+                    day: date | str) -> WeekSpan | None:
     """The one stored week whose span holds ``day``, or ``None``.
 
     Fails closed: when two stored weeks both claim the day and neither
@@ -394,7 +408,7 @@ def week_containing(ctx: VaultContext, day: date | str) -> WeekSpan | None:
     latest-starting week holds the day, because each earlier default yields.
     """
     day = _as_date(day)
-    holding = [span for span in week_spans(ctx) if span.contains(day)]
+    holding = [span for span in week_spans(source) if span.contains(day)]
     if not holding:
         return None
     for index, earlier in enumerate(holding[:-1]):

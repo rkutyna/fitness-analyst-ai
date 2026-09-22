@@ -145,6 +145,16 @@ def test_a_day_inside_two_stored_weeks_fails_closed(tmp_path):
         plan_log.week_containing(ctx, later + timedelta(days=1))
     assert plan_log.week_containing(ctx, START + timedelta(days=20)) is None
 
+    # A caller holding a plain connection gets the same answer.
+    raw = sqlite3.connect(ctx.db_path)
+    try:
+        assert plan_log.week_containing(raw, START).start == START
+        with pytest.raises(plan_log.OverlappingWeeks):
+            plan_log.week_containing(raw, later + timedelta(days=1))
+        assert raw.row_factory is None
+    finally:
+        raw.close()
+
 
 def test_an_undeclared_seven_day_default_yields_to_the_next_start(tmp_path):
     ctx = _ctx(tmp_path)

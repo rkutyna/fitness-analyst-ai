@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Mapping
 
@@ -62,20 +63,85 @@ def _rule_values(rule: plan_model.Rule) -> tuple[Any, ...]:
 
 
 def _week_metadata_values(week: plan_model.Week) -> tuple[Any, ...]:
+    week_end = week.week_end.isoformat() if week.week_end is not None else None
     if isinstance(week.provenance, plan_model.ConversationTurnProvenance):
         return (
             week.week_start.isoformat(),
             _json(plan_model.grading_policy_to_dict(week.grading_policy)),
             "conversation_turn", week.provenance.conversation_turn_id,
-            None, None,
+            None, None, week_end,
         )
     if isinstance(week.provenance, plan_model.ParsedProvenance):
         return (
             week.week_start.isoformat(),
             _json(plan_model.grading_policy_to_dict(week.grading_policy)),
             "parsed", None, week.provenance.file, week.provenance.line,
+            week_end,
         )
     raise TypeError("week provenance must be conversation-turn or parsed")
+
+
+class OverlappingWeeks(ValueError):
+    """Two stored weeks both claim a day, and neither yields.
+
+    Raised instead of choosing one: which plan a day belongs to decides what
+    is prescribed and graded on it, so an ambiguous answer is refused.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class WeekSpan:
+    """A stored week's day span, as its declaration row states it."""
+
+    start: date
+    end: date
+    declared_end: bool
+
+    def contains(self, day: date) -> bool:
+        return self.start <= day <= self.end
+
+
+def _span_from_row(row: Mapping[str, Any]) -> WeekSpan:
+    start = date.fromisoformat(row["week_start"])
+    raw_end = row["week_end"] if "week_end" in row.keys() else None
+    week_end = date.fromisoformat(raw_end) if raw_end else None
+    return WeekSpan(start, plan_model.week_span_end(start, week_end),
+                    week_end is not None)
+
+
+def _spans_conflict(first: WeekSpan, second: WeekSpan) -> bool:
+    """Whether two stored spans both claim a day with neither yielding.
+
+    A week that never declared its end has only a seven-day DEFAULT, and that
+    default yields to any later week's start: a declaration that did not say
+    where it ends cannot outrank one that says where it begins.  A declared
+    end never yields, so any shared day with it is a conflict.
+    """
+    earlier, later = sorted((first, second), key=lambda span: span.start)
+    if earlier.end < later.start:
+        return False
+    return earlier.declared_end or earlier.start == later.start
+
+
+def _read_spans(conn) -> list[WeekSpan]:
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'plan_week_log'"
+    ).fetchone()
+    if present is None:
+        return []
+    rows = conn.execute("SELECT * FROM plan_week_log ORDER BY week_start").fetchall()
+    return [_span_from_row(row) for row in rows]
+
+
+def _refuse_overlap(conn, week: plan_model.Week) -> None:
+    new = WeekSpan(week.week_start, week.end, week.week_end is not None)
+    for existing in _read_spans(conn):
+        if _spans_conflict(existing, new):
+            raise OverlappingWeeks(
+                f"week {new.start}..{new.end} overlaps the stored week "
+                f"{existing.start}..{existing.end}; a day may belong to only "
+                "one plan week"
+            )
 
 
 def _insert_rule(conn, rule: plan_model.Rule, statement_id: str) -> None:
@@ -94,12 +160,14 @@ def _insert_rule(conn, rule: plan_model.Rule, statement_id: str) -> None:
 
 
 def _insert_week_metadata(conn, week: plan_model.Week) -> None:
+    _refuse_overlap(conn, week)
     conn.execute(
         """
         INSERT INTO plan_week_log
             (week_start, grading_policy_json, provenance_kind,
-             conversation_turn_id, parsed_file, parsed_line, recorded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+             conversation_turn_id, parsed_file, parsed_line, week_end,
+             recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (*_week_metadata_values(week), db.utcnow_iso()),
     )
@@ -271,7 +339,7 @@ def read_rules(ctx: VaultContext) -> list[plan_model.Rule]:
 
 
 def _read_week_metadata(ctx: VaultContext, week_start: date) -> tuple[
-        plan_model.Provenance, plan_model.GradingPolicy]:
+        plan_model.Provenance, plan_model.GradingPolicy, date | None]:
     conn = ctx.read_only()
     try:
         row = conn.execute(
@@ -298,10 +366,50 @@ def _read_week_metadata(ctx: VaultContext, week_start: date) -> tuple[
         )
     return provenance, plan_model.grading_policy_from_dict(
         json.loads(row["grading_policy_json"])
-    )
+    ), _declared_end(row)
 
 
-def _scope_matches(scope: plan_model.Scope, week_start: date) -> bool:
+def _declared_end(row: Mapping[str, Any]) -> date | None:
+    raw = row["week_end"] if "week_end" in row.keys() else None
+    return date.fromisoformat(raw) if raw else None
+
+
+def week_spans(ctx: VaultContext) -> list[WeekSpan]:
+    """Every stored week's day span, ordered by start."""
+    if not isinstance(ctx, VaultContext):
+        raise TypeError("week_spans requires a VaultContext")
+    conn = ctx.read_only()
+    try:
+        return _read_spans(conn)
+    finally:
+        conn.close()
+
+
+def week_containing(ctx: VaultContext, day: date | str) -> WeekSpan | None:
+    """The one stored week whose span holds ``day``, or ``None``.
+
+    Fails closed: when two stored weeks both claim the day and neither
+    yields (see ``_spans_conflict``), this raises ``OverlappingWeeks`` rather
+    than choosing.  When only undeclared seven-day defaults overlap, the
+    latest-starting week holds the day, because each earlier default yields.
+    """
+    day = _as_date(day)
+    holding = [span for span in week_spans(ctx) if span.contains(day)]
+    if not holding:
+        return None
+    for index, earlier in enumerate(holding[:-1]):
+        for later in holding[index + 1:]:
+            if _spans_conflict(earlier, later):
+                raise OverlappingWeeks(
+                    f"{day} falls inside two stored plan weeks, "
+                    f"{earlier.start}..{earlier.end} and "
+                    f"{later.start}..{later.end}; refusing to choose one"
+                )
+    return holding[-1]
+
+
+def _scope_matches(scope: plan_model.Scope, week_start: date,
+                   week_end: date | None = None) -> bool:
     if scope.week is not None:
         week_values = {
             week_start.isoformat(),
@@ -315,7 +423,7 @@ def _scope_matches(scope: plan_model.Scope, week_start: date) -> bool:
         if not week_selector.startswith("week-") and week_selector not in week_values:
             return False
     if scope.days:
-        week_days = {week_start + timedelta(days=i) for i in range(7)}
+        week_days = set(_span_days(week_start, week_end))
         if not week_days.intersection(
             date.fromisoformat(day) for day in scope.days
         ):
@@ -323,13 +431,19 @@ def _scope_matches(scope: plan_model.Scope, week_start: date) -> bool:
     return True
 
 
-def _applies_to_week(rule: plan_model.Rule, week_start: date) -> bool:
-    if not _scope_matches(rule.scope, week_start):
+def _span_days(week_start: date, week_end: date | None) -> tuple[date, ...]:
+    """The week's days, start through its declared or seven-day end."""
+    last = plan_model.week_span_end(week_start, week_end)
+    return tuple(week_start + timedelta(days=offset)
+                 for offset in range((last - week_start).days + 1))
+
+
+def _applies_to_week(rule: plan_model.Rule, week_start: date,
+                     week_end: date | None = None) -> bool:
+    if not _scope_matches(rule.scope, week_start, week_end):
         return False
-    return any(
-        rule.stated.contains(week_start + timedelta(days=i))
-        for i in range(7)
-    )
+    return any(rule.stated.contains(day)
+               for day in _span_days(week_start, week_end))
 
 
 def _scope_key(scope: plan_model.Scope) -> str:
@@ -338,8 +452,10 @@ def _scope_key(scope: plan_model.Scope) -> str:
 
 def _project(rules: list[plan_model.Rule], week_start: date,
              provenance: plan_model.Provenance,
-             grading_policy: plan_model.GradingPolicy) -> plan_model.Week:
-    events = [rule for rule in rules if _applies_to_week(rule, week_start)]
+             grading_policy: plan_model.GradingPolicy,
+             week_end: date | None = None) -> plan_model.Week:
+    events = [rule for rule in rules
+              if _applies_to_week(rule, week_start, week_end)]
     active: list[plan_model.Rule] = []
     for rule in events:
         key = _scope_key(rule.scope)
@@ -362,6 +478,7 @@ def _project(rules: list[plan_model.Rule], week_start: date,
         rules=tuple(active),
         provenance=provenance,
         grading_policy=grading_policy,
+        week_end=week_end,
     )
 
 
@@ -371,8 +488,9 @@ def project_week(
 ) -> plan_model.Week:
     """Build a Week from the statement log, never from plan_projections."""
     week_start = _as_date(week_start)
-    provenance, grading_policy = _read_week_metadata(ctx, week_start)
-    return _project(read_rules(ctx), week_start, provenance, grading_policy)
+    provenance, grading_policy, week_end = _read_week_metadata(ctx, week_start)
+    return _project(read_rules(ctx), week_start, provenance, grading_policy,
+                    week_end)
 
 
 def rebuild_week_projection(
@@ -416,6 +534,7 @@ def rebuild_week_projection(
             plan_model.grading_policy_from_dict(
                 json.loads(metadata["grading_policy_json"])
             ),
+            _declared_end(metadata),
         )
         db.save_week_projection(conn, week, projection_id=uuid.uuid4().hex)
         return week
@@ -434,5 +553,6 @@ __all__ = [
     "append_rule", "append_week_metadata", "append_week", "write_rule",
     "read_rules", "load_rules",
     "project_week", "project_week_from_log", "rebuild_week_projection",
-    "rebuild_projection",
+    "rebuild_projection", "OverlappingWeeks", "WeekSpan", "week_spans",
+    "week_containing",
 ]

@@ -825,6 +825,10 @@ CREATE TABLE IF NOT EXISTS plan_week_log (
     parsed_file            TEXT,
     parsed_line            INTEGER,
     recorded_at            TEXT NOT NULL,
+    -- The week's last day, inclusive. NULL: the week never declared one and
+    -- spans seven days from week_start (every row written before this column
+    -- existed). Added to existing vaults by db._ADDED_COLUMNS.
+    week_end               TEXT,
     CHECK (
         (provenance_kind = 'conversation_turn'
          AND conversation_turn_id IS NOT NULL

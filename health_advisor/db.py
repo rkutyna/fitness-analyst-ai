@@ -152,6 +152,12 @@ _ADDED_COLUMNS = {
         "mode": "TEXT",
         "attachments_json": "TEXT",
     },
+    # A plan week's explicit last day (inclusive). NULL on every row written
+    # before it existed, and NULL still means the seven days from week_start,
+    # so an existing vault's weeks read exactly as they did.
+    "plan_week_log": {
+        "week_end": "TEXT",
+    },
 }
 
 # Tables which were not present in older vaults.

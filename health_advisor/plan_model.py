@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -470,16 +470,42 @@ class Rule:
         )
 
 
+DEFAULT_WEEK_DAYS = 7
+
+
+def week_span_end(week_start: date, week_end: date | None) -> date:
+    """A week's last day: the declared end, or six days after the start."""
+    if week_end is not None:
+        return week_end
+    return week_start + timedelta(days=DEFAULT_WEEK_DAYS - 1)
+
+
 @dataclass(frozen=True, slots=True)
 class Week:
+    """One plan week: its rules over the day span ``week_start .. end``.
+
+    ``week_end`` is the week's last day, inclusive.  ``None`` means the week
+    never declared one and spans the seven days from ``week_start`` -- every
+    week written before the end was explicit reads that way, unchanged.  An
+    explicit end lets a week be shorter than seven days (a first week that
+    starts mid-cycle) or longer (a first week extended to the following
+    boundary), which a start date alone cannot express.
+    """
+
     week_start: date
     rules: tuple[Rule, ...]
     provenance: Provenance
     grading_policy: GradingPolicy = DEFAULT_GRADING_POLICY
+    week_end: date | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.week_start, date):
             raise TypeError("week_start must be a date")
+        if self.week_end is not None:
+            if not isinstance(self.week_end, date):
+                raise TypeError("week_end must be a date or None")
+            if self.week_end < self.week_start:
+                raise ValueError("week_end must not precede week_start")
         object.__setattr__(self, "rules", tuple(self.rules))
         if not all(isinstance(rule, Rule) for rule in self.rules):
             raise TypeError("week rules must contain Rule values")
@@ -493,17 +519,33 @@ class Week:
         return self.week_start
 
     @property
+    def end(self) -> date:
+        """The week's last day, inclusive: declared, or the seventh day."""
+        return week_span_end(self.week_start, self.week_end)
+
+    @property
+    def days(self) -> tuple[date, ...]:
+        """Every calendar day of the week, ``start`` through ``end``."""
+        return tuple(self.week_start + timedelta(days=offset)
+                     for offset in range((self.end - self.week_start).days + 1))
+
+    @property
     def policy(self) -> GradingPolicy:
         return self.grading_policy
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": PLAN_MODEL_SCHEMA_VERSION,
             "week_start": _iso(self.week_start),
             "rules": [rule.to_dict() for rule in self.rules],
             "provenance": provenance_to_dict(self.provenance),
             "grading_policy": grading_policy_to_dict(self.grading_policy),
         }
+        # Only a declared end is serialized, so a week that never declared one
+        # serializes exactly as it did before the field existed.
+        if self.week_end is not None:
+            result["week_end"] = _iso(self.week_end)
+        return result
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
@@ -518,6 +560,7 @@ class Week:
             rules=tuple(Rule.from_dict(item) for item in data["rules"]),
             provenance=provenance_from_dict(data["provenance"]),
             grading_policy=policy,
+            week_end=_date(data["week_end"]) if data.get("week_end") else None,
         )
 
     @classmethod
@@ -537,5 +580,6 @@ __all__ = [
     "ConversationTurnProvenance", "ConversationTurn", "ParsedProvenance", "Parsed",
     "Provenance", "provenance_to_dict", "provenance_from_dict",
     "grading_policy_to_dict", "grading_policy_from_dict",
-    "validate_enforced_from", "Rule", "Week", "serialize_absence",
+    "validate_enforced_from", "Rule", "Week", "DEFAULT_WEEK_DAYS", "week_span_end",
+    "serialize_absence",
 ]

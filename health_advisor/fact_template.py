@@ -394,19 +394,24 @@ def _date_range_period_label(start: date, end: date) -> str | None:
     return f"from {start_text} to {end_text}"
 
 
-def _period_starts_label(starts: list[date]) -> str | None:
+def _period_starts_label(starts: list[date], row_end: date | None = None) -> str | None:
     """Name a run of regularly-spaced bucket starts by its real span.
 
     Never says ``last`` — the function has no notion of "now", only the
     spacing between the starts it was given, so naming a recency claim would
     be unfounded. Two different spans of the same cadence and count always
     render different text, because the span's own endpoints are in the label.
+
+    ``row_end`` overrides the trailing week's end (``starts[-1] + 6``) when
+    the caller has found the block's own ``weeks`` row for that start already
+    clamped to a partial trailing week (#77 last edge) -- otherwise a block
+    whose last week is short is labelled past the data it actually covers.
     """
     if len(starts) < 2:
         return None
     steps = [(right - left).days for left, right in zip(starts, starts[1:])]
     if all(step == 7 for step in steps):
-        span_end = starts[-1] + timedelta(days=6)
+        span_end = row_end if row_end is not None else starts[-1] + timedelta(days=6)
         start_text, end_text = _range_endpoint_texts(starts[0], span_end)
         return f"the {len(starts)} weeks from {start_text} to {end_text}"
     if all(step == 1 for step in steps):
@@ -416,7 +421,7 @@ def _period_starts_label(starts: list[date]) -> str | None:
     return None
 
 
-def _period_label(period) -> str | None:
+def _period_label(period, row_end: date | None = None) -> str | None:
     """Return a human label only for period shapes with explicit date meaning.
 
     Weekly block periods carry their bucket starts, so their count and cadence
@@ -427,6 +432,9 @@ def _period_label(period) -> str | None:
     labelled from their explicit day or inclusive date range. Unknown or
     malformed shapes return ``None`` rather than turning arbitrary structure
     into a guessed date.
+
+    ``row_end`` (see ``_period_starts_label``) is only meaningful for the
+    ``period_starts`` dict shape below; it is ignored for every other shape.
     """
     if isinstance(period, str):
         day = _period_date(period)
@@ -451,7 +459,7 @@ def _period_label(period) -> str | None:
                 return None
             starts = [value for value in starts if value is not None]
             if len(starts) > 1:
-                return _period_starts_label(starts)
+                return _period_starts_label(starts, row_end=row_end)
 
         start = _period_date(period.get("start"))
         end = _period_date(period.get("end"))
@@ -468,7 +476,51 @@ def _period_label(period) -> str | None:
     return None
 
 
-def _add_period_label_facts(facts: dict[str, dict]) -> None:
+def _block_row_end_overrides(ledger: list[dict]) -> dict[tuple[str, str], date]:
+    """Find each block node's own trailing-week row end (#77 last edge).
+
+    A block node (see ``mcp_server._impact_block_comparison``'s ``block()``)
+    publishes ``period`` as bucket *starts* only -- ``period_starts[-1]`` is a
+    start, not the block's real end -- beside a ``weeks`` list whose rows are
+    already clamped to the days present, so the last row can be a partial
+    week. Walking the raw ledger (rather than the flattened facts) is what
+    lets this see both siblings on the *same* node at once; the flattened
+    entries used elsewhere only carry the period, never the node it came from.
+    """
+    overrides: dict[tuple[str, str], date] = {}
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            period = node.get("period")
+            weeks = node.get("weeks")
+            starts = period.get("period_starts") if isinstance(period, dict) else None
+            if (isinstance(starts, list) and starts
+                    and isinstance(weeks, list) and weeks
+                    and isinstance(weeks[-1], dict)
+                    and node.get("metric") is not None):
+                last_start = starts[-1]
+                row_period = weeks[-1].get("period")
+                if (isinstance(row_period, str) and ":" in row_period
+                        and row_period.split(":", 1)[0] == str(last_start)):
+                    row_end = _period_date(row_period.split(":", 1)[1])
+                    if row_end is not None:
+                        overrides[(str(node["metric"]),
+                                   _period_identity(period))] = row_end
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    for record in ledger:
+        if isinstance(record, dict) and not record.get("result_elided"):
+            walk(record.get("result"))
+    return overrides
+
+
+def _add_period_label_facts(
+        facts: dict[str, dict],
+        row_end_overrides: dict[tuple[str, str], date] | None = None) -> None:
     """Add one Python-owned label leaf for each closed metric/period pair."""
     seen: set[tuple[str, str]] = set()
     for fact in list(facts.values()):
@@ -480,7 +532,8 @@ def _add_period_label_facts(facts: dict[str, dict]) -> None:
         if identity in seen:
             continue
         seen.add(identity)
-        label = _period_label(period)
+        row_end = (row_end_overrides or {}).get(identity)
+        label = _period_label(period, row_end=row_end)
         if label is None:
             continue
         key = fact_key(metric, period, "period_label")
@@ -1044,7 +1097,7 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
         cold_candidates.extend(_cold_start_entries(
             entries, sequence=record.get("sequence")))
     facts.update(_publish_unambiguous(cold_candidates))
-    _add_period_label_facts(facts)
+    _add_period_label_facts(facts, _block_row_end_overrides(ledger))
     return facts
 
 

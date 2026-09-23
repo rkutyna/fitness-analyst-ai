@@ -202,7 +202,8 @@ def test_week_and_day_periods_publish_human_period_labels():
                                        "period_label")
     assert week_facts[week_key]["value"] == "the week of August 10"
     assert day_facts[day_key]["value"] == "Fri Aug 7"
-    assert block_facts[block_key]["value"] == "the last 4 weeks"
+    assert block_facts[block_key]["value"] == (
+        "the 4 weeks from Mon Jul 27 to Sun Aug 23")
 
 
 def test_period_label_placeholder_interpolates_date_without_digit_refusal():

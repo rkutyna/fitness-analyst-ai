@@ -363,21 +363,68 @@ def _full_period_day(value: date) -> str:
     return f"{_MONTH_NAMES[value.month - 1]} {value.day}"
 
 
+# A span this long (inclusive days) forces the year onto both endpoints even
+# when they share a calendar year, so a multi-year block can never collide
+# with a same-year one of similar length.
+_LONG_SPAN_DAYS = 300
+
+
+def _short_period_day_with_year(value: date) -> str:
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    return (f"{weekdays[value.weekday()]} "
+            f"{_MONTH_ABBREVIATIONS[value.month - 1]} {value.day} {value.year}")
+
+
+def _range_endpoint_texts(start: date, end: date) -> tuple[str, str]:
+    """Render two endpoints, adding the year to both when it is needed to
+    keep the label from reading as a single day or from hiding a decade."""
+    span_days = (end - start).days
+    if start.year != end.year or span_days > _LONG_SPAN_DAYS:
+        return _short_period_day_with_year(start), _short_period_day_with_year(end)
+    return _short_period_day(start), _short_period_day(end)
+
+
 def _date_range_period_label(start: date, end: date) -> str | None:
     """Name a validated inclusive range without inferring its metric."""
     if end < start:
         return None
     if end - start == timedelta(days=6):
         return f"the week of {_full_period_day(start)}"
-    return f"from {_short_period_day(start)} to {_short_period_day(end)}"
+    start_text, end_text = _range_endpoint_texts(start, end)
+    return f"from {start_text} to {end_text}"
+
+
+def _period_starts_label(starts: list[date]) -> str | None:
+    """Name a run of regularly-spaced bucket starts by its real span.
+
+    Never says ``last`` — the function has no notion of "now", only the
+    spacing between the starts it was given, so naming a recency claim would
+    be unfounded. Two different spans of the same cadence and count always
+    render different text, because the span's own endpoints are in the label.
+    """
+    if len(starts) < 2:
+        return None
+    steps = [(right - left).days for left, right in zip(starts, starts[1:])]
+    if all(step == 7 for step in steps):
+        span_end = starts[-1] + timedelta(days=6)
+        start_text, end_text = _range_endpoint_texts(starts[0], span_end)
+        return f"the {len(starts)} weeks from {start_text} to {end_text}"
+    if all(step == 1 for step in steps):
+        span_end = starts[-1]
+        start_text, end_text = _range_endpoint_texts(starts[0], span_end)
+        return f"the {len(starts)} days from {start_text} to {end_text}"
+    return None
 
 
 def _period_label(period) -> str | None:
     """Return a human label only for period shapes with explicit date meaning.
 
     Weekly block periods carry their bucket starts, so their count and cadence
-    can be named directly (for example, ``the last 4 weeks``). Other shapes
-    are labelled from their explicit day or inclusive date range. Unknown or
+    can be named directly by the span they actually cover (for example, ``the
+    4 weeks from Mon Dec 2 to Sun Dec 29``) rather than by an unfounded
+    recency claim like "the last 4 weeks" — the function has no notion of
+    "now", only the spacing between the starts it was given. Other shapes are
+    labelled from their explicit day or inclusive date range. Unknown or
     malformed shapes return ``None`` rather than turning arbitrary structure
     into a guessed date.
     """
@@ -404,13 +451,7 @@ def _period_label(period) -> str | None:
                 return None
             starts = [value for value in starts if value is not None]
             if len(starts) > 1:
-                steps = [(right - left).days
-                         for left, right in zip(starts, starts[1:])]
-                if all(step == 7 for step in steps):
-                    return f"the last {len(starts)} weeks"
-                if all(step == 1 for step in steps):
-                    return f"the last {len(starts)} days"
-                return None
+                return _period_starts_label(starts)
 
         start = _period_date(period.get("start"))
         end = _period_date(period.get("end"))
@@ -423,14 +464,7 @@ def _period_label(period) -> str | None:
         if any(value is None for value in starts):
             return None
         starts = [value for value in starts if value is not None]
-        if len(starts) < 2:
-            return None
-        steps = [(right - left).days
-                 for left, right in zip(starts, starts[1:])]
-        if all(step == 7 for step in steps):
-            return f"the last {len(starts)} weeks"
-        if all(step == 1 for step in steps):
-            return f"the last {len(starts)} days"
+        return _period_starts_label(starts)
     return None
 
 

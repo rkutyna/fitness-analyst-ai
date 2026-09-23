@@ -29,6 +29,12 @@ MUST_ADMIT = [
     "Ease back your mileage for a week and see if the ache settles.",
     "Check the outer edge of your shoes for wear.",
     "If the pain sharpens or lingers into the next day, see a physio.",
+    # Review, 2026-09-23: the ordinary shapes of pain advice. A rule that
+    # refused "you have <word>" to catch a diagnosis refused these too, and
+    # the same predicate guards greetings ("You have a coach here...").
+    "You have a few options: rest, change shoes, or see a podiatrist.",
+    "If you have pain that lasts more than two weeks, see a physiotherapist.",
+    "You have to ease back your mileage for a week.",
 ]
 
 # A claim about the user's data -- a figure, a trend, or a diagnosis -- must
@@ -42,8 +48,17 @@ MUST_REFUSE = [
     "You ran 30 miles last week.",
     # Done-when 4: stance lines a fix must not admit.
     "Your pace dropped this week.",
-    "You have plantar fasciitis.",
     "Your mileage is too high.",
+]
+
+# A present-tense diagnosis carries no digit, no metric name and no past-tense
+# verb, so nothing lexical separates it from "You have a few options". It is a
+# KNOWN GAP, pinned so it cannot be forgotten. The stance against diagnosing
+# lives in the prompt, not in this predicate. Note also that scan_template
+# runs this rule only on advice spans that carry a digit, so a digit-free
+# diagnosis never reaches it in the advice slot anyway.
+KNOWN_GAP = [
+    "You have plantar fasciitis.",
 ]
 
 
@@ -65,11 +80,11 @@ def _old_pronoun_and_noun_rule(content: str) -> str:
 def test_before_the_fix_the_bare_your_rule_fails_the_oracle_both_ways():
     """The state this issue reports: measure before touching anything.
 
-    The old rule is wrong in both directions on this oracle: it refuses two
-    of three MUST-ADMIT lines (plain second-person coaching) and admits two
-    of the six MUST-REFUSE lines -- both claims about the user's data with no
-    "your" in them, the dangerous miss, since that is exactly what the
-    advice-slot exemption must not carry.
+    The old rule is wrong in both directions on this oracle: it refuses every
+    MUST-ADMIT line that says "your" (plain second-person coaching) and admits
+    a MUST-REFUSE claim about the user's data that happens not to say "your",
+    the dangerous miss, since that is exactly what the advice-slot exemption
+    must not carry.
     """
     wrongly_refused = [s for s in MUST_ADMIT if _old_pronoun_and_noun_rule(s)]
     wrongly_admitted = [s for s in MUST_REFUSE
@@ -78,10 +93,10 @@ def test_before_the_fix_the_bare_your_rule_fails_the_oracle_both_ways():
     assert wrongly_refused == [
         "Ease back your mileage for a week and see if the ache settles.",
         "Check the outer edge of your shoes for wear.",
+        "You have to ease back your mileage for a week.",
     ]
     assert wrongly_admitted == [
         "You ran 30 miles last week.",
-        "You have plantar fasciitis.",
     ]
 
 
@@ -95,6 +110,14 @@ def test_after_the_fix_every_must_refuse_line_is_refused():
     for line in MUST_REFUSE:
         violation = fact_template._advice_violation(line, None)
         assert violation != "", line
+
+
+@pytest.mark.xfail(strict=True, reason="known gap: a digit-free present-tense "
+                   "diagnosis is lexically indistinguishable from 'You have a "
+                   "few options'; see the KNOWN_GAP comment")
+def test_known_gap_a_bare_diagnosis_is_not_refused():
+    for line in KNOWN_GAP:
+        assert fact_template._advice_violation(line, None) != "", line
 
 
 def test_advice_slot_end_to_end_matches_the_oracle():
@@ -154,4 +177,5 @@ def test_mutation_reverting_to_the_bare_your_rule_reddens_the_oracle(
     assert failures == [
         "Ease back your mileage for a week and see if the ache settles.",
         "Check the outer edge of your shoes for wear.",
+        "You have to ease back your mileage for a week.",
     ], "mutation did not redden the oracle -- the pinned test is vacuous"

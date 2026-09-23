@@ -515,6 +515,16 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
     floor = metric_noise_floor(conn, metric, end)
     rows = mx.series_rows(conn, metric, start, end)
     unit = rows[0]["unit"] if rows else mx.nz.canonical_unit(metric, None)
+    # `series_rows` orders by date, so these are the first/last dates the
+    # WHOLE fetched series actually has -- already bounded by the caller's
+    # start/end and by data existence via `date BETWEEN ? AND ?` with the
+    # value column NOT NULL. Only a week containing one of these two dates
+    # can ever be clamped below 7 days; every interior week keeps its full
+    # Monday-Sunday span regardless of how sparse its own data is (a metric
+    # logged twice a week, e.g. body_mass, must not have every mid-history
+    # week shrink to its own first/last logged day and read "partial").
+    series_first_date = date.fromisoformat(rows[0]["date"]) if rows else None
+    series_last_date = date.fromisoformat(rows[-1]["date"]) if rows else None
     weeks: dict[str, list[tuple[float, str]]] = {}
     for row in rows:
         d, v = row["date"], row["v"]
@@ -533,10 +543,22 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
             status = mx.UNVERIFIED_LEGACY_STATUS
         else:
             status = "partially_unverified"
-        week_end = (date.fromisoformat(monday) + timedelta(days=6)).isoformat()
+        # Publishing the unconditional monday+6 (the old behaviour) let
+        # `period` claim days the vault has no data for at all, and days
+        # past what the caller asked for; a model then copies that string
+        # verbatim into a claim (engine #77 item 1). Clamp only against the
+        # series' own global first/last date, never against this week's own
+        # entries -- that is what keeps a sparse interior week whole.
+        monday_date = date.fromisoformat(monday)
+        period_start_date = max(monday_date, series_first_date)
+        period_end_date = min(monday_date + timedelta(days=6), series_last_date)
+        period_start = period_start_date.isoformat()
+        period_end = period_end_date.isoformat()
+        span_days = (period_end_date - period_start_date).days + 1
         row = {
             "week_start": monday,
-            "period": f"{monday}:{week_end}",
+            "period": f"{period_start}:{period_end}",
+            "partial": span_days < 7,
             "mean": mx.r(statistics.fmean(vs), 2),
             "n_days": len(vs),
             "unit": unit,

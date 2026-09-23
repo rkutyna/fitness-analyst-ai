@@ -130,6 +130,37 @@ def _claim_period_vocabulary(result) -> list[dict]:
     """
     vocabulary = []
 
+    def period_key(period) -> str:
+        return json.dumps(period, sort_keys=True, default=str)
+
+    # A block's `period` dict records bucket STARTS only, so the end of its
+    # last bucket is not in it. The rows that produced the block carry their
+    # own clamped periods (`weeks[i]["period"]`, a partial trailing week
+    # included), and the same period dict is republished elsewhere in the
+    # payload (e.g. get_impact_volume's presentation leaves) without them.
+    # Collect the row-derived end for every block period FIRST, keyed by the
+    # period's content, so every occurrence publishes one claim_period
+    # regardless of walk order or object identity.
+    row_ends: dict[str, str] = {}
+
+    def collect(node):
+        if isinstance(node, dict):
+            period, weeks = node.get("period"), node.get("weeks")
+            starts = period.get("period_starts") if isinstance(period, dict) else None
+            if (isinstance(starts, list) and starts and isinstance(weeks, list)
+                    and weeks and isinstance(weeks[-1], dict)):
+                row_period = weeks[-1].get("period")
+                if (isinstance(row_period, str) and ":" in row_period
+                        and row_period.split(":", 1)[0] == str(starts[-1])):
+                    row_ends[period_key(period)] = row_period.split(":", 1)[1]
+            for child in node.values():
+                collect(child)
+        elif isinstance(node, list):
+            for child in node:
+                collect(child)
+
+    collect(result)
+
     def walk(node, inherited_metric=None):
         if isinstance(node, dict):
             period = node.get("period")
@@ -151,14 +182,18 @@ def _claim_period_vocabulary(result) -> list[dict]:
                         step = (date.fromisoformat(str(starts[1])) - first).days
                     else:
                         step = 0
-                    if step > 0:
+                    if period_key(period) in row_ends:
+                        # The last row's own clamped end: exact, and it covers
+                        # a partial trailing week the spacing rule overshoots.
+                        last_end = row_ends[period_key(period)]
+                    elif step > 0:
                         last_end = (last + timedelta(days=step - 1)).isoformat()
-                    elif isinstance(period.get("end"), str):
-                        # One bucket: the payload's own end is the only honest
-                        # answer, and it is already inclusive for a single row.
-                        last_end = period["end"]
                     else:
-                        last_end = last.isoformat()
+                        # One bucket and no row to read (engine #77): the
+                        # block's own "end" is starts[-1], the week's START,
+                        # which published '2026-08-10:2026-08-10' for a 7-day
+                        # total. A weekly bucket spans seven days.
+                        last_end = (first + timedelta(days=6)).isoformat()
                     item = {"metric": str(metric),
                             "claim_period": f"{starts[0]}:{last_end}",
                             "ledger_period": period}

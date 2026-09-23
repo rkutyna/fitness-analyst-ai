@@ -445,10 +445,13 @@ def block_comparison(conn, metric: str, block_weeks: int, as_of: str) -> dict:
 
     blocks = {}
     for name, (start, end) in ranges.items():
-        _days, vals, _ = mx.series(conn, metric, start.isoformat(), end.isoformat())
+        days_present, vals, _ = mx.series(conn, metric, start.isoformat(), end.isoformat())
         block = {
             "period": f"{start.isoformat()}:{end.isoformat()}",
             "n": len(vals),
+            "window_start": start,
+            "window_end": end,
+            "days_present": days_present,
         }
         if len(vals) >= min_days:
             block["mean"] = statistics.fmean(vals)
@@ -474,17 +477,30 @@ def block_comparison(conn, metric: str, block_weeks: int, as_of: str) -> dict:
     floor_mdc = None
     if floor["sd_day"] is not None and floor["rho"] is not None:
         floor_mdc = mdc95(floor["sd_day"], floor["rho"], block_days)
+
+    def _published_block(block):
+        win_start, win_end = block["window_start"], block["window_end"]
+        days_present = block["days_present"]
+        if days_present:
+            actual_start = max(win_start, date.fromisoformat(days_present[0]))
+            actual_end = min(win_end, date.fromisoformat(days_present[-1]))
+        else:
+            actual_start, actual_end = win_start, win_end
+        partial = actual_start != win_start or actual_end != win_end
+        return {
+            "period": f"{actual_start.isoformat()}:{actual_end.isoformat()}",
+            "mean": mx.r(block["mean"], 2),
+            "n": block["n"],
+            "sd": mx.r(block["sd"], 2),
+            "partial": partial,
+        }
+
     return {
         "metric": metric,
         "block_weeks": block_weeks,
         "as_of": as_of,
         "blocks": {
-            name: {
-                "period": block["period"],
-                "mean": mx.r(block["mean"], 2),
-                "n": block["n"],
-                "sd": mx.r(block["sd"], 2),
-            }
+            name: _published_block(block)
             for name, block in blocks.items()
         },
         "diff": mx.r(diff, 2),

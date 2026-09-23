@@ -273,20 +273,35 @@ OPENROUTER_MODEL = os.environ.get("HA_OPENROUTER_MODEL")
 PLAN_MODEL = os.environ.get("HA_PLAN_MODEL")
 
 # The wire `max_tokens` bounds COMPLETION tokens, and completion includes
-# reasoning (median 56 %). Retained captures measured the ANSWER alone at p95
-# 838 and max 1,620 tokens, so ANSWER_MAX_TOKENS is the answer that must
-# survive. Reasoning is not bounded separately on the wire: its level is the
+# reasoning. Reasoning is not bounded separately on the wire: its level is the
 # one global `HA_OPENROUTER_REASONING` knob (`effort: low` in production), and
 # sending a reasoning token budget would replace that measured setting.
 # REASONING_HEADROOM_TOKENS is therefore headroom inside the completion cap,
-# not an enforced limit. Measured over 658 calls: no final or repair call
-# exceeded 5,820 completion tokens; the old 4,200 cap cut 8 of 193, and one
-# live repair with 4,216 reasoning tokens returned an empty answer.
+# not an enforced limit, and it must be sized from the ANSWER call's own
+# reasoning -- not from tool turns (median 138 reasoning tokens), which is
+# where the old 4,200 came from.
+#
+# Measured 2026-09-23 on the six-question ask battery (n=72, ten-year vault,
+# deepseek-v4-flash, reasoning low), after health_advisor#469 began publishing per-workout
+# figures and grew the answer prompt from a median ~13k to ~20k tokens:
+#   cap 5,820 : 32/72 asks fell back, 26 as `answer truncated`; 44 calls hit
+#               `finish_reason=length`, median 81% of the cap spent reasoning
+#   cap 12,000: 8/72 fell back (Fisher p < 0.0001), 5 truncated; answer calls
+#               that finished: p95 6,949, p99 8,203, max 11,698 completion
+#               tokens. Cost per 72 asks $0.905 against $0.919; ask p50
+#               57 s against 59 s, p95 121 s against 92 s.
+# On a 21-day vault the same pair read 27/72 -> 6/72 fallback, ask p50 46 s
+# -> 38 s, asks over 100 s 1/72 -> 2/72.
+# The 13 calls still capped at 12,000 are runaway generations (median ~10k
+# reasoning), which a larger cap would only make slower.
+# ANSWER_MAX_TOKENS is the answer text itself: p95 838, max 1,620 over 592
+# calls (engine #56).
 ANSWER_MAX_TOKENS = 1620
-REASONING_HEADROOM_TOKENS = 4200
+REASONING_HEADROOM_TOKENS = 10380
 ANSWER_COMPLETION_MAX_TOKENS = ANSWER_MAX_TOKENS + REASONING_HEADROOM_TOKENS
-# Tool-wired turns were uncapped. The same envelope covers 464 of 465 measured
-# tool turns (p99 4,151); the one it cuts spent 43,001 reasoning tokens.
+# Tool-wired turns were uncapped until #56; they share the envelope. Their
+# measured p99 is 4,151, so the cap binds only a runaway turn (the largest
+# measured spent 43,001 reasoning tokens and is now stopped at 12,000).
 TOOL_LOOP_MAX_TOKENS = ANSWER_COMPLETION_MAX_TOKENS
 
 

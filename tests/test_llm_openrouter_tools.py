@@ -257,9 +257,9 @@ def test_answer_budget_leaves_the_measured_answer_headroom(openrouter, monkeypat
         "final", ctx=None, tools=[], max_tokens=llm.ANSWER_COMPLETION_MAX_TOKENS)
 
     assert llm.ANSWER_MAX_TOKENS == 1620
-    assert llm.REASONING_HEADROOM_TOKENS == 4200
-    assert llm.ANSWER_COMPLETION_MAX_TOKENS == 5820
-    assert bodies[0]["max_tokens"] == 5820
+    assert llm.REASONING_HEADROOM_TOKENS == 10380
+    assert llm.ANSWER_COMPLETION_MAX_TOKENS == 12000
+    assert bodies[0]["max_tokens"] == 12000
     assert bodies[0]["reasoning"] == {"effort": "low"}
 
 
@@ -1153,3 +1153,20 @@ def test_the_anomaly_reaches_the_question_log_row():
 
     row = _json.loads(open(path).readlines()[-1])
     assert row["accounting_anomaly"] == "model-call time exceeds"
+
+
+# The largest completion of an answer call that FINISHED (not capped) in the
+# 2026-09-23 n=72 battery at a 12,000 cap (engine #56 / consumer #485).
+MEASURED_FINISHED_ANSWER_CALL_COMPLETION_MAX = 11698
+# The old cap, sized from tool turns rather than the answer call.
+_TOOL_TURN_SIZED_CAP = 5820
+
+
+def test_answer_cap_holds_every_measured_finished_answer_call():
+    """A cap below the measured finished-answer maximum truncates answers the
+    model would have completed; at 5,820 that was 18 of 160 finished calls and
+    26 of 72 asks fell back as `answer truncated`."""
+    assert llm.ANSWER_COMPLETION_MAX_TOKENS >= \
+        MEASURED_FINISHED_ANSWER_CALL_COMPLETION_MAX
+    assert llm.ANSWER_COMPLETION_MAX_TOKENS > _TOOL_TURN_SIZED_CAP
+    assert llm.TOOL_LOOP_MAX_TOKENS == llm.ANSWER_COMPLETION_MAX_TOKENS

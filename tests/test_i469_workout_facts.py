@@ -193,6 +193,65 @@ def test_build_workout_facts_publishes_longest_block_from_block_structure():
         "2001-03-04|running", "qualified_block_min") not in facts
 
 
+# --- A walk's zero "longest running block" is not a run (defect B) -------
+def test_walking_workout_with_zero_longest_block_publishes_no_fact():
+    """A walk's block_structure solo-day fields can be a genuine 0.
+
+    Narrating it verbatim reads as "your run had a longest running block of
+    0 minutes" for a vault that contains no run at all -- the intake tool
+    correctly said there was no jogging. The field is withheld, not
+    fabricated as non-zero.
+    """
+    facts = fact_template.build_workout_facts(
+        [_get_block_structure_record(workout_type="walking", bridged=0.0,
+                                      avg_hr_session=None)])
+    assert fact_template.workout_fact_key(
+        "2001-03-04|walking", "longest_block_min") not in facts
+
+
+def test_running_workout_with_zero_longest_block_still_publishes():
+    """The same zero is true and meaningful for an actual run."""
+    facts = fact_template.build_workout_facts(
+        [_get_block_structure_record(workout_type="running", bridged=0.0,
+                                      avg_hr_session=None)])
+    key = fact_template.workout_fact_key(
+        "2001-03-04|running", "longest_block_min")
+    assert facts[key]["value"] == 0.0
+
+
+def test_walking_workout_with_nonzero_longest_block_still_publishes():
+    """A walk that contained a real jogging burst still reports it."""
+    facts = fact_template.build_workout_facts(
+        [_get_block_structure_record(workout_type="walking", bridged=6.5,
+                                      avg_hr_session=None)])
+    key = fact_template.workout_fact_key(
+        "2001-03-04|walking", "longest_block_min")
+    assert facts[key]["value"] == 6.5
+
+
+def test_walking_workout_with_zero_qualified_block_publishes_no_fact():
+    facts = fact_template.build_workout_facts(
+        [_get_block_structure_record(workout_type="walking", bridged=0.0,
+                                      qualified=0.0, avg_hr_session=None)])
+    assert fact_template.workout_fact_key(
+        "2001-03-04|walking", "qualified_block_min") not in facts
+
+
+def test_run_form_zero_session_jog_minutes_still_publishes():
+    """session_jog_minutes is on the same gated-fields list as the two block
+
+    fields above (see ``_RUNNING_ONLY_ZERO_GATED_FIELDS``), per the task's
+    field list, even though get_run_form's own query is running-only today
+    (``WHERE w.workout_type = 'running'`` in mcp_server.get_run_form) --
+    so this identity can never be non-running and the gate is a no-op here.
+    A genuine 0 for the running session it does describe still publishes.
+    """
+    facts = fact_template.build_workout_facts(
+        [_get_run_form_record(jog_minutes=0.0)])
+    assert facts[fact_template.workout_fact_key(
+        "2001-03-04|running", "session_jog_minutes")]["value"] == 0.0
+
+
 # --- The defect this session fixes: a run+walk day ----------------------
 def test_run_and_walk_same_day_both_publish_duration():
     ledger = [_list_workouts_record(rows=_run_walk_day_rows())]

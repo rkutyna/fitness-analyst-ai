@@ -1006,6 +1006,35 @@ def publish_completeness(ledger: list[dict], published_facts) -> set[str]:
     return eligible_fact_keys(ledger) - published_keys
 
 
+def _is_percent_change_field(field: str | None) -> bool:
+    """Whether a leaf field name is a percent-change statistic.
+
+    Matches ``delta_pct``, ``mean_delta_pct``, ``total_delta_pct``, and any
+    future sibling that follows the same ``..._pct`` naming this codebase
+    already uses for every percent-change leaf (see ``_SERIES_FIELDS`` and
+    ``_INHERITED_SERIES_FIELDS`` in ``deepdive_verify.py``). A metric's own
+    native percent reading (e.g. ``blood_oxygen_saturation``'s ``mean``, or
+    ``sleep_timing_interval_regularity``'s own score) is never named this way
+    -- its field is ``mean``/``last``/etc, not one ending in ``_pct`` -- so
+    this cannot accidentally withhold a metric's primary value.
+    """
+    return isinstance(field, str) and field.endswith("_pct")
+
+
+def _publishes_clock_time(metric: str | None) -> bool:
+    """Whether a metric is a time-of-day reading, for which a percentage
+    change is meaningless: -5.86% of a bedtime expressed in hours depends on
+    an arbitrary zero point, not a real magnitude.
+
+    The set is the one ``metrics`` already uses to render these as clock
+    times. Not normalize's ``sleep_timing`` group, which also holds durations
+    and counts (time in bed, latency, awakenings) whose percent change is
+    meaningful.
+    """
+    return metric in (metrics._PREVIOUS_NOON_CLOCK_METRICS
+                      | metrics._MIDNIGHT_CLOCK_METRICS)
+
+
 def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
     """Build the closed fact set from result leaves in this call's ledger.
 
@@ -1044,6 +1073,13 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
             if (_CLAIM_CONTRACT.is_metricless_metric(entry.get("metric"))
                     or entry.get("field") == "presentation"
                     or entry.get("value") is None):
+                continue
+            if (_is_percent_change_field(entry.get("field"))
+                    and _publishes_clock_time(entry.get("metric"))):
+                # A percentage change of a clock time is meaningless (#C):
+                # "(a change of -5.86 percent)" for a bedtime shift. The
+                # metric's absolute delta (e.g. mean_delta) is unaffected --
+                # only fields recognized as percent-change are withheld.
                 continue
             presentation = _presentation_for(entry, presentations)
             period = (entry["period"] if entry["period"] is not None
@@ -1303,12 +1339,40 @@ def _workout_identity(date, workout_type, start_time=None) -> str | None:
     return "|".join(parts)
 
 
+# A "longest continuous running block" or a running-only session's jog-minute
+# count is only meaningful for a running workout. get_block_structure's
+# longest_block_min/qualified_block_min are computed for whichever session
+# type happens to be alone that day (health_advisor#469 follow-up's solo-day
+# fields, above), so a walk with no jogging inside it publishes a genuine 0 --
+# narrated live as "each run had a longest continuous running block of 0
+# minutes" for a vault of walks, which asserts a run that never happened.
+# session_jog_minutes (get_run_form) is hardcoded to workout type "running" at
+# its source (mcp_server.get_run_form's query is WHERE workout_type =
+# 'running'), so this gate is a no-op for it today; it is included so the
+# rule holds if that ever changes, per the task's field list. A NON-zero
+# value stays for every type: a walk that contained real jogging bursts is a
+# true and meaningful reading, only the false "zero run" is suppressed. A
+# zero for an actual running workout also stays, since a run can genuinely
+# have no continuous block above the qualifying pace.
+_RUNNING_ONLY_ZERO_GATED_FIELDS = frozenset({
+    "longest_block_min", "qualified_block_min", "session_jog_minutes",
+})
+
+
+def _workout_type_from_identity(workout: str) -> str | None:
+    parts = str(workout).split("|")
+    return parts[1] if len(parts) > 1 else None
+
+
 def _workout_candidate(workout: str | None, field: str, value, unit: str, *,
                        sequence, path: str) -> tuple[str, dict] | None:
     if workout is None or not str(workout).strip():
         return None
     if value is None or isinstance(value, bool) or not isinstance(
             value, (int, float)):
+        return None
+    if (field in _RUNNING_ONLY_ZERO_GATED_FIELDS and value == 0
+            and _workout_type_from_identity(workout) != "running"):
         return None
     key = workout_fact_key(workout, field)
     return key, {
@@ -1589,6 +1653,13 @@ def template_refused(template: str, facts: dict[str, dict]) -> bool:
     return not scan_template(template, facts)["ok"]
 
 
+_ORDINAL_SUFFIXES = ("st", "nd", "rd", "th")
+
+
+def _touches_letter(char: str) -> bool:
+    return bool(char) and char.isascii() and char.isalpha()
+
+
 def interpolate_template(template: str, facts: dict[str, dict], *,
                           advice_quantities: list[str] | None = None) -> str | None:
     """Interpolate a valid template and optionally collect advice spans.
@@ -1596,16 +1667,54 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
     The optional list keeps the established string-returning API intact while
     allowing the ask arm to publish the exact advice contents alongside its
     verification result.
+
+    A rendered value is never left touching an adjacent letter in the
+    surrounding template: the model writes placeholders with no space before
+    or after ("...field=mean}in {fact|...", "}to", "}and"), which glues the
+    Python-owned text to the next or previous word ("about8 hours",
+    "146.6ande"). When the template character immediately before or after the
+    placeholder is an ASCII letter, one space is inserted on that side. Three
+    exceptions stay glued, all on the trailing side, and only apply to the
+    template's own character right after the placeholder -- the rendered
+    value's own text is never touched:
+      - an ordinal suffix ("st"/"nd"/"rd"/"th") written directly in the
+        template right after a rendered value that itself ends in a digit
+        (e.g. a day-of-month fact followed by literal "th" in the template);
+      - a possessive "'s": the apostrophe is not an ASCII letter, so this is
+        already unaffected and needs no special case;
+      - anything already separated by whitespace or punctuation, which simply
+        never matches the glue condition above.
+    Advice spans are model-authored prose already surrounded by ordinary
+    template text on both sides, so they are left exactly as written.
     """
     scan = scan_template(template, facts)
     if not scan["ok"]:
         return None
     if advice_quantities is not None:
         advice_quantities.extend(scan["advice_quantities"])
-    return _PLACEHOLDER_RE.sub(
-        lambda match: (match.group(1)[len(_ADVICE_PREFIX):].strip()
-                       if match.group(1).startswith(_ADVICE_PREFIX)
-                       else str(facts[match.group(1)]["display"])), template)
+
+    def _replace(match: re.Match) -> str:
+        token = match.group(1)
+        if token.startswith(_ADVICE_PREFIX):
+            return token[len(_ADVICE_PREFIX):].strip()
+
+        rendered = str(facts[token]["display"])
+        before = template[match.start() - 1] if match.start() > 0 else ""
+        after = template[match.end()] if match.end() < len(template) else ""
+
+        prefix = " " if _touches_letter(before) else ""
+        suffix = ""
+        if _touches_letter(after):
+            next_two = template[match.end():match.end() + 2].lower()
+            after_suffix = template[match.end() + 2:match.end() + 3]
+            is_ordinal = (rendered[-1:].isdigit()
+                          and next_two in _ORDINAL_SUFFIXES
+                          and not _touches_letter(after_suffix))
+            if not is_ordinal:
+                suffix = " "
+        return prefix + rendered + suffix
+
+    return _PLACEHOLDER_RE.sub(_replace, template)
 
 
 # Verbose aliases make the two safety boundaries easy to discover at call sites.

@@ -161,6 +161,77 @@ def test_weekly_mean_without_period_uses_week_start_as_fact_period():
     assert facts[key]["value"] == 50.1
 
 
+def _comparison_ledger(metric, *, period="2026-08-10:2026-08-16",
+                       mean_delta=-1.4, delta_pct=-5.86, sequence=1):
+    """A minimal comparison-shaped result: one metric, one period, an
+
+    absolute delta beside a percent-change delta -- the two fields a
+    recent-vs-baseline or period-comparison tool publishes together (see
+    ``summarize_metric``/``compare_periods`` in mcp_server.py, which name
+    them ``delta_vs_baseline``/``delta_pct`` and ``mean_delta``/
+    ``mean_delta_pct`` respectively; ``mean_delta`` is used here because it
+    is on ``deepdive_verify``'s owned-fields list today).
+    """
+    return [{
+        "sequence": sequence,
+        "tool_name": "synthetic_compare",
+        "arguments": {},
+        "result": {
+            "metric": metric, "unit": "h", "period": period,
+            "mean_delta": mean_delta, "delta_pct": delta_pct,
+        },
+    }]
+
+
+def test_clock_time_metric_publishes_delta_but_not_delta_pct():
+    """A percentage change of a clock time is meaningless (defect C).
+
+    "(a change of -5.86 percent)" for a bedtime shift was cited from
+    ``sleep_bedtime``'s ``delta_pct``. ``sleep_bedtime`` is hours-of-day in
+    normalize's ``sleep_timing`` group, so the percent-change field is
+    withheld while the absolute delta -- a real number of hours -- stays.
+    """
+    facts = fact_template.build_fact_set(_comparison_ledger("sleep_bedtime"))
+
+    assert fact_template.fact_key(
+        "sleep_bedtime", "2026-08-10:2026-08-16", "mean_delta") in facts
+    assert fact_template.fact_key(
+        "sleep_bedtime", "2026-08-10:2026-08-16", "delta_pct") not in facts
+
+
+def test_clock_time_sibling_wake_time_also_withholds_delta_pct():
+    """The gate is looked up by normalize's group, not a hardcoded name."""
+    facts = fact_template.build_fact_set(_comparison_ledger("sleep_wake_time"))
+
+    assert fact_template.fact_key(
+        "sleep_wake_time", "2026-08-10:2026-08-16", "mean_delta") in facts
+    assert fact_template.fact_key(
+        "sleep_wake_time", "2026-08-10:2026-08-16", "delta_pct") not in facts
+
+
+def test_non_clock_metric_still_publishes_delta_pct():
+    """The gate is scoped to the sleep_timing group, not every metric."""
+    facts = fact_template.build_fact_set(
+        _comparison_ledger("resting_heart_rate", mean_delta=2.0, delta_pct=3.2))
+
+    key = fact_template.fact_key(
+        "resting_heart_rate", "2026-08-10:2026-08-16", "delta_pct")
+    assert facts[key]["value"] == 3.2
+    assert fact_template.fact_key(
+        "resting_heart_rate", "2026-08-10:2026-08-16", "mean_delta") in facts
+
+
+def test_duration_in_the_sleep_timing_group_still_publishes_delta_pct():
+    """Time in bed shares normalize's sleep_timing group with bedtime but is a
+    duration, so its percent change is meaningful and must stay."""
+    facts = fact_template.build_fact_set(
+        _comparison_ledger("sleep_time_in_bed", mean_delta=12.0, delta_pct=2.5))
+
+    key = fact_template.fact_key(
+        "sleep_time_in_bed", "2026-08-10:2026-08-16", "delta_pct")
+    assert facts[key]["value"] == 2.5
+
+
 def test_fact_key_round_trips_the_natural_identity_tuple():
     period = {"start": "2026-08-10", "end": "2026-08-17"}
     key = fact_template.fact_key("jog_minutes", period, "mean")
@@ -321,6 +392,46 @@ def test_advice_slot_mixed_with_fact_keeps_both_channels_separate():
     assert fact_template.scan_template(
         "You logged {" + key + "}; add {advice:3 sets of 10 reps}.", facts
     )["placeholders"] == [key]
+
+
+@pytest.mark.parametrize("template,display,expected", [
+    # A rendered value glued to the adjacent word on either side gets a
+    # single space; the model writes placeholders with no space, e.g.
+    # "...field=mean}in {fact|..." or "}to"/"}and" (#defect A).
+    ("about{key}hours", "8", "about 8 hours"),
+    ("{key}in more", "52.16in", "52.16in in more"),
+    ("{key}ande", "146.6", "146.6 ande"),
+    # Already separated by punctuation or whitespace: untouched.
+    ("{key}%", "50", "50%"),
+    ("{key},", "50", "50,"),
+    ("({key})", "50", "(50)"),
+    # An ordinal suffix directly after a value ending in a digit stays glued.
+    ("the {key}st of the month", "21", "the 21st of the month"),
+    # The rendered value's OWN text is never touched, even when it contains
+    # non-digit characters like a clock or a percent sign -- only the
+    # template characters around the placeholder are inspected.
+    ("at{key}tonight", "8:05 PM", "at 8:05 PM tonight"),
+    ("{key}of", "52%", "52% of"),
+    ("{key}.", "52%", "52%."),
+    ("{key}and", "1:23:45", "1:23:45 and"),
+    # The ordinal exemption only fires when the rendered value ends in a
+    # digit -- "52%" ending in "%" must still get a space before "th".
+    ("{key}th", "52%", "52% th"),
+], ids=[
+    "prefix-glued", "suffix-glued-in", "suffix-glued-ande",
+    "percent-unchanged", "comma-unchanged", "parens-unchanged",
+    "ordinal-unchanged",
+    "clock-display-both-sides", "percent-display-prefix",
+    "percent-display-period", "duration-display-suffix",
+    "percent-display-not-ordinal",
+])
+def test_interpolation_never_glues_a_rendered_value_to_a_letter(
+        template, display, expected):
+    facts = fact_template.build_fact_set(_ledger(display=display))
+    key = fact_template.fact_key("jog_minutes", "2026-08-17", "mean")
+
+    assert fact_template.interpolate_template(
+        template.replace("{key}", "{" + key + "}"), facts) == expected
 
 
 def _attachment_ledger(rows, *, units=None, table_name="resting_rate"):

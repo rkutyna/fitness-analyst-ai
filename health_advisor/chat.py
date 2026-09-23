@@ -374,9 +374,22 @@ def _fallback_answer(verification: dict | None = None) -> str:
             "ask answer has no tool-call ledger": (
                 "the answer had no tool-call ledger"),
         }
+        # Some reasons (this one, `restated_unit`, `contradicted_day_count`)
+        # embed draft-derived specifics -- a phrase, a count -- so they can
+        # never sit in `reason_labels` as an exact key. The closed `cause`
+        # is stable, so a label keyed on it can still give the user a safe,
+        # generic sentence instead of falling through to the scrubbed-reason
+        # branch below.
+        cause_labels = {
+            "unsupported_period_phrase": (
+                "the draft named a time period longer than the data "
+                "actually covers"),
+        }
         if reason:
             if reason in reason_labels:
                 reason_text = reason_labels[reason]
+            elif verification.get("cause") in cause_labels:
+                reason_text = cause_labels[verification.get("cause")]
             else:
                 # Unknown reasons are useful diagnostics, but a reason may
                 # carry a draft-derived number. Never copy numeric literals or
@@ -484,6 +497,7 @@ ASK_CAUSES = (
     "withheld_available_figure",
     "contradicted_day_count",
     "restated_unit",
+    "unsupported_period_phrase",
     "no_data_yet",
     "answer_truncated",
 )
@@ -560,6 +574,7 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
                withheld_eligible_figure: bool = False,
                contradicted_day_count: bool = False,
                restated_unit: bool = False,
+               unsupported_period_phrase: bool = False,
                no_data_yet: bool = False,
                answer_truncated: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
@@ -577,6 +592,10 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
     ``withheld_eligible_figure`` is a publisher-integrity refusal from the
     independent fact-set completeness walk. It outranks answer-level denial
     because the missing publication is the more fundamental event.
+
+    ``unsupported_period_phrase`` is checked right after ``restated_unit``:
+    both are post-scan markers over the model's own rendered/authored prose,
+    as distinct from the structural template scan (#488).
 
     ``conversational`` means the turn took the conversational path at all —
     not that it succeeded there. A turn that did splits on its own
@@ -609,6 +628,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "contradicted_day_count"
     if restated_unit:
         return "restated_unit"
+    if unsupported_period_phrase:
+        return "unsupported_period_phrase"
     if not verification.get("ok"):
         return "gate_refused"
     if judge_score is not None and judge_score < 70:
@@ -1465,6 +1486,138 @@ def _mark_restated_rendered_unit(verification: dict, *, text: str,
     return False
 
 
+_UNSUPPORTED_PERIOD_PHRASE_REASON = (
+    "narration names a period longer than the data")
+
+# Minimum span, in days, that a relative-period phrase in narration commits
+# to. A phrase whose minimum exceeds the vault's own history is a claim the
+# data cannot support -- #488, measured live: "Over the past month, your
+# sleep has been fairly consistent." on a 21-day vault.
+_PERIOD_PHRASE_MIN_DAYS = {
+    "week": 7,
+    "few weeks": 14,
+    "couple of weeks": 14,
+    "several weeks": 21,
+    "month": 28,
+    "few months": 56,
+    "couple of months": 56,
+    "several months": 90,
+    "quarter": 84,
+    "year": 365,
+}
+
+_PERIOD_PHRASE_RE = re.compile(
+    r"\b(?:over\s+the\s+past|in\s+the\s+past|past|last|previous)\s+"
+    r"(?:"
+    r"several\s+weeks|several\s+months|"
+    r"couple\s+of\s+weeks|couple\s+of\s+months|"
+    r"few\s+weeks|few\s+months|"
+    r"(?P<n_weeks>\d+)\s+weeks|(?P<n_months>\d+)\s+months|"
+    r"week|month|year|quarter"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _period_phrase_unit_key(match: "re.Match[str]") -> str:
+    """Normalize a matched phrase to its unit, discarding the qualifier.
+
+    ``past week``, ``last week`` and ``previous week`` all commit to the same
+    span, so they compare equal here -- this is the key used both to look up
+    the minimum span and to compare a template's phrase against the user's
+    own question (#488 review: the model echoing the question's own period
+    back is not the defect; a period phrase it introduces itself is).
+    """
+    if match.group("n_weeks") is not None:
+        return f"{int(match.group('n_weeks'))} weeks"
+    if match.group("n_months") is not None:
+        return f"{int(match.group('n_months'))} months"
+    unit = re.sub(r"\s+", " ", match.group(0).strip().lower())
+    for prefix in ("over the past ", "in the past ", "past ", "last ",
+                  "previous "):
+        if unit.startswith(prefix):
+            return unit[len(prefix):]
+    return unit
+
+
+def _period_phrase_min_days(unit_key: str) -> int:
+    """The minimum day-span a normalized phrase unit commits narration to."""
+    head, _, tail = unit_key.partition(" ")
+    if head.isdigit() and tail == "weeks":
+        return 7 * int(head)
+    if head.isdigit() and tail == "months":
+        return 28 * int(head)
+    return _PERIOD_PHRASE_MIN_DAYS[unit_key]
+
+
+def _question_period_phrase_units(question: str) -> frozenset[str]:
+    """Normalized phrase units already present in the user's own question."""
+    return frozenset(
+        _period_phrase_unit_key(match)
+        for match in _PERIOD_PHRASE_RE.finditer(question or ""))
+
+
+def _mark_unsupported_period_phrase(verification: dict, *, text: str,
+                                    template: str, facts: dict[str, dict],
+                                    history_days: int | None,
+                                    question: str) -> bool:
+    """Refuse prose that names a relative period longer than the vault's history.
+
+    The prompt already tells the model to put any period in a Python-rendered
+    ``{...|field=period_label}`` placeholder rather than writing one itself;
+    this is the post-scan marker that catches the model doing so anyway.
+
+    Scanned on the TEMPLATE, not the interpolated ``text`` -- the same choice
+    :func:`_mark_restated_rendered_unit` makes (it accepts ``text`` but never
+    reads it). Placeholders are Python-interpolated, so a rendered display
+    (e.g. a ``period_label`` that renders "the week of August 10") only ever
+    appears in ``text``, never in the raw template; scanning the template
+    keeps this marker from ever seeing Python-owned rendered content mixed in
+    with the model's own prose. Placeholder tokens are additionally stripped
+    out (rather than left in) before the scan, so a metric or table key
+    inside one cannot itself look like prose naming a period.
+
+    A phrase whose normalized unit also appears in ``question`` is exempt: the
+    user's own calendar phrase is Python's resolved window (``resolve_window``
+    asserts it into the prompt), so the model naming it back is not inventing
+    anything. #488's defect is a period the model introduces on its own, e.g.
+    "Over the past month" answering "How has my sleep been?" -- not "last
+    week" answering "How often did I cycle last week?".
+
+    ``facts`` is accepted for signature symmetry with the unit marker but is
+    not consulted: this marker never needs to know what a specific
+    placeholder renders, only that its span is not prose.
+    """
+    del facts  # Kept for interface symmetry with _mark_restated_rendered_unit.
+    if not verification.get("ok"):
+        return False
+    if history_days is None:
+        return False
+    question_units = _question_period_phrase_units(question)
+    stripped = _FACT_TEMPLATE_PLACEHOLDER_RE.sub(" ", template or "")
+    for match in _PERIOD_PHRASE_RE.finditer(stripped):
+        unit_key = _period_phrase_unit_key(match)
+        if unit_key in question_units:
+            continue
+        needed = _period_phrase_min_days(unit_key)
+        if needed > history_days:
+            phrase = re.sub(r"\s+", " ", match.group(0).strip()).lower()
+            verification.update({
+                "ok": False,
+                "grounded": False,
+                "reason": (
+                    f"{_UNSUPPORTED_PERIOD_PHRASE_REASON}: {phrase!r} needs "
+                    f"{needed} days, the vault holds {history_days}"),
+                "unsupported_period_phrase": {
+                    "phrase": phrase,
+                    "needed_days": needed,
+                    "history_days": history_days,
+                },
+            })
+            return True
+    return False
+
+
 def _strip_empty_paragraphs(text: str) -> str:
     """Remove blank or punctuation-only paragraphs before publication.
 
@@ -1928,6 +2081,34 @@ def _unused_fact_prompt(facts: dict[str, dict], ledger: list[dict]) -> str:
     return "UNUSED FACTS: none"
 
 
+def _ask_history_days(ctx: VaultContext, as_of: str | None) -> int | None:
+    """Days of history the vault holds up to ``as_of``, or ``None`` if unknown.
+
+    Mirrors ``cold_start.describe``'s ``day_now`` -- ``(as_of -
+    first_date).days + 1`` -- without walking any analytical surface;
+    ``_answer_question_inner`` already ran ``cold_start._first_date`` once
+    (in ``_no_data_answer``) before this is ever reached, so this is a second,
+    equally cheap probe, not a new heavy query. ``None`` for a context with no
+    vault file yet (some prompt-only unit tests use one) or a vault with no
+    qualifying data as of this date; ``_mark_unsupported_period_phrase``
+    treats ``None`` as "unknown" and never refuses on it.
+    """
+    if not os.path.exists(ctx.db_path):
+        return None
+    from . import cold_start
+
+    conn = ctx.read_only()
+    try:
+        effective_as_of = as_of or _today(conn).isoformat()
+        first = cold_start._first_date(conn, effective_as_of)
+        if first is None:
+            return None
+        return (date.fromisoformat(effective_as_of)
+                - date.fromisoformat(first)).days + 1
+    finally:
+        conn.close()
+
+
 def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           tool_schemas: list[dict], ledger_path: str,
                           *, capture: list | None = None,
@@ -1937,6 +2118,11 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                           on_tool_call=None) -> dict:
     """Gather facts, then ask for a template with one bounded repair retry."""
     from . import fact_template, llm
+
+    # Cheap and independent of the ledger below, so computed once up front
+    # and reused for both the first draft and the repair's period-phrase
+    # marker (#488).
+    history_days = _ask_history_days(ctx, as_of)
 
     # The first turn is deliberately discarded. Its only job is to let the
     # model select read-only tools; the final narration turn cannot add tools
@@ -2119,6 +2305,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         verification, text=rendered_text)
     restated_unit = _mark_restated_rendered_unit(
         verification, text=rendered_text, template=template, facts=facts)
+    unsupported_period_phrase = _mark_unsupported_period_phrase(
+        verification, text=rendered_text, template=template, facts=facts,
+        history_days=history_days, question=question)
     answer_truncated = _mark_answer_truncated(verification, final_status)
     withheld_eligible_figure = _mark_withheld_eligible_figure(
         verification, withheld_fact_keys)
@@ -2130,6 +2319,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         withheld_eligible_figure=withheld_eligible_figure,
         contradicted_day_count=contradicted_day_count,
         restated_unit=restated_unit,
+        unsupported_period_phrase=unsupported_period_phrase,
         answer_truncated=answer_truncated)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
@@ -2243,6 +2433,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     retry_restated_unit = _mark_restated_rendered_unit(
         retry_verification, text=retry_rendered_text,
         template=retry_template, facts=facts)
+    retry_unsupported_period_phrase = _mark_unsupported_period_phrase(
+        retry_verification, text=retry_rendered_text,
+        template=retry_template, facts=facts, history_days=history_days,
+        question=question)
     retry_answer_truncated = _mark_answer_truncated(
         retry_verification, retry_status)
     retry_withheld_eligible_figure = _mark_withheld_eligible_figure(
@@ -2256,6 +2450,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         withheld_eligible_figure=retry_withheld_eligible_figure,
         contradicted_day_count=retry_contradicted_day_count,
         restated_unit=retry_restated_unit,
+        unsupported_period_phrase=retry_unsupported_period_phrase,
         answer_truncated=retry_answer_truncated)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]

@@ -367,8 +367,19 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     if not vals:
         return {"metric": metric, "period": period, "n_days": 0,
                 "note": "no data in this period"}
-    out = {"metric": metric, "unit": unit, "agg": _agg(metric), "period": period}
-    out.update(_stats(dates, vals))
+    stats = _stats(dates, vals)
+    # `stats` already carries the true start/end of the rows it summarised
+    # (the first and last dates actually returned by `_series`, i.e.
+    # max(requested start, first row date) to min(requested end, last row
+    # date)) — no extra DB query needed. Publish THAT as the stat's period,
+    # not the caller's raw spec, which can be far wider than the data (an
+    # explicit '2020-01-01:2039-12-31' over 60 days of rows must not be
+    # labelled as spanning two decades). The raw spec is kept alongside as
+    # `requested_period` so nothing is lost.
+    published_period = f"{stats['start']}:{stats['end']}"
+    out = {"metric": metric, "unit": unit, "agg": _agg(metric),
+           "period": published_period, "requested_period": period}
+    out.update(stats)
     # recent vs baseline
     n = len(vals)
     rn = max(1, min(7, n // 3))
@@ -381,7 +392,7 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     out["delta_pct"] = _r((rmean - bmean) / bmean * 100) if bmean else None
     # linear trend per week
     out["trend_per_week"] = _r(mx.slope_per_week(dates, vals))
-    _add_stat_presentations(out, metric, period)
+    _add_stat_presentations(out, metric, published_period)
     return out
 
 

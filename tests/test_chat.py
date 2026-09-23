@@ -2241,7 +2241,7 @@ def test_malformed_advice_without_a_ledger_still_gets_one_repair(
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
     responses = iter([
         "",
-        "Try {advice:3 rounds after jog_minutes}.",
+        "Try {advice:You ran 30 miles last week}.",
         "Try {advice:3 rounds}.",
     ])
     calls = []

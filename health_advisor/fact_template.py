@@ -49,15 +49,28 @@ def _advice_metric_names(facts: dict[str, dict] | None) -> list[str]:
 
 
 def _advice_violation(content: str, facts: dict[str, dict] | None) -> str:
-    """Reject advice text that turns the coaching exemption into a data claim."""
-    if re.search(r"\byour\b", content, re.IGNORECASE):
-        return "advice slot references the user's own data"
-    for metric in _advice_metric_names(facts):
-        words = re.escape(metric).replace(r"_", r"(?:[_ -]+)")
-        if re.search(r"(?<![\w])" + words + r"(?![\w])",
-                     content, re.IGNORECASE):
-            return "advice slot references vault metric " + metric
-    return ""
+    """Reject advice text that turns the coaching exemption into a data claim.
+
+    The test is whether the span ASSERTS something about the user's data, not
+    whether it says "your". This is #69's rule applied to advice spans, and it
+    is the same rule for the same reason: a claim is a subject plus a
+    predicate, not a pronoun and not a noun.
+
+    The previous rule refused any span containing ``\byour\b``. Measured
+    through ``scan_template`` on a six-admit/five-refuse oracle
+    (health_advisor#483), that rule scored 3/6 and 3/5 and was wrong in both
+    directions at once. It refused "Ease back your mileage for 1 week and see
+    if the ache settles." -- advice is naturally second-person, and this is
+    the kind of sentence a coach exists to produce -- while admitting "You ran
+    30 miles last week.", an unverified claim about the user's data with no
+    "your" in it, which is precisely what the exemption must not carry.
+    ``conversational_assertion`` scores 6/6 and 5/5 on the same oracle.
+
+    Live consequence of the old rule: a general question about foot pain was
+    withheld after five model calls and 70.5 s, with both attempts refused as
+    "advice slot references the user's own data" (health_advisor#483).
+    """
+    return conversational_assertion(content, facts)
 
 
 # --- Number words (#49) -------------------------------------------------------

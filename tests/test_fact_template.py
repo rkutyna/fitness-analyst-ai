@@ -272,20 +272,38 @@ def test_advice_slot_allows_prescriptive_digits_and_surfaces_its_span():
 
 
 def test_advice_slot_cannot_bypass_vault_metric_verification():
+    """The slot may not carry a CLAIM about the user's data (#483).
+
+    This test previously pinned the opposite reading: that naming a metric, or
+    saying "your", was itself disqualifying. Measured through `scan_template`
+    on health_advisor#483's oracle, that rule scored 6/12 and was wrong in both
+    directions -- it refused ordinary second-person coaching while admitting
+    "You ran 30 miles last week.", an unverified claim about the user's data
+    with no "your" in it. The test is a claim, not a pronoun and not a noun,
+    which is the same conclusion #69 reached on the conversational path.
+    """
     facts = fact_template.build_fact_set(_ledger())
 
-    scan = fact_template.scan_template(
-        "Try {advice:3 sets after your jog_minutes reaches 50}.", facts)
-
-    assert scan["ok"] is False
-    assert scan["reason"] == "advice slot references the user's own data"
+    # A claim about the user's data: still refused, and that is the point.
+    claim = fact_template.scan_template(
+        "Try {advice:Your jog_minutes are 29 this week}.", facts)
+    assert claim["ok"] is False
+    assert claim["reason"] == (
+        "conversational answer makes the user data the subject of a statement")
     assert fact_template.interpolate_template(
-        "Try {advice:3 sets after your jog_minutes reaches 50}.", facts) is None
+        "Try {advice:Your jog_minutes are 29 this week}.", facts) is None
 
+    # So is a statement about what the user did, WITHOUT the word "your" --
+    # the case the old rule admitted.
+    did = fact_template.scan_template(
+        "Try {advice:You hit 50 jog minutes last week}.", facts)
+    assert did["ok"] is False
+    assert did["reason"] == "conversational answer states something the user did"
+
+    # A prescription that merely names a metric asserts nothing and is admitted.
     metric_only = fact_template.scan_template(
         "Try {advice:3 sets after jog_minutes training}.", facts)
-    assert metric_only["ok"] is False
-    assert metric_only["reason"] == "advice slot references vault metric jog_minutes"
+    assert metric_only["ok"] is True
 
 
 def test_advice_slot_mixed_with_fact_keeps_both_channels_separate():

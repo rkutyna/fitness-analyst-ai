@@ -99,6 +99,130 @@ def test_model_call_accounting_records_nested_usage(openrouter):
         abs=1e-6)
 
 
+def test_model_call_accounting_records_the_full_cache_usage_object(openrouter):
+    """The verbatim oracle shape (#304): cache read/write, cost and reasoning
+    tokens all land on the SAME per-call row as prompt_tokens, not a parallel
+    structure."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "provider": "CoreWeave",
+            "usage": {
+                "prompt_tokens": 17101, "completion_tokens": 12,
+                "total_tokens": 17113, "cost": 0.001213, "is_byok": False,
+                "prompt_tokens_details": {
+                    "cached_tokens": 16896, "cache_write_tokens": 0,
+                    "audio_tokens": 0, "video_tokens": 0,
+                },
+                "cost_details": {
+                    "upstream_inference_cost": 0.001213,
+                    "upstream_inference_prompt_cost": 0.00118,
+                    "upstream_inference_completions_cost": 3.36e-06,
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 11, "image_tokens": 0,
+                    "audio_tokens": 0,
+                },
+            },
+        })
+
+    openrouter(handler)
+    with llm.model_call_accounting() as accounting:
+        message, prompt_tokens = llm._openrouter_post(
+            [{"role": "user", "content": "question"}], tools=[], timeout=5)
+
+    assert message["content"] == "done"
+    assert prompt_tokens == 17101
+    call = accounting.snapshot(require_nonzero=True)["model_calls"][0]
+    assert call["prompt_tokens"] == 17101
+    assert call["cached_tokens"] == 16896
+    assert call["cache_write_tokens"] == 0
+    assert call["reasoning_tokens"] == 11
+    assert call["cost"] == pytest.approx(0.001213)
+
+
+def test_model_call_accounting_survives_a_small_prompt_with_no_cache_details(
+        openrouter):
+    """Under the caching threshold, OpenRouter omits ``prompt_tokens_details``
+    entirely rather than sending zeros — absent must not raise, and
+    prompt_tokens must still be recorded."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "provider": "CoreWeave",
+            "usage": {"prompt_tokens": 2198, "completion_tokens": 4},
+        })
+
+    openrouter(handler)
+    with llm.model_call_accounting() as accounting:
+        _msg, prompt_tokens = llm._openrouter_post(
+            [{"role": "user", "content": "question"}], tools=[], timeout=5)
+
+    assert prompt_tokens == 2198
+    call = accounting.snapshot(require_nonzero=True)["model_calls"][0]
+    assert call["prompt_tokens"] == 2198
+    assert call["cached_tokens"] in (0, None)
+    assert call["cache_write_tokens"] in (0, None)
+    assert call["cost"] is None
+
+
+def test_model_call_accounting_records_an_explicit_zero_cache_hit(openrouter):
+    """A cold call reports ``cached_tokens: 0`` explicitly (not omitted) —
+    that must be recorded as 0, same as the absent case above."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "provider": "CoreWeave",
+            "usage": {
+                "prompt_tokens": 17101, "completion_tokens": 12, "cost": 0.002226,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            },
+        })
+
+    openrouter(handler)
+    with llm.model_call_accounting() as accounting:
+        llm._openrouter_post([{"role": "user", "content": "question"}],
+                             tools=[], timeout=5)
+
+    call = accounting.snapshot(require_nonzero=True)["model_calls"][0]
+    assert call["cached_tokens"] == 0
+    assert call["cost"] == pytest.approx(0.002226)
+
+
+def test_model_call_accounting_keeps_per_call_cache_figures_distinct(openrouter):
+    """#304 needs to tell the loop's continuation turns (warm) apart from the
+    final answer call (cold) — both must be retrievable separately from the
+    SAME turn's accounting, not summed or overwritten."""
+    turns = {"n": 0}
+
+    def handler(request):
+        turns["n"] += 1
+        cached = 0 if turns["n"] == 1 else 16896
+        cost = 0.002226 if turns["n"] == 1 else 0.001213
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "provider": "CoreWeave",
+            "usage": {
+                "prompt_tokens": 17101, "completion_tokens": 12, "cost": cost,
+                "prompt_tokens_details": {"cached_tokens": cached},
+            },
+        })
+
+    openrouter(handler)
+    with llm.model_call_accounting() as accounting:
+        llm._openrouter_post([{"role": "user", "content": "q1"}],
+                             tools=[], timeout=5)
+        llm._openrouter_post([{"role": "user", "content": "q2"}],
+                             tools=[], timeout=5)
+
+    calls = accounting.snapshot(require_nonzero=True)["model_calls"]
+    assert len(calls) == 2
+    assert calls[0]["cached_tokens"] == 0
+    assert calls[0]["cost"] == pytest.approx(0.002226)
+    assert calls[1]["cached_tokens"] == 16896
+    assert calls[1]["cost"] == pytest.approx(0.001213)
+
+
 def test_tool_and_answer_calls_have_distinct_bounded_envelopes(openrouter):
     bodies = []
 

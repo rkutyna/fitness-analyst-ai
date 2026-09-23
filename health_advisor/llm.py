@@ -54,8 +54,9 @@ _ACCOUNTING_TOLERANCE_S = 0.001
 class ModelCallAccounting:
     """One answer turn's model-call measurements.
 
-    The transport records only timings and token counts.  In particular, no
-    prompt or completion text is retained here or in the question log.
+    The transport records only timings and token counts (plus, where the
+    provider bills per call, the reported cost).  In particular, no prompt or
+    completion text is retained here or in the question log.
     """
 
     started: float = field(default_factory=time.monotonic)
@@ -73,8 +74,10 @@ class ModelCallAccounting:
             "elapsed_seconds": max(0.0, float(elapsed_seconds)),
             "prompt_tokens": _token_count(usage.get("prompt_tokens")),
             "cached_tokens": _token_count(usage.get("cached_tokens")),
+            "cache_write_tokens": _token_count(usage.get("cache_write_tokens")),
             "completion_tokens": _token_count(usage.get("completion_tokens")),
             "reasoning_tokens": _token_count(usage.get("reasoning_tokens")),
+            "cost": _usage_cost(usage.get("cost")),
             "finish_reason": (str(finish_reason)
                               if finish_reason is not None else None),
         })
@@ -144,6 +147,20 @@ def _token_count(value) -> int:
         return 0
 
 
+def _usage_cost(value) -> float | None:
+    """A provider's per-call cost figure, or ``None`` when absent/unusable.
+
+    Unlike token counts, an absent cost is not equivalent to a free call, so
+    this deliberately does not coerce a missing or malformed value to 0.0.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _record_model_call(elapsed_seconds: float, usage: dict | None = None,
                        *, prompt_tokens: int | None = None,
                        cached_tokens: int | None = None,
@@ -175,8 +192,20 @@ def _record_model_call(elapsed_seconds: float, usage: dict | None = None,
     accounting.record(elapsed_seconds, usage, finish_reason=finish_reason)
 
 
-def _usage_tokens(data: dict, *, ollama: bool = False) -> dict[str, int]:
-    """Normalize provider usage without retaining model-generated content."""
+def _usage_tokens(data: dict, *, ollama: bool = False) -> dict:
+    """Normalize provider usage without retaining model-generated content.
+
+    OpenRouter's cache figures (#304) live one level down, under
+    ``prompt_tokens_details``/``completion_tokens_details``; a flat
+    ``cached_tokens``/``cache_write_tokens``/``reasoning_tokens`` on ``usage``
+    itself (used by ``_record_model_call``'s override kwargs and by the
+    Ollama shape below) is accepted as a fallback. All of these are
+    legitimately absent, null, or zero on the wire -- under-cache-threshold
+    prompts and cold calls report no cache activity at all -- so every read
+    here goes through ``_token_count``, which never raises. ``cost`` is
+    OpenRouter-only and NOT a token count, so it is kept separately as a
+    float-or-None rather than coerced to 0.
+    """
     data = data if isinstance(data, dict) else {}
     usage = data.get("usage") if not ollama else data
     usage = usage if isinstance(usage, dict) else {}
@@ -190,17 +219,23 @@ def _usage_tokens(data: dict, *, ollama: bool = False) -> dict[str, int]:
         return {
             "prompt_tokens": _token_count(data.get("prompt_eval_count")),
             "cached_tokens": 0,
+            "cache_write_tokens": 0,
             "completion_tokens": _token_count(data.get("eval_count")),
             "reasoning_tokens": 0,
+            "cost": None,
         }
     return {
         "prompt_tokens": _token_count(usage.get("prompt_tokens")),
         "cached_tokens": _token_count(
             prompt_details.get("cached_tokens", usage.get("cached_tokens"))),
+        "cache_write_tokens": _token_count(
+            prompt_details.get("cache_write_tokens",
+                              usage.get("cache_write_tokens"))),
         "completion_tokens": _token_count(usage.get("completion_tokens")),
         "reasoning_tokens": _token_count(
             completion_details.get("reasoning_tokens",
                                   usage.get("reasoning_tokens"))),
+        "cost": _usage_cost(usage.get("cost")),
     }
 
 

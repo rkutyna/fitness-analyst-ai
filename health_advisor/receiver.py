@@ -227,8 +227,16 @@ INGEST_CHUNK = int(os.environ.get("HA_INGEST_CHUNK", "10000"))
 # must be at least the client's own catch-up window (14 days in the reference
 # iOS client): the client treats an unrecognised 409 as transient and retries
 # the whole pull, so a bound tighter than its window would stall it every day.
+#
+# The default is that window PLUS ONE DAY of slack. The reference client
+# stamps `queried_at` with an ISO formatter that caches the time zone at first
+# use, while its catch-up cursor walks days in the current calendar's zone.
+# After westward travel an evening pull can therefore stamp `queried_at` with
+# TOMORROW's date, so the oldest day of a 14-day catch-up reads as lag 15. At
+# a bound of 14 that is an unrecognised 409, and the client's pull stops until
+# local midnight (health_advisor#220).
 DAILY_TOTAL_REPULL_WINDOW_DAYS = int(
-    os.environ.get("HA_DAILY_TOTAL_REPULL_WINDOW_DAYS", "14"))
+    os.environ.get("HA_DAILY_TOTAL_REPULL_WINDOW_DAYS", "15"))
 
 # Largest request body we will read. Derived from the unit's MemoryMax=2G, not
 # picked round: the raw bytes, the decoded JSON and the built record dicts are

@@ -433,20 +433,20 @@ def _reject_evidence(vault_path):
 
 def test_repull_older_than_the_window_is_refused_before_any_write(
         conn, vault, vault_path, monkeypatch, capsys):
-    """A pull 15 days after the day, window 14: refused whole, nothing written."""
+    """A pull 16 days after the day, window 15: refused whole, nothing written."""
     with _client(vault, monkeypatch) as client:
         response = _post(
             client,
             _wire_total(local_date="2026-08-25",
-                        queried_at="2026-09-09T09:00:00-04:00"),
+                        queried_at="2026-09-10T09:00:00-04:00"),
             _wire_total(local_date="2026-09-08",
-                        queried_at="2026-09-09T09:00:00-04:00"),
+                        queried_at="2026-09-10T09:00:00-04:00"),
             batch_id="backfill-attempt")
 
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert detail.startswith("daily total outside the re-pull window")
-    assert "pulled 15 days after the day, window is 14" in detail
+    assert "pulled 16 days after the day, window is 15" in detail
     # Neither client-parsed prefix, so a client cannot mistake it for a
     # settled day (which advances its cursor) or a watermark.
     assert not detail.startswith("daily total already settled")
@@ -458,19 +458,22 @@ def test_repull_older_than_the_window_is_refused_before_any_write(
     assert conn.execute("SELECT COUNT(*) FROM commit_log").fetchone()[0] == 0
     evidence = _reject_evidence(vault_path)
     assert len(evidence) == 1 and "repull_window_guard" in evidence[0]
-    assert "lag_days=15" in evidence[0]
+    assert "lag_days=16" in evidence[0]
 
 
 def test_repull_at_the_window_edge_is_accepted(conn, vault, monkeypatch):
+    """Lag 15: the client's 14-day catch-up plus the one day a `queried_at`
+    stamped in a stale (eastern) time zone can add after westward travel."""
+    assert receiver.DAILY_TOTAL_REPULL_WINDOW_DAYS == 15
     with _client(vault, monkeypatch) as client:
         response = _post(
             client,
             _wire_total(local_date="2026-08-25",
-                        queried_at="2026-09-08T09:00:00-04:00"),
+                        queried_at="2026-09-09T09:00:00-04:00"),
             batch_id="edge")
     assert response.status_code == 200, response.text
     assert conn.execute(
-        "SELECT lag_days FROM hk_daily_total_revisions").fetchone()[0] == 14
+        "SELECT lag_days FROM hk_daily_total_revisions").fetchone()[0] == 15
 
 
 def test_repull_window_is_configurable(conn, vault, monkeypatch):

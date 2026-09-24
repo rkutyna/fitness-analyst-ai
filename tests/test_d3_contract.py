@@ -350,22 +350,124 @@ def test_full_rebuild_records_what_it_rebuilt_and_what_it_skipped(conn):
     assert "basal_energy" in detail, "name the series that were left alone"
 
 
-def test_get_latest_says_when_its_sample_is_an_aggregate(conn, tools):
-    """D9. `distance_walking_running` is stored as 20-second sums, so the
-    'latest sample' is a window total whose timestamp is its earliest sample.
-    Reporting that as an instantaneous reading would be a claim about a moment
-    that never happened."""
+def _tools_for(path):
+    """MCP tools bound to a specific vault path, as a fresh session would get
+    them -- used where a test needs to inspect a *second*, purpose-built
+    vault rather than the `conn`/`tools` fixture pair's own file."""
+    from types import SimpleNamespace
+
+    from health_advisor import mcp_server as _mcp
+    from health_advisor.context import VaultContext
+
+    return SimpleNamespace(**_mcp.build_tools(
+        VaultContext.local(path, user_id="test", writable=True)))
+
+
+def test_get_latest_publishes_a_built_vaults_recorded_resolution(
+        conn, vault_path, tmp_path):
+    """health_advisor#332. D9: `distance_walking_running` is stored as
+    20-second sums, so the 'latest sample' is a window total whose timestamp
+    is its earliest sample -- reporting that as an instantaneous reading
+    would be a claim about a moment that never happened. `get_latest` must
+    read the width THIS built vault declares, not the module's current
+    build plan."""
     seed_metric(conn, "distance_walking_running", "2026-08-01", [3.1])
     _record(conn, "distance_walking_running", 0.001, "2026-08-01T09:00:00+00:00",
             "2026-08-01")
     seed_metric(conn, "heart_rate", "2026-08-01", [61.0])
     _record(conn, "heart_rate", 61.0, "2026-08-01T09:00:00+00:00", "2026-08-01")
     conn.commit()
+    conn.close()
 
-    assert tools.get_latest("distance_walking_running")["latest_sample"][
-        "resolution_seconds"] == 20
-    assert tools.get_latest("heart_rate")["latest_sample"][
-        "resolution_seconds"] == 0, "heart_rate is stored as recorded"
+    out_path = tmp_path / "built-20s.db"
+    V.build_vault(vault_path, out_path)
+    built = _tools_for(out_path)
+
+    dw = built.get_latest("distance_walking_running")["latest_sample"]
+    assert dw["resolution_seconds"] == 20
+    assert "resolution_status" not in dw
+    hr = built.get_latest("heart_rate")["latest_sample"]
+    assert hr["resolution_seconds"] == 0, "heart_rate is stored as recorded"
+    assert "resolution_status" not in hr
+
+
+def test_get_latest_publishes_a_300s_built_vaults_resolution(
+        conn, vault_path, tmp_path, monkeypatch):
+    """health_advisor#332: a vault built at a coarser width must publish
+    THAT width, not the module's current 20 s build plan -- the defect this
+    closes reported 20 s for every vault regardless of what it was actually
+    built at.
+
+    The build and the read happen with two DIFFERENT current-plan values
+    (300, then restored to the real default) precisely so this test cannot
+    pass by coincidence: reading the module constant at call time would
+    answer today's default, not the 300 the vault was actually built at."""
+    seed_metric(conn, "distance_walking_running", "2026-08-01", [3.1])
+    _record(conn, "distance_walking_running", 0.001, "2026-08-01T09:00:00+00:00",
+            "2026-08-01")
+    conn.commit()
+    conn.close()
+
+    out_path = tmp_path / "built-300s.db"
+    with monkeypatch.context() as build_time:
+        build_time.setitem(V.VAULT_BUCKET_SECONDS, "distance_walking_running", 300)
+        V.build_vault(vault_path, out_path)
+    # The module constant is back to its real default here -- the vault's own
+    # declaration, written above, is the only place 300 still lives.
+    assert V.VAULT_BUCKET_SECONDS["distance_walking_running"] != 300
+    built = _tools_for(out_path)
+
+    dw = built.get_latest("distance_walking_running")["latest_sample"]
+    assert dw["resolution_seconds"] == 300
+    assert "resolution_status" not in dw
+
+
+def test_get_latest_says_unknown_for_an_unmarked_vault(conn, tools):
+    """A vault opened without a build declaration -- a pre-#332 build, or
+    any schema-initialized-only database, same as `conn`/`tools` here --
+    must not be reported as if it matched today's build width. It must say
+    it does not know, following the published-status pattern #326
+    established (absence is not a fact)."""
+    seed_metric(conn, "distance_walking_running", "2026-08-01", [3.1])
+    _record(conn, "distance_walking_running", 0.001, "2026-08-01T09:00:00+00:00",
+            "2026-08-01")
+    conn.commit()
+
+    out = tools.get_latest("distance_walking_running")["latest_sample"]
+    assert out["resolution_seconds"] is None
+    assert out["resolution_status"] == (
+        "unknown: this vault records no build resolution for "
+        "'distance_walking_running'"
+    )
+
+
+def test_get_latest_publishes_a_receiver_fed_vaults_measured_resolution(
+        conn, tools):
+    """A receiver-fed vault carries no D3 build declaration, but
+    `insert_records` measures it from its own raw rows
+    (`mark_receiver_resolutions`, health_advisor#332) -- that measured value
+    must still reach `get_latest` rather than falling back to unknown."""
+    from datetime import datetime, timedelta
+
+    rows = []
+    for n in range(1, 101, 10):
+        start = datetime(2026, 8, 1, 9, 0, 0) + timedelta(seconds=n)
+        end = start + timedelta(seconds=300)
+        rows.append({
+            "metric": "step_count", "value": 1.0, "unit": "count",
+            "start_utc": start.isoformat() + "+00:00",
+            "end_utc": end.isoformat() + "+00:00",
+            "start_local": start.isoformat(), "local_date": "2026-08-01",
+            "source": "test", "origin": "receiver",
+            "dedupe_key": f"step_count-receiver-{n}",
+        })
+    dbmod.insert_records(conn, rows)
+    dbmod.recompute_daily_metrics(conn, full=True)
+    conn.commit()
+
+    out = tools.get_latest("step_count")["latest_sample"]
+    assert out["resolution_seconds"] == 300
+    assert "resolution_status" not in out
 
 
 def test_the_vault_bucket_width_is_the_width_consumers_read():

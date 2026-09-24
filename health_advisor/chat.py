@@ -1907,6 +1907,15 @@ def _mark_stale_window(verification: dict, *, template: str,
     if not anchors:
         return False
     latest = max(end for _metric, end in cited)
+    # A cited period that ends INSIDE the window Python resolved from the
+    # question answers that question, however far the window's own end sits
+    # from the data: "longest run last month" answered with the run of the
+    # 8th is current for "last month". Only a citation ending before the
+    # asked-for window starts is measured (review 2026-09-24).
+    from .calendar_window import CalendarWindow
+    if (isinstance(resolved_window, CalendarWindow)
+            and latest >= date.fromisoformat(str(resolved_window.start))):
+        return False
     anchor = max(anchors)
     if cap is not None:
         anchor = min(anchor, cap)

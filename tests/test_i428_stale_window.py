@@ -346,3 +346,30 @@ def test_a_question_naming_july_is_answered_by_the_july_window(
     assert len(capture) == 1
     assert result["mode"] == "narration"
     assert result["verification"]["cause"] == "ok"
+
+
+# --------------------------------------------------------------------- #
+# Review 2026-09-24: a citation inside the window the question resolved to
+# is the answer, not staleness.
+# --------------------------------------------------------------------- #
+
+def test_a_citation_inside_the_resolved_window_is_not_refused():
+    # "last month" on 2026-08-21 resolves to July; a run week ending the
+    # 12th is inside it, 40 days before the data and 19 before July 31.
+    inside = "2026-07-06:2026-07-12"
+    assert resolve_window("What was my resting heart rate last month?",
+                          AS_OF) is not None
+    fired, verification = _mark(
+        _template(inside), _facts(inside),
+        question="What was my resting heart rate last month?")
+    assert fired is False
+    assert verification["ok"] is True
+
+
+def test_a_citation_before_the_resolved_window_is_still_refused():
+    before = "2026-06-01:2026-06-07"
+    fired, verification = _mark(
+        _template(before), _facts(before),
+        question="What was my resting heart rate last month?")
+    assert fired is True
+    assert verification["stale_window"]["latest_cited_end"] == "2026-06-07"

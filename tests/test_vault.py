@@ -387,6 +387,103 @@ def test_unmarked_vault_resolution_is_unknown_and_fails_safe(tmp_path):
     assert refusal["reason"] == "resolution_unknown"
 
 
+def _sparse_step_source(path, width: int = 2, count: int = 12) -> None:
+    """Short step samples 600 s apart, so each 300 s bucket holds exactly one.
+
+    A bucket row spans the samples inside it, so every bucket here is ``width``
+    seconds wide -- the shape a real 300 s build takes wherever steps are
+    sparse, and the shape that makes measuring a built vault misread it.
+    """
+    conn = db.connect(path)
+    db.init_db(conn)
+    rows = []
+    for n in range(count):
+        start = datetime(2026, 8, 20, 6, 0, 0) + timedelta(seconds=600 * n)
+        row = _record("step_count", 5.0, "2026-08-20", n)
+        row["start_utc"] = start.isoformat() + "+00:00"
+        row["end_utc"] = (start + timedelta(seconds=width)).isoformat() + "+00:00"
+        row["start_local"] = start.isoformat()
+        rows.append(row)
+    db.insert_records(conn, rows)
+    conn.commit()
+    conn.close()
+
+
+def _strip_build_resolution(path) -> None:
+    """Make a current build look like one made before the build declared it."""
+    conn = db.connect(path)
+    conn.execute(
+        "DELETE FROM vault_meta WHERE key IN (?, ?, ?)",
+        (vault.VAULT_META_BUCKET_SECONDS, vault.VAULT_META_RAW_SERIES,
+         vault.VAULT_META_SOURCE_RECORDS_SPAN),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_pre_declaration_built_vault_stays_unknown_after_init_db(
+    tmp_path, monkeypatch
+):
+    """health_advisor#332 Done-when 4, on the vault it is actually about.
+
+    A 300 s vault built before the declaration existed has bucket rows whose
+    stored widths are the samples inside them (2 s here). ``init_db`` measured
+    those, marked step_count as sample resolution, and the coarse vault then
+    passed the cardiac-decoupling gate. It must stay unknown and refuse.
+    """
+    source = tmp_path / "source.db"
+    legacy = tmp_path / "legacy300.db"
+    _sparse_step_source(source)
+    monkeypatch.setitem(vault.VAULT_BUCKET_SECONDS, "step_count", 300)
+    build_vault(source, legacy, measure_gzip=False)
+    monkeypatch.setitem(vault.VAULT_BUCKET_SECONDS, "step_count", 20)
+    _strip_build_resolution(legacy)
+
+    conn = db.connect(legacy)
+    try:
+        widths = {row[0] for row in conn.execute(
+            "SELECT CAST(round((julianday(end_utc) - julianday(start_utc))"
+            " * 86400) AS INT) FROM records WHERE metric = 'step_count'")}
+        assert widths == {2}, "fixture: bucket rows must measure as samples"
+        db.init_db(conn)
+        conn.commit()
+        assert vault.is_vault(conn)
+        assert vault.raw_resolution_seconds(conn, "step_count") is None
+        refusal = vault.resolution_refusal(
+            conn, "step_count", 20, needed_for="cardiac_decoupling")
+    finally:
+        conn.close()
+    assert refusal["reason"] == "resolution_unknown"
+
+
+def test_live_batches_do_not_refine_a_built_vault_declaration(
+    tmp_path, monkeypatch
+):
+    """Fine live samples do not make a 300 s build's older buckets finer."""
+    source = tmp_path / "source.db"
+    built = tmp_path / "built300.db"
+    _sparse_step_source(source)
+    monkeypatch.setitem(vault.VAULT_BUCKET_SECONDS, "step_count", 300)
+    build_vault(source, built, measure_gzip=False)
+    monkeypatch.setitem(vault.VAULT_BUCKET_SECONDS, "step_count", 20)
+
+    conn = db.connect(built)
+    try:
+        db.init_db(conn)
+        rows = []
+        for n in range(vault.RESOLUTION_MIN_REPEAT):
+            start = datetime(2026, 8, 21, 6, 0, 0) + timedelta(seconds=10 * n)
+            row = _record("step_count", 3.0, "2026-08-21", n)
+            row["start_utc"] = start.isoformat() + "+00:00"
+            row["end_utc"] = (start + timedelta(seconds=2)).isoformat() + "+00:00"
+            rows.append(row)
+        db.insert_records(conn, rows)
+        conn.commit()
+        assert vault.raw_resolution_seconds(conn, "step_count") == 300
+    finally:
+        conn.close()
+
+
 def test_receiver_write_marks_after_init_without_restart(tmp_path):
     """The receiver's real init-then-batch order records the mark promptly."""
     target = tmp_path / "receiver-write.db"

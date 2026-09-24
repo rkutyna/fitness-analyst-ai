@@ -418,3 +418,152 @@ def test_mixed_daily_total_batch_is_refused_atomically(conn, vault, monkeypatch)
     assert conn.execute(
         "SELECT COUNT(*) FROM commit_log WHERE key = 'healthkit:dev-1:mixed-settled'"
     ).fetchone()[0] == 0
+
+
+# --- health_advisor#220: the re-pull is bounded, never a backfill ------------
+
+def _reject_evidence(vault_path):
+    fresh = dbmod.connect(vault_path, read_only=True)
+    try:
+        return [row["detail"] for row in fresh.execute(
+            "SELECT detail FROM ingest_log WHERE kind = 'reject'")]
+    finally:
+        fresh.close()
+
+
+def test_repull_older_than_the_window_is_refused_before_any_write(
+        conn, vault, vault_path, monkeypatch, capsys):
+    """A pull 15 days after the day, window 14: refused whole, nothing written."""
+    with _client(vault, monkeypatch) as client:
+        response = _post(
+            client,
+            _wire_total(local_date="2026-08-25",
+                        queried_at="2026-09-09T09:00:00-04:00"),
+            _wire_total(local_date="2026-09-08",
+                        queried_at="2026-09-09T09:00:00-04:00"),
+            batch_id="backfill-attempt")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail.startswith("daily total outside the re-pull window")
+    assert "pulled 15 days after the day, window is 14" in detail
+    # Neither client-parsed prefix, so a client cannot mistake it for a
+    # settled day (which advances its cursor) or a watermark.
+    assert not detail.startswith("daily total already settled")
+    assert not detail.startswith("history imported through")
+    assert "ingest-trace reject-409-repull-window" in capsys.readouterr().err
+    assert conn.execute("SELECT COUNT(*) FROM hk_daily_totals").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_total_revisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM commit_log").fetchone()[0] == 0
+    evidence = _reject_evidence(vault_path)
+    assert len(evidence) == 1 and "repull_window_guard" in evidence[0]
+    assert "lag_days=15" in evidence[0]
+
+
+def test_repull_at_the_window_edge_is_accepted(conn, vault, monkeypatch):
+    with _client(vault, monkeypatch) as client:
+        response = _post(
+            client,
+            _wire_total(local_date="2026-08-25",
+                        queried_at="2026-09-08T09:00:00-04:00"),
+            batch_id="edge")
+    assert response.status_code == 200, response.text
+    assert conn.execute(
+        "SELECT lag_days FROM hk_daily_total_revisions").fetchone()[0] == 14
+
+
+def test_repull_window_is_configurable(conn, vault, monkeypatch):
+    monkeypatch.setattr(receiver, "DAILY_TOTAL_REPULL_WINDOW_DAYS", 3)
+    with _client(vault, monkeypatch) as client:
+        inside = _post(client, _wire_total(
+            queried_at="2026-08-28T09:00:00-04:00"), batch_id="lag3")
+        outside = _post(client, _wire_total(
+            local_date="2026-08-24", queried_at="2026-08-28T09:00:00-04:00"),
+            batch_id="lag4", sequence=2)
+    assert inside.status_code == 200, inside.text
+    assert outside.status_code == 409
+    assert "window is 3" in outside.json()["detail"]
+
+
+def test_watermark_refusal_wins_over_the_window(conn, vault, monkeypatch):
+    """A day below the watermark AND too old keeps D14's parseable detail."""
+    vault_mod.set_history_imported_through(conn, "2026-08-21")
+    conn.commit()
+    with _client(vault, monkeypatch) as client:
+        response = _post(client, _wire_total(
+            local_date="2026-08-01", queried_at="2026-08-28T09:00:00-04:00"),
+            batch_id="old-and-below")
+    assert response.status_code == 409
+    assert response.json()["detail"].startswith(
+        "history imported through 2026-08-21;")
+
+
+def test_provisional_repull_above_the_watermark_is_not_a_history_violation(
+        conn, vault, vault_path, monkeypatch):
+    """DW3: with D14's watermark set, re-pulling a provisional recent day is
+    accepted, leaves no refusal evidence, and records before/after."""
+    vault_mod.set_history_imported_through(conn, "2026-08-21")
+    conn.commit()
+    with _client(vault, monkeypatch) as client:
+        first = _post(client, _wire_total(value=9000.0), batch_id="p1")
+        repull = _post(client, _wire_total(
+            value=9905.0, queried_at="2026-08-28T09:00:00-04:00"),
+            batch_id="p2", sequence=2)
+    assert first.status_code == 200, first.text
+    assert repull.status_code == 200, repull.text
+    assert _reject_evidence(vault_path) == []
+    rev = conn.execute(
+        "SELECT from_value, to_value, from_state, to_state, lag_days "
+        "FROM hk_daily_total_revisions ORDER BY id DESC LIMIT 1").fetchone()
+    assert tuple(rev) == (9000.0, 9905.0, "provisional", "provisional", 3)
+
+
+# --- health_advisor#220 Done-when 1: the revision distribution --------------
+
+def test_revision_report_counts_changed_days_by_lag_and_delta(conn):
+    def write(day, value, lag, state="provisional", metric="step_count"):
+        queried = (__import__("datetime").date.fromisoformat(day)
+                   + __import__("datetime").timedelta(days=lag)).isoformat()
+        dbmod.insert_daily_totals(conn, [_total(
+            metric=metric, local_date=day, value=value, state=state,
+            queried_at=f"{queried}T09:00:00")], batch_id=f"{metric}{day}{lag}")
+
+    # 08-20: moved at lag 2 (+100), then unchanged at lag 3 and settled.
+    write("2026-08-20", 9000.0, 1)
+    write("2026-08-20", 9100.0, 2)
+    write("2026-08-20", 9100.0, 3, state="settled")
+    # 08-21: moved at lag 3 (-50), the latest change anywhere.
+    write("2026-08-21", 5000.0, 1)
+    write("2026-08-21", 5000.0, 2)
+    write("2026-08-21", 4950.0, 3)
+    # 08-22: never moved.
+    write("2026-08-22", 7000.0, 1)
+    write("2026-08-22", 7000.0, 2)
+    # A second metric that never moved, from a zero first value.
+    write("2026-08-20", 0.0, 1, metric="flights_climbed")
+    write("2026-08-20", 0.0, 2, metric="flights_climbed")
+
+    report = dbmod.daily_total_revision_report(conn)["metrics"]
+    steps = report["step_count"]
+    assert steps["days"] == 3
+    assert steps["repulls"] == 5
+    assert steps["changed_repulls"] == 2
+    assert steps["days_changed"] == 2
+    assert steps["last_change_lag"] == 3
+    assert steps["max_observed_lag"] == 3
+    assert steps["by_lag"][2] == {"repulls": 3, "changed": 1,
+                                  "max_abs_delta": 100.0,
+                                  "max_rel_delta": pytest.approx(100 / 9000)}
+    assert steps["by_lag"][3]["changed"] == 1
+    assert steps["by_lag"][3]["max_abs_delta"] == 50.0
+    assert steps["abs_delta"] == {"median": 75.0, "max": 100.0}
+    assert steps["rel_delta"]["max"] == pytest.approx(100 / 9000)
+    flights = report["flights_climbed"]
+    assert (flights["repulls"], flights["changed_repulls"],
+            flights["days_changed"], flights["last_change_lag"]) == (1, 0, 0, None)
+    assert flights["abs_delta"] == {"median": None, "max": None}
+
+
+def test_revision_report_is_empty_on_a_vault_without_totals(conn):
+    assert dbmod.daily_total_revision_report(conn) == {"metrics": {}}

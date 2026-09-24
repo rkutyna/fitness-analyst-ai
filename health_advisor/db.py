@@ -2091,6 +2091,105 @@ def apply_consolidated_totals(
     return written
 
 
+def daily_total_lag_days(queried_at: str, local_date: str) -> int:
+    """Days between a consolidated total's day and the pull that described it.
+
+    `queried_at`'s own local date minus `local_date`. The single definition of
+    "lag" for #220: `hk_daily_total_revisions.lag_days` stores it and the
+    receiver's re-pull window guard bounds it, so the instrument that chooses N
+    and the guard that bounds the re-pull cannot disagree about a day.
+    """
+    return (datetime.fromisoformat(queried_at[:10]).date()
+            - datetime.fromisoformat(local_date).date()).days
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def daily_total_revision_report(conn: sqlite3.Connection) -> dict:
+    """How many consolidated days changed on a re-pull, by how much, at what lag.
+
+    The read side of #220 Done-when 1: the settle lag N is chosen from this
+    distribution, not assumed. Every accepted write appends a
+    `hk_daily_total_revisions` row, so a *re-pull* is a row with a prior value
+    (`from_value IS NOT NULL`) and a *change* is a re-pull whose value moved.
+
+    Per metric:
+
+    - `days`: distinct days with any write; `repulls`/`changed_repulls`: counts;
+      `days_changed`: distinct days on which any re-pull moved the value.
+    - `by_lag`: `{lag_days: {repulls, changed, max_abs_delta, max_rel_delta}}`.
+    - `abs_delta`/`rel_delta`: median and max over changed re-pulls. Relative
+      delta is `|to - from| / from` and is omitted when `from` is 0.
+    - `last_change_lag`: the largest lag at which any value still moved (None
+      when nothing moved) — a settle lag at or below it would have frozen a
+      value that later changed. `max_observed_lag`: the largest lag re-pulled at
+      all, i.e. how far the evidence reaches.
+
+    Read-only; one scan of a table that holds a few rows per metric per day.
+    """
+    if not _has_table(conn, "hk_daily_total_revisions"):
+        return {"metrics": {}}
+    metrics: dict[str, dict] = {}
+    rows = conn.execute(
+        "SELECT metric, local_date, from_value, to_value, lag_days "
+        "FROM hk_daily_total_revisions ORDER BY metric, local_date, id")
+    for metric, day, from_value, to_value, lag in rows:
+        m = metrics.setdefault(metric, {
+            "_days": set(), "_changed_days": set(), "_abs": [], "_rel": [],
+            "repulls": 0, "changed_repulls": 0, "by_lag": {},
+            "last_change_lag": None, "max_observed_lag": None})
+        m["_days"].add(day)
+        if from_value is None:
+            continue
+        m["repulls"] += 1
+        m["max_observed_lag"] = (lag if m["max_observed_lag"] is None
+                                 else max(m["max_observed_lag"], lag))
+        bucket = m["by_lag"].setdefault(lag, {
+            "repulls": 0, "changed": 0, "max_abs_delta": 0.0,
+            "max_rel_delta": None})
+        bucket["repulls"] += 1
+        if to_value == from_value:
+            continue
+        delta = abs(to_value - from_value)
+        rel = delta / from_value if from_value else None
+        m["changed_repulls"] += 1
+        m["_changed_days"].add(day)
+        m["_abs"].append(delta)
+        if rel is not None:
+            m["_rel"].append(rel)
+        m["last_change_lag"] = (lag if m["last_change_lag"] is None
+                                else max(m["last_change_lag"], lag))
+        bucket["changed"] += 1
+        bucket["max_abs_delta"] = max(bucket["max_abs_delta"], delta)
+        if rel is not None:
+            bucket["max_rel_delta"] = (rel if bucket["max_rel_delta"] is None
+                                       else max(bucket["max_rel_delta"], rel))
+    report = {}
+    for metric, m in metrics.items():
+        report[metric] = {
+            "days": len(m["_days"]),
+            "repulls": m["repulls"],
+            "changed_repulls": m["changed_repulls"],
+            "days_changed": len(m["_changed_days"]),
+            "by_lag": dict(sorted(m["by_lag"].items())),
+            "abs_delta": {"median": _median(m["_abs"]),
+                          "max": max(m["_abs"], default=None)},
+            "rel_delta": {"median": _median(m["_rel"]),
+                          "max": max(m["_rel"], default=None)},
+            "last_change_lag": m["last_change_lag"],
+            "max_observed_lag": m["max_observed_lag"],
+        }
+    return {"metrics": report}
+
+
 def insert_daily_totals(
     conn: sqlite3.Connection,
     rows: Iterable[dict],
@@ -2134,8 +2233,7 @@ def insert_daily_totals(
         prior = conn.execute(
             "SELECT value, state, first_seen_at FROM hk_daily_totals "
             "WHERE metric = ? AND local_date = ?", (metric, day)).fetchone()
-        lag_days = (datetime.fromisoformat(row["queried_at"][:10]).date()
-                    - datetime.fromisoformat(day).date()).days
+        lag_days = daily_total_lag_days(row["queried_at"], day)
         if prior is None:
             conn.execute(
                 "INSERT INTO hk_daily_totals (metric, local_date, value, unit, "

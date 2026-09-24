@@ -215,6 +215,21 @@ def _shared_secret_for_request() -> str:
 # batch's one-transaction atomicity.
 INGEST_CHUNK = int(os.environ.get("HA_INGEST_CHUNK", "10000"))
 
+# How far back a consolidated daily total may describe, measured from the day
+# it was pulled (health_advisor#220: "do not let the re-pull become a
+# backfill"). The lag is `db.daily_total_lag_days` — the queried_at local date
+# minus local_date — the same definition `hk_daily_total_revisions.lag_days`
+# records, so the guard and the instrument agree about what "N days" means.
+#
+# This is NOT the settle lag. When a day settles is the client's setting and is
+# chosen from the revision distribution (`db.daily_total_revision_report`);
+# this bound only stops a pull from reaching back past the recent window. It
+# must be at least the client's own catch-up window (14 days in the reference
+# iOS client): the client treats an unrecognised 409 as transient and retries
+# the whole pull, so a bound tighter than its window would stall it every day.
+DAILY_TOTAL_REPULL_WINDOW_DAYS = int(
+    os.environ.get("HA_DAILY_TOTAL_REPULL_WINDOW_DAYS", "14"))
+
 # Largest request body we will read. Derived from the unit's MemoryMax=2G, not
 # picked round: the raw bytes, the decoded JSON and the built record dicts are
 # all resident at once, roughly 8-10x the body, so ~256 MiB is about the most
@@ -802,6 +817,40 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                             f"history_guard watermark={history} offending={offending} "
                             f"kind={kind} batch_min={lo} batch_max={hi} records={n} "
                             f"batch_id={parsed.get('batch_id')} "
+                            f"device={parsed.get('device_id')}"
+                        ),
+                        nbytes=len(raw),
+                    )
+
+            # A re-pull settles recent days; it is never a backfill (#220).
+            # Reaching back past the window is D7's separate migration, so a
+            # total described more than DAILY_TOTAL_REPULL_WINDOW_DAYS after
+            # its own day is refused whole, before any write. It runs after
+            # the watermark guard, so a day that is both below the watermark
+            # and too old still gets the parseable history detail a client
+            # uses to advance its cursor.
+            for row in parsed["daily_totals"]:
+                lag = db.daily_total_lag_days(row["queried_at"], row["local_date"])
+                if lag > DAILY_TOTAL_REPULL_WINDOW_DAYS:
+                    _trace("reject-409-repull-window", metric=row["metric"],
+                           day=row["local_date"], lag_days=lag,
+                           window=DAILY_TOTAL_REPULL_WINDOW_DAYS,
+                           batch_id=parsed["batch_id"])
+                    _refuse_guard(
+                        ctx, conn,
+                        detail=(
+                            f"daily total outside the re-pull window for "
+                            f"{row['metric']} on {row['local_date']}: pulled "
+                            f"{lag} days after the day, window is "
+                            f"{DAILY_TOTAL_REPULL_WINDOW_DAYS} (#220) — a "
+                            "re-pull settles recent days only and is not a "
+                            "backfill"
+                        ),
+                        evidence=(
+                            f"repull_window_guard metric={row['metric']} "
+                            f"day={row['local_date']} lag_days={lag} "
+                            f"window={DAILY_TOTAL_REPULL_WINDOW_DAYS} "
+                            f"batch_id={parsed['batch_id']} "
                             f"device={parsed.get('device_id')}"
                         ),
                         nbytes=len(raw),

@@ -489,6 +489,7 @@ ASK_CAUSES = (
     "transport_failed",
     "backend_unavailable",
     "conversational_refused",
+    "conversational_scripted",
     "empty_gather",
     "gate_refused",
     "no_gather_needed",
@@ -822,6 +823,36 @@ _CONVERSATIONAL_MESSAGE_RE = re.compile(
     r"(?:good )?(?:morning|afternoon|evening)|"
     r"thanks?(?: a lot)?|thank you|ok(?:ay)?|got it|understood|"
     r"sounds good|great|perfect)")
+
+
+_SCRIPTED_THANKS_RE = re.compile(r"thanks?(?: a lot)?|thank you")
+_SCRIPTED_ACK_RE = re.compile(
+    r"ok(?:ay)?|got it|understood|sounds good|great|perfect")
+_SCRIPTED_TIME_OF_DAY_RE = re.compile(
+    r"(?:good )?(morning|afternoon|evening)")
+_SCRIPTED_OFFER = ("What would you like to look at? You can ask about your "
+                   "training, sleep, recovery or your plan.")
+
+
+def _scripted_conversational_reply(question: str) -> str:
+    """A Python-authored reply to an allowlisted greeting, thanks or ack.
+
+    Used only when the model's own reply to such a message is refused
+    (health_advisor#410): a pure greeting asked for nothing, so a fixed,
+    data-free line answers it as well as the model would, and far better
+    than a withheld card. The caller re-checks it with the same
+    ``conversational_violation`` the model's reply failed.
+    """
+    normalized = re.sub(r"[\W_]+", " ", str(question).casefold()).strip()
+    if _SCRIPTED_THANKS_RE.fullmatch(normalized):
+        return ("You're welcome. Ask me anything about your training, sleep "
+                "or recovery whenever you like.")
+    if _SCRIPTED_ACK_RE.fullmatch(normalized):
+        return "Sounds good. I'm here whenever you want to look at something."
+    time_of_day = _SCRIPTED_TIME_OF_DAY_RE.fullmatch(normalized)
+    if time_of_day:
+        return f"Good {time_of_day.group(1)}! {_SCRIPTED_OFFER}"
+    return f"Hi! {_SCRIPTED_OFFER}"
 
 
 def _question_is_data_request(question: str,
@@ -2198,6 +2229,31 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                 "tool_trace": [],
                 "verification": conversational_verification,
             }
+        # #410: the model DID answer a pure greeting/thanks/ack, but its reply
+        # failed the claim check (capability menus such as "anything else
+        # your wearable has been tracking" read as claims). Answer with a
+        # fixed, data-free line instead of a withheld card. A transport or
+        # backend failure is not rescued here; it still surfaces as itself.
+        # The refused draft stays in the capture as attempt 1.
+        if _status_outcome_family(gather_status) == "other":
+            scripted = _scripted_conversational_reply(question)
+            if not fact_template.conversational_violation(scripted, facts):
+                scripted_verification = {
+                    **conversational_verification,
+                    "ok": True,
+                    "grounded": True,
+                    "reason": "",
+                    "refused_model_reason": conversational_reason,
+                    "cause": "conversational_scripted",
+                }
+                _record_attempt(capture, 2, scripted, None,
+                                scripted_verification, None, [])
+                return {
+                    "text": scripted,
+                    "mode": "narration",
+                    "tool_trace": [],
+                    "verification": scripted_verification,
+                }
         return {
             "text": _fallback_answer(conversational_verification),
             "mode": "fallback",

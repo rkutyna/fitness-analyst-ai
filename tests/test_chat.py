@@ -2162,8 +2162,11 @@ def test_conversational_reply_with_digit_or_metric_is_refused(
 
     result = chat.answer_question(vault, "Hello!")
 
-    assert result["mode"] == "fallback"
-    assert result["verification"]["reason"]
+    # #410: the refused draft is never shown; a scripted, data-free line is.
+    assert result["mode"] == "narration"
+    assert reply not in result["text"]
+    assert result["text"] == chat._scripted_conversational_reply("Hello!")
+    assert result["verification"]["refused_model_reason"]
 
 
 @pytest.mark.parametrize("reply", ("Hello there 7", "Hello, jog_minutes is ready"))
@@ -2185,10 +2188,36 @@ def test_refused_conversational_reply_reports_its_own_cause_not_empty_gather(
 
     result = chat.answer_question(vault, "Hello!")
 
-    assert result["mode"] == "fallback"
-    assert result["verification"]["cause"] == "conversational_refused"
+    assert result["verification"]["cause"] == "conversational_scripted"
     assert result["verification"]["cause"] != "empty_gather"
+    assert "conversational_scripted" in chat.ASK_CAUSES
+    # Kept for rows written before #410's scripted reply existed.
     assert "conversational_refused" in chat.ASK_CAUSES
+
+
+@pytest.mark.parametrize("message, opening", (
+    ("Hello!", "Hi!"), ("hey there", "Hi!"), ("Good morning", "Good morning!"),
+    ("good evening.", "Good evening!"), ("thanks", "You're welcome."),
+    ("Thank you!", "You're welcome."), ("ok", "Sounds good."),
+    ("got it", "Sounds good."),
+))
+def test_scripted_reply_matches_the_message_and_is_itself_claim_free(
+        message, opening):
+    reply = chat._scripted_conversational_reply(message)
+    assert reply.startswith(opening)
+    assert fact_template.conversational_violation(reply, {}) == ""
+
+
+def test_transport_failure_on_a_greeting_is_not_papered_over(monkeypatch, vault):
+    """The scripted reply rescues a REFUSED model reply only. A gather that
+    never reached a model must still report itself, not look like an answer."""
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(chat, "_status_outcome_family",
+                        lambda status: "transport_failed")
+    monkeypatch.setattr(llm, "tool_loop", lambda *args, **kwargs: "")
+    result = chat.answer_question(vault, "Hello!")
+    assert result["verification"].get("cause") != "conversational_scripted"
 
 
 def test_accepted_and_refused_conversational_causes_are_distinct(
@@ -2211,9 +2240,10 @@ def test_accepted_and_refused_conversational_causes_are_distinct(
     refused = chat.answer_question(vault, "Hello!")
 
     assert accepted["mode"] == "narration"
-    assert refused["mode"] == "fallback"
+    assert refused["mode"] == "narration"
+    assert "jog_minutes" not in refused["text"]
     assert accepted["verification"]["cause"] == "conversational"
-    assert refused["verification"]["cause"] == "conversational_refused"
+    assert refused["verification"]["cause"] == "conversational_scripted"
     assert accepted["verification"]["cause"] != refused["verification"]["cause"]
 
 

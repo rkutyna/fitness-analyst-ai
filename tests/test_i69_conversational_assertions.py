@@ -197,6 +197,6 @@ def test_recorded_menus_publish_on_the_deployed_shape(monkeypatch, vault,
 ))
 def test_claims_are_withheld_on_the_deployed_shape(monkeypatch, vault, reply):
     result = _conversational(monkeypatch, vault, reply)
-    assert result["mode"] == "fallback"
-    assert result["verification"]["cause"] == "conversational_refused"
+    # #410: the claim is still never published; a scripted line replaces it.
+    assert result["verification"]["cause"] == "conversational_scripted"
     assert reply not in result["text"]

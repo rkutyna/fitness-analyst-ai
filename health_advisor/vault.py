@@ -655,7 +655,19 @@ def mark_receiver_resolutions(
     series may refine an existing mark, but only toward finer measured data.
     A metric without enough evidence is omitted rather than assigned the
     current build bucket width.
+
+    A D3-built vault is never measured. Its bucketed rows span the samples
+    they aggregate (``MIN(start_utc)``..``MAX(end_utc)``), so a bucket holding
+    one short sample measures as that sample: the newest step_count rows of a
+    300 s build measure 2-5 s, and measuring them marked the vault as sample
+    resolution and let a 300 s vault publish a figure (health_advisor#332).
+    Only ``build_vault`` can declare a built vault's resolution. A built vault
+    without that declaration predates it and stays unknown, and live batches
+    cannot refine a declaration either, because they do not make the vault's
+    older bucketed rows any finer. The remedy for either is a rebuild.
     """
+    if is_vault(conn):
+        return {}
     encoded_buckets = _vault_meta_value(conn, VAULT_META_BUCKET_SECONDS)
     encoded_raw = _vault_meta_value(conn, VAULT_META_RAW_SERIES)
     if encoded_buckets is None and encoded_raw is None:

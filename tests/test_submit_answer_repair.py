@@ -57,9 +57,7 @@ def openrouter(monkeypatch):
     monkeypatch.setattr(llm, "OPENROUTER_PROVIDER_SORT", "")
     monkeypatch.setattr(llm, "OPENROUTER_REASONING", "off")
     monkeypatch.setattr(llm, "_registry", lambda ctx, include=None: {})
-    llm._LAST_LOOP_STATUS.clear()
-    llm._LAST_LOOP_STATUS.update({"call_id": 0, "outcome": "not_called",
-                                  "backend": None, "detail": ""})
+    llm._reset_loop_status()
     monkeypatch.setattr(llm, "_SUBMIT_REPAIRS", {"attempted": 0, "succeeded": 0})
 
     def set_handler(handler):

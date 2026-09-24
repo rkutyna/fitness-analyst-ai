@@ -872,8 +872,55 @@ def last_codex_status() -> dict:
 # run's journal carries it, and this side channel for a caller that wants to
 # branch on it. It is a separate dict from _LAST_CODEX_STATUS because that one
 # describes a subprocess and these are HTTP loops.
+#
+# health_advisor#487: the side channel is PER THREAD. A caller attributes an
+# event to its own call by comparing `call_id` before and after the call, which
+# is only sound if nothing else can write between the two reads. With a single
+# process-global dict, concurrent asks (the receiver serves /v1/ask on worker
+# threads; the ask battery runs a thread pool) charged a neighbour's
+# `tool_loop_truncated` to an answer that had finished cleanly, turning it into
+# an unneeded repair and sometimes a fallback. The loops are synchronous and
+# never hop threads (no executor, no to_thread inside them; the deadline timer
+# thread announces nothing), so the thread that calls a loop is the thread that
+# announces its events, and `threading.local` is exactly "events emitted by this
+# call's thread". `call_id` still comes from one process-wide counter, so it is
+# unique and monotonic across threads; `loop_event_count()` is the process-wide
+# total for a caller that wants a run-level count across workers.
+# `_LAST_LOOP_STATUS` remains the process-wide most recent event, for
+# diagnostics only: nothing may attribute from it.
 _LOOP_EVENT_ID = 0
+_LOOP_EVENT_LOCK = threading.Lock()
 _LAST_LOOP_STATUS = {"call_id": 0, "outcome": "not_called", "backend": None, "detail": ""}
+_THREAD_LOOP_STATUS = threading.local()
+
+
+def _thread_loop_status() -> dict:
+    status = getattr(_THREAD_LOOP_STATUS, "status", None)
+    if status is None:
+        status = {"call_id": 0, "outcome": "not_called", "backend": None,
+                  "detail": ""}
+        _THREAD_LOOP_STATUS.status = status
+    return status
+
+
+def _reset_loop_status() -> None:
+    """Forget the calling thread's and the process-wide latest event (tests)."""
+    _THREAD_LOOP_STATUS.status = None
+    _LAST_LOOP_STATUS.clear()
+    _LAST_LOOP_STATUS.update({"call_id": 0, "outcome": "not_called",
+                              "backend": None, "detail": ""})
+
+
+def loop_event_count() -> int:
+    """Loop events announced by ANY thread since the process started.
+
+    Monotonic, so a difference across a window counts every non-answer
+    announced in it, whichever thread announced it. Use this, not
+    ``last_loop_status()["call_id"]``, for a run-level count: the latter is the
+    calling thread's own latest event.
+    """
+    with _LOOP_EVENT_LOCK:
+        return _LOOP_EVENT_ID
 
 # The submit_answer repair turn's counters. PROCESS-CUMULATIVE, never reset by a
 # loop, because a caller like `chat.answer_question` runs two `tool_loop`s per
@@ -886,9 +933,12 @@ _SUBMIT_REPAIRS = {"attempted": 0, "succeeded": 0}
 
 
 def last_loop_status() -> dict:
-    """The most recent `tool_loop`/`research_loop` non-answer, JSON-safe.
+    """The calling thread's most recent `tool_loop`/`research_loop` non-answer.
 
-    ``outcome`` is ``not_called`` until a loop declines or fails. It is not
+    JSON-safe. ``outcome`` is ``not_called`` until a loop on THIS thread
+    declines or fails; another thread's events never appear here
+    (health_advisor#487), so comparing ``call_id`` before and after a call
+    attributes exactly this call's events even under concurrent asks. It is not
     cleared by a successful loop: a caller reads it immediately after receiving
     an empty answer, to tell a refusal from a genuinely empty finding.
 
@@ -896,7 +946,7 @@ def last_loop_status() -> dict:
     in-loop submit_answer repair turns (see :data:`_SUBMIT_REPAIRS`) since the
     process started, so they are read as a difference across a call.
     """
-    status = dict(_LAST_LOOP_STATUS)
+    status = dict(_thread_loop_status())
     status["submit_repairs_attempted"] = _SUBMIT_REPAIRS["attempted"]
     status["submit_repairs_succeeded"] = _SUBMIT_REPAIRS["succeeded"]
     return status
@@ -905,11 +955,14 @@ def last_loop_status() -> dict:
 def _announce(event: str, detail: str = "", *, on_log=None, turn: int = 0) -> None:
     """Record and surface a loop outcome that is not a model answer."""
     global _LOOP_EVENT_ID
-    _LOOP_EVENT_ID += 1
-    _LAST_LOOP_STATUS.clear()
-    _LAST_LOOP_STATUS.update({"call_id": _LOOP_EVENT_ID, "outcome": event,
-                              "backend": BACKEND,
-                              "detail": str(detail)[:CODEX_STDERR_MAX]})
+    with _LOOP_EVENT_LOCK:
+        _LOOP_EVENT_ID += 1
+        status = {"call_id": _LOOP_EVENT_ID, "outcome": event,
+                  "backend": BACKEND,
+                  "detail": str(detail)[:CODEX_STDERR_MAX]}
+        _LAST_LOOP_STATUS.clear()
+        _LAST_LOOP_STATUS.update(status)
+    _THREAD_LOOP_STATUS.status = status
     if on_log:
         try:
             on_log(turn, event, str(detail)[:CODEX_STDERR_MAX])

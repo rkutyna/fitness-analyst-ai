@@ -524,7 +524,10 @@ def _ask_loop_outcome(before: dict, after: dict) -> dict:
 
     ``llm.last_loop_status`` deliberately remains unchanged after a successful
     loop.  Comparing its event id keeps an earlier failure from being reported
-    as the cause of a later answer.
+    as the cause of a later answer.  The status is per thread
+    (health_advisor#487), so both reads must be made on the thread that ran
+    the loop, and a concurrent ask's event on another thread never lands
+    between them.
     """
     before_id = before.get("call_id") if isinstance(before, dict) else None
     after_id = after.get("call_id") if isinstance(after, dict) else None

@@ -50,9 +50,7 @@ def openrouter(monkeypatch):
     monkeypatch.setattr(llm, "OPENROUTER_PROVIDER_SORT", "")
     monkeypatch.setattr(llm, "OPENROUTER_REASONING", "off")
     monkeypatch.setattr(llm, "_registry", lambda ctx, include=None: {})
-    llm._LAST_LOOP_STATUS.clear()
-    llm._LAST_LOOP_STATUS.update({"outcome": "not_called", "backend": None,
-                                  "detail": ""})
+    llm._reset_loop_status()
 
     def set_handler(handler):
         monkeypatch.setattr(llm, "_TRANSPORT", httpx.MockTransport(handler))

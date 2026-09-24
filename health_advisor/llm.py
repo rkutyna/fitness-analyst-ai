@@ -896,7 +896,14 @@ _THREAD_LOOP_STATUS = threading.local()
 
 def _thread_loop_status() -> dict:
     status = getattr(_THREAD_LOOP_STATUS, "status", None)
-    if status is None:
+    # `_LAST_LOOP_STATUS` always carries the highest id issued, so a thread's
+    # event with a HIGHER id means the global was reset from outside (test
+    # fixtures written against the process-global channel clear it in place).
+    # Honour that reset as they intended: this thread reads `not_called` again.
+    # Read under the lock, because `_announce` rewrites the global in place.
+    with _LOOP_EVENT_LOCK:
+        latest = _LAST_LOOP_STATUS.get("call_id") or 0
+    if status is None or status["call_id"] > latest:
         status = {"call_id": 0, "outcome": "not_called", "backend": None,
                   "detail": ""}
         _THREAD_LOOP_STATUS.status = status

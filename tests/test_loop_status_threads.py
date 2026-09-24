@@ -180,3 +180,16 @@ def test_each_thread_reads_its_own_status_and_ids_stay_unique():
         assert own_ids == sorted(own_ids)
     # The main thread announced nothing, so it still reads `not_called`.
     assert llm.last_loop_status()["outcome"] == "not_called"
+
+
+def test_an_external_reset_of_the_process_global_still_resets_this_thread():
+    """Consumer fixtures written against the process-global channel reset it in
+    place; that must still make this thread read `not_called`."""
+    llm._announce("tool_loop_empty_answer", "before the fixture reset")
+    assert llm.last_loop_status()["outcome"] == "tool_loop_empty_answer"
+    llm._LAST_LOOP_STATUS.clear()
+    llm._LAST_LOOP_STATUS.update({"call_id": 0, "outcome": "not_called",
+                                  "backend": None, "detail": ""})
+    assert llm.last_loop_status()["outcome"] == "not_called"
+    llm._announce("tool_loop_truncated", "after the reset")
+    assert llm.last_loop_status()["outcome"] == "tool_loop_truncated"

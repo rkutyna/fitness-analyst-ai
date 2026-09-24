@@ -1815,11 +1815,16 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
     """Most recent reading for a metric: the latest daily aggregate plus the
     most recent stored sample (value + local timestamp).
 
-    `latest_sample.resolution_seconds` says what that sample IS. 0 means it is
-    a sample as the device recorded it. A positive number means the vault stores
-    that series aggregated into windows of that width (D9), so the value is a
-    sum over the window and the timestamp is its earliest sample — calling it
-    "the latest reading" would be a claim about an instant that never happened.
+    `latest_sample.resolution_seconds` says what that sample IS, for THIS
+    vault. 0 means it is a sample as the device recorded it. A positive
+    number means the vault stores that series aggregated into windows of
+    that width (D9), so the value is a sum over the window and the
+    timestamp is its earliest sample — calling it "the latest reading"
+    would be a claim about an instant that never happened. When this
+    vault's build resolution was never recorded, `resolution_seconds` is
+    null and `latest_sample.resolution_status` says so explicitly, rather
+    than assuming today's build width applies to a vault that may predate
+    it.
     """
     unit_system = ctx.settings()["unit_system"]
     conn = ctx.read_only()
@@ -1845,6 +1850,11 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
             "LIMIT 1", (metric, dm["date"])).fetchone() \
             if dm and V.raw_series_available(metric) and ctx.can(RAW_SAMPLES) \
             else None
+        # This vault's OWN recorded resolution (health_advisor#332), not the
+        # module's current build plan — a vault built at a different width,
+        # or never marked at all, must not be reported as if it matched
+        # today's constant. Must be read before conn closes below.
+        resolution_seconds = V.raw_resolution_seconds(conn, metric) if raw else None
     finally:
         conn.close()
     day_value, day_unit = (V.convert_for_unit_system(
@@ -1853,13 +1863,22 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
     raw_value, raw_unit = (V.convert_for_unit_system(
         raw["value"], raw["unit"] or nz.canonical_unit(metric, None), unit_system)
         if raw else (None, None))
+    latest_sample = None
+    if raw:
+        latest_sample = {"value": _r(raw_value), "unit": raw_unit,
+                         "local_time": raw["start_local"],
+                         "resolution_seconds": resolution_seconds}
+        if resolution_seconds is None:
+            # Absence is not a fact (#326): say why there is no number
+            # rather than publish a bare null a caller can round to zero.
+            latest_sample["resolution_status"] = (
+                "unknown: this vault records no build resolution for "
+                f"{metric!r}"
+            )
     out = {
         "metric": metric, "agg": _agg(metric),
         "latest_day": {"date": dm["date"], "value": _r(day_value), "unit": day_unit} if dm else None,
-        "latest_sample": {"value": _r(raw_value), "unit": raw_unit,
-                          "local_time": raw["start_local"],
-                          "resolution_seconds": V.raw_resolution_seconds(metric)}
-        if raw else None,
+        "latest_sample": latest_sample,
     }
     _add_caveat(out, metric)
     if out["latest_day"] is not None:

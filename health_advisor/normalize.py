@@ -187,10 +187,12 @@ CATALOG: dict[str, dict] = {
     # readings are real; caveated so the next consumer does not have to
     # rediscover that they carry no independent information.
     "body_fat_percentage":        {"unit": "%",          "agg": "last", "group": "body",
+                                   "derived_from": "body_mass",
                                    "caveat": "derived from scale weight on this "
                                              "device (R^2 0.991); not an independent "
                                              "measurement"},
     "lean_body_mass":             {"unit": "lb",         "agg": "last", "group": "body",
+                                   "derived_from": "body_mass",
                                    "caveat": "identically body_mass * (1 - "
                                              "body_fat/100); carries no information "
                                              "beyond body_mass"},
@@ -855,6 +857,28 @@ def hk_canonical_value(type_identifier: str, metric: str, value: float) -> float
 #
 # `tests/test_catalog_coverage.py` pins both pairs so that removing one to
 # tidy up fails loudly instead of silently reopening the fork.
+
+
+def derived_from(metric: str) -> str | None:
+    """Canonical name of the metric this one is a pure function of, or None.
+
+    health_advisor#434: `body_fat_percentage` and `lean_body_mass` are both
+    computed from `body_mass` on this device (see the note above their
+    catalogue entries) and carry `derived_from` so callers — correlate.py and
+    the MCP publish surfaces — can find that relationship by lookup instead of
+    each re-deriving or hard-coding the pair.
+    """
+    return CATALOG.get(metric, {}).get("derived_from")
+
+
+def caveat(metric: str) -> str | None:
+    """The catalogue's caveat string for this metric, or None.
+
+    health_advisor#434: the catalogue has carried a `caveat` string for
+    `body_fat_percentage`/`lean_body_mass` since before this accessor existed;
+    nothing read it. This is the single place that should.
+    """
+    return CATALOG.get(metric, {}).get("caveat")
 
 
 def is_known_metric(metric: str) -> bool:

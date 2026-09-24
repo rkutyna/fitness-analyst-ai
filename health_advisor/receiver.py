@@ -737,6 +737,14 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     accepted: list[dict] = []
     diagnostic_rows: list[dict] = list(parsed["rejections"])
     affected: set[tuple[str, str]] = set()
+    # `rebuild_metric_source_months` derives solely from the `records` table
+    # (health_advisor/db.py, `rebuild_metric_source_months`): it counts raw
+    # sample rows per (metric, month, source). Track only the pairs where
+    # THIS batch actually inserted or deleted a `records` row, so a
+    # daily-totals-only batch — which never touches `records` — doesn't pay
+    # for a rebuild that would just recount the same rows it already counted
+    # (engine#78).
+    records_touched: set[tuple[str, str]] = set()
     rec_added = 0
     daily_totals_added = 0
     routes_added = 0
@@ -905,6 +913,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     (uuid, dtype, parsed["device_id"]),
                 ).fetchall()
                 affected.update((row["metric"], row["local_date"]) for row in rows)
+                records_touched.update(
+                    (row["metric"], row["local_date"]) for row in rows)
                 # Capture the sample's own date BEFORE deleting it. This is the
                 # only moment it exists: the row is about to go, and the
                 # tombstone is all that survives. `deleted_at` gives when a
@@ -962,6 +972,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     continue
                 accepted.append(row)
                 affected.add((row["metric"], row["local_date"]))
+                records_touched.add((row["metric"], row["local_date"]))
 
             # A HealthKit UUID is the source identity. Replace a prior copy of
             # that UUID in raw records so a source correction cannot trip the
@@ -974,6 +985,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     (row["metric"], row["hk_uuid"]),
                 ).fetchall()
                 affected.update((item["metric"], item["local_date"]) for item in old)
+                records_touched.update(
+                    (item["metric"], item["local_date"]) for item in old)
                 conn.execute(
                     "DELETE FROM records WHERE metric = ? AND hk_uuid = ?",
                     (row["metric"], row["hk_uuid"]),
@@ -1065,7 +1078,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                         conn, pairs=sorted(affected)
                     )
 
-            db.rebuild_metric_source_months(conn, pairs=sorted(affected))
+            # Scoped to `records_touched`, not `affected`: `affected` also
+            # carries daily-totals and workout-arbitration pairs that never
+            # write a `records` row, and rebuilding for those would just
+            # recount a `records` slice that did not change (engine#78).
+            if records_touched:
+                db.rebuild_metric_source_months(
+                    conn, pairs=sorted(records_touched))
 
             for anchor in parsed["anchors"]:
                 conn.execute(

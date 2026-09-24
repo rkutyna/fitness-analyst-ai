@@ -2498,6 +2498,18 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
               if fact.get("period") is not None}, as_of)
 
     cold_start_guidance = fact_template.cold_start_guidance(facts)
+    # Prompt-cache layout (health_advisor#304). This call is deliberately a
+    # FRESH, tool-less prompt, not a continuation of the gather transcript,
+    # and its question-independent instruction block leads so that block is
+    # what a prefix cache can reuse across turns. Its low cached share is not
+    # recoverable: the bulk of this prompt is the closed fact set, which is
+    # new text on every turn wherever it is placed. Continuing the gather
+    # array (or resending the tool schemas, which the provider's chat
+    # template renders ahead of the messages) raises the cached PERCENTAGE by
+    # prepending already-cached context, but leaves the uncached token count
+    # the same or larger, and shows the narration turn raw tool results and
+    # callable tools it must not use. Keep the question and the fact set in
+    # the tail; tests/test_i304_answer_prefix.py pins this.
     final_prompt = (
         "You are writing the final answer to the user's question. Return a "
         "prose TEMPLATE only, with no JSON, commentary, or claim metadata. "

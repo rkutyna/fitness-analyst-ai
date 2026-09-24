@@ -108,3 +108,89 @@ def test_batch_with_records_still_rebuilds_metric_source_months(
     # landed on) — not to step_count, which only appeared in daily_totals
     # and never wrote a `records` row.
     assert set(pairs) == {("heart_rate", "2026-08-25")}
+
+
+SLEEP = "HKCategoryTypeIdentifierSleepAnalysis"
+
+
+def _sleep(uuid, start, end, value):
+    return {
+        "kind": "category", "hk_uuid": uuid, "type_identifier": SLEEP,
+        "start": start, "end": end, "value": value, "unit": None,
+        "source_revision": {"source_name": "Apple Watch",
+                             "bundle_id": "com.apple.Health"},
+    }
+
+
+def _source_months(vault):
+    conn = dbmod.connect(vault.db_path)
+    try:
+        return sorted(tuple(row) for row in conn.execute(
+            "SELECT metric, month, source, n FROM metric_source_months "
+            "WHERE metric LIKE 'sleep_%'"))
+    finally:
+        conn.close()
+
+
+def test_sleep_reattribution_across_a_month_boundary_rebuilds_both_months(
+    vault, monkeypatch,
+):
+    """`derive.reattribute_sleep(apply=True)` rewrites `records.local_date`.
+
+    An in-bed interval ingested alone on Aug 31 is its own session and stays
+    there; the asleep interval that arrives in the next batch joins it into
+    one session ending Sep 1, so the in-bed record MOVES to Sep 1. That move
+    is this batch's only `records` effect on sleep_in_bed, and it changes the
+    per-month count in BOTH months -- August loses a row, September gains
+    one -- so both must be rebuilt, or `metric_source_months` keeps an
+    in-bed row in August that `records` no longer holds.
+    """
+    calls = []
+    real_rebuild = dbmod.rebuild_metric_source_months
+
+    def _spy(conn, *a, **k):
+        calls.append(k.get("pairs") if "pairs" in k else a[0])
+        return real_rebuild(conn, *a, **k)
+
+    monkeypatch.setattr(dbmod, "rebuild_metric_source_months", _spy)
+
+    in_bed = _sleep("bed-1", "2026-08-31T23:30:00-04:00",
+                    "2026-08-31T23:55:00-04:00",
+                    "HKCategoryValueSleepAnalysisInBed")
+    asleep = _sleep("core-1", "2026-09-01T00:05:00-04:00",
+                    "2026-09-01T06:00:00-04:00",
+                    "HKCategoryValueSleepAnalysisAsleepCore")
+    with _client(vault, monkeypatch) as client:
+        for n, sample in enumerate((in_bed, asleep), start=1):
+            response = client.post(
+                "/v1/ingest",
+                json=_payload(samples=[sample], batch_id=f"sleep-{n}",
+                              sequence=n),
+                headers={"x-health-secret": "hk-secret"},
+            )
+            assert response.status_code == 200
+            assert response.json()["ok"] is True
+
+    conn = dbmod.connect(vault.db_path)
+    try:
+        moved = conn.execute(
+            "SELECT local_date FROM records WHERE metric = 'sleep_in_bed'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [row[0] for row in moved] == ["2026-09-01"], (
+        "precondition: the in-bed record must have been reattributed")
+
+    second_batch_months = {(metric, day[:7]) for metric, day in calls[-1]}
+    assert ("sleep_in_bed", "2026-08") in second_batch_months
+    assert ("sleep_in_bed", "2026-09") in second_batch_months
+
+    # The invariant the scoped rebuild must keep: identical to a full recount.
+    scoped = _source_months(vault)
+    conn = dbmod.connect(vault.db_path)
+    try:
+        real_rebuild(conn, full=True)
+        conn.commit()
+    finally:
+        conn.close()
+    assert scoped == _source_months(vault)

@@ -1073,7 +1073,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 )
                 if moves:
                     moved = len(moves)
-                    affected |= derive.pairs_for_moves(moves)
+                    moved_pairs = derive.pairs_for_moves(moves)
+                    affected |= moved_pairs
+                    # A move rewrites `records.local_date`, so it changes the
+                    # per-month raw counts on BOTH sides -- across a month
+                    # boundary, two months -- even when this batch wrote no
+                    # other row for that metric (engine#78).
+                    records_touched |= moved_pairs
                     dm += db.recompute_daily_metrics(
                         conn, pairs=sorted(affected)
                     )

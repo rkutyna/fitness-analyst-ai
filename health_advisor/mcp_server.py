@@ -132,6 +132,18 @@ MAX_SERIES_POINTS = mx.MAX_SERIES_POINTS
 _PRESENTATION_FIELDS = mx._PRESENTATION_FIELDS
 
 
+def _add_caveat(node: dict, metric: str) -> None:
+    """health_advisor#434: publish the catalogue's caveat (if any) alongside a
+    metric's value/summary/series, wherever this metric is the whole node —
+    e.g. body_fat_percentage and lean_body_mass are pure functions of
+    body_mass on this device and carry no independent information. Mirrors
+    `_add_presentation`'s one-source-of-truth pattern: nz.caveat() owns the
+    text, this just wires it into the outgoing dict."""
+    c = nz.caveat(metric)
+    if c:
+        node["caveat"] = c
+
+
 def _add_presentation(node: dict, metric: str, period, value, *, field: str) -> None:
     """Publish the Python-owned rendering as a first-class claim leaf."""
     leaf = mx.presentation_leaf(metric, period, value, field=field)
@@ -321,6 +333,7 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
                           field="value")
     out = {"metric": metric, "unit": unit, "agg": _agg(metric),
            "start": start, "end": anchor}
+    _add_caveat(out, metric)
     if len(points) > MAX_SERIES_POINTS:
         # Weekly resample, reduced the same way the metric's dailies are: a
         # weekly MEAN of a cumulative metric is not that week's total.
@@ -365,8 +378,10 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     finally:
         conn.close()
     if not vals:
-        return {"metric": metric, "period": period, "n_days": 0,
-                "note": "no data in this period"}
+        empty_out = {"metric": metric, "period": period, "n_days": 0,
+                     "note": "no data in this period"}
+        _add_caveat(empty_out, metric)
+        return empty_out
     stats = _stats(dates, vals)
     # `stats` already carries the true start/end of the rows it summarised
     # (the first and last dates actually returned by `_series`, i.e.
@@ -379,6 +394,7 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     published_period = f"{stats['start']}:{stats['end']}"
     out = {"metric": metric, "unit": unit, "agg": _agg(metric),
            "period": published_period, "requested_period": period}
+    _add_caveat(out, metric)
     out.update(stats)
     # recent vs baseline
     n = len(vals)
@@ -427,6 +443,7 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     out = {"metric": metric, "unit": unit,
            "period_a": {"spec": period_a, "range": [a0, a1], **sa},
            "period_b": {"spec": period_b, "range": [b0, b1], **sb}}
+    _add_caveat(out, metric)
     _add_stat_presentations(out["period_a"], metric, f"{a0}:{a1}")
     _add_stat_presentations(out["period_b"], metric, f"{b0}:{b1}")
     if not va or not vb:
@@ -1844,6 +1861,7 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
                           "resolution_seconds": V.raw_resolution_seconds(metric)}
         if raw else None,
     }
+    _add_caveat(out, metric)
     if out["latest_day"] is not None:
         _add_presentation(out["latest_day"], metric, dm["date"],
                           out["latest_day"]["value"], field="value")
@@ -1928,6 +1946,21 @@ def correlate_metrics(ctx: VaultContext, metric_x: str, metric_y: str, lag_days:
                 caveats.append(f"{name} present on only {cov}% of window days")
         if meta["dropped_low_wear"]:
             caveats.append(f"{meta['dropped_low_wear']} days excluded for wear_hours < 12")
+        # health_advisor#434: the catalogue's own caveat (e.g. body_fat_percentage
+        # is a pure function of body_mass on this device) travels with the figure
+        # regardless of what it's being correlated against, and a pair coupled
+        # through derived_from gets an explicit "not independent" flag — this is
+        # the surface catalog.caveat() exists to reach.
+        for name in (metric_x, metric_y):
+            c = nz.caveat(name)
+            if c:
+                caveats.append(f"{name}: {c}")
+        if C.derived_pair(metric_x, metric_y):
+            caveats.append(
+                f"{metric_x} and {metric_y} are coupled through the metric "
+                "catalogue's derived_from marker — this is not an independent "
+                "finding, do not report it as one"
+            )
         caveats.append("correlation is not causation — report as association")
     return {"metric_x": metric_x, "metric_y": metric_y, "lag_days": lag_days,
             "lag_semantics": lag_semantics, "period": period,
@@ -1946,8 +1979,11 @@ def scan_correlations(ctx: VaultContext, target: str, period: str = "90d", lags:
     with Benjamini-Hochberg FDR (q=0.10): only trust passed_fdr=true, and use
     tested_count to report honestly ('3 of 41 associations survived
     correction'). related_group=true pairs are trivially coupled (e.g. sleep
-    stages vs total sleep) — never report them as findings. Follow up on
-    interesting hits with correlate_metrics."""
+    stages vs total sleep, or a metric and something the catalogue marks as
+    derived from it, such as body_fat_percentage vs body_mass) — never report
+    them as findings. Each row's `caveats` carries any catalogue caveat for
+    the target or candidate metric. Follow up on interesting hits with
+    correlate_metrics."""
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, target):
@@ -2411,6 +2447,7 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
             "status": status,
             "expected_training_effect_bpm": _literature_figure(
                 "expected_training_effect_bpm")}
+    _add_caveat(result, metric)
     if A.mx.agg(metric) == "sum" or metric in {"jog_minutes", "longest_block_min"}:
         result["total"] = A.mx.r(sum(row["total"] for row in weeks), 1)
     return result
@@ -2444,7 +2481,9 @@ def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
     try:
         if not _metric_exists(conn, metric):
             return {"error": f"no data for metric {metric!r}"}
-        return A.block_comparison(conn, metric, block_weeks, as_of)
+        result = A.block_comparison(conn, metric, block_weeks, as_of)
+        _add_caveat(result, metric)
+        return result
     finally:
         conn.close()
 

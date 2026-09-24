@@ -103,6 +103,18 @@ def bh_fdr(pvals, q: float = FDR_Q):
     return [float(v) for v in qvals], [bool(v <= q) for v in qvals]
 
 
+def derived_pair(metric_x: str, metric_y: str) -> bool:
+    """Whether x and y are coupled through the catalogue's `derived_from`
+    marker: one is a pure function of the other (either direction), or both
+    are pure functions of the same source metric (health_advisor#434, e.g.
+    body_fat_percentage vs lean_body_mass, both derived from body_mass). A
+    correlation between such a pair is not an independent finding — it is
+    restating the same measurement, by construction."""
+    dx, dy = nz.derived_from(metric_x), nz.derived_from(metric_y)
+    return (dx == metric_y or dy == metric_x
+            or (dx is not None and dx == dy))
+
+
 def _needs_wear(metric: str) -> bool:
     return (metric != "wear_hours"
             and nz.CATALOG.get(metric, {}).get("group") in WATCH_GROUPS)
@@ -183,6 +195,7 @@ def scan(conn, target: str, start_iso: str, end_iso: str, lags=(0, 1)) -> list[d
         "AND " + mx.current_daily_metrics_predicate(conn),
         (target,)).fetchall()
     tgroup = nz.CATALOG.get(target, {}).get("group")
+    target_caveat = nz.caveat(target)
     tests: list[dict] = []
     for row in rows:
         m = row["metric"]
@@ -195,12 +208,15 @@ def scan(conn, target: str, start_iso: str, end_iso: str, lags=(0, 1)) -> list[d
                 continue
             mgroup = nz.CATALOG.get(m, {}).get("group")
             related = ((tgroup is not None and mgroup == tgroup)
-                       or frozenset({m, target}) in TRIVIAL_PAIRS)
+                       or frozenset({m, target}) in TRIVIAL_PAIRS
+                       or derived_pair(m, target))
+            caveats = [c for c in (target_caveat, nz.caveat(m)) if c]
             tests.append({
                 "metric": m, "lag_days": lag, "related_group": related,
                 "n_pairs": res["n_pairs"], "spearman_rho": res["spearman_rho"],
                 "spearman_p": res["spearman_p"], "pearson_r": res["pearson_r"],
                 "dropped_low_wear": meta["dropped_low_wear"],
+                "caveats": caveats,
             })
     qvals, passed = bh_fdr([t["spearman_p"] for t in tests])
     for t, qv, ok in zip(tests, qvals, passed):
@@ -243,11 +259,13 @@ def _hypothesis_window(conn, spec: dict, metric_y: str,
 
 
 def _related_pair(metric_x: str, metric_y: str) -> bool:
-    """Whether the pair is a same-group or explicitly known tautology."""
+    """Whether the pair is a same-group pair, an explicitly known tautology,
+    or a derived_from pair (health_advisor#434)."""
     xgroup = nz.CATALOG.get(metric_x, {}).get("group")
     ygroup = nz.CATALOG.get(metric_y, {}).get("group")
     return ((xgroup is not None and xgroup == ygroup)
-            or frozenset({metric_x, metric_y}) in TRIVIAL_PAIRS)
+            or frozenset({metric_x, metric_y}) in TRIVIAL_PAIRS
+            or derived_pair(metric_x, metric_y))
 
 
 def test_hypotheses(conn, specs, end_iso: str | None = None,
@@ -289,10 +307,12 @@ def test_hypotheses(conn, specs, end_iso: str | None = None,
             conn, metric_x, metric_y, lag_days, start_iso, range_end
         )
         res = correlate(xs, ys)
+        caveats = [c for c in (nz.caveat(metric_x), nz.caveat(metric_y)) if c]
         row = {
             "metric_x": metric_x, "metric_y": metric_y, "lag_days": lag_days,
             "window": [start_iso, range_end],
             "related_group": _related_pair(metric_x, metric_y),
+            "caveats": caveats,
             "status": res["status"], "n_pairs": res["n_pairs"],
             "rho": res.get("spearman_rho"), "p": res.get("spearman_p"),
             "q": None, "q_value": None, "passed_fdr": False,

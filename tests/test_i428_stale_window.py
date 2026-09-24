@@ -140,6 +140,76 @@ def test_a_rolling_period_phrase_is_not_exempt():
     assert fired is True
 
 
+# A question about one past day or event names no present: the old window
+# it cites is its answer. Each of these was refused at a 26-day gap before
+# the check became default-exempt (adversarial review of #428).
+SPECIFIC_PAST_QUESTIONS = [
+    "How did I sleep on 8/29?",
+    "How did I sleep the night before my half marathon?",
+    "What did I do 3 weeks ago on Saturday?",
+    "What was my HR on my last long run?",
+]
+
+
+def _assert_specific_past_question_exempt(question):
+    fired, verification = _mark(_template(STALE), _facts(STALE),
+                                question=question)
+    assert fired is False, question
+    assert verification == {"ok": True}, question
+
+
+def _assert_specific_past_questions_exempt():
+    for question in SPECIFIC_PAST_QUESTIONS:
+        _assert_specific_past_question_exempt(question)
+
+
+@pytest.mark.parametrize("question", SPECIFIC_PAST_QUESTIONS)
+def test_a_question_about_a_specific_past_day_is_exempt(question):
+    _assert_specific_past_question_exempt(question)
+
+
+@pytest.mark.parametrize("period", [
+    "2026-07-27:2026-08-02",    # ends 19 days before AS_OF
+    "2026-07-28:2026-08-03",    # ends 18 days before AS_OF
+])
+def test_the_historical_rolling_true_positive_is_still_refused(period):
+    fired, verification = _mark(
+        _template(period), _facts(period),
+        question="How much have I been running over the last two weeks?")
+
+    assert fired is True
+    assert verification["stale_window"]["gap_days"] in (18, 19)
+
+
+# The present/rolling questions the window battery asks: every one stays
+# subject to the check.
+@pytest.mark.parametrize("question", [
+    "How has my running been lately?",
+    "Is my resting heart rate trending the right way?",
+    "How has my sleep been recently?",
+    "Have I been more active than usual?",
+    "How consistent have I been with my training?",
+    "Is my weight moving?",
+    "How is my cardio fitness doing?",
+    "What has changed in my heart rate variability?",
+    # #70's reproducer.
+    "How's my running been?",
+])
+def test_a_present_or_rolling_question_is_subject_to_the_check(question):
+    exempt, _cap = chat._stale_window_scope(question,
+                                            resolve_window(question, AS_OF))
+    assert exempt is False
+    assert _mark(_template(STALE), _facts(STALE), question=question)[0] is True
+
+
+def test_mutation_present_marker_always_true_refuses_the_past_day(
+        monkeypatch):
+    monkeypatch.setattr(chat, "_asks_about_present", lambda question: True)
+
+    with pytest.raises(AssertionError):
+        _assert_specific_past_questions_exempt()
+
+
 def test_a_sparse_metric_is_measured_against_its_own_latest_day():
     """A metric last recorded a month ago is current at its last reading."""
     horizons = {"resting_heart_rate": date(2026, 7, 26)}

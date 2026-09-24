@@ -1692,6 +1692,46 @@ _CALENDAR_PERIOD_PHRASE_UNITS = frozenset({"week", "month", "quarter", "year"})
 _CALENDAR_PERIOD_PHRASE_RE = re.compile(
     r"\b(?:last|previous)\s+(?:week|month|quarter|year)\b", re.IGNORECASE)
 
+# What makes a question subject to the stale-window check at all: it asks
+# about the PRESENT or a rolling window that ends now. #428's defect is an
+# old window answering exactly such a question ("How's my running been?"
+# answered with weeks ending three weeks back). A question about one past
+# day or event -- "How did I sleep on 8/29?", "the night before my half
+# marathon", "3 weeks ago on Saturday", "my last long run" -- names no
+# present, and an old window is its answer; the check refusing those was
+# the false positive the default-exempt reading removes. Python decides
+# which questions ask about now; the model never does.
+_NUMBER_WORD = (r"(?:\d+|a\s+few|few|a\s+couple(?:\s+of)?|couple(?:\s+of)?|"
+                r"several|two|three|four|five|six|seven|eight|nine|ten|"
+                r"eleven|twelve)")
+_PRESENT_QUESTION_RE = re.compile(
+    # Present and recency adverbs.
+    r"\b(?:lately|recently|recent|latest|these\s+days|nowadays|now|"
+    r"currently|current|at\s+the\s+moment|so\s+far|to\s+date|"
+    r"today|tonight|this\s+morning|yesterday|last\s+night)\b"
+    # The running calendar period ("this week", "this block").
+    r"|\bthis\s+(?:week|month|year|season|block|cycle|phase)\b"
+    # Rolling spans that end now: "past week", "last two weeks",
+    # "past few days", "last 4 runs".
+    r"|\bpast\s+(?:day|week|fortnight|month|quarter|year)\b"
+    rf"|\b(?:past|last|previous|recent)\s+{_NUMBER_WORD}\s+"
+    r"(?:days?|nights?|weeks?|months?|years?|runs?|workouts?|sessions?)\b"
+    # Direction of travel.
+    r"|\btrend(?:s|ing)?\b|\btrajectory\b|\bimproving\b|\bprogress(?:ing)?\b"
+    r"|\bgetting\s+(?:better|worse|fitter|faster|slower|stronger|weaker)\b"
+    r"|\bon\s+track\b"
+    # Present-tense and present-perfect questions about the user:
+    # "Am I ...", "Is my ...", "How is/has my ...", "have I been",
+    # "What has changed".
+    r"|\bam\s+I\b"
+    r"|(?:^|[.!?;:,]\s*|\b(?:and|but|so|or)\s+)(?:is|are)\s+my\b"
+    r"|\bhow(?:'s|\s+is|\s+are|\s+has|\s+have)\s+(?:my|I)\b"
+    r"|\b(?:have|has)\s+(?:I|my)\b|\bI(?:'ve|\s+have)\s+been\b"
+    r"|\b(?:do|does)\s+(?:I|my)\b"
+    r"|(?:\b(?:has|have)|'s)\s+(?:changed|improved|shifted|moved|dropped|"
+    r"risen|gone\s+(?:up|down))\b",
+    re.IGNORECASE)
+
 
 def _stale_window_scope(question: str, resolved_window=None
                         ) -> tuple[bool, date | None]:
@@ -1706,6 +1746,11 @@ def _stale_window_scope(question: str, resolved_window=None
     (``calendar_window.resolve_window``), which bounds how current an answer
     can be: "last month" asked on the 24th is answered by a window ending on
     the last day of the previous month, and is measured against that day.
+
+    Otherwise the question is exempt UNLESS it positively asks about the
+    present or a rolling window ending now (:data:`_PRESENT_QUESTION_RE`).
+    A question about one past day or event names no present, and the old
+    window it cites is its answer (health_advisor#428's false refusals).
     """
     from .calendar_window import CalendarWindow
 
@@ -1719,7 +1764,14 @@ def _stale_window_scope(question: str, resolved_window=None
             & _CALENDAR_PERIOD_PHRASE_UNITS
             and _CALENDAR_PERIOD_PHRASE_RE.search(question or "")):
         return True, None
+    if not _asks_about_present(question):
+        return True, None
     return False, None
+
+
+def _asks_about_present(question: str) -> bool:
+    """True when the question asks about now or a rolling-recent window."""
+    return bool(_PRESENT_QUESTION_RE.search(question or ""))
 
 
 def _fact_period_end(period) -> date | None:
@@ -1839,7 +1891,8 @@ def _mark_stale_window(verification: dict, *, template: str,
 
     Not refused: a draft already refused (the first refusal's detail is the
     one the repair needs), a question that names a period which may have
-    ended long ago (see :func:`_stale_window_scope`), and any draft whose
+    ended long ago or asks about no present or rolling-recent window (see
+    :func:`_stale_window_scope`), and any draft whose
     cited metrics have no known horizon. A single window Python resolved
     from the question caps the anchor at that window's end.
     """

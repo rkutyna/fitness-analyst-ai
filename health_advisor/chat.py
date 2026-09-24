@@ -21,7 +21,7 @@ import re
 import sys
 import tempfile
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Mapping
 
@@ -384,6 +384,9 @@ def _fallback_answer(verification: dict | None = None) -> str:
             "unsupported_period_phrase": (
                 "the draft named a time period longer than the data "
                 "actually covers"),
+            "stale_window": (
+                "the draft described a period that ended well before your "
+                "most recent data"),
         }
         if reason:
             if reason in reason_labels:
@@ -499,6 +502,7 @@ ASK_CAUSES = (
     "contradicted_day_count",
     "restated_unit",
     "unsupported_period_phrase",
+    "stale_window",
     "no_data_yet",
     "answer_truncated",
 )
@@ -576,6 +580,7 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
                contradicted_day_count: bool = False,
                restated_unit: bool = False,
                unsupported_period_phrase: bool = False,
+               stale_window: bool = False,
                no_data_yet: bool = False,
                answer_truncated: bool = False) -> str:
     """Derive the closed response cause from loop and Python-owned facts.
@@ -597,6 +602,9 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
     ``unsupported_period_phrase`` is checked right after ``restated_unit``:
     both are post-scan markers over the model's own rendered/authored prose,
     as distinct from the structural template scan (#488).
+    ``stale_window`` follows it: the same kind of post-scan marker, over the
+    periods the template cites rather than the words it writes
+    (health_advisor#428).
 
     ``conversational`` means the turn took the conversational path at all —
     not that it succeeded there. A turn that did splits on its own
@@ -631,6 +639,8 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "restated_unit"
     if unsupported_period_phrase:
         return "unsupported_period_phrase"
+    if stale_window:
+        return "stale_window"
     if not verification.get("ok"):
         return "gate_refused"
     if judge_score is not None and judge_score < 70:
@@ -1650,6 +1660,222 @@ def _mark_unsupported_period_phrase(verification: dict, *, text: str,
     return False
 
 
+_STALE_WINDOW_REASON = "narration cites a period that ended before the recent data"
+
+# How far, in days, the latest period a narration cites may end before its
+# metrics' own most recent day with data. Two Monday-anchored week buckets:
+# the most recent COMPLETE week ends at most 6 days before any horizon and
+# the one before it at most 13, so a latest cited end more than 14 days back
+# has skipped at least two newer week buckets the vault holds (#70's
+# reproducer ended three weeks back).
+STALE_WINDOW_DAYS = 14
+
+# A calendar period the user names outright ("How was August?", "in 2025",
+# "since 2026-07-01") that ``calendar_window.resolve_window`` does not
+# resolve to one window. "May" must be capitalised: lower-case "may" is a
+# modal verb in most questions.
+_NAMED_CALENDAR_PERIOD_RE = re.compile(
+    r"\b(?i:january|february|march|april|june|july|august|september|"
+    r"october|november|december)\b|\bMay\b|"
+    r"\b(?i:jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\.?\s+\d{1,2}\b|"
+    r"\b(?:19|20)\d{2}\b")
+
+# #488's relative-period phrases that can name a FINISHED calendar period
+# ("last year" asked in September may mean the calendar year before). The
+# rest of #488's vocabulary is rolling -- "past month", "last few weeks",
+# "last 4 weeks" all end now -- so an old window answering one of them is
+# exactly the staleness this check exists for, and is not exempt.
+_CALENDAR_PERIOD_PHRASE_UNITS = frozenset({"week", "month", "quarter", "year"})
+_CALENDAR_PERIOD_PHRASE_RE = re.compile(
+    r"\b(?:last|previous)\s+(?:week|month|quarter|year)\b", re.IGNORECASE)
+
+
+def _stale_window_scope(question: str, resolved_window=None
+                        ) -> tuple[bool, date | None]:
+    """(exempt, cap) for the stale-window marker, from the user's question.
+
+    ``exempt`` is True when the question names a period that may have ended
+    well before today -- a month or year by name, several resolved calendar
+    phrases, or a calendar reading of #488's phrase vocabulary ("last year").
+    An older window answering such a question is the answer, not staleness.
+
+    ``cap`` is the end of the single window Python resolved from the question
+    (``calendar_window.resolve_window``), which bounds how current an answer
+    can be: "last month" asked on the 24th is answered by a window ending on
+    the last day of the previous month, and is measured against that day.
+    """
+    from .calendar_window import CalendarWindow
+
+    if isinstance(resolved_window, tuple):
+        return True, None
+    if _NAMED_CALENDAR_PERIOD_RE.search(question or ""):
+        return True, None
+    if isinstance(resolved_window, CalendarWindow):
+        return False, date.fromisoformat(str(resolved_window.end))
+    if (_question_period_phrase_units(question)
+            & _CALENDAR_PERIOD_PHRASE_UNITS
+            and _CALENDAR_PERIOD_PHRASE_RE.search(question or "")):
+        return True, None
+    return False, None
+
+
+def _fact_period_end(period) -> date | None:
+    """The last day a published fact period covers, or ``None`` if unknown.
+
+    Mirrors the shapes ``fact_template._period_label`` names: an ISO day, an
+    inclusive ``start:end`` range, a ``{start, end}`` object, or regularly
+    spaced bucket starts (the last bucket runs one step past its start).
+    For a block whose trailing week is partial this reads a few days LATE,
+    which can only make a window look more current, never refuse one.
+    """
+    from . import fact_template
+
+    if isinstance(period, str):
+        day = fact_template._period_date(period)
+        if day is not None:
+            return day
+        head, sep, tail = period.partition(":")
+        if sep and fact_template._period_date(head) is not None:
+            return fact_template._period_date(tail)
+        return None
+    starts_raw = None
+    if isinstance(period, dict):
+        starts_raw = period.get("period_starts")
+        # Bucket starts outrank ``end``, the precedence ``_period_label``
+        # uses: a block node's ``end`` can be its last bucket's START.
+        if not (isinstance(starts_raw, list) and len(starts_raw) > 1):
+            return fact_template._period_date(period.get("end"))
+    elif isinstance(period, (list, tuple)):
+        starts_raw = period
+    if not isinstance(starts_raw, (list, tuple)) or not starts_raw:
+        return None
+    starts = [fact_template._period_date(value) for value in starts_raw]
+    if any(value is None for value in starts):
+        return None
+    step = (starts[-1] - starts[-2]).days if len(starts) > 1 else 7
+    return starts[-1] + timedelta(days=max(step, 1) - 1)
+
+
+def _cited_period_ends(template: str,
+                       facts: dict[str, dict]) -> list[tuple[str, date]]:
+    """(metric, period end) for every published metric fact the template cites.
+
+    Read from the placeholder keys themselves -- the ``period=`` field Python
+    published -- so the check never reads a date out of model prose. Keys not
+    in the closed fact set are ignored here; the template scan refuses them.
+    """
+    from . import fact_template
+
+    cited: list[tuple[str, date]] = []
+    for match in _FACT_TEMPLATE_TOKEN_RE.finditer(template or ""):
+        key = match.group(1)
+        if key not in facts:
+            continue
+        parsed = fact_template.parse_fact_key(key)
+        if parsed is None:
+            continue
+        metric, period, _field = parsed
+        end = _fact_period_end(period)
+        if end is not None:
+            cited.append((metric, end))
+    return cited
+
+
+def _ask_metric_horizons(ctx: VaultContext, metrics,
+                         as_of: str | None) -> dict[str, date]:
+    """Each metric's most recent day with data, on or before the ask's as-of.
+
+    Per metric, not per vault: a scale used monthly or a sensor that stopped
+    reporting has an honest latest period long before the vault's own last
+    day, and citing it is current for THAT metric. A metric absent from
+    ``daily_metrics`` (a derived or tool-only name) is left out, and
+    :func:`_mark_stale_window` never refuses on a metric it cannot place.
+    One indexed ``MAX(date)`` per distinct metric, so the bind count never
+    grows with the vault.
+    """
+    names = sorted({str(metric) for metric in metrics if metric})
+    if not names or not os.path.exists(ctx.db_path):
+        return {}
+    import sqlite3
+
+    from . import analysis
+    from . import metrics as mx
+
+    conn = ctx.read_only()
+    try:
+        bound = analysis._as_of(conn, as_of)
+        predicate = mx.current_daily_metrics_predicate(conn)
+        horizons: dict[str, date] = {}
+        for name in names:
+            row = conn.execute(
+                "SELECT MAX(date) FROM daily_metrics "
+                f"WHERE metric = ? AND date <= ? AND {predicate}",
+                (name, bound)).fetchone()
+            if row and row[0]:
+                horizons[name] = date.fromisoformat(row[0])
+        return horizons
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+
+def _mark_stale_window(verification: dict, *, template: str,
+                       facts: dict[str, dict],
+                       metric_horizons: dict[str, date], question: str,
+                       resolved_window=None) -> bool:
+    """Refuse a narration whose latest cited period ends well before today's data.
+
+    health_advisor#428: a live answer three weeks stale with every figure
+    correct -- the model chose the PERIOD, and no gate asked whether it was
+    current. This marker compares the latest period END the template cites
+    (from Python-published placeholder keys) with the most recent day with
+    data among the cited metrics, and refuses when the gap exceeds
+    :data:`STALE_WINDOW_DAYS`. Python owns both dates; the model is never
+    asked to judge one.
+
+    Not refused: a draft already refused (the first refusal's detail is the
+    one the repair needs), a question that names a period which may have
+    ended long ago (see :func:`_stale_window_scope`), and any draft whose
+    cited metrics have no known horizon. A single window Python resolved
+    from the question caps the anchor at that window's end.
+    """
+    if not verification.get("ok"):
+        return False
+    exempt, cap = _stale_window_scope(question, resolved_window)
+    if exempt:
+        return False
+    cited = _cited_period_ends(template, facts)
+    anchors = [metric_horizons[metric] for metric, _end in cited
+               if metric in metric_horizons]
+    if not anchors:
+        return False
+    latest = max(end for _metric, end in cited)
+    anchor = max(anchors)
+    if cap is not None:
+        anchor = min(anchor, cap)
+    gap = (anchor - latest).days
+    if gap <= STALE_WINDOW_DAYS:
+        return False
+    earliest_current = anchor - timedelta(days=STALE_WINDOW_DAYS)
+    verification.update({
+        "ok": False,
+        "grounded": False,
+        "reason": (
+            f"{_STALE_WINDOW_REASON}: the latest period cited ends {latest}, "
+            f"{gap} days before the most recent data ({anchor}); cite a fact "
+            f"whose period ends on or after {earliest_current}, or say the "
+            "recent data does not cover the question"),
+        "stale_window": {
+            "latest_cited_end": latest.isoformat(),
+            "most_recent_data": anchor.isoformat(),
+            "gap_days": gap,
+            "threshold_days": STALE_WINDOW_DAYS,
+        },
+    })
+    return True
+
+
 def _strip_empty_paragraphs(text: str) -> str:
     """Remove blank or punctuation-only paragraphs before publication.
 
@@ -2261,6 +2487,13 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             "verification": conversational_verification,
         }
 
+    # Each cited metric's own most recent day with data, for the stale-window
+    # marker below (health_advisor#428). Computed once over the closed fact
+    # set, which neither narration attempt can add to.
+    metric_horizons = _ask_metric_horizons(
+        ctx, {fact.get("metric") for fact in facts.values()
+              if fact.get("period") is not None}, as_of)
+
     cold_start_guidance = fact_template.cold_start_guidance(facts)
     final_prompt = (
         "You are writing the final answer to the user's question. Return a "
@@ -2365,6 +2598,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     unsupported_period_phrase = _mark_unsupported_period_phrase(
         verification, text=rendered_text, template=template, facts=facts,
         history_days=history_days, question=question)
+    stale_window = _mark_stale_window(
+        verification, template=template, facts=facts,
+        metric_horizons=metric_horizons, question=question,
+        resolved_window=resolved_window)
     answer_truncated = _mark_answer_truncated(verification, final_status)
     withheld_eligible_figure = _mark_withheld_eligible_figure(
         verification, withheld_fact_keys)
@@ -2377,6 +2614,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         contradicted_day_count=contradicted_day_count,
         restated_unit=restated_unit,
         unsupported_period_phrase=unsupported_period_phrase,
+        stale_window=stale_window,
         answer_truncated=answer_truncated)
     _record_attempt(capture, 1, template, None, verification, None, ledger)
 
@@ -2494,6 +2732,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         retry_verification, text=retry_rendered_text,
         template=retry_template, facts=facts, history_days=history_days,
         question=question)
+    retry_stale_window = _mark_stale_window(
+        retry_verification, template=retry_template, facts=facts,
+        metric_horizons=metric_horizons, question=question,
+        resolved_window=resolved_window)
     retry_answer_truncated = _mark_answer_truncated(
         retry_verification, retry_status)
     retry_withheld_eligible_figure = _mark_withheld_eligible_figure(
@@ -2508,6 +2750,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         contradicted_day_count=retry_contradicted_day_count,
         restated_unit=retry_restated_unit,
         unsupported_period_phrase=retry_unsupported_period_phrase,
+        stale_window=retry_stale_window,
         answer_truncated=retry_answer_truncated)
     if (retry_verification["ok"] and retry_interpolated is not None
             and not retry_scan["placeholders"]

@@ -24,24 +24,48 @@ protecting. A judge or scorer that only reads back an already-produced
 answer (no vault handle) does not qualify, and correctly so: it cannot
 invent a period, it can only grade one that already exists.
 
-The rest of the package was checked by hand and excluded from the scan
-because it cannot even take part: ``grep -rn "llm\\.complete(\\|llm\\.tool_loop("
-health_advisor/*.py`` finds calls only in ``chat.py`` (and the definitions
-in ``agents.py``); ``agents.run_model`` itself has ``ctx`` but no
-``as_of``/window parameter, and ``analyst.build_repair_prompt`` /
-``analyst_prompt.build_analyst_prompt`` take neither a vault handle nor a
-window -- they write Python analysis code against an explicit schema
-summary, not a narrated answer bound to a period.
+The scan covers EVERY module of the ``health_advisor`` package, not only
+``chat.py``, and matches a model call by name whether it is reached as an
+attribute (``llm.complete``) or as a bare name (an injected ``complete``
+callable, as ``analyst.run_analyst`` uses). Every model-invoking call site
+the scan finds is pinned in ``_EXPECTED_MODEL_CALL_SITES`` together with
+whether it qualifies, so a new model call ANYWHERE in the engine fails
+loudly until someone decides which side of the criterion it is on. As of
+health_advisor#428 the non-qualifying sites are: ``chat._ask_judge`` (grades
+an answer already produced; no vault handle), ``agents.run_model`` (a
+generic transport wrapper with ``ctx`` but no window -- its prompts are
+assembled by the CONSUMER's briefing and review paths, which is where their
+date statement has to live), and ``analyst.run_analyst`` (writes Python
+analysis code against a schema summary; holds a vault path but no window).
+
+How each qualifying site is anchored to the vault's current date (#428
+Done-when 3):
+
+* the ask first draft, its retry, and the fact-template gather turn state
+  the date in the prompt (``_render_ask_calendar_dates``);
+* the fact-template final narration and its repair do NOT, deliberately:
+  the prompt forbids digits and ISO dates in prose and routes every period
+  through a Python-rendered placeholder, so a stated date would be a digit
+  trap. They are anchored in Python instead -- ``_mark_stale_window``
+  refuses a narration whose cited periods end well before the data -- and
+  the tests below assert that anchor on each of the two call sites;
+* the span-suppression regeneration has neither. Its prompt's contract is
+  that no failed figure's digits reach the model, which a date line breaks
+  (a year such as 2026 contains the figure 26 -- pinned by
+  ``test_span_suppression_rewrites_from_only_verified_claims``). It stays an
+  open, measured gap; it runs only under ``HA_ASK_SPAN_SUPPRESS``.
 """
 from __future__ import annotations
 
 import ast
-import inspect
+import pathlib
 from collections import Counter
 
 import pytest
 
+import health_advisor
 from health_advisor import chat
+from health_advisor import db as dbmod
 from health_advisor import fact_template
 from health_advisor import llm
 from health_advisor import vault as vaultmod
@@ -63,9 +87,10 @@ def _seed_a_metric_so_the_vault_is_not_day_zero(conn):
 # Discovery
 # ---------------------------------------------------------------------------
 
-_MODEL_CALL_TARGETS = {
-    ("llm", "complete"), ("llm", "tool_loop"), ("agents", "run_model"),
-}
+# A call is model-invoking when it names one of these functions, reached as
+# ``llm.<name>`` / ``agents.<name>`` or as a bare (imported or injected) name.
+_MODEL_CALL_NAMES = {"complete", "tool_loop", "run_model"}
+_MODEL_CALL_MODULES = {"llm", "agents"}
 
 
 def _takes_vault_handle_and_window(funcdef: ast.FunctionDef) -> bool:
@@ -78,39 +103,63 @@ def _takes_vault_handle_and_window(funcdef: ast.FunctionDef) -> bool:
     return has_vault_handle and has_window
 
 
-def _discover_windowed_prompt_call_sites() -> list[dict]:
-    """Statically enumerate qualifying model-invoking call sites in
-    ``health_advisor.chat``, per the module docstring's criterion."""
-    source = inspect.getsource(chat)
-    tree = ast.parse(source)
-    stack: list[ast.FunctionDef] = []
+def _model_call_name(func: ast.expr) -> str | None:
+    if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+            and func.value.id in _MODEL_CALL_MODULES
+            and func.attr in _MODEL_CALL_NAMES):
+        return f"{func.value.id}.{func.attr}"
+    if isinstance(func, ast.Name) and func.id in _MODEL_CALL_NAMES:
+        return func.id
+    return None
+
+
+def _discover_model_call_sites() -> list[dict]:
+    """Every model-invoking call site in every ``health_advisor`` module.
+
+    ``llm.py`` itself is skipped: it DEFINES the model calls, and its own
+    internals reach the transports, not these names.
+    """
+    package_dir = pathlib.Path(health_advisor.__file__).parent
     sites: list[dict] = []
+    for path in sorted(package_dir.glob("*.py")):
+        module = path.stem
+        if module == "llm":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        stack: list[ast.FunctionDef] = []
 
-    class _Visitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node):  # noqa: N802 (ast API name)
-            stack.append(node)
-            self.generic_visit(node)
-            stack.pop()
+        class _Visitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):  # noqa: N802 (ast API name)
+                stack.append(node)
+                self.generic_visit(node)
+                stack.pop()
 
-        visit_AsyncFunctionDef = visit_FunctionDef
+            visit_AsyncFunctionDef = visit_FunctionDef
 
-        def visit_Call(self, node):  # noqa: N802 (ast API name)
-            func = node.func
-            if (isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and (func.value.id, func.attr) in _MODEL_CALL_TARGETS
-                    and stack
-                    and _takes_vault_handle_and_window(stack[-1])):
-                sites.append({
-                    "function": stack[-1].name,
-                    "def_line": stack[-1].lineno,
-                    "call_line": node.lineno,
-                    "target": f"{func.value.id}.{func.attr}",
-                })
-            self.generic_visit(node)
+            def visit_Call(self, node):  # noqa: N802 (ast API name)
+                target = _model_call_name(node.func)
+                if target is not None:
+                    enclosing = stack[-1] if stack else None
+                    sites.append({
+                        "module": module,
+                        "function": (f"{module}.{enclosing.name}"
+                                     if enclosing else f"{module}.<module>"),
+                        "call_line": node.lineno,
+                        "target": target,
+                        "qualifies": bool(
+                            enclosing is not None
+                            and _takes_vault_handle_and_window(enclosing)),
+                    })
+                self.generic_visit(node)
 
-    _Visitor().visit(tree)
-    return sorted(sites, key=lambda s: s["call_line"])
+        _Visitor().visit(tree)
+    return sorted(sites, key=lambda s: (s["module"], s["call_line"]))
+
+
+def _discover_windowed_prompt_call_sites() -> list[dict]:
+    """Statically enumerate qualifying model-invoking call sites, package-wide,
+    per the module docstring's criterion."""
+    return [site for site in _discover_model_call_sites() if site["qualifies"]]
 
 
 # The discovered shape as of this file's writing. A per-path test below
@@ -121,9 +170,18 @@ def _discover_windowed_prompt_call_sites() -> list[dict]:
 # itself: silently leaving a new call site untested is exactly the failure
 # mode #428 is about.
 _EXPECTED_CALL_SITE_COUNTS = {
-    "_answer_question_inner": 2,
-    "_answer_fact_template": 3,
-    "_try_span_suppression": 1,
+    "chat._answer_question_inner": 2,
+    "chat._answer_fact_template": 3,
+    "chat._try_span_suppression": 1,
+}
+
+# Every model-invoking call site in the package, qualifying or not, and why
+# the non-qualifying ones are out (see the module docstring).
+_EXPECTED_MODEL_CALL_SITES = {
+    **{name: (count, True) for name, count in _EXPECTED_CALL_SITE_COUNTS.items()},
+    "chat._ask_judge": (1, False),
+    "agents.run_model": (2, False),
+    "analyst.run_analyst": (2, False),
 }
 
 
@@ -142,7 +200,8 @@ def test_discovery_finds_a_plausible_number_of_windowed_paths():
         f"discovery is broken or the engine restructured these paths -- "
         f"either way this must be investigated, not silenced. sites={sites}")
     functions = {site["function"] for site in sites}
-    assert functions >= {"_answer_question_inner", "_answer_fact_template"}, (
+    assert functions >= {"chat._answer_question_inner",
+                         "chat._answer_fact_template"}, (
         f"expected core narration functions missing from discovery: {sites}")
 
 
@@ -160,6 +219,25 @@ def test_discovered_call_sites_match_the_covered_manifest():
         "discovered windowed-prompt call sites changed shape; update this "
         f"file's per-path tests to match.\ndiscovered={counts}\n"
         f"expected={_EXPECTED_CALL_SITE_COUNTS}\nsites={sites}")
+
+
+def test_every_model_call_in_the_package_is_classified():
+    """No model call anywhere in the engine escapes the criterion unseen.
+
+    The windowed manifest above can only notice a new call site that
+    already qualifies; this one notices a model call in ANY module -- a new
+    briefing path, a second judge, an injected ``complete`` -- and forces a
+    decision about which side of the criterion it belongs on.
+    """
+    sites = _discover_model_call_sites()
+    shape: dict[str, tuple[int, bool]] = {}
+    for site in sites:
+        count, _ = shape.get(site["function"], (0, site["qualifies"]))
+        shape[site["function"]] = (count + 1, site["qualifies"])
+    assert shape == _EXPECTED_MODEL_CALL_SITES, (
+        "the engine's model-invoking call sites changed; classify the new "
+        f"one(s) in this file.\ndiscovered={shape}\n"
+        f"expected={_EXPECTED_MODEL_CALL_SITES}\nsites={sites}")
 
 
 # ---------------------------------------------------------------------------
@@ -255,22 +333,21 @@ def test_fact_template_gather_prompt_states_the_date(monkeypatch, vault, conn):
     assert "2026-02-03" in calls[0]
 
 
-# NOTE on the two fact-template xfails below, added by the orchestrator on
-# review: whether these paths SHOULD state the date is an OPEN DESIGN QUESTION,
-# not a settled defect, and `xfail(strict=True)` should not be read as deciding
-# it. The final-narration prompt instructs the model to write a *placeholder*
-# for any date it wants in prose
-# ({fact|metric=...|period=...|field=period_label}), which is Python-owned and
-# is a STRONGER guarantee than stating a date the model could then paraphrase.
-# On that reading, the narration turn not knowing today is correct by design,
-# and #428's stale window enters upstream -- at the gather turn that chooses
-# the window, which DOES state the date (call site #1, passing).
+# NOTE on the two fact-template xfails below. Whether these paths should
+# state the date in the PROMPT was left open when this file was written; #428
+# Done-when 4 answered it the other way. The final-narration prompt forbids
+# digits and ISO dates in prose and routes any period through a Python-owned
+# ``{fact|...|field=period_label}`` placeholder, so a stated date would be a
+# digit trap. Instead both call sites are anchored to the vault's date IN
+# PYTHON: ``_mark_stale_window`` refuses a template whose latest cited period
+# ends more than ``STALE_WINDOW_DAYS`` before its metrics' most recent data.
+# The two ``..._is_anchored_by_the_stale_window_check`` tests at the end of
+# this file assert that anchor per call site.
 #
 # These stay xfail(strict=True) because the mechanical claim in each reason
-# string is true and worth pinning: if someone adds the date here, the xfail
-# flips and forces the question to be answered rather than drifted into. What
-# must not happen is a future session reading "xfail" as "known bug, go fix
-# it". See health_advisor#428.
+# string is still true: if someone adds the date here, the xfail flips and
+# forces the digit-trap question to be measured rather than drifted into.
+# See health_advisor#428.
 
 # --- _answer_fact_template: call site #2, the final-narration llm.tool_loop
 
@@ -373,3 +450,87 @@ def test_span_suppression_prompt_states_the_date(monkeypatch, vault, conn):
 
     assert calls, "the span-regeneration llm.complete call never happened"
     assert "2026-02-03" in calls[0]
+
+
+# ---------------------------------------------------------------------------
+# The Python anchor for fact-template call sites #2 and #3 (#428 Done-when 4)
+#
+# The final narration and its repair do not state the date in the prompt
+# (see the NOTE above); the stale-window marker is what binds them to the
+# vault's current date. One test per call site, so removing the marker from
+# either one turns exactly that test red.
+# ---------------------------------------------------------------------------
+
+def _seed_current_resting_rate(vault):
+    conn = vault.connect()
+    dbmod.init_db(conn)
+    # Resting heart rate recorded daily through the as-of below.
+    seed_metric(conn, "resting_heart_rate", "2026-07-01", [60] * 52)
+    conn.close()
+
+
+def _two_week_resting_rate_ledger():
+    ledger = []
+    for sequence, period in enumerate(
+            ("2026-07-20:2026-07-26", "2026-08-10:2026-08-16"), start=1):
+        ledger.append({
+            "sequence": sequence, "tool_name": "synthetic_metric",
+            "arguments": {},
+            "result": {
+                "metric": "resting_heart_rate", "period": period,
+                "mean": 61 + sequence, "unit": "bpm",
+                "presentation": {"metric": "resting_heart_rate",
+                                 "period": period, "field": "presentation",
+                                 "value": f"{61 + sequence} bpm"},
+            },
+        })
+    return ledger
+
+
+def _run_resting_rate_templates(monkeypatch, vault, templates):
+    replies = iter(["acknowledged", *templates])
+    ledger = _two_week_resting_rate_ledger()
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *a, **k: [])
+    monkeypatch.setattr(llm, "tool_loop", lambda *a, **k: next(replies))
+    capture: list = []
+    result = chat.answer_question(
+        vault, "How has my resting heart rate been?", as_of="2026-08-21",
+        capture=capture)
+    return result, capture
+
+
+_STALE_KEY = fact_template.fact_key(
+    "resting_heart_rate", "2026-07-20:2026-07-26", "mean")
+_CURRENT_KEY = fact_template.fact_key(
+    "resting_heart_rate", "2026-08-10:2026-08-16", "mean")
+
+
+def test_fact_template_final_narration_is_anchored_by_the_stale_window_check(
+        monkeypatch, vault):
+    """Call site #2: a first draft citing only a window that ended 26 days
+    before the data is refused with the stale-window cause."""
+    _seed_current_resting_rate(vault)
+    result, capture = _run_resting_rate_templates(monkeypatch, vault, [
+        "Your resting heart rate averaged {" + _STALE_KEY + "}.",
+        "Your resting heart rate averaged {" + _CURRENT_KEY + "}.",
+    ])
+
+    assert capture[0]["verification"]["cause"] == "stale_window"
+    assert result["mode"] == "narration"
+    assert result["verification"]["cause"] == "ok"
+
+
+def test_fact_template_repair_is_anchored_by_the_stale_window_check(
+        monkeypatch, vault):
+    """Call site #3: a repair that cites the stale window again is refused
+    too, so one failed attempt is never the way past the check."""
+    _seed_current_resting_rate(vault)
+    stale = "Your resting heart rate averaged {" + _STALE_KEY + "}."
+    result, capture = _run_resting_rate_templates(
+        monkeypatch, vault, [stale, stale])
+
+    assert capture[1]["verification"]["cause"] == "stale_window"
+    assert result["mode"] == "fallback"
+    assert result["verification"]["cause"] == "stale_window"

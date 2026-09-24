@@ -2110,6 +2110,10 @@ DATA_QUESTIONS = (
     "How many did I do?",
     "Is my resting rate coming down?",
     "Am I ready for a hard one tomorrow?",
+    # A time-of-day greeting carrying a question is still a data request.
+    "Good morning, how did I sleep?",
+    "How was my run this morning?",
+    "Morning run stats?",
 )
 
 
@@ -2123,6 +2127,9 @@ def test_ordinary_data_questions_cannot_take_conversational_shape(question):
 
 @pytest.mark.parametrize("message", (
     "Hello!", "hi there", "thanks", "thank you", "ok", "got it",
+    # health_advisor#410, live 2026-09-24: "Good morning" fell to the data path
+    # 2/2 and was refused for having no tool-call ledger.
+    "Good morning", "good afternoon!", "Good evening.", "Morning!",
 ))
 def test_allowlisted_conversation_reuses_gather_reply_in_one_model_call(
         monkeypatch, vault, message):

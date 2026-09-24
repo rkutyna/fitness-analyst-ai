@@ -819,6 +819,7 @@ def _fact_template_enabled() -> bool:
 
 _CONVERSATIONAL_MESSAGE_RE = re.compile(
     r"(?:hello(?: there)?|hi(?: there)?|hey(?: there)?|"
+    r"(?:good )?(?:morning|afternoon|evening)|"
     r"thanks?(?: a lot)?|thank you|ok(?:ay)?|got it|understood|"
     r"sounds good|great|perfect)")
 

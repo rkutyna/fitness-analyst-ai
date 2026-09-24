@@ -29,6 +29,8 @@ from . import db
 from . import facts as fact_store
 from . import vault
 from .context import VaultContext
+# health_advisor#495: each PUBLISHED model reply is normalised before its gate.
+from .numeric_tokens import normalise_model_prose
 
 
 from . import deepdive_verify as _DV_VOCAB
@@ -1125,7 +1127,7 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
             # suppression feature fail-closed if a provider adapter is not.
             continue
         regenerated, _ = agents.split_claim_channel(str(raw or ""))
-        regenerated = regenerated.strip()
+        regenerated = normalise_model_prose(regenerated).strip()
         if not regenerated:
             continue
         verify_conn = ctx.read_only()
@@ -2479,7 +2481,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # data. Reuse the gather reply only for that closed class; a data question
     # can never become a conversational answer merely because no tool fired.
     if not ledger and not _question_is_data_request(question, facts):
-        conversational_text = str(gather_raw or "").strip()
+        conversational_text = normalise_model_prose(
+            str(gather_raw or "")).strip()
         conversational_reason = fact_template.conversational_violation(
             conversational_text, facts)
         conversational_ok = (not conversational_reason
@@ -2619,7 +2622,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         on_tool_call=on_tool_call)
     final_status = _ask_loop_outcome(final_status_before,
                                      llm.last_loop_status())
-    template = str(raw or "").strip()
+    template = normalise_model_prose(str(raw or "")).strip()
     scan = fact_template.scan_template(template, facts)
     advice_quantities: list[str] = []
     # A pure advice answer (zero fact placeholders, >=1 labeled advice span)
@@ -2758,7 +2761,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         timeout=llm.TIMEOUT_ASK_TURN, deadline=llm.DEADLINE_ASK_LOOP)
     retry_status = _ask_loop_outcome(retry_status_before,
                                      llm.last_loop_status())
-    retry_template = str(raw or "").strip()
+    retry_template = normalise_model_prose(str(raw or "")).strip()
     retry_scan = fact_template.scan_template(retry_template, facts)
     retry_advice_quantities: list[str] = []
     retry_tier_counts = _fact_template_tier_counts(retry_scan, facts)
@@ -2958,6 +2961,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         first_loop_status = _ask_loop_outcome(first_status_before,
                                               llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))
+        prose = normalise_model_prose(prose)
         if hasattr(raw, "claims") and raw.claims is not None:
             claims = raw.claims
         ledger = _read_ledger(ledger_path)
@@ -3032,6 +3036,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
         retry_loop_status = _ask_loop_outcome(retry_status_before,
                                               llm.last_loop_status())
         prose, claims = agents.split_claim_channel(str(raw or ""))
+        prose = normalise_model_prose(prose)
         if hasattr(raw, "claims") and raw.claims is not None:
             claims = raw.claims
         ledger = _read_ledger(ledger_path)

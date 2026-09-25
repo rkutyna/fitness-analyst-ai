@@ -59,7 +59,8 @@ def _encrypt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_round_trip_is_byte_identical_and_inspect_needs_no_key(tmp_path, monkeypatch):
     source, ciphertext, original, audit = _encrypt(tmp_path, monkeypatch)
     header = crypto.inspect_header(ciphertext)
-    assert header["version"] == 1
+    assert header["version"] == crypto.FORMAT_VERSION == 2
+    assert "wrapped_data_key" not in header  # key material lives in the key block
     assert header["vault_id"] == "user-123"
     assert header["chunk_count"] == 3
     replace_event = json.loads(audit.read_text().splitlines()[0])
@@ -175,7 +176,7 @@ def test_hard_kill_during_verification_leaves_no_plaintext_staging(tmp_path, mon
 def test_generation_is_optional_for_legacy_headers():
     header = {
         "format": "health-advisor-vault",
-        "version": crypto.FORMAT_VERSION,
+        "version": crypto.LEGACY_FORMAT_VERSION,
         "cipher": crypto.CIPHER_NAME,
         "chunk_size": crypto.DEFAULT_CHUNK_SIZE,
         "plaintext_size": 0,
@@ -235,7 +236,7 @@ def test_plaintext_and_chunk_limits_are_enforced(tmp_path, monkeypatch):
     monkeypatch.undo()
     header = {
         "format": "health-advisor-vault",
-        "version": crypto.FORMAT_VERSION,
+        "version": crypto.LEGACY_FORMAT_VERSION,
         "cipher": crypto.CIPHER_NAME,
         "chunk_size": 4096,
         "plaintext_size": crypto.MAX_PLAINTEXT_SIZE,

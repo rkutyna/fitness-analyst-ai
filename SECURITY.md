@@ -70,6 +70,19 @@ held by a pluggable key provider. Two providers ship — an environment variable
   `decrypt_vault`; an older generation is refused. Version-1 envelopes created
   before this field existed remain readable when no expected generation is
   requested.
+- Envelopes are written as **format version 2**: the wrapped data key lives in
+  a trailing, separately authenticated key block (one AES-GCM wrap slot per
+  key-encryption key, each bound to the SHA-256 of the body header and to its
+  own slot label, plus an HMAC over the whole block under a key derived from
+  the data key). The body is encrypted under a second key derived from the
+  data key and its AAD binds only the immutable body header (vault id,
+  generation, sizes, data-key id, footer nonce), so `rewrap_vault` (CLI:
+  `rewrap`) can move an envelope under a new key-encryption key by rewriting
+  the key block alone. A key block that is edited, stripped of a slot, or
+  taken from another envelope fails closed. Version-1 envelopes stay readable
+  and become version 2 at their next write; `rewrap_vault` converts one without
+  writing plaintext anywhere, and an interrupted re-wrap or conversion leaves
+  the previous envelope in place.
 - The master key is never written into the vault, and access is recorded to an
   audit log (`HEALTH_ADVISOR_VAULT_AUDIT_LOG`).
 - Encryption is **opt-in**. If you never configure a key provider, your vault is

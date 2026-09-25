@@ -1261,6 +1261,11 @@ CREATE TABLE IF NOT EXISTS deepdive_traces (
 -- register of the vault it is bound to, never a file shared by every vault.
 -- skipped_rows is the importer's count of unparseable source rows, repeated on
 -- each row because an import always writes the whole register at once.
+-- does_not_license is a JSON array of the row's authored scope lines, in
+-- authored order (a row may carry several, and their order is meaningful);
+-- '[]' when the row states none. NULL means the row was imported before the
+-- column existed, so its scope is unknown rather than empty. Existing vaults
+-- gain it through db._ADDED_COLUMNS.
 CREATE TABLE IF NOT EXISTS claims_register (
     ordinal       INTEGER PRIMARY KEY CHECK (ordinal > 0),
     claim         TEXT NOT NULL,
@@ -1274,7 +1279,8 @@ CREATE TABLE IF NOT EXISTS claims_register (
     source        TEXT NOT NULL,
     source_mtime  TEXT,
     skipped_rows  INTEGER NOT NULL DEFAULT 0 CHECK (skipped_rows >= 0),
-    imported_at   TEXT NOT NULL
+    imported_at   TEXT NOT NULL,
+    does_not_license TEXT
 );
 
 -- The cross-review coaching agenda: items carried from one weekly review to the

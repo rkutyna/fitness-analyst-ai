@@ -158,6 +158,12 @@ _ADDED_COLUMNS = {
     "plan_week_log": {
         "week_end": "TEXT",
     },
+    # A claim's authored scope lines, as a JSON array in authored order. No
+    # default: rows imported before the column existed read NULL (scope
+    # unknown) until the next import, rather than '[]' (states no scope).
+    "claims_register": {
+        "does_not_license": "TEXT",
+    },
 }
 
 # Tables which were not present in older vaults.

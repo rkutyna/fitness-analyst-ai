@@ -125,3 +125,63 @@ def test_plan_projections_keeps_its_provenance_check(tmp_path):
                 "VALUES ('p1', '2026-08-17', '{}', 1, '2026-08-26T00:00:00Z')")
     finally:
         conn.close()
+
+
+_CLAIMS_REGISTER_BEFORE_SCOPE = """
+CREATE TABLE claims_register (
+    ordinal       INTEGER PRIMARY KEY CHECK (ordinal > 0),
+    claim         TEXT NOT NULL,
+    asserted_in   TEXT NOT NULL,
+    encoded_in    TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    last_verified TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    status_class  TEXT NOT NULL,
+    recheck       TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    source_mtime  TEXT,
+    skipped_rows  INTEGER NOT NULL DEFAULT 0 CHECK (skipped_rows >= 0),
+    imported_at   TEXT NOT NULL
+)
+"""
+
+
+def _columns(conn, table):
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def test_fresh_vault_claims_register_carries_scope_lines(tmp_path):
+    conn = sqlite3.connect(tmp_path / "vault.db")
+    try:
+        db.init_db(conn)
+        assert "does_not_license" in _columns(conn, "claims_register")
+    finally:
+        conn.close()
+
+
+def test_existing_claims_register_gains_scope_column_without_inventing_scope(tmp_path):
+    """A register imported before the column existed gains it on init_db.
+
+    Its rows read NULL -- scope unknown until the next import -- not '[]',
+    which would claim the authored rows state no scope. Running init_db again
+    is a no-op.
+    """
+    conn = sqlite3.connect(tmp_path / "vault.db")
+    try:
+        conn.execute(_CLAIMS_REGISTER_BEFORE_SCOPE)
+        conn.execute(
+            "INSERT INTO claims_register (ordinal, claim, asserted_in, "
+            "encoded_in, evidence_type, last_verified, status, status_class, "
+            "recheck, source, imported_at) VALUES (1, 'c', 'a', 'e', 't', "
+            "'2026-09-20', 'holds', 'holds', 'r', 'CLAIMS.md', "
+            "'2026-09-20T00:00:00Z')")
+        conn.commit()
+        db.init_db(conn)
+        db.init_db(conn)
+        assert _columns(conn, "claims_register")[-1] == "does_not_license"
+        assert _columns(conn, "claims_register").count("does_not_license") == 1
+        assert conn.execute(
+            "SELECT does_not_license FROM claims_register WHERE ordinal = 1"
+        ).fetchone()[0] is None
+    finally:
+        conn.close()

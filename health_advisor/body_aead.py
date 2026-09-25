@@ -25,6 +25,12 @@ HKDF_SALT = b"ha-d23-body-aead-v1"
 INFO_REQUEST = b"ha/d23/v1/body/request"
 INFO_RESPONSE = b"ha/d23/v1/body/response"
 INFO_KEY_ID = b"ha/d23/v1/key-id"
+# The value a client sends as its authentication header. It is derived from the
+# shared secret under its own info label, so an intermediary that reads request
+# headers learns a bearer token but nothing from which the body keys above (or
+# the secret itself) can be computed.
+INFO_AUTH_TOKEN = b"ha/d23/v1/auth-token"
+AUTH_TOKEN_BYTES = 32
 KEY_BYTES = 32
 KEY_ID_BYTES = 8
 NONCE_BYTES = 12
@@ -63,6 +69,7 @@ class DerivedKeys:
 class _DerivedMaterial:
     keys: DerivedKeys
     key_id: str
+    auth_token: str
 
 
 _DERIVED_CACHE_LIMIT = 4
@@ -95,6 +102,9 @@ def _derived_material(secret: str) -> _DerivedMaterial:
         key_id=base64.urlsafe_b64encode(
             _hkdf(secret, INFO_KEY_ID, KEY_ID_BYTES)
         ).decode("ascii").rstrip("="),
+        auth_token=base64.urlsafe_b64encode(
+            _hkdf(secret, INFO_AUTH_TOKEN, AUTH_TOKEN_BYTES)
+        ).decode("ascii").rstrip("="),
     )
     _DERIVED_CACHE[secret_b] = material
     _DERIVED_CACHE.move_to_end(secret_b)
@@ -106,6 +116,15 @@ def _derived_material(secret: str) -> _DerivedMaterial:
 def derive_keys(secret: str) -> DerivedKeys:
     """Derive the request and response AES-256 keys from ``secret``."""
     return _derived_material(secret).keys
+
+
+def auth_token(secret: str) -> str:
+    """Return the unpadded base64url authentication token for ``secret``.
+
+    This is what a client presents in its secret header instead of the secret.
+    It is one-way: neither the secret nor the body keys can be derived from it.
+    """
+    return _derived_material(secret).auth_token
 
 
 def key_id(secret: str) -> str:

@@ -287,6 +287,60 @@ def _secret_bytes(value: str | None) -> bytes | None:
         return None
 
 
+_BAD_SECRET_DETAIL = "missing or bad shared secret"
+_RAW_SECRET_REFUSED_DETAIL = (
+    "raw shared secret refused: this server accepts only the derived auth "
+    "token in X-Health-Secret (HA_SECRET_HEADER_MODE=token_only)")
+SECRET_HEADER_MODES = ("raw_or_token", "token_only")
+
+
+def _secret_header_mode() -> str:
+    """Return which values ``X-Health-Secret`` may carry.
+
+    ``raw_or_token`` (the default, and what an unset or empty value means)
+    accepts the derived auth token and, for clients that predate it, the raw
+    shared secret. ``token_only`` accepts only the token, so the secret, which
+    is also the root of the D23 body keys, never has to cross an intermediary
+    that reads request headers. Anything else refuses at startup, like
+    HA_D23_MODE, rather than guessing which of the two was meant.
+    """
+    mode = os.environ.get("HA_SECRET_HEADER_MODE", "")
+    if mode == "":
+        return "raw_or_token"
+    if mode in SECRET_HEADER_MODES:
+        return mode
+    raise RuntimeError(
+        "secret header check refuses to start: HA_SECRET_HEADER_MODE is set "
+        f"to invalid value {mode!r}; set it to 'raw_or_token' or "
+        "'token_only', or leave it unset for 'raw_or_token'."
+    )
+
+
+def _secret_header_refusal(x_health_secret: str | None, secret: str) -> str | None:
+    """Return None when the header authenticates for ``secret``, else a detail.
+
+    The header may carry ``body_aead.auth_token(secret)``; while the mode is
+    ``raw_or_token`` it may also carry the secret itself. Both comparisons are
+    constant-time and both always run, so timing does not say which one
+    matched. The distinct detail for a correct raw secret in ``token_only``
+    mode reveals nothing a caller holding that secret could not learn by
+    sending its token.
+    """
+    presented = _secret_bytes(x_health_secret)
+    if presented is None:
+        return _BAD_SECRET_DETAIL
+    token_ok = hmac.compare_digest(
+        presented, body_aead.auth_token(secret).encode("ascii"))
+    raw_ok = hmac.compare_digest(presented, secret.encode("utf-8"))
+    if token_ok:
+        return None
+    if raw_ok:
+        if _secret_header_mode() == "raw_or_token":
+            return None
+        return _RAW_SECRET_REFUSED_DETAIL
+    return _BAD_SECRET_DETAIL
+
+
 def _require_ask_secret(x_health_secret: str | None) -> None:
     """Require a configured, non-empty secret for the interactive endpoint.
 
@@ -295,10 +349,11 @@ def _require_ask_secret(x_health_secret: str | None) -> None:
     endpoint into an unauthenticated data reader.
     """
     secret = _shared_secret_for_request()
-    presented = _secret_bytes(x_health_secret)
-    if (not secret or presented is None or
-            not hmac.compare_digest(presented, secret.encode("utf-8"))):
-        raise HTTPException(status_code=401, detail="missing or bad shared secret")
+    if not secret:
+        raise HTTPException(status_code=401, detail=_BAD_SECRET_DETAIL)
+    refusal = _secret_header_refusal(x_health_secret, secret)
+    if refusal is not None:
+        raise HTTPException(status_code=401, detail=refusal)
 
 
 def _ask_payload(raw: bytes) -> dict:
@@ -1276,11 +1331,10 @@ def _require_ingest_secret(x_health_secret: str | None, *, request: Request | No
     if state is not None and getattr(state, "ingest_secret_checked", False):
         return
     secret = _shared_secret_for_request()
-    presented = _secret_bytes(x_health_secret)
-    if (secret and
-            (presented is None or
-             not hmac.compare_digest(presented, secret.encode("utf-8")))):
-        raise HTTPException(status_code=401, detail="missing or bad shared secret")
+    if secret:
+        refusal = _secret_header_refusal(x_health_secret, secret)
+        if refusal is not None:
+            raise HTTPException(status_code=401, detail=refusal)
     if state is not None:
         state.ingest_secret_checked = True
 
@@ -1435,6 +1489,9 @@ class D23BodyAEADApp:
         request_receive = receive
 
         if not exempt:
+            # The body keys come from the server's own secret, never from the
+            # request's X-Health-Secret header: that header carries a derived
+            # auth token, from which no body key can be computed.
             secret = self.secret_for_request()
             has_d23_content_type = self._has_d23_content_type(scope)
             max_wire = (MAX_BODY_BYTES + body_aead.HEADER_BYTES + body_aead.TAG_BYTES
@@ -1565,6 +1622,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     """
     llm.assert_backend_approved()
     mode = _d23_mode()
+    _secret_header_mode()  # an invalid value refuses here, not on a request
     app = FastAPI(title="Health Advisor Receiver", docs_url=None,
                   redoc_url=None, openapi_url=None)
     analyst_permit = asyncio.Semaphore(1)

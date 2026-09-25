@@ -1409,6 +1409,45 @@ def _fact_template_figure_count(scan: dict, facts: dict[str, dict]) -> int:
                if (facts.get(key) or {}).get("field") != "period_label")
 
 
+_ANSWER_FIGURE_LABEL_FIELDS = ("metric", "period", "field",
+                               "table", "column", "row")
+
+
+def _answer_figures(placeholders, facts: dict[str, dict]) -> list[dict]:
+    """The published figures of one narration answer, joined to their calls.
+
+    ``placeholders`` are the fact keys the interpolated template used (the
+    scan's own list), so this is exactly the set of figures the answer
+    states, in first-use order and once each. Every field is copied from the
+    Python-built fact: ``display`` is the string interpolated into the text
+    and ``sequence`` is the ledger record that produced it, so a client can
+    show which tool call each stated figure came from without recomputing
+    anything. A key with no fact, or a fact with no ledger sequence, is left
+    out rather than guessed at.
+    """
+    figures: list[dict] = []
+    seen: set[str] = set()
+    for key in placeholders or []:
+        if key in seen:
+            continue
+        fact = (facts or {}).get(key)
+        if not isinstance(fact, dict):
+            continue
+        source = fact.get("source") or {}
+        sequence = source.get("sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            continue
+        seen.add(key)
+        figure = {"key": key, "display": fact.get("display"),
+                  "unit": fact.get("unit"), "sequence": sequence,
+                  "path": source.get("path")}
+        for name in _ANSWER_FIGURE_LABEL_FIELDS:
+            if name in fact:
+                figure[name] = fact[name]
+        figures.append(figure)
+    return figures
+
+
 def _fact_template_tier_counts(scan: dict, facts: dict[str, dict]) -> dict:
     """Report the assurances for the placeholders actually interpolated."""
     resolved = (sum(1 for key in scan.get("placeholders", [])
@@ -2730,6 +2769,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         return {
             "text": interpolated, "mode": "narration", "tool_trace": ledger,
             "verification": verification,
+            "figures": _answer_figures(scan["placeholders"], facts),
         }
 
     # One bounded repair retry, and only one.  The closed facts and the
@@ -2861,6 +2901,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "text": retry_interpolated, "mode": "narration",
         "tool_trace": ledger,
         "verification": {**retry_verification, "retry": True},
+        "figures": _answer_figures(retry_scan["placeholders"], facts),
     }
 
 

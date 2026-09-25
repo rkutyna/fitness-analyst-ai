@@ -1609,6 +1609,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                analyst_corpus_path: str | None = None,
                ingest_guard: Callable[[], Response | None] | None = None,
                health_extra: Callable[[], dict] | None = None,
+               ask_extra: Callable[[dict], dict] | None = None,
                apns_config: push.APNsConfig | None = None,
                apns_sender=None,
                secret_for_request: Callable[[], str] = _shared_secret_for_request) -> D23BodyAEADApp:
@@ -1619,6 +1620,14 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     A factory rather than a module-level `app` because the vault has to be
     chosen by the caller. The route body stays a module-level function taking
     `ctx` first; only the FastAPI wiring lives in here.
+
+    ``ask_extra``, when supplied, is called with a copy of each completed
+    ``/v1/ask`` response and returns extra top-level fields for it — the
+    deployment's hook for decorating an answer (for example, plain-language
+    sources built from ``tool_trace`` and ``figures``). It may only ADD keys:
+    a key the engine already set is never replaced. A hook that raises is
+    announced on stderr and the answer is returned undecorated, because a
+    decoration must never cost the user the answer itself.
     """
     llm.assert_backend_approved()
     mode = _d23_mode()
@@ -1919,11 +1928,24 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 "answer": result["text"],
                 "mode": result["mode"],
                 "tool_trace": result["tool_trace"],
+                # Which ledger call produced each figure the answer states
+                # (chat._answer_figures). Empty on every non-narration path.
+                "figures": list(result.get("figures") or []),
                 "provenance": {"tool_calls": len(result["tool_trace"])},
                 "verification": result["verification"],
                 "attachments": result.get("attachments", attachments),
                 "freshness": _ask_freshness(ctx, payload["as_of"]),
             }
+            if ask_extra is not None:
+                try:
+                    extra = ask_extra(dict(response))
+                except Exception as exc:
+                    print(f"ask-extra failed: {type(exc).__name__}: {exc}",
+                          file=sys.stderr, flush=True)
+                    extra = None
+                if isinstance(extra, dict):
+                    for key, value in extra.items():
+                        response.setdefault(key, value)
         except BaseException:
             if progress_id is not None:
                 PROGRESS_REGISTRY.finish(progress_id, "error")

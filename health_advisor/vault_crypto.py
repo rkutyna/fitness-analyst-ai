@@ -40,7 +40,10 @@ header, every chunk and the footer are byte-identical before and after.
 The KEK is whatever a ``KeyProvider`` returns.  Today that is the operator's
 master key (slot kind ``"master"``).  A provider may declare ``key_kind`` and
 ``key_id``; a user-held vault key is such a provider with a different kind,
-and nothing else in the format changes.
+and nothing else in the format changes.  ``MemoryKeyProvider`` is that
+provider (kind ``"user"``, a key id derived one-way from the key, held in
+memory only); ``key_slots`` reads an envelope's slot labels without a key, and
+``verify_vault`` authenticates a whole envelope while writing nothing.
 
 This module implements the cipher only, and delivers exactly that: encryption
 at rest, with a per-vault data key wrapped by a provider-held master key.  It
@@ -110,6 +113,10 @@ SUPPORTED_FORMAT_VERSIONS = (LEGACY_FORMAT_VERSION, FORMAT_VERSION)
 KEYBLOCK_FORMAT = "health-advisor-vault-keys"
 KDF_NAME = "HKDF-SHA256"
 MASTER_KEY_KIND = "master"
+# The slot kind of a vault key the USER holds (consumer #427, T3): generated on
+# the user's phone, presented per unlock, and never written by this module.
+USER_KEY_KIND = "user"
+USER_KEY_ID_PREFIX = "vk-"
 MAX_KEY_BLOCK_SIZE = 64 * 1024
 MAX_KEY_SLOTS = 16
 DEK_ID_SIZE = 16
@@ -257,6 +264,64 @@ class KeychainKeyProvider:
             return _decode_key(result.stdout.strip(), source="macOS Keychain")
         except ValueError as exc:
             raise VaultCryptoError(str(exc)) from None
+
+
+def user_key_id(key: bytes) -> str:
+    """The public slot label for a user-held vault key (consumer #427, T3).
+
+    ``"vk-"`` plus 16 hex characters of HKDF-SHA256 over the key under its own
+    label: stable for one key, different for the next one (so a rotated key
+    gets a new slot rather than silently reusing the old label), and 64 bits of
+    a one-way derivation reveal nothing usable about the key itself.  A wrong
+    key therefore names a slot the envelope does not have, and is refused as
+    ``WrongMasterKeyError`` before any AES operation.
+    """
+    if not isinstance(key, (bytes, bytearray)) or len(key) != KEY_SIZE:
+        raise VaultCryptoError("a user vault key must be exactly 32 bytes")
+    digest = HKDF(
+        algorithm=hashes.SHA256(), length=8, salt=None,
+        info=b"health-advisor-vault-user-key-id-v1",
+    ).derive(bytes(key))
+    return USER_KEY_ID_PREFIX + digest.hex()
+
+
+class MemoryKeyProvider:
+    """A KEK held in process memory only -- the user-held vault key's provider.
+
+    Never reads or writes the environment, a file, or a log.  ``key_kind``
+    defaults to ``"user"`` and ``key_id`` to :func:`user_key_id` of the key, so
+    ``encrypt_vault(..., provider=MemoryKeyProvider(vk))`` writes exactly one
+    user slot and no master slot.  ``wipe()`` overwrites the held copy; Python
+    cannot promise that no other copy of the bytes exists (the caller decoded
+    them from somewhere), so this narrows exposure rather than guaranteeing
+    erasure.
+    """
+
+    def __init__(self, key: bytes, *, key_kind: str = USER_KEY_KIND,
+                 key_id: str | None = None) -> None:
+        if not isinstance(key, (bytes, bytearray)) or len(key) != KEY_SIZE:
+            raise VaultCryptoError("an in-memory vault key must be exactly 32 bytes")
+        self._key = bytearray(key)
+        self.key_kind = key_kind
+        self.key_id = key_id if key_id is not None else user_key_id(bytes(key))
+        _slot_identity(self)  # an invalid label refuses here, not at a check-in
+
+    def get_master_key(self) -> bytes:
+        if not any(self._key):
+            raise VaultCryptoError("this in-memory vault key has been wiped")
+        return bytes(self._key)
+
+    def matches(self, key: bytes) -> bool:
+        """Constant-time comparison against another presented key."""
+        return (isinstance(key, (bytes, bytearray)) and len(key) == KEY_SIZE
+                and hmac.compare_digest(bytes(self._key), bytes(key)))
+
+    def wipe(self) -> None:
+        for index in range(len(self._key)):
+            self._key[index] = 0
+
+    def __repr__(self) -> str:  # never the key, in any traceback or log
+        return f"MemoryKeyProvider(key_kind={self.key_kind!r}, key_id={self.key_id!r})"
 
 
 def _decode_key(value: str, *, source: str) -> bytes:
@@ -1205,6 +1270,59 @@ def decrypt_vault(
             staging.unlink(missing_ok=True)
 
 
+def key_slots(src: str | os.PathLike[str]) -> list[dict[str, str]]:
+    """The ``{kind, kid}`` labels of an envelope's key slots, without a key.
+
+    Structural only: the key block's MAC needs the DEK, so these labels are
+    what the file CLAIMS and are authenticated only when a slot is opened.
+    That is enough to decide which key to ask for (a deploy that finds no
+    ``master`` slot starts locked and waits for the user's key); it is never
+    enough to decide that a key is right.  A version-1 envelope has one
+    implicit ``master`` slot.
+    """
+    with Path(src).open("rb") as handle:
+        header = _parse_header_bytes(_read_header(handle))
+        if header["version"] == LEGACY_FORMAT_VERSION:
+            return [{"kind": MASTER_KEY_KIND, "kid": MASTER_KEY_KIND}]
+        _, fields = _read_key_block(handle)
+    return [{"kind": slot["kind"], "kid": slot["kid"]} for slot in fields["slots"]]
+
+
+def verify_vault(
+    src: str | os.PathLike[str],
+    *,
+    provider: KeyProvider,
+    actor: str,
+    purpose: str,
+) -> dict[str, Any]:
+    """Authenticate a whole envelope under ``provider`` and write nothing.
+
+    Opens the provider's slot (audited, as any unwrap is), authenticates the
+    key block, every chunk and the footer, and returns the public header.  No
+    plaintext is written anywhere.  This is the "fresh decrypt using only the
+    new key" a key migration checks before it trusts its own result.
+    """
+    source = Path(src)
+    _validate_identity(actor, "actor")
+    _validate_identity(purpose, "purpose")
+    with source.open("rb") as input_handle:
+        header_bytes = _read_header(input_handle)
+        header = _parse_header_bytes(header_bytes)
+        body_offset = input_handle.tell()
+        _append_unwrap_audit(
+            vault_id=header["vault_id"], actor=actor, purpose=purpose, source=source
+        )
+        body_key, plan = _open_data_key(input_handle, header_bytes, header, provider)
+        input_handle.seek(body_offset)
+        _read_authenticated_body(
+            input_handle, header_bytes, body_key, plan["footer_nonce"],
+            header["chunk_size"], header["plaintext_size"], header["chunk_count"],
+            chunk_aad=plan["chunk_aad"], footer_aad=plan["footer_aad"],
+            body_end=plan["body_end"],
+        )
+    return header
+
+
 # ------------------------------------------------------------------ re-wrap
 
 _DARWIN_CLONE_NOFOLLOW = 0x0001
@@ -1478,10 +1596,15 @@ def main(argv: list[str] | None = None) -> int:
 
     inspect = subparsers.add_parser("inspect", help="print the public envelope header")
     inspect.add_argument("src")
+    slots = subparsers.add_parser(
+        "slots", help="print the envelope's key-slot labels (unauthenticated)")
+    slots.add_argument("src")
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect":
             print(json.dumps(inspect_header(args.src), indent=2, sort_keys=True))
+        elif args.command == "slots":
+            print(json.dumps(key_slots(args.src), sort_keys=True))
         elif args.command == "encrypt":
             encrypt_vault(
                 args.src, args.dst, provider=_provider_from_args(args),

@@ -45,6 +45,12 @@ provider (kind ``"user"``, a key id derived one-way from the key, held in
 memory only); ``key_slots`` reads an envelope's slot labels without a key, and
 ``verify_vault`` authenticates a whole envelope while writing nothing.
 
+Any older envelope is still a valid envelope, so a caller that must not be
+served a stale copy remembers the :func:`envelope_identity` it last saw and
+passes it back as ``decrypt_vault(expected_identity=...)``;
+:func:`compare_envelope_identity` states the ordering (a re-wrap is the same
+identity; a re-encryption at the same generation is not).
+
 This module implements the cipher only, and delivers exactly that: encryption
 at rest, with a per-vault data key wrapped by a provider-held master key.  It
 is not a key-management or access-control system.  Both ``KeyProvider``
@@ -90,6 +96,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -146,6 +153,15 @@ class VaultFormatError(VaultCryptoError):
 
 class TamperError(VaultCryptoError):
     """Authenticated envelope content failed validation."""
+
+
+class RollbackError(TamperError):
+    """The envelope is older than, or diverges from, one the caller has seen.
+
+    A ``TamperError`` so every caller that already refuses tampering refuses
+    this too; its own class so a caller can tell "a stale or forked copy was
+    served" from "the bytes were altered".
+    """
 
 
 class WrongMasterKeyError(VaultCryptoError):
@@ -1191,6 +1207,7 @@ def decrypt_vault(
     actor: str,
     purpose: str,
     expected_generation: int | None = None,
+    expected_identity: Mapping[str, Any] | None = None,
 ) -> None:
     """Stream-decrypt an envelope into an atomically replaced plaintext file.
 
@@ -1199,12 +1216,19 @@ def decrypt_vault(
     plaintext staging file is created.  If ``expected_generation`` is
     supplied, an envelope without a generation or with an older generation is
     refused.  Version-1 envelopes created before generation support remain
-    readable when no expected generation is supplied.  Plaintext is limited to
-    2,199,023,255,552 bytes (2 TiB) and 2,147,483,648 chunks per data key.
+    readable when no expected generation is supplied.  If ``expected_identity``
+    (an :func:`envelope_identity` the caller saw earlier) is supplied, an
+    envelope that :func:`compare_envelope_identity` orders ``"older"`` or
+    ``"diverged"`` against it is refused with :class:`RollbackError` before
+    any key is used.  Both refusals are ``RollbackError``, a ``TamperError``.
+    Plaintext is limited to 2,199,023,255,552 bytes (2 TiB) and 2,147,483,648
+    chunks per data key.
     """
     source = Path(src)
     destination = Path(dst)
     _check_paths(source, destination)
+    if expected_identity is not None:
+        expected_identity = validate_envelope_identity(expected_identity)
     _validate_identity(actor, "actor")
     _validate_identity(purpose, "purpose")
     if expected_generation is not None and (
@@ -1228,9 +1252,20 @@ def decrypt_vault(
             if expected_generation is not None and (
                 generation is None or generation < expected_generation
             ):
-                raise TamperError(
+                raise RollbackError(
                     "vault envelope generation is older than the expected generation"
                 )
+            if expected_identity is not None:
+                # Read from the same handle that is decrypted below, so the
+                # identity compared is the identity opened: no window in which
+                # the file can be swapped between the check and the decrypt.
+                verdict = compare_envelope_identity(
+                    expected_identity, _identity_of(header, header_bytes)
+                )
+                if verdict not in (IDENTITY_SAME, IDENTITY_NEWER):
+                    raise RollbackError(
+                        f"vault envelope is {verdict} relative to the expected identity"
+                    )
 
             # The audit is intentionally before provider access and before the
             # first plaintext chunk can be written.  A failed audit aborts the
@@ -1286,6 +1321,98 @@ def key_slots(src: str | os.PathLike[str]) -> list[dict[str, str]]:
             return [{"kind": MASTER_KEY_KIND, "kid": MASTER_KEY_KIND}]
         _, fields = _read_key_block(handle)
     return [{"kind": slot["kind"], "kid": slot["kid"]} for slot in fields["slots"]]
+
+
+# ------------------------------------------------------- rollback identity
+#
+# A holder of an older envelope can serve it in place of the newest one, and
+# every older envelope is still a valid envelope.  The defence is a caller
+# that remembers what it has seen and refuses to go backwards.  What it must
+# remember is not the generation alone: ``rewrap_vault`` keeps the
+# generation, and so does a version-1 conversion (under a fresh data key), so
+# "same generation" does not mean "same content".  The body header does: it
+# carries the ``dek_id`` of the data key the body is encrypted under, and a
+# fresh data key is drawn for every new envelope.  A re-wrap keeps the body
+# header byte-for-byte, so it is the same identity; anything re-encrypted is
+# a different one.
+
+IDENTITY_SAME = "same"
+IDENTITY_NEWER = "newer"
+IDENTITY_OLDER = "older"
+IDENTITY_DIVERGED = "diverged"
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _identity_of(header: dict[str, Any], header_bytes: bytes) -> dict[str, Any]:
+    return {
+        "vault_id": header["vault_id"],
+        "generation": header.get("generation"),
+        "header_sha256": hashlib.sha256(header_bytes).hexdigest(),
+    }
+
+
+def envelope_identity(src: str | os.PathLike[str]) -> dict[str, Any]:
+    """``{vault_id, generation, header_sha256}`` of an envelope, without a key.
+
+    ``header_sha256`` is the hex SHA-256 of the body header bytes (for a
+    version-2 envelope, the same digest the key block binds as
+    ``header_sha256``, in hex rather than base64).  Every chunk's AAD binds
+    those bytes, so the identity is authenticated whenever the body is; read
+    here without a key it is what the file CLAIMS, like :func:`key_slots`.
+    ``generation`` is ``None`` only for a version-1 envelope written before
+    generations existed.
+    """
+    with Path(src).open("rb") as handle:
+        header_bytes = _read_header(handle)
+    return _identity_of(_parse_header_bytes(header_bytes), header_bytes)
+
+
+def validate_envelope_identity(seen: Any) -> dict[str, Any]:
+    """Check the shape of an identity a caller remembered (and may have
+    received from somewhere untrusted); returns a clean copy or raises
+    ``VaultCryptoError``."""
+    if not isinstance(seen, Mapping):
+        raise VaultCryptoError("an expected identity must be a mapping")
+    vault_id = seen.get("vault_id")
+    generation = seen.get("generation")
+    digest = seen.get("header_sha256")
+    if not isinstance(vault_id, str) or not vault_id or len(vault_id) > 512:
+        raise VaultCryptoError("an expected identity needs a vault_id")
+    if (not isinstance(generation, int) or isinstance(generation, bool)
+            or generation < 1 or generation > MAX_GENERATION):
+        raise VaultCryptoError(
+            f"an expected identity needs a generation from 1 to {MAX_GENERATION}"
+        )
+    if not isinstance(digest, str) or not _HEX_DIGEST.match(digest):
+        raise VaultCryptoError("an expected identity needs a 64-character hex header_sha256")
+    return {"vault_id": vault_id, "generation": generation, "header_sha256": digest}
+
+
+def compare_envelope_identity(seen: Mapping[str, Any], current: Mapping[str, Any]) -> str:
+    """Order ``current`` against an identity the caller ``seen`` earlier.
+
+    * ``"same"`` -- identical: the envelope itself, or a re-wrap of it.
+    * ``"newer"`` -- a higher generation of the same vault.
+    * ``"older"`` -- a lower generation, or none at all.
+    * ``"diverged"`` -- a different ``vault_id``, or the SAME generation with
+      a different body header: other content presented as the version seen.
+
+    The generation orders; the digest only decides between equal generations.
+    Accepting ``"diverged"`` would let an older state be re-encrypted up to
+    the generation the caller last saw and pass as it.
+    """
+    seen = validate_envelope_identity(seen)
+    if current.get("vault_id") != seen["vault_id"]:
+        return IDENTITY_DIVERGED
+    generation = current.get("generation")
+    if generation is None or generation < seen["generation"]:
+        return IDENTITY_OLDER
+    if generation > seen["generation"]:
+        return IDENTITY_NEWER
+    digest = current.get("header_sha256")
+    if isinstance(digest, str) and hmac.compare_digest(digest, seen["header_sha256"]):
+        return IDENTITY_SAME
+    return IDENTITY_DIVERGED
 
 
 def verify_vault(

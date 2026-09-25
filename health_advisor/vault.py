@@ -120,12 +120,47 @@ D3_GOVERNED_ORIGINS = frozenset({"backfill", "receiver", "healthkit"})
 
 
 def declare_vault(conn: sqlite3.Connection) -> None:
-    """Mark this database as D3-filtered. `build_vault` calls this; nothing else
-    should. A snapshot that gains this key gets the D3 retention contract."""
+    """Mark this database as D3-filtered. `build_vault` calls this, and so does
+    `declare_empty_vault` once it has confirmed there is nothing to filter;
+    nothing else should. A snapshot that gains this key gets the D3 retention
+    contract."""
     conn.execute(
         "INSERT OR IGNORE INTO vault_meta (key, value) VALUES (?, '1')",
         (VAULT_DECLARATION,),
     )
+
+
+def declare_empty_vault(conn: sqlite3.Connection) -> None:
+    """Declare a vault that has never received a row as D3-filtered.
+
+    `build_vault` earns the declaration by filtering a real snapshot's raw rows
+    through the D3 allowlist as it copies them. A freshly bootstrapped vault
+    (schema initialized, owner stamped, nothing ingested) has nothing to
+    filter, so it satisfies D3 trivially — but only if it is genuinely empty.
+
+    "Empty" is checked against every table `build_vault` copies (`_COPY_ORDER`),
+    not just `records`: a database that already holds, say, `workouts` or
+    `daily_metrics` rows without having gone through `build_vault`'s filter is
+    not empty, and declaring it here would assert a filtering pass that never
+    happened, silently exposing it to `compact()`'s retention DELETE on
+    `records` with none of the protection an honest D3 build provides. This
+    refuses instead.
+
+    Idempotent: calling this again on a vault that is still empty (no row has
+    landed since the first call) is a no-op, same as `declare_vault`'s own
+    `INSERT OR IGNORE`.
+    """
+    populated = [
+        table for table in _COPY_ORDER
+        if db._has_table(conn, table)
+        and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+    ]
+    if populated:
+        raise ValueError(
+            "declare_empty_vault: refusing to declare — not empty, rows "
+            "found in: " + ", ".join(populated)
+        )
+    declare_vault(conn)
 
 
 def is_vault(conn: sqlite3.Connection) -> bool:

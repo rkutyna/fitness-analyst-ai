@@ -121,3 +121,38 @@ def test_a_typed_median_is_labelled_as_typed(conn):
     row = benchmark.series(conn)[0]
     assert row["median_source"] == "typed"
     assert row["median_hr_last_two_min"] == 140
+
+
+# Issue #81: an empty `benchmark` table must never read as "no run ever
+# happened" -- it says only that no stage row is stored, in words, and states
+# a deployment-supplied run count beside it or says that count is unknown.
+
+
+def test_get_benchmark_series_status_names_the_row_count_and_marks_runs_unknown(tools, conn):
+    out = tools.get_benchmark_series()
+    assert out["count"] == 0
+    assert out["status"] == (
+        "`benchmark` holds 0 row(s); how many runs have been recorded is "
+        "UNKNOWN (no external count was supplied -- this is not evidence of "
+        "zero runs).")
+    # The status must never claim zero runs happened.
+    assert "0 run" not in out["status"]
+
+
+def test_get_benchmark_series_status_states_a_supplied_run_count(tools, conn):
+    benchmark.record(conn, date="2026-08-25", stage=1, pace="15:00",
+                     median_hr_last_two_min=140)
+    out = tools.get_benchmark_series(runs_recorded=3)
+    assert out["count"] == 1
+    assert out["status"] == "`benchmark` holds 1 row(s); 3 run(s) recorded."
+
+
+def test_get_benchmark_series_status_is_not_the_bare_count(tools, conn):
+    """Mutation for #81: returning the bare `count` with no `status` string
+    is exactly the defect the issue reports (an empty table reading as
+    'never run'). This must go red against that regression."""
+    out = tools.get_benchmark_series()
+    assert "status" in out, (
+        "get_benchmark_series returned a bare count with no status string -- "
+        "this is issue #81's defect: an empty table now reads as 'never run'"
+    )

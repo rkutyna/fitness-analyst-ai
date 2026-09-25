@@ -161,8 +161,14 @@ _ADDED_COLUMNS = {
     # A claim's authored scope lines, as a JSON array in authored order. No
     # default: rows imported before the column existed read NULL (scope
     # unknown) until the next import, rather than '[]' (states no scope).
+    # section/row_id (consumer #502): which of the three split-register
+    # tables the row belongs to ("rules"/"facts"/"archive"), and its
+    # permanent R<n> identity. No default: pre-existing rows read NULL
+    # (unknown) until the next import, not a guessed section or id.
     "claims_register": {
         "does_not_license": "TEXT",
+        "section": "TEXT",
+        "row_id": "TEXT",
     },
 }
 

@@ -2689,7 +2689,7 @@ def record_benchmark(ctx: VaultContext, date: str, stage: int, pace: str,
 
 
 @tool
-def get_benchmark_series(ctx: VaultContext) -> dict:
+def get_benchmark_series(ctx: VaultContext, *, runs_recorded: int | None = None) -> dict:
     """Every benchmark stage ever recorded, in date/stage order.
 
     This is the instrument to reach for because uncontrolled weekly wearable
@@ -2705,6 +2705,15 @@ def get_benchmark_series(ctx: VaultContext) -> dict:
     Compare stages ACROSS dates, never stages within one date — the four paces
     are four different efforts. Read `median_source` before comparing: a
     "records:protocol" median came from an inferred window.
+
+    The engine keeps no register of benchmark runs — only this vault's stage
+    rows. So an empty `stages` list here says only "no completed stage rows",
+    never "no run ever happened": a run can be underway, or recorded elsewhere
+    and not yet re-imported. `status` states the row count in words and, when
+    a deployment passes `runs_recorded` (its own register's count — this tool
+    never computes one), states that count beside it. With no `runs_recorded`
+    supplied, `status` says the run count is UNKNOWN rather than implying
+    zero: silence about the register is not evidence the register is empty.
     """
     metric_units = ctx.settings()["unit_system"] == "metric"
     conn = ctx.read_only()
@@ -2712,7 +2721,14 @@ def get_benchmark_series(ctx: VaultContext) -> dict:
         rows = benchmark.series(conn, metric_units=metric_units)
     finally:
         conn.close()
-    return {"stages": rows, "count": len(rows),
+    count = len(rows)
+    if runs_recorded is None:
+        status = (f"`benchmark` holds {count} row(s); how many runs have "
+                  "been recorded is UNKNOWN (no external count was supplied "
+                  "-- this is not evidence of zero runs).")
+    else:
+        status = f"`benchmark` holds {count} row(s); {runs_recorded} run(s) recorded."
+    return {"stages": rows, "count": count, "status": status,
             "dates": sorted({r["date"] for r in rows}),
             "heat_effect_bpm_per_c": _literature_figure(
                 "heat_effect_bpm_per_c")}

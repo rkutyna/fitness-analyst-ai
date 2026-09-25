@@ -1298,6 +1298,11 @@ CREATE TABLE IF NOT EXISTS deepdive_traces (
 -- '[]' when the row states none. NULL means the row was imported before the
 -- column existed, so its scope is unknown rather than empty. Existing vaults
 -- gain it through db._ADDED_COLUMNS.
+-- section/row_id (consumer #502): the split register's table
+-- ("rules"/"facts"/"archive") and the row's permanent R<n> identity, frozen
+-- at the split and never reused. NULL means the row predates these columns
+-- (unknown until the next import), not "unsplit". Existing vaults gain them
+-- through db._ADDED_COLUMNS.
 CREATE TABLE IF NOT EXISTS claims_register (
     ordinal       INTEGER PRIMARY KEY CHECK (ordinal > 0),
     claim         TEXT NOT NULL,
@@ -1312,7 +1317,9 @@ CREATE TABLE IF NOT EXISTS claims_register (
     source_mtime  TEXT,
     skipped_rows  INTEGER NOT NULL DEFAULT 0 CHECK (skipped_rows >= 0),
     imported_at   TEXT NOT NULL,
-    does_not_license TEXT
+    does_not_license TEXT,
+    section       TEXT,
+    row_id        TEXT
 );
 
 -- The cross-review coaching agenda: items carried from one weekly review to the

@@ -178,10 +178,56 @@ def test_existing_claims_register_gains_scope_column_without_inventing_scope(tmp
         conn.commit()
         db.init_db(conn)
         db.init_db(conn)
-        assert _columns(conn, "claims_register")[-1] == "does_not_license"
+        assert "does_not_license" in _columns(conn, "claims_register")
         assert _columns(conn, "claims_register").count("does_not_license") == 1
         assert conn.execute(
             "SELECT does_not_license FROM claims_register WHERE ordinal = 1"
         ).fetchone()[0] is None
+    finally:
+        conn.close()
+
+
+def test_fresh_vault_claims_register_carries_section_and_row_id(tmp_path):
+    """Consumer #502: the split register's section and permanent row id.
+
+    Mutation: drop either key from db.py's `_ADDED_COLUMNS["claims_register"]`
+    (or from the schema.sql declaration) and this goes red.
+    """
+    conn = sqlite3.connect(tmp_path / "vault.db")
+    try:
+        db.init_db(conn)
+        columns = _columns(conn, "claims_register")
+        assert "section" in columns
+        assert "row_id" in columns
+    finally:
+        conn.close()
+
+
+def test_existing_claims_register_gains_section_and_row_id_without_inventing_them(tmp_path):
+    """A register imported before these columns existed gains them on init_db.
+
+    Its existing row reads NULL for both -- section/id unknown until the next
+    import -- never a guessed value. Running init_db again is a no-op.
+    """
+    conn = sqlite3.connect(tmp_path / "vault.db")
+    try:
+        conn.execute(_CLAIMS_REGISTER_BEFORE_SCOPE)
+        conn.execute(
+            "INSERT INTO claims_register (ordinal, claim, asserted_in, "
+            "encoded_in, evidence_type, last_verified, status, status_class, "
+            "recheck, source, imported_at) VALUES (1, 'c', 'a', 'e', 't', "
+            "'2026-09-20', 'holds', 'holds', 'r', 'CLAIMS.md', "
+            "'2026-09-20T00:00:00Z')")
+        conn.commit()
+        db.init_db(conn)
+        db.init_db(conn)
+        columns = _columns(conn, "claims_register")
+        assert columns.count("section") == 1
+        assert columns.count("row_id") == 1
+        row = conn.execute(
+            "SELECT section, row_id FROM claims_register WHERE ordinal = 1"
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
     finally:
         conn.close()

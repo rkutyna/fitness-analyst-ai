@@ -11,6 +11,7 @@ deliberate re-derivation migration.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -537,6 +538,90 @@ def compaction_status(conn: sqlite3.Connection) -> dict[str, Any]:
 
 COMPACTION_CHUNK = 10_000
 
+# D1 (consumer #37, 2026-09-25): the raw window is 30 days, measured back from
+# the last sync, until the HealthKit-direct deletion lag has been measured. It
+# must clear three things, all relative to the last sync: the receiver's D19
+# re-pull window (`receiver.DAILY_TOTAL_REPULL_WINDOW_DAYS`, 15 -- inside it a
+# compacted day would be re-pulled every day), late arrival (11.3 days maximum,
+# HAE era), and the deletion lag (unmeasured; `hk_deletions.sample_local_date`
+# measures it). Tighten only from measured data.
+COMPACTION_WINDOW_DAYS = 30
+# The floor the code itself imposes: one day past the re-pull window. The
+# receiver's value is environment-tunable, so `run_compaction` also refuses a
+# window at or under the live value; this is the default-configuration floor.
+COMPACTION_MIN_WINDOW_DAYS = 16
+
+
+def compacted_sample_key(hk_uuid: str) -> int:
+    """64-bit key under which ``compacted_samples`` remembers one HealthKit UUID.
+
+    BLAKE2b rather than a slice of the UUID: a v4 UUID carries fixed version
+    bits, and nothing guarantees every writer's UUIDs are v4 at all.
+    """
+    digest = hashlib.blake2b(hk_uuid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def _unix_day(local_date: str) -> int:
+    return (date.fromisoformat(local_date[:10]) - date(1970, 1, 1)).days
+
+
+def _compacted_metric_id(conn: sqlite3.Connection, metric: str,
+                         cache: dict[str, int]) -> int:
+    if metric not in cache:
+        conn.execute(
+            "INSERT OR IGNORE INTO compacted_sample_metrics (metric) VALUES (?)",
+            (metric,))
+        cache[metric] = conn.execute(
+            "SELECT id FROM compacted_sample_metrics WHERE metric = ?",
+            (metric,)).fetchone()[0]
+    return cache[metric]
+
+
+def compacted_sample(conn: sqlite3.Connection,
+                     hk_uuid: str) -> dict[str, str] | None:
+    """The day and metric of a HealthKit sample that compaction removed.
+
+    None when this vault never compacted a sample with that UUID -- which is
+    also the answer for a UUID it never held at all. The receiver uses this to
+    date a deletion whose `records` row is already gone (engine #28).
+    """
+    if not db._has_table(conn, "compacted_samples"):
+        return None
+    row = conn.execute(
+        "SELECT s.local_day, m.metric FROM compacted_samples s "
+        "JOIN compacted_sample_metrics m ON m.id = s.metric_id "
+        "WHERE s.uuid_key = ?",
+        (compacted_sample_key(hk_uuid),)).fetchone()
+    if row is None:
+        return None
+    day = (date(1970, 1, 1) + timedelta(days=row[0])).isoformat()
+    return {"local_date": day, "metric": row[1]}
+
+
+def frozen_through(conn: sqlite3.Connection) -> str | None:
+    """The watermark behind which non-allowlisted daily rows are FROZEN.
+
+    D3 (consumer #37, 2026-09-25): once `compact()` has removed a
+    non-allowlisted series' raw rows for a day, that day's `daily_metrics` row
+    is a copy the engine can no longer rebuild. Nothing may delete or rewrite
+    it from `records` -- `_recompute_core` and `rebuild_metric_source_months`
+    skip such pairs and log them. None on anything that is not a declared,
+    compacted vault, where nothing is frozen.
+    """
+    if not is_vault(conn):
+        return None
+    try:
+        return compacted_through(conn)
+    except sqlite3.Error:
+        return None
+
+
+def is_frozen(metric: str, day: str, through: str | None) -> bool:
+    """Whether (metric, day) is a frozen pair under watermark ``through``."""
+    return (through is not None and metric not in VAULT_RAW_SERIES
+            and day[:10] <= through)
+
 
 def compact(conn: sqlite3.Connection, *, through: str) -> dict[str, int]:
     """Delete transient raw rows through ``through`` and advance the watermark.
@@ -544,6 +629,13 @@ def compact(conn: sqlite3.Connection, *, through: str) -> dict[str, int]:
     Rows are deleted in short transactions because the database uses SQLite's
     DELETE journal mode. A repeated or older compaction is a logged no-op; the
     watermark is monotonic and only moves after all selected rows are gone.
+
+    Each deleted row that carries a HealthKit UUID is remembered in
+    ``compacted_samples`` (day and metric only) in the same transaction as its
+    DELETE, so a later HealthKit deletion of it can still be dated.
+
+    This frees no disk space by itself: the pages go to SQLite's freelist.
+    `run_compaction` is the driver, and it VACUUMs (D4).
     """
     if not is_vault(conn):
         raise ValueError("compaction requires a declared vault")
@@ -556,18 +648,38 @@ def compact(conn: sqlite3.Connection, *, through: str) -> dict[str, int]:
         )
         return {}
 
+    if not db._has_table(conn, "compacted_samples"):
+        # A vault migrated before engine #28 lacks the table; schema.sql is
+        # the one declaration of it, so migrate rather than repeat the DDL.
+        db.init_db(conn)
+        conn.commit()
+
     placeholders = ",".join("?" * len(VAULT_RAW_SERIES))
     params = (*sorted(VAULT_RAW_SERIES), through)
     deleted: dict[str, int] = {}
+    metric_ids: dict[str, int] = {}
+    remembered_total = 0
     while True:
         rows = conn.execute(
-            "SELECT id, metric FROM records "
+            "SELECT id, metric, local_date, hk_uuid FROM records "
             f"WHERE metric NOT IN ({placeholders}) AND local_date <= ? "
             "ORDER BY id LIMIT ?",
             (*params, COMPACTION_CHUNK),
         ).fetchall()
         if not rows:
             break
+        remembered = [
+            (compacted_sample_key(row["hk_uuid"]),
+             _unix_day(row["local_date"]),
+             _compacted_metric_id(conn, row["metric"], metric_ids))
+            for row in rows if row["hk_uuid"]
+        ]
+        if remembered:
+            conn.executemany(
+                "INSERT OR REPLACE INTO compacted_samples "
+                "(uuid_key, local_day, metric_id) VALUES (?, ?, ?)",
+                remembered)
+            remembered_total += len(remembered)
         conn.executemany("DELETE FROM records WHERE id = ?",
                          [(row["id"],) for row in rows])
         for row in rows:
@@ -584,10 +696,121 @@ def compact(conn: sqlite3.Connection, *, through: str) -> dict[str, int]:
     detail = "through=" + through + " " + (
         " ".join(f"{metric}={n}" for metric, n in sorted(deleted.items()))
         if deleted else "deleted=none"
-    )
+    ) + f" remembered_uuids={remembered_total}"
     db.log_ingest(conn, "vault", "compact", total, total, detail)
     conn.commit()
     return deleted
+
+
+def last_sync_date(conn: sqlite3.Connection, *,
+                   today: str | None = None) -> str | None:
+    """The latest local date a device-origin raw row describes, capped at today.
+
+    D1 measures the compaction window from the LAST SYNC, not from today, so a
+    user who stops syncing for a fortnight does not have the unsynced days'
+    late samples compacted out from under them. Future-dated samples (a skewed
+    clock) are capped at ``today`` so they cannot drag the watermark forward.
+    """
+    origins = sorted(D3_GOVERNED_ORIGINS)
+    row = conn.execute(
+        "SELECT MAX(local_date) FROM records WHERE origin IN ("
+        + ",".join("?" * len(origins)) + ")",
+        origins).fetchone()
+    latest = row[0] if row else None
+    if latest is None:
+        return None
+    cap = today or date.today().isoformat()
+    return min(latest[:10], cap)
+
+
+def run_compaction(
+    db_path: str | Path,
+    *,
+    window_days: int = COMPACTION_WINDOW_DAYS,
+    through: str | None = None,
+    vacuum: bool = True,
+    dry_run: bool = False,
+    today: str | None = None,
+    repull_window_days: int | None = None,
+) -> dict[str, Any]:
+    """The compaction job: compact to (last sync - window), then VACUUM.
+
+    D4 (consumer #37): VACUUM runs with every compaction. Without it compaction
+    returns no bytes to the disk at all -- the pages go to SQLite's freelist
+    and are reused, which caps growth but never shrinks the file.
+    `auto_vacuum=INCREMENTAL` was rejected for its per-transaction cost.
+
+    ``through`` overrides the computed watermark (for a measured test); the
+    window is still checked against the re-pull floor. ``dry_run`` reports what
+    would be deleted without writing. VACUUM needs exclusive access, so the
+    caller holds the vault's write lease around this call.
+    """
+    floor = max(COMPACTION_MIN_WINDOW_DAYS, (repull_window_days or 0) + 1)
+    path = Path(db_path)
+    started = time.monotonic()
+    conn = db.connect(path, read_only=dry_run)
+    try:
+        if not dry_run:
+            db.init_db(conn)
+            conn.commit()
+        if not is_vault(conn):
+            raise ValueError("compaction requires a declared vault")
+        synced = last_sync_date(conn, today=today)
+        if through is None:
+            if window_days < floor:
+                raise ValueError(
+                    f"compaction window {window_days} days is under the floor of "
+                    f"{floor}: the D19 re-pull window would re-pull compacted days "
+                    "every day (engine #28)")
+            if synced is None:
+                return {"status": "no_raw_rows", "compacted_through": None,
+                        "deleted": {}, "vacuumed": False}
+            through = (date.fromisoformat(synced)
+                       - timedelta(days=window_days)).isoformat()
+        elif synced is not None:
+            lag = (date.fromisoformat(synced) - date.fromisoformat(through)).days
+            if lag < floor:
+                raise ValueError(
+                    f"through={through} leaves {lag} days behind the last sync "
+                    f"({synced}); the floor is {floor} (engine #28)")
+        before = compaction_status(conn)
+        report: dict[str, Any] = {
+            "last_sync": synced, "window_days": window_days,
+            "through": through, "previous": before["compacted_through"],
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            placeholders = ",".join("?" * len(VAULT_RAW_SERIES))
+            report["would_delete"] = conn.execute(
+                "SELECT COUNT(*) FROM records "
+                f"WHERE metric NOT IN ({placeholders}) AND local_date <= ?",
+                (*sorted(VAULT_RAW_SERIES), through)).fetchone()[0]
+            report["status"] = "dry_run"
+            return report
+        bytes_before = path.stat().st_size
+        t = time.monotonic()
+        deleted = compact(conn, through=through)
+        report["deleted"] = deleted
+        report["deleted_total"] = sum(deleted.values())
+        report["compact_seconds"] = round(time.monotonic() - t, 1)
+        report["vacuumed"] = False
+        if vacuum:
+            conn.commit()
+            t = time.monotonic()
+            conn.execute("VACUUM")
+            report["vacuumed"] = True
+            report["vacuum_seconds"] = round(time.monotonic() - t, 1)
+            db.log_ingest(conn, "vault", "vacuum", 0, 0,
+                          f"after compact through={through} "
+                          f"seconds={report['vacuum_seconds']}")
+            conn.commit()
+        report["bytes_before"] = bytes_before
+        report["bytes_after"] = path.stat().st_size
+        report["status"] = compaction_status(conn)["status"]
+        report["seconds"] = round(time.monotonic() - started, 1)
+        return report
+    finally:
+        conn.close()
 
 
 def raw_series_available(metric: str) -> bool:

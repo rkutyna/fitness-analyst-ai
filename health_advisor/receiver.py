@@ -238,6 +238,10 @@ INGEST_CHUNK = int(os.environ.get("HA_INGEST_CHUNK", "10000"))
 DAILY_TOTAL_REPULL_WINDOW_DAYS = int(
     os.environ.get("HA_DAILY_TOTAL_REPULL_WINDOW_DAYS", "15"))
 
+# ingest_diagnostics reason, 409 body reason, and trace name for a point dated
+# behind the compaction watermark (engine #28, D2).
+COMPACTED_REFUSAL = "behind_compaction_watermark"
+
 # Largest request body we will read. Derived from the unit's MemoryMax=2G, not
 # picked round: the raw bytes, the decoded JSON and the built record dicts are
 # all resident at once, roughly 8-10x the body, so ~256 MiB is about the most
@@ -824,6 +828,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     deleted = 0
     tombstones_added = 0
     moved = 0
+    # Engine #28 / D2: what this batch carried for days behind the compaction
+    # watermark. Those points are refused -- the batch answers 409 -- while the
+    # rest of the batch is applied and committed.
+    compacted_through = None
+    refused_samples: list[dict] = []
+    refused_deletions: list[dict] = []
     # Sub-workouts refused as contained in a same-source session (#150).
     workout_fragments: list[str] = []
     dm = 0
@@ -971,6 +981,19 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     continue
                 writable_totals.append(row)
 
+            # D2 (consumer #37, engine #28): behind the compaction watermark a
+            # non-allowlisted day is FROZEN -- its raw rows are gone, its
+            # daily row is a copy nothing can rebuild. A late sample for such
+            # a day used to reach db.insert_records' D13 ValueError and fail
+            # the whole batch with a 500, on every retry, so unrelated samples
+            # in it never landed. It is now refused here, point by point,
+            # before any write; the rest of the batch applies, and the answer
+            # is a 409 naming what was refused. A deletion of a compacted
+            # sample is treated the same way (D2 rules out treating them
+            # differently): its tombstone is written, dated from
+            # compacted_samples, and the frozen daily row is left as it is.
+            compacted_through = vault.frozen_through(conn)
+
             # A tombstone is durable before the add filter is evaluated. A
             # deletion for an unknown UUID therefore still protects against a
             # later stale add, while replaying the deletion does no work.
@@ -1001,6 +1024,19 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 # so the value is deterministic rather than whichever row
                 # SQLite returned first.
                 oldest = min(rows, key=lambda r: r["local_date"]) if rows else None
+                if not rows and compacted_through is not None:
+                    # The row may be gone because compaction removed it, not
+                    # because this vault never held it. compact() remembered
+                    # the sample's day and metric for exactly this moment.
+                    gone = vault.compacted_sample(conn, uuid)
+                    if gone is not None and vault.is_frozen(
+                            gone["metric"], gone["local_date"], compacted_through):
+                        oldest = gone
+                        refused_deletions.append({
+                            "hk_uuid": uuid, "type_identifier": dtype,
+                            "metric": gone["metric"],
+                            "local_date": gone["local_date"],
+                        })
                 cur = conn.execute(
                     "DELETE FROM records WHERE hk_uuid = ? "
                     "AND hk_type_identifier = ? AND hk_device_id = ?",
@@ -1046,6 +1082,32 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                         "reason": "dedupe",
                         "detail": "sample matched a durable deletion tombstone",
                     })
+                    continue
+                if (compacted_through is not None
+                        and row.get("origin") in vault.D3_GOVERNED_ORIGINS
+                        and vault.is_frozen(row["metric"], row["local_date"],
+                                            compacted_through)):
+                    diagnostic_rows.append({
+                        "batch_id": parsed["batch_id"],
+                        "point_kind": "sample",
+                        "point_index": row["_point_index"],
+                        "metric": row["metric"],
+                        "type_identifier": row["hk_type_identifier"],
+                        "local_date": row["local_date"],
+                        "source": row["source"],
+                        "device_id": row["hk_device_id"],
+                        "hk_uuid": row["hk_uuid"],
+                        "unit": row["unit"],
+                        "reason": COMPACTED_REFUSAL,
+                        "detail": (
+                            f"sample dated on or before compacted_through="
+                            f"{compacted_through} for a series whose raw rows "
+                            "compaction removed; its daily row is frozen, so "
+                            "the sample was refused and the rest of the batch "
+                            "applied (engine #28)"
+                        ),
+                    })
+                    refused_samples.append(row)
                     continue
                 accepted.append(row)
                 affected.add((row["metric"], row["local_date"]))
@@ -1205,6 +1267,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                    if parsed["workout_elevation_present"] else "")
                 + route_detail
                 + f"history_imported_through={history or '-'} "
+                + (f"compacted_through={compacted_through} "
+                   f"compacted_refused_samples={len(refused_samples)} "
+                   f"compacted_refused_deletions={len(refused_deletions)} "
+                   if refused_samples or refused_deletions else "")
                 + f"batch_sequence={parsed['batch_sequence']}"
             )
             conn.execute(
@@ -1287,7 +1353,11 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 f"daily_totals_skipped_settled={daily_totals_skipped_settled} "
                 f"daily_pairs={dm} derived={derived} "
                 f"history_imported_through={history or '-'} "
-                f"unhandled={len(parsed['unhandled'])} "
+                + (f"compacted_through={compacted_through} "
+                   f"compacted_refused_samples={len(refused_samples)} "
+                   f"compacted_refused_deletions={len(refused_deletions)} "
+                   if refused_samples or refused_deletions else "")
+                + f"unhandled={len(parsed['unhandled'])} "
                 f"batch_sequence={parsed['batch_sequence']}",
             )
         except Exception:                      # noqa: BLE001 - never fail a durable ingest
@@ -1343,7 +1413,56 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             "routes_empty": routes_empty,
             "routes_deleted": routes_deleted,
         })
+    if refused_samples or refused_deletions:
+        return _compacted_refusal(response, compacted_through,
+                                  refused_samples, refused_deletions)
     return JSONResponse(response)
+
+
+def _compacted_refusal(response: dict, through: str, samples: list[dict],
+                       deletions: list[dict]) -> JSONResponse:
+    """The D2 answer: 409, with the rest of the batch already committed.
+
+    The body is the ordinary success response (``applied: true``) plus a
+    machine-readable ``refusal`` block and a ``detail`` string with a stable
+    prefix, ``compacted through YYYY-MM-DD``, which a client matches the way it
+    matches the history watermark's. The batch's commit key is recorded, so a
+    retry of the same batch is answered ``already_applied`` (200), and its
+    anchors have advanced: nothing here is transient, and re-offering the
+    refused points can never succeed. Refused points are also listed in
+    ingest_diagnostics (reason ``behind_compaction_watermark``).
+    """
+    days = sorted({row["local_date"] for row in samples}
+                  | {row["local_date"] for row in deletions})
+    metrics = sorted({row["metric"] for row in samples}
+                     | {row["metric"] for row in deletions})
+    detail = (
+        f"compacted through {through}; refused {len(samples)} sample(s) and "
+        f"{len(deletions)} deletion(s) dated on or before it for series whose "
+        "raw rows were compacted (their daily rows are frozen); the rest of "
+        "the batch was applied"
+    )
+    _trace("reject-409-compacted", watermark=through,
+           samples=len(samples), deletions=len(deletions),
+           batch_id=response.get("batch_id"),
+           date_min=days[0] if days else None,
+           date_max=days[-1] if days else None)
+    body = {
+        **response,
+        "detail": detail,
+        "reason": COMPACTED_REFUSAL,
+        "refusal": {
+            "reason": COMPACTED_REFUSAL,
+            "compacted_through": through,
+            "samples_refused": len(samples),
+            "deletions_refused": len(deletions),
+            "metrics": metrics,
+            "date_min": days[0] if days else None,
+            "date_max": days[-1] if days else None,
+            "retryable": False,
+        },
+    }
+    return JSONResponse(body, status_code=409)
 
 
 def _require_ingest_secret(x_health_secret: str | None, *, request: Request | None = None) -> None:

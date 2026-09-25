@@ -1780,6 +1780,14 @@ def rebuild_metric_source_months(
     Returns the number of rows written.
     """
     outer = conn.in_transaction
+    from . import vault
+    through = vault.frozen_through(conn)
+    if through is not None:
+        written = _rebuild_source_months_frozen(conn, through, pairs=pairs,
+                                                full=full)
+        if not outer:
+            conn.commit()
+        return written
     if full:
         conn.execute("DELETE FROM metric_source_months")
         conn.execute(
@@ -1818,6 +1826,84 @@ def rebuild_metric_source_months(
     return written
 
 
+def _rebuild_source_months_frozen(
+    conn: sqlite3.Connection,
+    through: str,
+    *,
+    pairs: Sequence[tuple[str, str]] | None,
+    full: bool,
+) -> int:
+    """`rebuild_metric_source_months` on a compacted vault (engine #28).
+
+    A (non-allowlisted metric, month) on or before the watermark's month has
+    lost some or all of its raw rows, so a recount from `records` would
+    shrink or erase provenance the engine cannot rebuild -- a full recompute
+    turned `instrument_eras_status` from `ok` into `raw_series_not_in_vault`,
+    an answer about the vault that compaction made false. Those months are
+    FROZEN: never deleted, and merged rather than recounted -- n becomes
+    MAX(stored, recount), and a source seen for the first time is added.
+
+    The watermark's own month is only partly compacted. There MAX is a lower
+    bound: samples that arrive for its post-watermark days after the month
+    froze are not added to the frozen count. It never loses a source and
+    never lowers a count, which is the failure this exists to stop. Every
+    other month -- and every allowlisted metric -- is recounted exactly as
+    on an uncompacted vault.
+    """
+    from . import vault
+    cutoff = through[:7]
+    allow = sorted(vault.VAULT_RAW_SERIES)
+    ph = ",".join("?" * len(allow))
+    frozen_sql = f"(metric NOT IN ({ph}) AND month <= ?)"
+    if full:
+        frozen_months = conn.execute(
+            "SELECT COUNT(DISTINCT metric || '|' || month) FROM "
+            f"metric_source_months WHERE {frozen_sql}", (*allow, cutoff)
+        ).fetchone()[0]
+        conn.execute(f"DELETE FROM metric_source_months WHERE NOT {frozen_sql}",
+                     (*allow, cutoff))
+        conn.execute(
+            "INSERT INTO metric_source_months (metric, month, source, n) "
+            "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
+            "FROM records WHERE 1 GROUP BY metric, substr(local_date, 1, 7), source "
+            "ON CONFLICT(metric, month, source) DO UPDATE SET "
+            "n = MAX(metric_source_months.n, excluded.n)")
+        log_ingest(conn, "recompute", "frozen", frozen_months, 0,
+                   f"caller=rebuild_metric_source_months(full) "
+                   f"compacted_through={through} merged={frozen_months} frozen "
+                   "(metric, month) pair(s); counts kept, not recounted")
+        return conn.execute(
+            "SELECT COUNT(*) FROM metric_source_months").fetchone()[0]
+
+    if not pairs:
+        return 0
+    written = 0
+    merged = 0
+    for metric, month in sorted({(metric, day[:7]) for metric, day in pairs}):
+        frozen = metric not in vault.VAULT_RAW_SERIES and month <= cutoff
+        if frozen:
+            merged += 1
+        else:
+            conn.execute(
+                "DELETE FROM metric_source_months WHERE metric = ? AND month = ?",
+                (metric, month))
+        cur = conn.execute(
+            "INSERT INTO metric_source_months (metric, month, source, n) "
+            "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
+            "FROM records WHERE metric = ? AND substr(local_date, 1, 7) = ? "
+            "GROUP BY metric, substr(local_date, 1, 7), source "
+            "ON CONFLICT(metric, month, source) DO UPDATE SET "
+            "n = MAX(metric_source_months.n, excluded.n)",
+            (metric, month))
+        written += cur.rowcount if cur.rowcount > 0 else 0
+    if merged:
+        log_ingest(conn, "recompute", "frozen", merged, 0,
+                   f"caller=rebuild_metric_source_months "
+                   f"compacted_through={through} merged={merged} frozen "
+                   "(metric, month) pair(s); counts kept, not recounted")
+    return written
+
+
 def record_backed_series(conn: sqlite3.Connection) -> list[str]:
     """Metrics that actually have sample-level rows in THIS database.
 
@@ -1828,6 +1914,58 @@ def record_backed_series(conn: sqlite3.Connection) -> list[str]:
     """
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT metric FROM records ORDER BY metric")]
+
+
+def _without_frozen_pairs(
+    conn: sqlite3.Connection,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    source_table: str = "records",
+    caller: str,
+) -> list[tuple[str, str]]:
+    """Drop FROZEN pairs from a recompute, and log how many were skipped.
+
+    D3 (consumer #37, engine #28): behind a compaction watermark a
+    non-allowlisted series has no raw rows left, so re-aggregating one of its
+    days finds `count == 0` and deletes a row the engine can never rebuild --
+    an ordinary incremental rebuild on a compacted vault deleted 48% of
+    `daily_metrics` that way, and a D19 re-pull stripped a row to its `sum`.
+    Such a row is a frozen copy: it is skipped, never deleted or rewritten.
+
+    One exception, because it is not a copy of anything: a pair that holds a
+    raw row of an origin D3 does not govern (a check-in mirrored into
+    `records`, typed behind the watermark) is rebuilt from those rows, since
+    those rows are where the value originates.
+    """
+    from . import vault
+    through = vault.frozen_through(conn)
+    if through is None:
+        return list(pairs)
+    governed = sorted(vault.D3_GOVERNED_ORIGINS)
+    has_origin = any(r[1] == "origin" for r in conn.execute(
+        f"PRAGMA table_info({source_table})"))
+    keep: list[tuple[str, str]] = []
+    frozen: list[tuple[str, str]] = []
+    for metric, day in pairs:
+        if vault.is_frozen(metric, day, through):
+            own = None if not has_origin else conn.execute(
+                f"SELECT 1 FROM {source_table} WHERE metric = ? AND local_date = ? "
+                "AND origin IS NOT NULL AND origin NOT IN ("
+                + ",".join("?" * len(governed)) + ") LIMIT 1",
+                (metric, day, *governed)).fetchone()
+            if own is None:
+                frozen.append((metric, day))
+                continue
+        keep.append((metric, day))
+    if frozen:
+        frozen = sorted(set(frozen))
+        log_ingest(
+            conn, "recompute", "frozen", len(frozen), 0,
+            f"caller={caller} compacted_through={through} "
+            f"skipped={len(frozen)} frozen pair(s), not re-derivable: "
+            + ", ".join(f"{m}@{d}" for m, d in frozen[:8])
+            + (", ..." if len(frozen) > 8 else ""))
+    return keep
 
 
 def recompute_daily_metrics(
@@ -1991,6 +2129,8 @@ def _recompute_core(
 
     written = 0
     source = _source_table(source_table)
+    pairs = _without_frozen_pairs(conn, pairs, source_table=source,
+                                  caller="recompute_daily_metrics")
     for metric, date in set(pairs):
         clause, extra = _arbitration(conn, metric, date,
                                      source_table=source_table)

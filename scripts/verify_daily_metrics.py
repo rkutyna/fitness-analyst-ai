@@ -293,6 +293,37 @@ def diffs(conn, minmax_from: str | None = None) -> list[dict]:
     return out
 
 
+def split_frozen(conn, rows: list[dict]) -> tuple[list[dict], list[dict], str | None]:
+    """Take FROZEN rows out before classification (engine #28, consumer #37).
+
+    Behind a compaction watermark a non-allowlisted series has no raw rows, so
+    its stored daily row has nothing to be rebuilt from and the rebuild side of
+    the diff is simply absent. That is not a verified row and it is not a D3
+    "legitimate" divergence either: on the first compacted clone this script
+    counted all 31,768 such rows as category one and exited 0, which is a green
+    instrument measuring nothing. They are reported as their own category,
+    "frozen, not re-derivable", and never folded into category one.
+
+    Only rows whose rebuild is ABSENT are frozen. A frozen pair that still has
+    raw rows (a check-in typed behind the watermark, which the engine rebuilds
+    from those rows) is compared like any other.
+
+    Returns (frozen, rest, compacted_through).
+    """
+    through = vault.frozen_through(conn)
+    if through is None:
+        return [], rows, None
+    frozen: list[dict] = []
+    rest: list[dict] = []
+    for row in rows:
+        if (vault.is_frozen(row["metric"], row["date"], through)
+                and row.get("r_count") is None):
+            frozen.append(row)
+        else:
+            rest.append(row)
+    return frozen, rest, through
+
+
 def classify_diffs(conn, rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split raw aggregate divergences into legitimate and genuine rows.
 
@@ -640,7 +671,12 @@ def main() -> int:
           + ("" if args.derived_days == 0 else f" — pass --derived-days 0 for all "
                                               f"{len(source_days):,}"))
 
-    legitimate, genuine = classify_diffs(conn, bad)
+    frozen, bad_unfrozen, compacted = split_frozen(conn, bad)
+    legitimate, genuine = classify_diffs(conn, bad_unfrozen)
+    if compacted is not None:
+        print(f"frozen, not re-derivable (compacted through {compacted}): "
+              f"{len(frozen)} -- NOT verified and NOT legitimate: these rows "
+              "have no raw rows left to rebuild them from")
     print(f"category one (legitimate): {len(legitimate)}")
     print(f"category two (genuine): {len(genuine)}")
 
@@ -694,9 +730,17 @@ def main() -> int:
                   "repair unless you know the phone was on.")
 
     if not genuine and not bad_derived and not fatal_consolidated:
+        if frozen:
+            print(f"NOTE — {len(frozen)} frozen row(s) on or before "
+                  f"compacted_through={compacted} were not verified; they "
+                  "cannot be re-derived from this vault.")
         if legitimate:
             print("OK — no category-two discrepancies; D3-filtered divergences "
                   "are legitimate, and derived metrics match a fresh re-derive.")
+        elif frozen:
+            print("OK — every re-derivable row matches a rebuild from records "
+                  "(frozen rows excluded, see NOTE), and the derived metrics "
+                  "match a fresh re-derive.")
         else:
             print("OK — daily_metrics matches a full rebuild from records, and the "
                   "derived metrics match a fresh re-derive.")

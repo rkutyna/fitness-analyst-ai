@@ -344,9 +344,41 @@ CREATE TABLE IF NOT EXISTS hk_deletions (
     -- for a deletion whose sample this vault never held -- a tombstone is
     -- written before the add filter runs, so an unknown UUID still gets one --
     -- and those rows are outside the measurement rather than zeroes in it.
+    -- A deletion of a sample `vault.compact()` already removed is dated from
+    -- `compacted_samples` below instead (engine #28).
     sample_local_date TEXT,
     sample_metric     TEXT,
     PRIMARY KEY (device_id, type_identifier, hk_uuid)
+);
+
+-- ---------------------------------------------------------------------------
+-- compacted_samples: what `vault.compact()` must remember about a HealthKit
+-- sample whose raw row it deletes, so that a later deletion of that sample can
+-- still be dated (engine #28). A HealthKit deletion carries only the UUID and
+-- the type; once the row is compacted nothing else holds the sample's day or
+-- metric, and `hk_deletions.sample_local_date` -- the deletion-lag instrument
+-- the compaction window is set from -- would go blind to exactly the late
+-- deletions it exists to measure.
+--
+-- Sized for the tail it covers: measured ~17-19 bytes a row after VACUUM,
+-- against a full raw row of ~340. `uuid_key` is a 64-bit BLAKE2b digest of the
+-- UUID (`vault.compacted_sample_key`), not the UUID: the text form costs more
+-- than twice as much. A collision would date one tombstone wrongly; at 64 bits
+-- the per-lookup odds are about 1e-10 with 1e9 samples stored. `local_day` is
+-- days since 1970-01-01. The metric is an id into compacted_sample_metrics,
+-- because a type identifier is ambiguous for sleep stages and a metric name on
+-- every row would double the table. Only rows with an hk_uuid are remembered:
+-- nothing without one can be the subject of a HealthKit deletion.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS compacted_sample_metrics (
+    id     INTEGER PRIMARY KEY,
+    metric TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS compacted_samples (
+    uuid_key  INTEGER PRIMARY KEY,
+    local_day INTEGER NOT NULL,
+    metric_id INTEGER NOT NULL
 );
 
 -- ---------------------------------------------------------------------------

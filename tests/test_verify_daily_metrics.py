@@ -763,3 +763,50 @@ def test_an_unreadable_expectation_is_a_finding_not_a_traceback(tmp_path):
     assert "Traceback" not in result.stderr, result.stderr
     assert "[FAIL] check 6" in result.stdout
     assert "which is not a date" in result.stdout
+
+
+# Kept identical to the downstream copy, which also runs on older engines.
+_needs_freeze = pytest.mark.skipif(
+    not hasattr(vault, "frozen_through"),
+    reason="installed engine predates the compaction freeze (engine #28)")
+
+
+@_needs_freeze
+def test_compacted_rows_are_frozen_not_legitimate(tmp_path):
+    """Engine #28: on the first compacted clone this script counted 31,768
+    rows with nothing left to rebuild them from as "category one
+    (legitimate)" and exited 0. They are their own category now."""
+    path, conn = _database(tmp_path, "basal_energy", [1.0, 2.0])
+    db.insert_records(conn, [_record("basal_energy", 5.0, 1, day="2026-08-25")])
+    db.recompute_daily_metrics(conn, pairs=[("basal_energy", "2026-08-25")])
+    vault.compact(conn, through=DAY)
+    conn.close()
+
+    result = _run(path)
+
+    _assert_categories(result, legitimate=0, genuine=0, returncode=0)
+    assert (f"frozen, not re-derivable (compacted through {DAY}): 1"
+            in result.stdout)
+    assert "NOTE — 1 frozen row(s)" in result.stdout
+    assert "matches a full rebuild from records" not in result.stdout
+
+
+@_needs_freeze
+def test_frozen_split_needs_an_absent_rebuild(tmp_path):
+    """A frozen pair that still has raw rows is compared, not waved through."""
+    path, conn = _database(tmp_path, "basal_energy", [1.0])
+    vault.compact(conn, through=DAY)
+    rows = [{"metric": "basal_energy", "date": DAY, "r_count": None},
+            {"metric": "basal_energy", "date": DAY, "r_count": 3},
+            {"metric": "heart_rate", "date": DAY, "r_count": None}]
+    frozen, rest, through = V.split_frozen(conn, rows)
+    assert through == DAY
+    assert frozen == rows[:1] and rest == rows[1:]
+    conn.close()
+
+
+def test_frozen_split_is_empty_without_a_watermark(tmp_path):
+    path, conn = _database(tmp_path, "basal_energy", [1.0])
+    rows = [{"metric": "basal_energy", "date": DAY, "r_count": None}]
+    assert V.split_frozen(conn, rows) == ([], rows, None)
+    conn.close()

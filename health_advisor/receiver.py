@@ -12,6 +12,10 @@ Env:  HA_SECRET_FILE (preferred) or HA_SHARED_SECRET; HA_REQUIRE_SECRET=1 makes
       "no secret at all" a startup failure instead of an unauthenticated receiver
       HEALTH_ADVISOR_ANALYST_EXECUTOR=transient explicitly selects the
       user-systemd analyst executor; absent means the platform default
+      HA_DEVICE_AUTH_MODE=off|accept|required (default off) and
+      HA_DEVICE_REGISTRY_FILE: per-device request signatures, see
+      device_auth.py; an invalid mode, or an enabled one without a usable
+      registry, refuses at startup
 
 The vault is an argument, never an environment variable: `create_app(ctx)` binds
 one receiver to one user's vault, and a process that serves two of them must not
@@ -60,6 +64,7 @@ from . import analyst_corpus
 from . import push
 from . import ask_progress
 from . import body_aead
+from . import device_auth
 
 logger = logging.getLogger(__name__)
 
@@ -1465,6 +1470,61 @@ def _compacted_refusal(response: dict, through: str, samples: list[dict],
     return JSONResponse(body, status_code=409)
 
 
+def _enrol_refusal(code: str, status: int) -> HTTPException:
+    return HTTPException(status_code=status, detail={"error": code})
+
+
+def _enrol_upgrade(devices: "device_auth.DeviceAuth", request: Request,
+                   raw: bytes) -> dict:
+    """Record a phone's device key, on the shared-secret channel (T4).
+
+    The caller has already passed the secret-token check. This route adds the
+    two things that make that channel sound for enrolment:
+
+    - the body must have arrived D23-sealed. The token alone crosses the edge
+      in a header; sealing needs the secret itself, which never does. Without
+      this, anyone who read one request header could enrol a key of their own.
+    - the request must be signed by the key it enrols (proof of possession),
+      over the same signed string every later request uses.
+
+    ``accept`` admits new keys. ``required`` only re-confirms keys already
+    enrolled, so the shared secret cannot add a device once it has retired.
+    """
+    info = request.scope.get("ha_device") or {}
+    if not info.get("d23_sealed"):
+        raise _enrol_refusal("device_enrol_unsealed", 400)
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or payload.get("v") != 1:
+            raise ValueError("version")
+        public_key = device_auth._b64url_decode(payload["public_key"])
+        device_auth.load_public_key(public_key)
+        key_storage = payload.get("key_storage")
+        if key_storage not in device_auth.KEY_STORAGE_VALUES:
+            raise ValueError("key_storage")
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        raise _enrol_refusal("device_enrol_malformed", 400)
+    try:
+        signed = device_auth.parse_headers(request.headers.get)
+        if signed is None:
+            raise device_auth.DeviceAuthError("device_sig_missing")
+        if signed.kid != device_auth.kid_for(public_key):
+            raise device_auth.DeviceAuthError("device_sig_bad")
+        device_auth.check_signature(
+            public_key, signed, method=request.method, target=info["target"],
+            body_hash=info["wire_body_sha256"])
+        device, created = devices.registry.enrol(
+            public_key, via="upgrade", key_storage=key_storage,
+            allow_new=devices.mode == "accept")
+    except device_auth.DeviceAuthError as exc:
+        raise _enrol_refusal(exc.code, exc.status)
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("device enrolment could not update the registry: %s", exc)
+        raise _enrol_refusal("device_registry_unreadable", 503)
+    return {"ok": True, "kid": device.kid, "created": created,
+            "mode": devices.mode}
+
+
 def _require_ingest_secret(x_health_secret: str | None, *, request: Request | None = None) -> None:
     state = getattr(request, "state", None)
     if state is not None and getattr(state, "ingest_secret_checked", False):
@@ -1500,15 +1560,17 @@ class D23BodyAEADApp:
 
     _OWN_ATTRS = frozenset({
         "_OWN_ATTRS", "app", "secret_for_request", "mode", "ctx",
-        "routes", "protected_routes",
+        "routes", "protected_routes", "device_auth",
     })
 
     def __init__(self, app, secret_for_request: Callable[[], str], mode: str,
-                 ctx=None):
+                 ctx=None, device_auth: "device_auth.DeviceAuth | None" = None):
         self.app = app
         self.secret_for_request = secret_for_request
         self.mode = mode
         self.ctx = ctx
+        # None is HA_DEVICE_AUTH_MODE=off: not one header is read.
+        self.device_auth = device_auth
 
     def __setattr__(self, name, value):
         if name in type(self)._OWN_ATTRS:
@@ -1645,6 +1707,28 @@ class D23BodyAEADApp:
                 return
             if request_body is None:
                 return
+            # Device signatures are checked on the body as it crossed the
+            # wire, before anything is decrypted. The enrolment route is the
+            # one exception: its key is not enrolled yet, so the route itself
+            # proves possession against the key in the (sealed) body.
+            device_kid = None
+            wire_body_sha256 = None
+            if self.device_auth is not None:
+                wire_body_sha256 = device_auth.body_sha256(request_body)
+                if scope.get("path") != device_auth.ENROL_UPGRADE_PATH:
+                    headers = self._headers(scope)
+
+                    def _get(name: str) -> str | None:
+                        value = self._header(headers, name.encode("ascii"))
+                        return None if value is None else value.decode("latin-1")
+
+                    try:
+                        device_kid = self.device_auth.authenticate(
+                            _get, method=scope["method"].upper(),
+                            target=target, body=request_body)
+                    except device_auth.DeviceAuthError as exc:
+                        await self._refusal(send, exc.code, status=exc.status)
+                        return
             if has_d23_content_type:
                 if request_body is None:
                     return
@@ -1673,6 +1757,14 @@ class D23BodyAEADApp:
                 headers.extend(((b"content-type", b"application/octet-stream"),
                                 (b"content-length", str(len(request_body)).encode("ascii"))))
                 scope["headers"] = headers
+            if self.device_auth is not None:
+                scope = dict(scope)
+                scope["ha_device"] = {
+                    "kid": device_kid,
+                    "target": target,
+                    "wire_body_sha256": wire_body_sha256,
+                    "d23_sealed": encrypted_request,
+                }
 
         messages: list[dict] = []
         response_body: list[bytes] = []
@@ -1724,10 +1816,10 @@ class D23BodyAEADApp:
             raise pending_error
 
     @staticmethod
-    async def _refusal(send, code: str):
+    async def _refusal(send, code: str, status: int = 400):
         body = json.dumps({"detail": {"error": code}},
                           separators=(",", ":")).encode("utf-8")
-        await send({"type": "http.response.start", "status": 400,
+        await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"),
                                 (b"content-length", str(len(body)).encode("ascii"))]})
         await send({"type": "http.response.body", "body": body,
@@ -1771,6 +1863,11 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     llm.assert_backend_approved()
     mode = _d23_mode()
     _secret_header_mode()  # an invalid value refuses here, not on a request
+    device_mode = device_auth.device_auth_mode()  # likewise
+    devices = None
+    if device_mode != "off":
+        devices = device_auth.DeviceAuth(device_mode,
+                                         device_auth.registry_from_env())
     app = FastAPI(title="Health Advisor Receiver", docs_url=None,
                   redoc_url=None, openapi_url=None)
     analyst_permit = asyncio.Semaphore(1)
@@ -1804,6 +1901,13 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             if refusal := ingest_guard():
                 return refusal
         return await _raw_body(request)
+
+    if devices is not None:
+        @app.post(device_auth.ENROL_UPGRADE_PATH)
+        def enrol_upgrade(request: Request, raw: bytes = Depends(_raw_body),
+                          x_health_secret: str | None = Header(default=None)):
+            _require_ask_secret(x_health_secret)
+            return _enrol_upgrade(devices, request, raw)
 
     @app.get("/health")
     def health():
@@ -2107,7 +2211,8 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     # Deliberately wrap the completed FastAPI result at raw ASGI level. This
     # outer placement covers Starlette's ServerErrorMiddleware, including its
     # generated 500 body, as well as every route wired above.
-    return D23BodyAEADApp(app, secret_for_request, mode, ctx)
+    return D23BodyAEADApp(app, secret_for_request, mode, ctx,
+                          device_auth=devices)
 
 
 def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:

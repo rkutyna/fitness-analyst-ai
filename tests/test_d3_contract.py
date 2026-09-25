@@ -478,3 +478,82 @@ def test_the_vault_bucket_width_is_the_width_consumers_read():
         mx.IMPACT_BUCKET_SECONDS
     assert V.VAULT_BUCKET_SECONDS["step_count"] is \
         mx.IMPACT_BUCKET_SECONDS
+
+
+# --------------------------------------------------------------------------- #
+# #80: a declared vault that still holds raw rows for a non-allowlisted metric
+# --------------------------------------------------------------------------- #
+def test_full_rebuild_on_a_vault_scopes_the_insert_like_the_delete(conn):
+    """An uncompacted vault holds raw rows for every metric, allowlisted or
+    not. `full=True` used to rank ALL of `records` for the INSERT while the
+    preceding DELETE only cleared the allowlisted metrics' daily rows — so the
+    INSERT re-wrote a row the DELETE never removed and hit
+    UNIQUE(metric, date). The two statements must agree on scope.
+
+    Intended behaviour (Done-when 3): a non-allowlisted metric's daily rows
+    are left exactly as they were — not rebuilt, not deleted — because its raw
+    history in a vault is only ever a transient tail, not a complete series.
+    """
+    day = "2026-07-22"
+    V.declare_vault(conn)
+
+    # A pre-existing daily aggregate for a non-allowlisted metric, as a vault
+    # would carry from before its raw rows were last compacted.
+    seed_metric(conn, "basal_energy", day, [1800.0])
+    dbmod.insert_records(conn, [
+        # Non-allowlisted: still has raw rows (the uncompacted case #80 found).
+        {
+            "metric": "basal_energy", "value": 600.0, "unit": "kcal",
+            "start_utc": f"{day}T12:00:00+00:00",
+            "end_utc": f"{day}T12:00:00+00:00",
+            "start_local": f"{day} 08:00:00", "local_date": day,
+            "source": "test", "origin": "receiver",
+            "dedupe_key": "rebuild-scope-basal",
+        },
+        # Allowlisted: no daily row yet, so this is what a full rebuild should
+        # produce.
+        {
+            "metric": "heart_rate", "value": 145.0, "unit": "count/min",
+            "start_utc": f"{day}T12:00:00+00:00",
+            "end_utc": f"{day}T12:00:00+00:00",
+            "start_local": f"{day} 08:00:00", "local_date": day,
+            "source": "test", "origin": "healthkit",
+            "dedupe_key": "rebuild-scope-hr",
+        },
+    ])
+
+    before_basal = conn.execute(
+        "SELECT metric, date, count, sum, avg, min, max, last, unit "
+        "FROM daily_metrics WHERE metric = 'basal_energy' AND date = ?",
+        (day,),
+    ).fetchone()
+    assert before_basal is not None
+
+    # This is the call that raised sqlite3.IntegrityError before the fix.
+    dbmod.recompute_daily_metrics(conn, full=True)
+
+    after_basal = conn.execute(
+        "SELECT metric, date, count, sum, avg, min, max, last, unit "
+        "FROM daily_metrics WHERE metric = 'basal_energy' AND date = ?",
+        (day,),
+    ).fetchone()
+    assert tuple(after_basal) == tuple(before_basal), (
+        "a non-allowlisted metric's daily row must be untouched, byte-for-byte"
+    )
+
+    heart_rate_row = conn.execute(
+        "SELECT count, sum, avg, min, max, last, unit "
+        "FROM daily_metrics WHERE metric = 'heart_rate' AND date = ?",
+        (day,),
+    ).fetchone()
+    assert tuple(heart_rate_row) == (1, 145.0, 145.0, 145.0, 145.0, 145.0,
+                                      "count/min")
+
+    # The log line is the only place a vault records which series a full
+    # rebuild left alone (#80 Done-when 3) — assert it says so.
+    detail = conn.execute(
+        "SELECT detail FROM ingest_log WHERE source = 'recompute' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    assert "left_intact" in detail
+    assert "basal_energy" in detail

@@ -1917,6 +1917,15 @@ def _recompute_core(
         conn.execute(
             f"DELETE FROM daily_metrics WHERE metric IN ({placeholders})",
             rebuildable)
+        # Same scope as the DELETE above (`rebuildable`/`placeholders`), used
+        # here too: on a declared vault `source` still carries raw rows for
+        # metrics outside the allowlist (a vault that has never been
+        # compacted holds them for every metric), and ranking those alongside
+        # the rebuildable set re-inserts rows the DELETE never removed, which
+        # collides with the UNIQUE(metric, date) index. Scoping the INSERT to
+        # the same list the DELETE used keeps the two statements agreeing
+        # about which metrics this pass touches; the rest are left exactly as
+        # `untouched` (and its log line above) already say they are.
         conn.execute(
             f"""
             INSERT INTO daily_metrics
@@ -1932,12 +1941,14 @@ def _recompute_core(
                            ORDER BY start_utc DESC, end_utc DESC, id DESC
                        ) AS rn
                 FROM {source}
+                WHERE metric IN ({placeholders})
             )
             SELECT metric, local_date, COUNT(*), SUM(value), AVG(value),
                    MIN(value), MAX(value), MAX(value) FILTER (WHERE rn = 1),
                    MAX(unit)
             FROM ranked GROUP BY metric, local_date
-            """
+            """,
+            rebuildable,
         )
         # The bulk pass above sums every row; redo the days where more than one
         # source describes the same movement.

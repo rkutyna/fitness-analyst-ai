@@ -202,7 +202,8 @@ backend with `HA_LLM_BACKEND`:
 | Backend | What it is | Where data goes |
 |---|---|---|
 | `ollama` | Direct `/api/chat` against a local Ollama server | Stays on your machine |
-| `openrouter` | OpenAI-compatible HTTP transport | A third party you must explicitly pin |
+| `openai_compatible` | Any OpenAI-compatible chat-completions endpoint you name | Wherever you point it, and only hosts you list |
+| `openrouter` | OpenRouter, with the engine's built-in reviewed provider profile | A third party you must explicitly pin |
 | `codex` | A `codex exec` subprocess using ChatGPT auth | A third party |
 
 The OpenRouter path will not start without an explicit provider pin, with
@@ -215,6 +216,49 @@ before configuring anything.
 
 Nothing is sent anywhere until you configure a backend. Ingest, the vault, and
 the whole deterministic analysis layer involve no network at all.
+
+### Bring your own model
+
+Which model a deployment talks to is the operator's choice. The
+`openai_compatible` backend speaks the OpenAI chat-completions shape, so it works
+with a local model server (llama.cpp's `llama-server`, vLLM, LM Studio, Ollama's
+`/v1` endpoint), a machine on your LAN, or a hosted provider's own API. Every
+setting is stated by you; none has a default:
+
+| Variable | Meaning |
+|---|---|
+| `HA_OPENAI_COMPAT_URL` | Base URL, the part before `/chat/completions` |
+| `HA_OPENAI_COMPAT_MODEL` | The model name the endpoint serves |
+| `HA_OPENAI_COMPAT_APPROVED_HOSTS` | Comma-separated hostnames allowed to receive your data |
+| `HA_OPENAI_COMPAT_API_KEY` or `HA_OPENAI_COMPAT_API_KEY_FILE` | Optional bearer key. A key file must be mode 600 or 400 |
+
+A local model, with nothing leaving the machine:
+
+```bash
+# Serve any OpenAI-compatible model on loopback, e.g.
+#   llama-server -m ./models/your-model.gguf --port 8080
+export HA_LLM_BACKEND=openai_compatible
+export HA_OPENAI_COMPAT_URL=http://127.0.0.1:8080/v1
+export HA_OPENAI_COMPAT_MODEL=your-model
+export HA_OPENAI_COMPAT_APPROVED_HOSTS=127.0.0.1
+```
+
+The same fail-closed rules apply as for every other backend. The process refuses to
+start if the URL, the model or the approved-host list is unset. It also refuses if
+the URL's host is not in the list. The host is compared exactly after parsing,
+never as a substring, and wildcards in the list are refused, not interpreted.
+Loopback is not approved by default either: you list it, as above. Only the
+loopback addresses (`127.0.0.1`, `::1`, `localhost`) may use plain HTTP. A LAN
+or remote host must be HTTPS. The requests carry only standard chat-completions
+fields. OpenRouter's `provider` routing block and `reasoning` field are sent to
+OpenRouter alone.
+
+`HA_LLM_BACKEND=openrouter` opts into a built-in profile. It fixes the host to
+`openrouter.ai` and checks your `HA_OPENROUTER_PROVIDERS` pin against a reviewed,
+per-model provider table in `health_advisor/llm.py`. Nothing selects that profile
+unless you name it. If you want OpenRouter under your own policy, point
+`openai_compatible` at `https://openrouter.ai/api/v1` and list `openrouter.ai`.
+Then OpenRouter chooses the serving provider, because no pin is sent.
 
 ## Status and limitations
 

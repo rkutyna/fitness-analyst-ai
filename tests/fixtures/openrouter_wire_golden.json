@@ -1,0 +1,275 @@
+[
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "410"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-flash-0731\",\"messages\":[{\"role\":\"user\",\"content\":\"daily prompt\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.3,\"top_p\":0.9,\"presence_penalty\":0.0,\"provider\":{\"order\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"only\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ },
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "429"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-flash-0731\",\"messages\":[{\"role\":\"user\",\"content\":\"judge prompt\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.0,\"top_p\":0.9,\"presence_penalty\":0.0,\"max_tokens\":12000,\"provider\":{\"order\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"only\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ },
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "415"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-pro\",\"messages\":[{\"role\":\"user\",\"content\":\"plan prompt\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.3,\"top_p\":0.9,\"presence_penalty\":0.0,\"max_tokens\":900,\"provider\":{\"order\":[\"novita/fp8\",\"parasail/fp8\"],\"only\":[\"novita/fp8\",\"parasail/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ },
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "3137"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-flash-0731\",\"messages\":[{\"role\":\"user\",\"content\":\"gather prompt\"},{\"role\":\"user\",\"content\":\"\\n\\nRESEARCH CLAIM CHANNEL: When you finish, return a JSON object with keys text and claims. text is the prose answer. claims is a list of the same scoped objects used by the coach: {metric, period, field, value}; `value` may be the exact number or exact string from a Python-owned `presentation` leaf. Each research claim must additionally include source {sequence, path}. The sequence is the _ledger.sequence shown in the tool result. The path must be the exact JSON path in the ledger, rooted as $.result... or $.arguments.... Name the field and metric that the path actually contains; EXCEPTION - a row published by list_workouts carries workout_key and belongs to no metric series: for a number taken from such a row omit metric entirely. Naming a metric there is refused, and a per-session workout value must never be relabelled as a daily-metric series. For period, copy one of the exact strings in _ledger.period_vocabulary[*].claim_period verbatim; do not compose an ISO range or reinterpret the ledger's internal period.end. A structured period dict may be copied only when it is present in the published vocabulary. do not use prose to infer a source. Derived claims use operation and operands, with every operand carrying its own source. Do not report a number in text unless its claim is present.\\n`get_weekly_series` publishes each row's inclusive Monday-Sunday `period` as `YYYY-MM-DD:YYYY-MM-DD`; copy that exact string into a claim and never invent a period from `week_start`. Metric ownership is per field: inherit a row's `metric` only for its own series-value leaves (`mean`, `median`, `min`, `max`, `std`, `latest`, `sum`, `recent_avg`, `baseline_avg`, `delta_pct`, `slope_per_week`) or a leaf whose field is exactly that metric; never inherit it for context fields such as `n_days`, `rho`, `sd_day`, `mdc95`, `unit`, dates, day counts, or other siblings. `get_subjective` keeps flat day fields and adds `period` equal to the day plus `field_metrics` for the non-null rating fields (`stress`, `soreness`, `energy`, `sleep_quality`); cite the direct field with its mapped `subjective_*` metric, and omit `metric` for fields absent from `field_metrics`. `list_workouts` publishes full-range per-type counts as `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path with `metric` omitted, and never count the possibly truncated `workouts` rows. For a metric-less claim, omit the `metric` key entirely; do not send `metric: null`, `metric: \\\"\\\"`, or whitespace as a substitute for omission.\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.7,\"top_p\":0.95,\"max_tokens\":12000,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"probe\",\"description\":\"probe\",\"parameters\":{\"type\":\"object\",\"properties\":{\"days\":{\"type\":\"integer\"}}}}}],\"tool_choice\":\"auto\",\"provider\":{\"order\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"only\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ },
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "3367"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-flash-0731\",\"messages\":[{\"role\":\"user\",\"content\":\"gather prompt\"},{\"role\":\"user\",\"content\":\"\\n\\nRESEARCH CLAIM CHANNEL: When you finish, return a JSON object with keys text and claims. text is the prose answer. claims is a list of the same scoped objects used by the coach: {metric, period, field, value}; `value` may be the exact number or exact string from a Python-owned `presentation` leaf. Each research claim must additionally include source {sequence, path}. The sequence is the _ledger.sequence shown in the tool result. The path must be the exact JSON path in the ledger, rooted as $.result... or $.arguments.... Name the field and metric that the path actually contains; EXCEPTION - a row published by list_workouts carries workout_key and belongs to no metric series: for a number taken from such a row omit metric entirely. Naming a metric there is refused, and a per-session workout value must never be relabelled as a daily-metric series. For period, copy one of the exact strings in _ledger.period_vocabulary[*].claim_period verbatim; do not compose an ISO range or reinterpret the ledger's internal period.end. A structured period dict may be copied only when it is present in the published vocabulary. do not use prose to infer a source. Derived claims use operation and operands, with every operand carrying its own source. Do not report a number in text unless its claim is present.\\n`get_weekly_series` publishes each row's inclusive Monday-Sunday `period` as `YYYY-MM-DD:YYYY-MM-DD`; copy that exact string into a claim and never invent a period from `week_start`. Metric ownership is per field: inherit a row's `metric` only for its own series-value leaves (`mean`, `median`, `min`, `max`, `std`, `latest`, `sum`, `recent_avg`, `baseline_avg`, `delta_pct`, `slope_per_week`) or a leaf whose field is exactly that metric; never inherit it for context fields such as `n_days`, `rho`, `sd_day`, `mdc95`, `unit`, dates, day counts, or other siblings. `get_subjective` keeps flat day fields and adds `period` equal to the day plus `field_metrics` for the non-null rating fields (`stress`, `soreness`, `energy`, `sleep_quality`); cite the direct field with its mapped `subjective_*` metric, and omit `metric` for fields absent from `field_metrics`. `list_workouts` publishes full-range per-type counts as `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path with `metric` omitted, and never count the possibly truncated `workouts` rows. For a metric-less claim, omit the `metric` key entirely; do not send `metric: null`, `metric: \\\"\\\"`, or whitespace as a substitute for omission.\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"probe\",\"arguments\":\"{\\\"days\\\": 14}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"name\":\"probe\",\"content\":\"{\\\"mean\\\": 5413, \\\"days\\\": 14}\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.7,\"top_p\":0.95,\"max_tokens\":12000,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"probe\",\"description\":\"probe\",\"parameters\":{\"type\":\"object\",\"properties\":{\"days\":{\"type\":\"integer\"}}}}}],\"tool_choice\":\"auto\",\"provider\":{\"order\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"only\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ },
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "3139"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-flash-0731\",\"messages\":[{\"role\":\"user\",\"content\":\"research prompt\"},{\"role\":\"user\",\"content\":\"\\n\\nRESEARCH CLAIM CHANNEL: When you finish, return a JSON object with keys text and claims. text is the prose answer. claims is a list of the same scoped objects used by the coach: {metric, period, field, value}; `value` may be the exact number or exact string from a Python-owned `presentation` leaf. Each research claim must additionally include source {sequence, path}. The sequence is the _ledger.sequence shown in the tool result. The path must be the exact JSON path in the ledger, rooted as $.result... or $.arguments.... Name the field and metric that the path actually contains; EXCEPTION - a row published by list_workouts carries workout_key and belongs to no metric series: for a number taken from such a row omit metric entirely. Naming a metric there is refused, and a per-session workout value must never be relabelled as a daily-metric series. For period, copy one of the exact strings in _ledger.period_vocabulary[*].claim_period verbatim; do not compose an ISO range or reinterpret the ledger's internal period.end. A structured period dict may be copied only when it is present in the published vocabulary. do not use prose to infer a source. Derived claims use operation and operands, with every operand carrying its own source. Do not report a number in text unless its claim is present.\\n`get_weekly_series` publishes each row's inclusive Monday-Sunday `period` as `YYYY-MM-DD:YYYY-MM-DD`; copy that exact string into a claim and never invent a period from `week_start`. Metric ownership is per field: inherit a row's `metric` only for its own series-value leaves (`mean`, `median`, `min`, `max`, `std`, `latest`, `sum`, `recent_avg`, `baseline_avg`, `delta_pct`, `slope_per_week`) or a leaf whose field is exactly that metric; never inherit it for context fields such as `n_days`, `rho`, `sd_day`, `mdc95`, `unit`, dates, day counts, or other siblings. `get_subjective` keeps flat day fields and adds `period` equal to the day plus `field_metrics` for the non-null rating fields (`stress`, `soreness`, `energy`, `sleep_quality`); cite the direct field with its mapped `subjective_*` metric, and omit `metric` for fields absent from `field_metrics`. `list_workouts` publishes full-range per-type counts as `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path with `metric` omitted, and never count the possibly truncated `workouts` rows. For a metric-less claim, omit the `metric` key entirely; do not send `metric: null`, `metric: \\\"\\\"`, or whitespace as a substitute for omission.\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.7,\"top_p\":0.95,\"max_tokens\":12000,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"probe\",\"description\":\"probe\",\"parameters\":{\"type\":\"object\",\"properties\":{\"days\":{\"type\":\"integer\"}}}}}],\"tool_choice\":\"auto\",\"provider\":{\"order\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"only\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ },
+ {
+  "method": "POST",
+  "url": "https://openrouter.ai/api/v1/chat/completions",
+  "headers": [
+   [
+    "host",
+    "openrouter.ai"
+   ],
+   [
+    "accept",
+    "*/*"
+   ],
+   [
+    "accept-encoding",
+    "gzip, deflate"
+   ],
+   [
+    "connection",
+    "keep-alive"
+   ],
+   [
+    "user-agent",
+    "<httpx-user-agent>"
+   ],
+   [
+    "authorization",
+    "Bearer wire-test-key"
+   ],
+   [
+    "content-length",
+    "3369"
+   ],
+   [
+    "content-type",
+    "application/json"
+   ]
+  ],
+  "body": "{\"model\":\"deepseek/deepseek-v4-flash-0731\",\"messages\":[{\"role\":\"user\",\"content\":\"research prompt\"},{\"role\":\"user\",\"content\":\"\\n\\nRESEARCH CLAIM CHANNEL: When you finish, return a JSON object with keys text and claims. text is the prose answer. claims is a list of the same scoped objects used by the coach: {metric, period, field, value}; `value` may be the exact number or exact string from a Python-owned `presentation` leaf. Each research claim must additionally include source {sequence, path}. The sequence is the _ledger.sequence shown in the tool result. The path must be the exact JSON path in the ledger, rooted as $.result... or $.arguments.... Name the field and metric that the path actually contains; EXCEPTION - a row published by list_workouts carries workout_key and belongs to no metric series: for a number taken from such a row omit metric entirely. Naming a metric there is refused, and a per-session workout value must never be relabelled as a daily-metric series. For period, copy one of the exact strings in _ledger.period_vocabulary[*].claim_period verbatim; do not compose an ISO range or reinterpret the ledger's internal period.end. A structured period dict may be copied only when it is present in the published vocabulary. do not use prose to infer a source. Derived claims use operation and operands, with every operand carrying its own source. Do not report a number in text unless its claim is present.\\n`get_weekly_series` publishes each row's inclusive Monday-Sunday `period` as `YYYY-MM-DD:YYYY-MM-DD`; copy that exact string into a claim and never invent a period from `week_start`. Metric ownership is per field: inherit a row's `metric` only for its own series-value leaves (`mean`, `median`, `min`, `max`, `std`, `latest`, `sum`, `recent_avg`, `baseline_avg`, `delta_pct`, `slope_per_week`) or a leaf whose field is exactly that metric; never inherit it for context fields such as `n_days`, `rho`, `sd_day`, `mdc95`, `unit`, dates, day counts, or other siblings. `get_subjective` keeps flat day fields and adds `period` equal to the day plus `field_metrics` for the non-null rating fields (`stress`, `soreness`, `energy`, `sleep_quality`); cite the direct field with its mapped `subjective_*` metric, and omit `metric` for fields absent from `field_metrics`. `list_workouts` publishes full-range per-type counts as `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path with `metric` omitted, and never count the possibly truncated `workouts` rows. For a metric-less claim, omit the `metric` key entirely; do not send `metric: null`, `metric: \\\"\\\"`, or whitespace as a substitute for omission.\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"r1\",\"type\":\"function\",\"function\":{\"name\":\"probe\",\"arguments\":\"{\\\"days\\\": 30}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"r1\",\"name\":\"probe\",\"content\":\"{\\\"mean\\\": 5413, \\\"days\\\": 30}\"}],\"stream\":false,\"reasoning\":{\"effort\":\"low\"},\"temperature\":0.7,\"top_p\":0.95,\"max_tokens\":12000,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"probe\",\"description\":\"probe\",\"parameters\":{\"type\":\"object\",\"properties\":{\"days\":{\"type\":\"integer\"}}}}}],\"tool_choice\":\"auto\",\"provider\":{\"order\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"only\":[\"coreweave/fp8\",\"nextbit/fp8\"],\"allow_fallbacks\":false,\"require_parameters\":true,\"zdr\":true,\"data_collection\":\"deny\",\"preferred_min_throughput\":{\"p50\":50}}}"
+ }
+]

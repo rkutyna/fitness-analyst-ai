@@ -121,14 +121,19 @@ The rules are enforced in `health_advisor/llm.py` — the one module that talks 
 a model — at the entry point of every provider-facing process, and again on the
 response.
 
-**1. The backend must be on an allow-list.** `ollama`, `openrouter`, and `codex`.
-Anything else refuses to start.
+**1. The backend must be on an allow-list.** `ollama`, `openai_compatible`,
+`openrouter`, and `codex`. Anything else refuses to start. Being on the list
+admits a backend's name only. `openai_compatible` also needs you to state its
+URL, its model and the hosts you approve (`HA_OPENAI_COMPAT_APPROVED_HOSTS`).
+The engine ships no approved host for it, loopback included. `openrouter` names
+the built-in profile that rules 3 to 6 describe.
 
 **2. The endpoint host is validated, by parsed hostname, not by substring.** The
 provider pin says who the API routes your request to; it says nothing about who
 receives the request in the first place, and the endpoint URL is an environment
 variable. So the URL's host is parsed and compared against a per-backend set —
-`openrouter.ai` for OpenRouter, loopback only for Ollama. Substring matching is
+`openrouter.ai` for OpenRouter, loopback only for Ollama, and exactly the hosts
+you listed for `openai_compatible`. Substring matching is
 explicitly rejected as unsafe: `https://openrouter.ai.attacker.example/` contains
 the string `openrouter.ai` and is a different host. Non-loopback endpoints must
 be HTTPS; loopback is exempt because Ollama serves plain HTTP locally.

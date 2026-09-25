@@ -1,5 +1,5 @@
 """Robust model runtime for the health_advisor PIPELINE (briefings + deep-dive).
-The ONLY module that talks to the model. Three backends, selected by
+The ONLY module that talks to the model. Four backends, selected by
 HA_LLM_BACKEND:
 
 - "codex" (default): GPT via a `codex exec` subprocess (ChatGPT auth). Tool-less
@@ -16,7 +16,17 @@ HA_LLM_BACKEND:
   `low` sends its effort form, `{"reasoning": {"effort": "low"}}`, which the
   boolean cannot express.
   Added on #128, because the rebuilt host runs neither of the other two
-  backends.
+  backends. Naming it opts into the engine's built-in OpenRouter profile: the
+  host is openrouter.ai and the provider pin is checked against the reviewed
+  per-model table below.
+- "openai_compatible": any endpoint serving the OpenAI chat-completions shape —
+  a local model server, a LAN box, or a provider's own API (#79). Base URL,
+  model and approved hosts come ONLY from the environment
+  (`HA_OPENAI_COMPAT_URL`, `HA_OPENAI_COMPAT_MODEL`,
+  `HA_OPENAI_COMPAT_APPROVED_HOSTS`, optional key); there is no default for
+  any of them, so an unconfigured process refuses. It uses the same
+  OpenAI-dialect transport and loops as openrouter but sends only the standard
+  request fields — never OpenRouter's `provider` block or `reasoning`.
 
 Every error degrades to "" and never raises, so the callers'
 grounding/judge/fallback gates always receive a clean string and a slow or down
@@ -305,15 +315,22 @@ ANSWER_COMPLETION_MAX_TOKENS = ANSWER_MAX_TOKENS + REASONING_HEADROOM_TOKENS
 TOOL_LOOP_MAX_TOKENS = ANSWER_COMPLETION_MAX_TOKENS
 
 
-def _read_openrouter_api_key_file(path: str) -> str:
-    """Read and validate the explicitly configured OpenRouter key file."""
+def _read_openrouter_api_key_file(path: str, *,
+                                  variable: str = "HA_OPENROUTER_API_KEY_FILE",
+                                  fallback: str = "OPENROUTER_API_KEY",
+                                  label: str = "OpenRouter") -> str:
+    """Read and validate an explicitly configured key file.
+
+    The defaults are the OpenRouter variables; the openai_compatible backend
+    passes its own names so its refusals name the variable actually set.
+    """
     try:
         raw = Path(path).read_text()
     except OSError as exc:
         raise RuntimeError(
-            f"HA_OPENROUTER_API_KEY_FILE={path!r} is set but could not be "
+            f"{variable}={path!r} is set but could not be "
             f"read ({exc}). Refusing to start rather than falling back to "
-            "OPENROUTER_API_KEY.") from exc
+            f"{fallback}.") from exc
 
     mode = stat.S_IMODE(os.stat(path).st_mode)
     if mode not in (0o600, 0o400):
@@ -324,8 +341,8 @@ def _read_openrouter_api_key_file(path: str) -> str:
     key = "".join(raw.split())
     if not key:
         raise RuntimeError(
-            f"refusing to start: the OpenRouter key in {path} is empty "
-            "after trimming; refusing to fall back to OPENROUTER_API_KEY.")
+            f"refusing to start: the {label} key in {path} is empty "
+            f"after trimming; refusing to fall back to {fallback}.")
     return key
 
 
@@ -363,10 +380,51 @@ def _plan_providers() -> str:
     return PLAN_PROVIDERS if PLAN_PROVIDERS is not None else OPENROUTER_PROVIDERS
 OPENROUTER_PROVIDER_SORT = os.environ.get("HA_OPENROUTER_PROVIDER_SORT", "")
 
+# The bring-your-own-endpoint backend (#79). Every value is the operator's
+# statement at the entry point, and none has a default: an unset URL, model or
+# approved-host list refuses in assert_backend_approved(), exactly as an unset
+# OpenRouter pin does. In particular the engine ships NO approved host for this
+# backend -- not even loopback -- so the host a deployment sends health data to
+# is always one its operator wrote down.
+OPENAI_COMPATIBLE = "openai_compatible"
+OPENAI_COMPAT_URL = os.environ.get("HA_OPENAI_COMPAT_URL")
+OPENAI_COMPAT_MODEL = os.environ.get("HA_OPENAI_COMPAT_MODEL")
+OPENAI_COMPAT_APPROVED_HOSTS = os.environ.get("HA_OPENAI_COMPAT_APPROVED_HOSTS")
+# The key is optional (a local server usually has none). When given, it follows
+# the OpenRouter key's rules: a file must be mode 600/400 and non-empty, and a
+# file and an env value that disagree refuse rather than pick one.
+OPENAI_COMPAT_API_KEY_FILE = os.environ.get(
+    "HA_OPENAI_COMPAT_API_KEY_FILE", "").strip()
+_OPENAI_COMPAT_API_KEY_ENV = os.environ.get("HA_OPENAI_COMPAT_API_KEY")
+_OPENAI_COMPAT_API_KEY_FILE_VALUE = (
+    _read_openrouter_api_key_file(
+        OPENAI_COMPAT_API_KEY_FILE,
+        variable="HA_OPENAI_COMPAT_API_KEY_FILE",
+        fallback="HA_OPENAI_COMPAT_API_KEY", label="endpoint")
+    if OPENAI_COMPAT_API_KEY_FILE else None)
+OPENAI_COMPAT_API_KEY = (_OPENAI_COMPAT_API_KEY_FILE_VALUE
+                         if OPENAI_COMPAT_API_KEY_FILE
+                         else (_OPENAI_COMPAT_API_KEY_ENV or ""))
+
 # D15 (2026-08-24 amendment): this is an explicit allow-list for every
 # provider-facing entry point. Codex is approved for the solo phase only under
 # D17; that approval expires when the first other person's vault exists.
-APPROVED_BACKENDS = frozenset({"ollama", "openrouter", "codex"})
+#
+# #79: which backend a deployment connects to is the operator's choice.
+# `openai_compatible` is the bring-your-own-endpoint backend; being on this list
+# admits the NAME only -- its destination, model and hosts are refused until
+# the operator states them (assert_backend_approved).
+APPROVED_BACKENDS = frozenset({"ollama", "openrouter", OPENAI_COMPATIBLE,
+                               "codex"})
+
+# THE BUILT-IN OPENROUTER PROFILE (#79). Everything from here to
+# OPENROUTER_PROVIDER_TAGS is the policy that `HA_LLM_BACKEND=openrouter`
+# opts into: the endpoint host is openrouter.ai, and a provider pin is admitted
+# only if every name in it is in the reviewed per-model table below. The
+# profile is selected by NAMING that backend and never by absence -- the default
+# backend is codex, and an openrouter process still refuses without an explicit
+# model, pin and reasoning mode. A deployment that wants a different endpoint or
+# policy states it through `openai_compatible` instead of editing this table.
 
 # D15 (2026-08-25 amendment, enforced by #104): the approved OpenRouter
 # providers per model. This is the ONE place the mapping lives; both the
@@ -545,6 +603,40 @@ def _endpoint_host(url: str) -> str:
     return host
 
 
+def _openai_compat_approved_hosts() -> frozenset[str]:
+    """Parse HA_OPENAI_COMPAT_APPROVED_HOSTS, refusing unset, empty or wildcards.
+
+    The list holds bare hostnames or IP literals, compared EXACTLY against the
+    parsed host of HA_OPENAI_COMPAT_URL -- never by substring, suffix or
+    pattern, so a wildcard or a URL in the list is refused rather than
+    interpreted. There is no default: absence is a refusal, never "any host".
+    """
+    raw = OPENAI_COMPAT_APPROVED_HOSTS
+    prefix = (f"LLM backend {OPENAI_COMPATIBLE!r} is not approved under D15: "
+              "HA_OPENAI_COMPAT_APPROVED_HOSTS")
+    if raw is None:
+        raise RuntimeError(
+            f"{prefix} is unset; list the endpoint host(s) this deployment "
+            "approves to receive health data. There is no default.")
+    hosts = []
+    for entry in raw.split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        if entry.startswith("[") and entry.endswith("]"):
+            entry = entry[1:-1]
+        if any(ch in entry for ch in "*?/@ ") or "://" in entry:
+            raise RuntimeError(
+                f"{prefix} entry {entry!r} is not a bare hostname; wildcards, "
+                "URLs and paths are refused, not interpreted.")
+        hosts.append(entry)
+    if not hosts:
+        raise RuntimeError(
+            f"{prefix} is empty; list the endpoint host(s) this deployment "
+            "approves to receive health data. There is no default.")
+    return frozenset(hosts)
+
+
 def assert_endpoint_approved(backend: str | None = None) -> None:
     """Refuse an endpoint host D15 does not name, whatever the provider pin says.
 
@@ -552,12 +644,30 @@ def assert_endpoint_approved(backend: str | None = None) -> None:
     it names a local executable, and D15's question is who *receives* the data,
     which a filesystem path cannot establish — a check that a path exists would
     look like coverage and provide none. Recorded on #138 as its own axis.
+
+    For ``openai_compatible`` the approved set is the operator's
+    HA_OPENAI_COMPAT_APPROVED_HOSTS rather than a constant (#79); the host
+    comparison, the TLS rule and the loopback exemption are the same code.
     """
     backend = backend or BACKEND
-    approved = APPROVED_ENDPOINT_HOSTS.get(backend)
-    if approved is None:
-        return
-    url = {"openrouter": OPENROUTER_URL, "ollama": OLLAMA_URL}[backend]
+    if backend == OPENAI_COMPATIBLE:
+        approved = _openai_compat_approved_hosts()
+        url = OPENAI_COMPAT_URL
+        if not url:
+            raise RuntimeError(
+                f"LLM backend {backend!r} is not approved under D15: "
+                "HA_OPENAI_COMPAT_URL is unset; set it to the endpoint's base "
+                "URL (the part before /chat/completions). There is no "
+                "default.")
+        remedy = ("Add the host to HA_OPENAI_COMPAT_APPROVED_HOSTS only if "
+                  "this deployment approves it to receive health data.")
+    else:
+        approved = APPROVED_ENDPOINT_HOSTS.get(backend)
+        if approved is None:
+            return
+        url = {"openrouter": OPENROUTER_URL, "ollama": OLLAMA_URL}[backend]
+        remedy = ("Set the endpoint back to its default, or propose the host "
+                  "with its published terms.")
     host = _endpoint_host(url)
     if not host:
         raise RuntimeError(
@@ -567,8 +677,7 @@ def assert_endpoint_approved(backend: str | None = None) -> None:
         raise RuntimeError(
             f"LLM backend {backend!r} is not approved under D15: endpoint host "
             f"{host!r} is not in the approved set "
-            f"({', '.join(sorted(approved))}). Set the endpoint back to its "
-            f"default, or propose the host with its published terms.")
+            f"({', '.join(sorted(approved))}). {remedy}")
     scheme = urllib.parse.urlparse(url).scheme.lower()
     if host not in _LOOPBACK_HOSTS and scheme != "https":
         raise RuntimeError(
@@ -672,6 +781,22 @@ def _assert_openrouter_pair(*, model: str | None, providers: str,
         )
 
 
+def _assert_openai_compat_configured() -> None:
+    """The openai_compatible checks beyond the endpoint host (#79)."""
+    if not (OPENAI_COMPAT_MODEL or "").strip():
+        raise RuntimeError(
+            f"LLM backend {OPENAI_COMPATIBLE!r} is not approved under D15: "
+            "HA_OPENAI_COMPAT_MODEL is unset; name the model the endpoint "
+            "serves. There is no default.")
+    if (_OPENAI_COMPAT_API_KEY_FILE_VALUE is not None
+            and _OPENAI_COMPAT_API_KEY_ENV is not None
+            and _OPENAI_COMPAT_API_KEY_FILE_VALUE != _OPENAI_COMPAT_API_KEY_ENV):
+        raise RuntimeError(
+            f"LLM backend {OPENAI_COMPATIBLE!r} is not approved under D15: "
+            "HA_OPENAI_COMPAT_API_KEY_FILE and HA_OPENAI_COMPAT_API_KEY are "
+            "both set but disagree; remove one or make them identical.")
+
+
 def assert_backend_approved() -> None:
     """Refuse a provider-facing process whose backend is outside D15's list."""
     if BACKEND not in APPROVED_BACKENDS:
@@ -686,6 +811,9 @@ def assert_backend_approved() -> None:
         )
     # The destination, not only the name of who is meant to be at it (#138).
     assert_endpoint_approved(BACKEND)
+    if BACKEND == OPENAI_COMPATIBLE:
+        _assert_openai_compat_configured()
+        return
     if BACKEND != "openrouter":
         return
     if (_OPENROUTER_API_KEY_FILE_VALUE is not None
@@ -1270,12 +1398,22 @@ def _openrouter_deadline_timeout(*, flow: str, model: str | None,
 def _openrouter_request(payload: dict, *, timeout: float, flow: str,
                         model: str | None = None,
                         providers: str | None = None) -> dict:
-    """Make one OpenRouter request with a total, rather than read, deadline."""
+    """Make one OpenAI-dialect request with a total, rather than read, deadline.
+
+    Serves both OpenAI-dialect backends. On ``openai_compatible`` the URL is the
+    operator's base URL and the Authorization header is sent only when a key is
+    configured; the openrouter request is built exactly as before #79.
+    """
     started = time.monotonic()
     deadline = started + float(timeout)
     body = bytearray()
-    request_url = f"{OPENROUTER_URL}/chat/completions"
-    headers = {"Authorization": f"Bearer {_openrouter_api_key()}"}
+    if BACKEND == OPENAI_COMPATIBLE:
+        request_url = f"{(OPENAI_COMPAT_URL or '').rstrip('/')}/chat/completions"
+        headers = ({"Authorization": f"Bearer {OPENAI_COMPAT_API_KEY}"}
+                   if OPENAI_COMPAT_API_KEY else {})
+    else:
+        request_url = f"{OPENROUTER_URL}/chat/completions"
+        headers = {"Authorization": f"Bearer {_openrouter_api_key()}"}
     timer_fired = threading.Event()
     handles: dict[str, object] = {}
 
@@ -1403,6 +1541,11 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
     request_model = OPENROUTER_MODEL if flow == "daily" else _plan_model()
     request_providers = (OPENROUTER_PROVIDERS if flow == "daily"
                          else _plan_providers())
+    if BACKEND == OPENAI_COMPATIBLE:
+        # One stated model serves both flows; the plan pair is an OpenRouter
+        # profile setting, and there is no provider pin to carry.
+        request_model = OPENAI_COMPAT_MODEL
+        request_providers = ""
     openrouter_reasoning = None
     if BACKEND == "openrouter":
         try:
@@ -1433,30 +1576,51 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
             text_length=len(text),
         )
         return text
-    if BACKEND == "openrouter":
-        api_key = _openrouter_api_key()
-        if not api_key:
-            _set_complete_status(outcome="no_api_key", response_received=False,
-                                 request_made=False,
-                                 detail="OPENROUTER_API_KEY is unset")
-            return ""
-        payload = {
-            "model": request_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "reasoning": _openrouter_reasoning_field(openrouter_reasoning),
-            **_openai_sampling(options, max_tokens=max_tokens),
-        }
-        provider = _openrouter_provider(request_providers)
-        if provider:
-            payload["provider"] = provider
+    if BACKEND in (OPENAI_COMPATIBLE, "openrouter"):
+        if BACKEND == OPENAI_COMPATIBLE:
+            # The entry-point gate, re-applied per call: a direct caller that
+            # skipped startup must not reach an endpoint nobody approved.
+            try:
+                assert_backend_approved()
+            except RuntimeError as exc:
+                _set_complete_status(outcome="backend_error",
+                                     response_received=False,
+                                     request_made=False, detail=str(exc))
+                return ""
+            # Standard chat-completions fields only: `provider` and
+            # `reasoning` are OpenRouter's and go nowhere else (#79).
+            payload = {
+                "model": request_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                **_openai_sampling(options, max_tokens=max_tokens),
+            }
+        else:
+            api_key = _openrouter_api_key()
+            if not api_key:
+                _set_complete_status(outcome="no_api_key",
+                                     response_received=False,
+                                     request_made=False,
+                                     detail="OPENROUTER_API_KEY is unset")
+                return ""
+            payload = {
+                "model": request_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "reasoning": _openrouter_reasoning_field(openrouter_reasoning),
+                **_openai_sampling(options, max_tokens=max_tokens),
+            }
+            provider = _openrouter_provider(request_providers)
+            if provider:
+                payload["provider"] = provider
         call_started = time.monotonic()
         data = {}
         try:
             data = _openrouter_request(
                 payload, timeout=timeout, flow=flow, model=request_model,
                 providers=request_providers)
-            _assert_openrouter_response_provider(data, model=request_model)
+            if BACKEND == "openrouter":
+                _assert_openrouter_response_provider(data, model=request_model)
             content = data["choices"][0]["message"]["content"]
             text = _strip_think(content).strip()
             _set_complete_status(
@@ -2131,6 +2295,10 @@ def _ledger_index_text(ledger_path) -> str:
     return "\n".join(lines)
 
 
+# The backends served by the in-process OpenAI-dialect loop (#128, #79).
+_OPENAI_DIALECT_BACKENDS = frozenset({"openrouter", OPENAI_COMPATIBLE})
+
+
 def _openrouter_ready(on_log=None) -> bool:
     """D15 gate and credential check for the OpenAI-dialect tool path.
 
@@ -2143,8 +2311,11 @@ def _openrouter_ready(on_log=None) -> bool:
     try:
         assert_backend_approved()
     except Exception as exc:
-        _announce("openrouter_not_approved", str(exc), on_log=on_log)
+        _announce(f"{BACKEND}_not_approved", str(exc), on_log=on_log)
         return False
+    if BACKEND == OPENAI_COMPATIBLE:
+        # A key is optional here: a local server usually takes none.
+        return True
     if not _openrouter_api_key():
         _announce("openrouter_no_api_key",
                   "OPENROUTER_API_KEY is unset; no request was made", on_log=on_log)
@@ -2167,27 +2338,42 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
         # measured turn spent 43,001 reasoning tokens. Bound the whole
         # completion; the reasoning level itself stays the global knob.
         max_tokens = max_tokens or TOOL_LOOP_MAX_TOKENS
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": _payload_messages(messages),
-        "stream": False,
-        "reasoning": _openrouter_reasoning_field(_openrouter_reasoning_mode()),
-        **_openai_sampling(options, max_tokens=max_tokens),
-    }
+    openrouter = BACKEND != OPENAI_COMPATIBLE
+    if openrouter:
+        model, providers = OPENROUTER_MODEL, OPENROUTER_PROVIDERS
+        payload = {
+            "model": model,
+            "messages": _payload_messages(messages),
+            "stream": False,
+            "reasoning": _openrouter_reasoning_field(
+                _openrouter_reasoning_mode()),
+            **_openai_sampling(options, max_tokens=max_tokens),
+        }
+    else:
+        # Standard fields only; OpenRouter's go to OpenRouter alone (#79).
+        model, providers = OPENAI_COMPAT_MODEL, ""
+        payload = {
+            "model": model,
+            "messages": _payload_messages(messages),
+            "stream": False,
+            **_openai_sampling(options, max_tokens=max_tokens),
+        }
     if tools:
         payload["tools"] = list(tools)
         payload["tool_choice"] = "auto"
-    provider = _openrouter_provider()
-    if provider:
-        payload["provider"] = provider
+    if openrouter:
+        provider = _openrouter_provider()
+        if provider:
+            payload["provider"] = provider
     call_started = time.monotonic()
     data = {}
     finish_reason = None
     try:
         data = _openrouter_request(
-            payload, timeout=timeout, flow="tool_loop", model=OPENROUTER_MODEL,
-            providers=OPENROUTER_PROVIDERS)
-        _assert_openrouter_response_provider(data)
+            payload, timeout=timeout, flow="tool_loop", model=model,
+            providers=providers)
+        if openrouter:
+            _assert_openrouter_response_provider(data)
         choices = data.get("choices") or []
         choice = (choices[0] if choices else None) or {}
         finish_reason = _openai_finish_reason(data)
@@ -2320,7 +2506,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
             _announce("tool_loop_empty_answer",
                       json.dumps(last_codex_status(), sort_keys=True))
         return answer
-    openai_dialect = BACKEND == "openrouter"
+    openai_dialect = BACKEND in _OPENAI_DIALECT_BACKENDS
     if openai_dialect and not _openrouter_ready():
         return ResearchResponse()
     if analyst_query_fn is None:
@@ -2638,7 +2824,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                 {**last_codex_status(), "answer_length": len(text)},
                 sort_keys=True), on_log=on_log)
         return answer
-    openai_dialect = BACKEND == "openrouter"
+    openai_dialect = BACKEND in _OPENAI_DIALECT_BACKENDS
     if openai_dialect and not _openrouter_ready(on_log):
         return ResearchResponse()
     reg = {**_registry(ctx), **extra_tools}

@@ -480,6 +480,12 @@ CREATE TABLE IF NOT EXISTS hk_daily_totals (
     queried_at    TEXT NOT NULL,       -- phone clock at the pull that wrote this value
     first_seen_at TEXT NOT NULL,       -- UTC, the provisional write
     settled_at    TEXT,                -- UTC, the settle write; NULL while provisional
+    -- NULL for every ordinary phone pull (D19 live path). Non-NULL identifies
+    -- a row written by an M6 historical migration (consumer #430, D7/D19
+    -- decision brief 20260925 item 2) -- what lets the two triggers below tell
+    -- a migration row apart from an ordinary settled one, and what
+    -- db.revert_historical_migration scopes its DELETEs to.
+    migration_id  TEXT,
     PRIMARY KEY (metric, local_date)
 );
 
@@ -487,9 +493,19 @@ CREATE TABLE IF NOT EXISTS hk_daily_totals (
 -- Python-level guards are bypassable by the next script somebody writes; a
 -- trigger is not. Same shape as conversation_turns_no_update (schema.sql:79-86)
 -- and retro_claims_no_update.
+--
+-- The `migration_id IS NULL` clause (consumer #430) is the only change since
+-- D19/#220: an ordinary settled row (a live phone pull) still refuses every
+-- UPDATE, but a migration row -- written `settled` directly, with no live
+-- re-pull window to wait out -- may be re-run under db.write_historical_
+-- consolidated_totals (a corrected batch reusing the day) or reverted. This is
+-- the storage-engine half of that decision; nothing in Python may substitute
+-- for it (a script bypassing the trigger is exactly what #220 designed
+-- against), so narrowing the WHEN clause here, not adding a Python guard
+-- beside it, is the fix.
 CREATE TRIGGER IF NOT EXISTS hk_daily_totals_settled_immutable
 BEFORE UPDATE ON hk_daily_totals
-WHEN OLD.state = 'settled'
+WHEN OLD.state = 'settled' AND OLD.migration_id IS NULL
 BEGIN
     -- One string literal: SQLite has no adjacent-literal concatenation, so the
     -- two-line form this was written as is a syntax error, not a long message.
@@ -498,7 +514,7 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS hk_daily_totals_settled_no_delete
 BEFORE DELETE ON hk_daily_totals
-WHEN OLD.state = 'settled'
+WHEN OLD.state = 'settled' AND OLD.migration_id IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'hk_daily_totals: settled totals are not deletable');
 END;
@@ -525,7 +541,31 @@ CREATE TABLE IF NOT EXISTS hk_daily_total_revisions (
     to_state    TEXT NOT NULL,
     lag_days    INTEGER NOT NULL,   -- pull's local date minus local_date
     batch_id    TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
+    recorded_at TEXT NOT NULL,
+    -- NULL for an ordinary phone pull; the M6 batch id for a historical write
+    -- (consumer #430). Mirrors hk_daily_totals.migration_id so a revision row
+    -- and the hk_daily_totals row it describes are found by the same key.
+    migration_id      TEXT,
+    -- The `daily_metrics.sum` this write overwrote, captured BEFORE the write
+    -- (consumer #430, D7/D19 decision brief 20260925 item 2). Only ever set on
+    -- a migration row: a live D19 pull's target daily_metrics row is rebuilt by
+    -- the ordinary recompute path on every ingest, so its prior sum is neither
+    -- needed nor reliable to keep. A migration's target is historical: once
+    -- compaction has frozen it (D3, consumer #37), delete-and-recompute is
+    -- refused (db._without_frozen_pairs) and the prior sum is gone forever
+    -- unless something recorded it first. This is that something --
+    -- db.revert_historical_migration is the only reader.
+    prior_sum         REAL,
+    -- The `daily_metrics.source_kind` this write overwrote, captured at the
+    -- same instant as `prior_sum` (consumer #430). `sum` alone is not enough
+    -- to restore: apply_consolidated_totals also relabels the row
+    -- 'apple_consolidated', so restoring the number without the label would
+    -- leave a records-derived sum mislabelled as Apple's. NULL means no
+    -- daily_metrics row existed for this (metric, local_date) before the
+    -- write -- schema.sql declares source_kind NOT NULL on every row that
+    -- exists -- which is how revert_historical_migration tells "restore" from
+    -- "the migration created this row; delete it" without a separate flag.
+    prior_source_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_hk_totals_rev_metric_date
     ON hk_daily_total_revisions (metric, local_date, lag_days);

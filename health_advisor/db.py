@@ -170,6 +170,16 @@ _ADDED_COLUMNS = {
         "section": "TEXT",
         "row_id": "TEXT",
     },
+    # M6 historical migration (consumer #430, D7/D19 decision brief 20260925
+    # item 2). NULL on every column here for an existing vault's rows: they are
+    # all ordinary D19 live pulls, and the settled-immutability triggers below
+    # (init_db's DROP TRIGGER pair) must keep refusing them exactly as before.
+    "hk_daily_totals": {"migration_id": "TEXT"},
+    "hk_daily_total_revisions": {
+        "migration_id": "TEXT",
+        "prior_sum": "REAL",
+        "prior_source_kind": "TEXT",
+    },
 }
 
 # Tables which were not present in older vaults.
@@ -414,6 +424,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     # CREATE TRIGGER IF NOT EXISTS cannot replace #108's assistant-only
     # trigger on a table that did not need a table rebuild.
     conn.execute("DROP TRIGGER IF EXISTS conversation_turns_answers_same_conversation")
+    # consumer #430: the settled-immutability pair gained a `migration_id IS
+    # NULL` clause. A vault that predates that column still has the OLD
+    # trigger body (CREATE TRIGGER IF NOT EXISTS cannot replace it), which
+    # would refuse write_historical_consolidated_totals/revert_historical_
+    # migration outright. Drop both here, before the column migration below,
+    # and let schema.sql recreate them with the new WHEN clause.
+    conn.execute("DROP TRIGGER IF EXISTS hk_daily_totals_settled_immutable")
+    conn.execute("DROP TRIGGER IF EXISTS hk_daily_totals_settled_no_delete")
     # schema.sql creates the partial HK indexes. Existing vaults need their
     # nullable columns first or SQLite would reject those CREATE INDEX lines.
     _apply_column_migrations(conn)
@@ -2425,6 +2443,167 @@ def insert_daily_totals(
             "(?, ?)", (f"daily_totals_expected_from:{metric}", day))
         written += 1
     return written
+
+
+def write_historical_consolidated_totals(
+    conn: sqlite3.Connection,
+    rows: Iterable[dict],
+    *,
+    migration_id: str,
+) -> int:
+    """Write a batch of historical Apple-consolidated totals as `settled`.
+
+    Consumer #430 (M6), D7/D19 decision brief 20260925 item 2: "settled, but
+    only once a migration_id column exists AND each revision row records the
+    daily_metrics.sum it overwrote." This is step 1's engine primitive for that
+    decision — the history pull, the staging import and `--apply` (build steps
+    2-4) are NOT here.
+
+    Each row is a dict shaped like `insert_daily_totals`' rows (`metric`,
+    `local_date`, `value`, `unit`, `interval`, `device_id`, `queried_at`) minus
+    `state`: a migration writes `settled` directly. There is no provisional
+    phase to wait out — the live re-pull window (#220) exists because a fresh
+    phone pull can still change in the next few days; a historical pull of a
+    day years gone cannot. `migration_id` is required and stamped on every
+    hk_daily_totals/hk_daily_total_revisions row this writes; NULL stays
+    reserved for an ordinary live pull (schema.sql).
+
+    Before writing, this reads each (metric, local_date)'s CURRENT
+    `daily_metrics.sum`/`source_kind` and records them on the revision row as
+    `prior_sum`/`prior_source_kind` — the one thing a migration id alone cannot
+    recover (brief item 2's own reasoning: "a migration id alone can re-run a
+    batch, but it cannot restore the old value"). `prior_source_kind IS NULL`
+    means no `daily_metrics` row existed for that pair yet (the column is NOT
+    NULL on every row that exists), which is what tells
+    `revert_historical_migration` to delete the pair rather than restore it.
+
+    Applies the value to `daily_metrics` through `apply_consolidated_totals` —
+    the same function the live D19 path uses, not a parallel computation — so
+    only `sum`/`unit`/`source_kind` move and a frozen pair (D3, consumer #37)
+    is overwritten exactly as it already is for a live re-pull. This is the
+    correct behaviour for a migration, not a gap: Apple's consolidated total is
+    authoritative even where the raw rows behind the old sum are gone, which is
+    the whole reason `prior_sum` exists — to make that overwrite reversible.
+
+    `hk_daily_totals_settled_immutable`/`_settled_no_delete` (schema.sql) let
+    this UPDATE a row this same function wrote earlier under a different
+    (corrected) `migration_id`, because the trigger's guard is `OLD.migration_id
+    IS NULL`, never the value. They still refuse outright if `(metric,
+    local_date)` already holds an ORDINARY settled row (`migration_id IS
+    NULL`) — which should never happen given M6's scope stops at 2026-08-18 and
+    D19 live pulls start 2026-08-21, but if it ever does, the trigger's
+    IntegrityError is the correct outcome, not something to catch here
+    (storage-engine enforcement is the point of the trigger).
+
+    Returns the number of days written. Every write scopes by the single
+    `migration_id` string, never by an IN-list of (metric, date) pairs, so the
+    bind count is independent of batch size (production's 32,766-bind limit
+    differs from a Mac's; #430 review note).
+    """
+    now = utcnow_iso()
+    written = 0
+    pairs: list[tuple[str, str]] = []
+    for row in rows:
+        metric, day = row["metric"], row["local_date"]
+        prior_total = conn.execute(
+            "SELECT value, state FROM hk_daily_totals "
+            "WHERE metric = ? AND local_date = ?", (metric, day)).fetchone()
+        prior_dm = conn.execute(
+            "SELECT sum, source_kind FROM daily_metrics "
+            "WHERE metric = ? AND date = ?", (metric, day)).fetchone()
+        lag_days = daily_total_lag_days(row["queried_at"], day)
+        if prior_total is None:
+            conn.execute(
+                "INSERT INTO hk_daily_totals (metric, local_date, value, unit, "
+                "interval, state, device_id, queried_at, first_seen_at, "
+                "settled_at, migration_id) "
+                "VALUES (?, ?, ?, ?, ?, 'settled', ?, ?, ?, ?, ?)",
+                (metric, day, row["value"], row["unit"], row["interval"],
+                 row["device_id"], row["queried_at"], now, now, migration_id))
+        else:
+            conn.execute(
+                "UPDATE hk_daily_totals SET value = ?, unit = ?, interval = ?, "
+                "state = 'settled', device_id = ?, queried_at = ?, "
+                "settled_at = ?, migration_id = ? "
+                "WHERE metric = ? AND local_date = ?",
+                (row["value"], row["unit"], row["interval"], row["device_id"],
+                 row["queried_at"], now, migration_id, metric, day))
+        conn.execute(
+            "INSERT INTO hk_daily_total_revisions (metric, local_date, "
+            "from_value, to_value, from_state, to_state, lag_days, batch_id, "
+            "recorded_at, migration_id, prior_sum, prior_source_kind) "
+            "VALUES (?, ?, ?, ?, ?, 'settled', ?, ?, ?, ?, ?, ?)",
+            (metric, day, prior_total["value"] if prior_total else None,
+             row["value"], prior_total["state"] if prior_total else None,
+             lag_days, migration_id, now, migration_id,
+             prior_dm["sum"] if prior_dm else None,
+             prior_dm["source_kind"] if prior_dm else None))
+        conn.execute(
+            "INSERT OR IGNORE INTO vault_meta (key, value) VALUES "
+            "(?, ?)", (f"daily_totals_expected_from:{metric}", day))
+        pairs.append((metric, day))
+        written += 1
+    apply_consolidated_totals(conn, pairs=pairs)
+    return written
+
+
+def revert_historical_migration(conn: sqlite3.Connection, migration_id: str) -> dict:
+    """Undo one `write_historical_consolidated_totals` batch, in full.
+
+    Consumer #430 (M6). Two things happen, scoped to THIS `migration_id` only:
+
+    1. Every `daily_metrics` row the migration touched is restored from the
+       `prior_sum`/`prior_source_kind` its own revision row recorded —
+       INCLUDING a frozen pair (D3, consumer #37) with no raw rows left to
+       recompute from. That is the entire reason those two columns exist: once
+       compaction has removed a non-allowlisted series' raw rows for a day,
+       `_without_frozen_pairs` refuses to delete-and-recompute it, so
+       delete-and-recompute is not an available undo — restoring the recorded
+       prior value is the only one. A revision with `prior_source_kind IS
+       NULL` means no `daily_metrics` row existed before the migration wrote
+       it, so that pair is DELETEd instead of restored.
+    2. The migration's own `hk_daily_totals` and `hk_daily_total_revisions`
+       rows are deleted — the visible state and the audit trail this specific
+       migration created, not the whole table. `hk_daily_totals_settled_no_
+       delete` (schema.sql) permits this because these rows carry a non-NULL
+       `migration_id`; an ordinary settled row (`migration_id IS NULL`) still
+       refuses, unconditionally.
+
+    Every statement here is scoped by the `migration_id` column directly, never
+    by an IN-list of the (metric, date) pairs it covers, so this reverting a
+    decade of days costs the same bind count as reverting one (#430 review
+    note on the 32,766-bind production limit).
+
+    Returns `{"restored": n, "deleted": n}` — daily_metrics rows put back to a
+    real prior value vs. removed because none existed before the migration.
+    Does nothing, and returns zeros, for an unknown `migration_id` (including
+    one that was never applied, or already reverted).
+    """
+    revisions = conn.execute(
+        "SELECT metric, local_date, prior_sum, prior_source_kind "
+        "FROM hk_daily_total_revisions WHERE migration_id = ?",
+        (migration_id,)).fetchall()
+    restored = 0
+    deleted = 0
+    for row in revisions:
+        metric, day = row["metric"], row["local_date"]
+        if row["prior_source_kind"] is None:
+            conn.execute(
+                "DELETE FROM daily_metrics WHERE metric = ? AND date = ?",
+                (metric, day))
+            deleted += 1
+        else:
+            conn.execute(
+                "UPDATE daily_metrics SET sum = ?, source_kind = ? "
+                "WHERE metric = ? AND date = ?",
+                (row["prior_sum"], row["prior_source_kind"], metric, day))
+            restored += 1
+    conn.execute(
+        "DELETE FROM hk_daily_totals WHERE migration_id = ?", (migration_id,))
+    conn.execute(
+        "DELETE FROM hk_daily_total_revisions WHERE migration_id = ?",
+        (migration_id,))
+    return {"restored": restored, "deleted": deleted}
 
 
 # --------------------------------------------------------------------------- #

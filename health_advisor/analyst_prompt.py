@@ -15,6 +15,7 @@ from typing import Any
 
 from health_advisor import normalize
 from health_advisor import metrics as mx
+from health_advisor import vault as V
 
 
 # These are the tables that can contribute data to a training analysis.  The
@@ -119,9 +120,24 @@ def schema_summary(conn: Any) -> str:
         ).fetchone()[0]
         columns = ", ".join(_columns(conn, table)) or "(no columns)"
         indexes = "; ".join(_indexes(conn, table)) or "(none)"
-        sections.append(
-            f"{table} [rows={count}]: columns: {columns}; indexes: {indexes}"
-        )
+        line = f"{table} [rows={count}]: columns: {columns}; indexes: {indexes}"
+        if table == "metric_source_months":
+            # D3 (consumer #37 d, engine #28): the compaction watermark's own
+            # month is only partly compacted, so that month's rows here are a
+            # LOWER BOUND, not exact -- a late-arriving sample for one of its
+            # post-watermark days is never added once the month has frozen.
+            # No count changes; this only names the month. None on a vault
+            # with no watermark, so an uncompacted vault's summary is
+            # unchanged.
+            through = V.frozen_through(conn)
+            if through is not None:
+                line += (
+                    f"; CAVEAT: {through[:7]} is the compaction watermark's "
+                    "own month -- its counts here are a LOWER BOUND, not "
+                    "exact (late-arriving samples after the month froze are "
+                    "not counted). Every other month is exact."
+                )
+        sections.append(line)
 
     if "daily_metrics" in present:
         metrics = [

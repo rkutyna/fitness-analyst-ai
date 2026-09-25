@@ -1949,6 +1949,27 @@ def _source_months(conn, metric: str, start: str, end: str):
     return None, None
 
 
+def _watermark_month_caveat(conn, provenance: str | None,
+                            start: str, end: str) -> str | None:
+    """The month (``YYYY-MM``) whose `metric_source_months` counts are only a
+    lower bound, if the query range names it — otherwise None.
+
+    D3 (consumer #37 d, engine #28): only the derived table is affected. Raw
+    `records` (``provenance == "records"``) is queried live and is exact; a
+    vault with no compaction watermark (``V.frozen_through`` is None on an
+    undeclared vault, an unset watermark, or a DB error) has nothing to caveat.
+    """
+    if provenance != "metric_source_months":
+        return None
+    through = V.frozen_through(conn)
+    if through is None:
+        return None
+    month = through[:7]
+    if start[:7] <= month <= end[:7]:
+        return month
+    return None
+
+
 def instrument_eras_status(conn, metric: str, start: str, end: str) -> dict:
     """Instrument-era boundaries, or an explicit statement that they are unknown.
 
@@ -1973,6 +1994,15 @@ def instrument_eras_status(conn, metric: str, start: str, end: str) -> dict:
     independent methodology review ruled NOT USABLE (F3-1) — Apple does not
     publish its overlap-resolution algorithm. Ties break deterministically by
     source text.
+
+    D3 (consumer #37 d, engine #28): the compaction watermark's own month is
+    only partly compacted (`db._rebuild_source_months_frozen`), so
+    `metric_source_months` counts for it are a LOWER BOUND, not exact — a
+    late-arriving sample for one of its post-watermark days is never added
+    once the month has frozen. When that month falls inside ``[start, end]``
+    and the provenance is the derived table (raw `records`, the pre-table
+    fallback, is never affected), it is named in a `caveats` list on the
+    result. No count changes and no other month is named.
     """
     rows, provenance = _source_months(conn, metric, start, end)
     if rows is None:
@@ -1999,8 +2029,16 @@ def instrument_eras_status(conn, metric: str, start: str, end: str) -> dict:
                 previous = source
             continue
         previous = source
-    return {"status": "ok", "metric": metric, "provenance": provenance,
-            "boundaries": boundaries}
+    result = {"status": "ok", "metric": metric, "provenance": provenance,
+              "boundaries": boundaries}
+    watermark_month = _watermark_month_caveat(conn, provenance, start, end)
+    if watermark_month is not None:
+        result["caveats"] = [
+            f"{watermark_month}: compaction watermark's own month — "
+            "metric_source_months counts are a lower bound, not exact "
+            "(late-arriving samples after the month froze are not counted)"
+        ]
+    return result
 
 
 def instrument_eras(conn, metric: str, start: str, end: str) -> list[str]:

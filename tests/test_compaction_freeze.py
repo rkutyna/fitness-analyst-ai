@@ -136,6 +136,99 @@ def test_full_recompute_keeps_frozen_provenance(conn):
     assert eras_before["status"] == "ok"
 
 
+# --------------------------------------------------------------------------- #
+# Consumer #37 (d): the watermark month is a caveated LOWER BOUND, not a fix
+# --------------------------------------------------------------------------- #
+def test_instrument_eras_status_has_no_caveat_without_a_watermark(conn):
+    """No compaction watermark at all (not even a declared vault) -- the
+    exact pre-(d) shape, no new key."""
+    db.insert_records(conn, [
+        _raw("basal_energy", "2026-07-10", "b1", 1.0),
+        _raw("basal_energy", "2026-07-30", "b2", 5.0),
+    ])
+    db.recompute_daily_metrics(conn, pairs=[
+        ("basal_energy", "2026-07-10"), ("basal_energy", "2026-07-30")])
+    db.rebuild_metric_source_months(conn, full=True)
+    conn.commit()
+
+    out = analysis.instrument_eras_status(
+        conn, "basal_energy", "2026-07-01", "2026-07-31")
+
+    assert out["provenance"] == "metric_source_months"
+    assert "caveats" not in out
+
+
+def test_instrument_eras_status_watermark_month_is_a_lower_bound(conn):
+    """The watermark's own month (2026-07) is named as a lower bound; a later,
+    fully post-watermark month in the same query range is not -- 'the other
+    months don't' carry it."""
+    _compacted_vault(conn)
+    db.insert_records(conn, [_raw("basal_energy", "2026-08-05", "b9", 3.0)])
+    db.recompute_daily_metrics(conn, pairs=[("basal_energy", "2026-08-05")])
+    db.rebuild_metric_source_months(
+        conn, pairs=[("basal_energy", "2026-08-05")])
+    conn.commit()
+
+    out = analysis.instrument_eras_status(
+        conn, "basal_energy", "2026-07-01", "2026-08-31")
+
+    assert out["caveats"] == [
+        "2026-07: compaction watermark's own month — metric_source_months "
+        "counts are a lower bound, not exact (late-arriving samples after "
+        "the month froze are not counted)"
+    ]
+    assert "2026-08" not in out["caveats"][0]
+
+
+def test_instrument_eras_status_no_caveat_when_range_excludes_the_month(conn):
+    """The watermark month (2026-07) is outside this query's range, so no
+    caveat is added even though the vault is compacted."""
+    _compacted_vault(conn)
+    db.insert_records(conn, [_raw("basal_energy", "2026-08-05", "b9", 3.0)])
+    db.recompute_daily_metrics(conn, pairs=[("basal_energy", "2026-08-05")])
+    db.rebuild_metric_source_months(
+        conn, pairs=[("basal_energy", "2026-08-05")])
+    conn.commit()
+
+    out = analysis.instrument_eras_status(
+        conn, "basal_energy", "2026-08-01", "2026-08-31")
+
+    assert "caveats" not in out
+
+
+def test_instrument_eras_status_no_caveat_from_the_records_fallback(conn):
+    """Raw `records` (the pre-table fallback) is queried live and is exact, so
+    it is never caveated even with a watermark set."""
+    V.declare_vault(conn)
+    conn.commit()
+    V.compact(conn, through=WATERMARK)
+    db.insert_records(conn, [
+        _raw("mood", "2026-07-10", "m1", 4.0, origin="checkin",
+             source="checkin"),
+    ])
+    conn.commit()
+
+    out = analysis.instrument_eras_status(
+        conn, "mood", "2026-07-01", "2026-07-31")
+
+    assert out["provenance"] == "records"
+    assert "caveats" not in out
+
+
+def test_dropping_the_caveat_check_loses_it(conn, monkeypatch):
+    """Mutation: with `_watermark_month_caveat` stubbed to always return None
+    (the shape of forgetting to add the check), the watermark-month test above
+    goes red."""
+    _compacted_vault(conn)
+    monkeypatch.setattr(analysis, "_watermark_month_caveat",
+                        lambda *a, **k: None)
+
+    out = analysis.instrument_eras_status(
+        conn, "basal_energy", "2026-07-01", "2026-07-31")
+
+    assert "caveats" not in out
+
+
 def test_frozen_month_merges_rather_than_recounts(conn):
     """The watermark's own month keeps its count and still gains new sources;
     months after it, and allowlisted series, are recounted exactly."""

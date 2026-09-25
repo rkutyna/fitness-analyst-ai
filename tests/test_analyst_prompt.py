@@ -10,6 +10,7 @@ from health_advisor.analyst_prompt import (
     schema_summary,
 )
 from health_advisor import normalize
+from health_advisor import vault as V
 from tests.conftest import seed_metric, seed_workout
 
 
@@ -46,6 +47,41 @@ def test_schema_summary_is_live_compact_and_training_focused(conn):
     assert "(metric, start_utc)" in summary
     assert "metrics" in summary
     assert all(metric in summary for metric in ("heart_rate", "resting_heart_rate", "step_count"))
+
+
+def test_schema_summary_has_no_caveat_without_a_compaction_watermark(conn):
+    """D3 (consumer #37 d, engine #28): a vault that has never compacted (no
+    watermark at all, whether declared or not) gets the exact pre-(d) summary
+    -- no CAVEAT text appears anywhere."""
+    seed_metric(conn, "basal_energy", "2026-07-01", [1.0])
+    assert "CAVEAT" not in schema_summary(conn)
+
+    V.declare_vault(conn)
+    conn.commit()
+    assert V.frozen_through(conn) is None
+    assert "CAVEAT" not in schema_summary(conn)
+
+
+def test_schema_summary_names_the_watermark_month_as_a_lower_bound(conn):
+    """The watermark's own month is only partly compacted (engine #28's
+    `_rebuild_source_months_frozen`), so its `metric_source_months` counts are
+    a lower bound. The caveat names that month and changes no count."""
+    V.declare_vault(conn)
+    conn.commit()
+    before_rows = conn.execute(
+        "SELECT count(*) FROM metric_source_months").fetchone()[0]
+
+    V.compact(conn, through="2026-07-22")
+    summary = schema_summary(conn)
+
+    assert (
+        "CAVEAT: 2026-07 is the compaction watermark's own month -- its "
+        "counts here are a LOWER BOUND, not exact"
+    ) in summary
+    after_rows = conn.execute(
+        "SELECT count(*) FROM metric_source_months").fetchone()[0]
+    assert after_rows == before_rows
+    assert f"metric_source_months [rows={after_rows}]" in summary
 
 
 def test_prompt_pins_contract_aggregation_and_all_performance_facts():

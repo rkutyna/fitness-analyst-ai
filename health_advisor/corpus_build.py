@@ -39,6 +39,7 @@ exist is a pessimisation with a comment on it, so there is neither.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -144,6 +145,17 @@ class BuildResult:
     corpus_sha256: str
     mode: int
     shippable: bool
+    # #394 / engine #22 item 1, decision 4: the domain lexicon is rebuilt here
+    # and versioned with `corpus_version`. `domain_lexicon_status` is one of
+    # `analyst_corpus.DOMAIN_LEXICON_STATUS_BUILT` (control corpora were
+    # supplied and the lexicon in `corpus_meta` is trustworthy for this
+    # version) or `..._NO_CONTROLS` (none were supplied -- see
+    # `control_corpus_paths` below -- and nothing was written, on purpose:
+    # a lexicon built with no contrast against control corpora is not the
+    # thing the decision brief measured). `domain_lexicon_size` is `None` in
+    # the latter case, never 0-as-a-stand-in-for-"not built".
+    domain_lexicon_status: str
+    domain_lexicon_size: int | None
 
 
 # --------------------------------------------------------------------------- #
@@ -427,6 +439,7 @@ def build_corpus(
     shippable: bool = False,
     built_at: str | None = None,
     read_only: bool = True,
+    control_corpus_paths: Sequence[str | Path] = (),
 ) -> BuildResult:
     """Validate every entry, then write a fresh corpus at `out_path`.
 
@@ -444,6 +457,46 @@ def build_corpus(
     that may not be redistributed.
 
     The finished file is chmod 444 unless `read_only=False`.
+
+    ``control_corpus_paths`` -- #394 / engine #22 item 1, decision 4: "the
+    lexicon is rebuilt by `corpus_build` and versioned with `corpus_version`."
+    Zero or more already-built corpus files (each opened read-only) to
+    contrast against when deriving `analyst_corpus.domain_lexicon`. When
+    given, the lexicon is computed against THIS build's own freshly-written
+    chunks (so it reflects exactly the corpus_version being stamped, not a
+    stale in-memory copy) and stored in `corpus_meta`
+    (`analyst_corpus.DOMAIN_LEXICON_META_KEY`) alongside a status row and the
+    build parameters used, keyed to this `corpus_version` by construction
+    (one `corpus_meta` per corpus file, one lexicon per file).
+
+    When EMPTY (the default), no lexicon is computed or written beyond a
+    `DOMAIN_LEXICON_STATUS_KEY` row reading
+    `DOMAIN_LEXICON_STATUS_NO_CONTROLS` -- this is the honest state, not a
+    degraded fallback: the decision brief measured that a lexicon with no
+    control-corpus contrast ("any word the corpus has ever seen") refuses 0
+    of 12 out-of-domain "far" questions, so writing one anyway under this
+    condition would ship something that FAILS Recommendation 1 while
+    `domain_lexicon_status` still claimed it was fine. `analyst_corpus.
+    load_domain_lexicon` returns `None` for both "never built" and "built
+    without controls", so a caller cannot tell the two apart -- and does not
+    need to; both mean "trigger A has nothing to check against here."
+
+    As of 2026-09-25 there is no production supplier of control-corpus paths:
+    `scripts/corpus_ingest.py` (this module's only entry point, run by a
+    human, no vault access by design) builds ONE corpus from ONE registry and
+    has no notion of a second or third corpus at all. The two control corpora
+    this decision was measured against (`corpus-nearmiss.db`, `corpus-null.db`
+    in the consumer repo's `data/corpus/`) were built ad hoc for the
+    `scripts/corpus_relevance.py` measurement in
+    `docs/product/corpus/RELEVANCE-MEASUREMENT.md` and are not part of this
+    engine's own registry, fetch, or ingest tooling. `control_corpus_paths`
+    makes the plumbing exist and is exercised by
+    `tests/test_analyst_corpus.py` and `tests/test_corpus_build.py`; wiring an
+    actual `--control-corpus PATH` (repeatable) flag onto
+    `scripts/corpus_ingest.py` is the natural next step and is deliberately
+    NOT done here, since it is a CLI/operational change with no test coverage
+    of its own in this pass and is not needed to satisfy this issue's `Done
+    when` (offline reproduction of the oracle table, plus the tests listed).
     """
     out_path = Path(out_path)
     if len(entries) != len(texts):
@@ -492,6 +545,8 @@ def build_corpus(
 
     chunk_count = 0
     orphan_chunk_count = 0
+    domain_lexicon_status = ""
+    domain_lexicon_size: int | None = None
     conn = sqlite3.connect(tmp_path)
     try:
         conn.executescript(CORPUS_SCHEMA)
@@ -532,6 +587,47 @@ def build_corpus(
                 f"integrity check found {orphan_chunk_count} chunk(s) without "
                 "a docs row",
             )
+
+        # #394 / engine #22 item 1, decision 4. Imported here, not at module
+        # top: `analyst_corpus` imports `check_corpus_integrity` FROM this
+        # module, so a top-level import here would be circular. By the time
+        # `build_corpus` is actually called, both modules are fully loaded.
+        from health_advisor.analyst_corpus import (  # noqa: PLC0415
+            DOMAIN_LEXICON_META_KEY, DOMAIN_LEXICON_PARAMS_KEY,
+            DOMAIN_LEXICON_STATUS_BUILT, DOMAIN_LEXICON_STATUS_KEY,
+            DOMAIN_LEXICON_STATUS_NO_CONTROLS, DOMAIN_LEXICON_MIN_CHUNKS,
+            DOMAIN_LEXICON_RATE_MULTIPLE, domain_lexicon,
+        )
+        if control_corpus_paths:
+            control_conns = [
+                sqlite3.connect(f"file:{Path(p)}?mode=ro", uri=True)
+                for p in control_corpus_paths
+            ]
+            try:
+                lexicon = domain_lexicon(conn, control_conns)
+            finally:
+                for control_conn in control_conns:
+                    control_conn.close()
+            domain_lexicon_status = DOMAIN_LEXICON_STATUS_BUILT
+            domain_lexicon_size = len(lexicon)
+            conn.executemany(
+                "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
+                [(DOMAIN_LEXICON_META_KEY,
+                  json.dumps(sorted(lexicon), ensure_ascii=False)),
+                 (DOMAIN_LEXICON_STATUS_KEY, domain_lexicon_status),
+                 (DOMAIN_LEXICON_PARAMS_KEY, json.dumps({
+                     "min_chunks": DOMAIN_LEXICON_MIN_CHUNKS,
+                     "rate_multiple": DOMAIN_LEXICON_RATE_MULTIPLE,
+                     "control_corpus_count": len(control_corpus_paths),
+                 }))],
+            )
+        else:
+            domain_lexicon_status = DOMAIN_LEXICON_STATUS_NO_CONTROLS
+            conn.execute(
+                "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
+                (DOMAIN_LEXICON_STATUS_KEY, domain_lexicon_status),
+            )
+        conn.commit()
     finally:
         conn.close()
 
@@ -552,6 +648,8 @@ def build_corpus(
         corpus_sha256=corpus_file_sha256(out_path),
         mode=os.stat(out_path).st_mode & 0o777,
         shippable=shippable,
+        domain_lexicon_status=domain_lexicon_status,
+        domain_lexicon_size=domain_lexicon_size,
     )
 
 

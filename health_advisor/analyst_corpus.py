@@ -67,6 +67,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 from health_advisor.corpus_build import check_corpus_integrity as _check_corpus_integrity
 
@@ -74,6 +75,13 @@ __all__ = [
     "CHILD_CITE_SNIPPET",
     "CITE_CAPS",
     "DEFAULT_SNIPPET_TOKENS",
+    "DOMAIN_LEXICON_MIN_CHUNKS",
+    "DOMAIN_LEXICON_META_KEY",
+    "DOMAIN_LEXICON_PARAMS_KEY",
+    "DOMAIN_LEXICON_RATE_MULTIPLE",
+    "DOMAIN_LEXICON_STATUS_BUILT",
+    "DOMAIN_LEXICON_STATUS_KEY",
+    "DOMAIN_LEXICON_STATUS_NO_CONTROLS",
     "CiteCaps",
     "CiteRefusal",
     "CiteState",
@@ -82,8 +90,12 @@ __all__ = [
     "build_match_expression",
     "child_source_with_cite",
     "cite",
+    "domain_lexicon",
+    "fts5_stems",
+    "load_domain_lexicon",
     "normalize_span",
     "open_corpus",
+    "question_in_domain",
     "serve_cite",
     "serve_cite_frame",
     "span_is_verbatim",
@@ -192,6 +204,327 @@ have how i if in into is it its me my no nor not of on or our so such than that
 the their them then there these they this those to too was we were what when
 where which while who whom why will with would you your
 """.split())
+
+
+# --------------------------------------------------------------------------- #
+# Domain lexicon (#394 / engine #22 item 1, decision brief 2026-09-25) --
+# trigger A: a corpus-derived vocabulary check on the USER'S QUESTION.
+# --------------------------------------------------------------------------- #
+#
+# All four recommendations of
+# ``docs/product/reviews/i394-decision-brief-20260925.md`` were accepted
+# 2026-09-25 (consumer #394). Recommendation 1: a question is refused (no
+# ``cite`` for that turn) when it
+# contains none of a lexicon of corpus-specific stems. The lexicon itself is a
+# contrast: a stem earns membership by appearing often in the evidence corpus
+# AND rarely in two control corpora (a "far" one -- unrelated fields entirely
+# -- and a "near-miss" one -- adjacent clinical medicine, the harder case).
+# "The plainer version, any word the corpus has ever seen, refused 0 of 12 far
+# questions" (the brief), so the contrast against controls is essential, not
+# an optimisation.
+#
+# TWENTY GENERIC QUESTION WORDS -- RECONSTRUCTED, NOT THE ORIGINAL LIST.
+# ----------------------------------------------------------------------
+# The decision brief's method paragraph says its offline measurement script
+# "uses the #22 stopwords plus 20 generic question words" but the script
+# itself "was a session-scratchpad file and is not committed" -- confirmed
+# absent from this tree and from the consumer repo (grepped for
+# "question word[s]" and "GENERIC_QUESTION" in both checkouts, 2026-09-25,
+# nothing). `_GENERIC_QUESTION_WORDS` below is this session's reconstruction,
+# not a recovery of the original 20. It is deliberately NOT mined from the
+# committed question sets (`questions-lay.json` / `questions-clinical.json`):
+# a breadth-across-topics probe over those 104 questions ranks "run" first
+# (present in all 9 topics) precisely because this corpus's domain *is*
+# running, so a corpus-mined list would exclude the strongest domain term by
+# construction. Instead these are hand-picked, generic across *any* question
+# domain (not just this one): words a question about gallium arsenide could
+# just as easily contain as a question about running. Excluding the #22
+# stopwords (which are pure function words) plus these leaves a lexicon of
+# content words that still requires a *topical* match, not merely a
+# grammatically question-shaped one.
+_GENERIC_QUESTION_WORDS = frozenset({
+    "should", "good", "bad", "better", "worse", "normal", "much", "many",
+    "long", "often", "help", "know", "tell", "mean", "think", "feel",
+    "matter", "problem", "safe", "recommend",
+})
+assert len(_GENERIC_QUESTION_WORDS) == 20
+
+# The lexicon build's thresholds, named so a caller need not memorise two bare
+# numbers: a stem needs >= 3 corpus chunks (design brief's own trigger-A
+# definition) and an evidence-corpus rate at least 2x ITS RATE IN THE TWO
+# CONTROL CORPORA POOLED INTO ONE -- read as a single combined rate over
+# "the two control corpora" taken together (sum of the chunks each stem
+# appears in across every control, divided by the sum of their chunk counts),
+# not a separate 2x bar against each control individually.
+#
+# THIS WAS MEASURED, NOT ASSUMED -- the brief's own English is ambiguous
+# between the two readings, and this session tried both against the real
+# corpora (`data/corpus/{corpus,corpus-nearmiss,corpus-null}.db`) before
+# picking one. Per-control (a stem must clear 2x against EACH control
+# separately) gives a lexicon of 1,559 terms; pooled gives 2,024 -- against
+# the brief's own measured 2,026. Pooled is both closer by two orders of
+# magnitude and the plainer reading of "their rate in the two control
+# corpora" as one combined figure, so it is what is implemented. The
+# remaining gap of 2 terms is very likely the 20 generic question words,
+# which are this session's reconstruction, not the original uncommitted
+# list (see `_GENERIC_QUESTION_WORDS` above) -- see the tests and
+# `PROGRESS.md`/the session report for the full comparison, including that
+# per-control was tried and measured, not merely considered.
+#
+# A term absent from every control entirely has a pooled rate of 0.0, so the
+# 2x comparison is satisfied trivially and by construction -- exactly right,
+# since "never seen in either control" is the strongest possible contrast
+# signal, not a gap in the check.
+DOMAIN_LEXICON_MIN_CHUNKS = 3
+DOMAIN_LEXICON_RATE_MULTIPLE = 2.0
+
+# corpus_meta keys (decision 4: rebuilt by corpus_build, versioned with
+# corpus_version -- corpus_meta already carries corpus_version, built_at and
+# builder_sha as the same kind of key/value row, so the lexicon is stored
+# there rather than in a new table).
+DOMAIN_LEXICON_META_KEY = "domain_lexicon"
+DOMAIN_LEXICON_STATUS_KEY = "domain_lexicon_status"
+DOMAIN_LEXICON_PARAMS_KEY = "domain_lexicon_params"
+
+# `domain_lexicon_status` values. `built` means the two keys above are
+# present and trustworthy for this corpus_version. `unavailable_no_controls`
+# means a build ran WITHOUT control corpora (see `corpus_build.build_corpus`)
+# and `domain_lexicon` was deliberately left unwritten rather than computed
+# against nothing -- "any word the corpus has ever seen" was measured and
+# rejected in the brief, so a lexicon with no contrast must never masquerade
+# as one that has it.
+DOMAIN_LEXICON_STATUS_BUILT = "built"
+DOMAIN_LEXICON_STATUS_NO_CONTROLS = "unavailable_no_control_corpora"
+
+
+_TOKENIZER_CONN: sqlite3.Connection | None = None
+
+
+def _tokenizer_connection() -> sqlite3.Connection:
+    """A private, in-memory connection used only to run text through the
+    corpus's own tokenizer.
+
+    Standard `sqlite3` gives no direct binding to FTS5's tokenizer API, so
+    this uses the documented indirect route: index the text into a one-row
+    FTS5 table built with the identical `tokenize='porter unicode61'` option
+    the corpus schema uses (`corpus_build.CORPUS_SCHEMA`), then read the
+    stemmed vocabulary back out through `fts5vocab`. This is a tokenizer
+    probe, not a search -- nothing here is ever queried with `MATCH`, and
+    nothing here touches a corpus file; nothing about `cite`'s query-syntax
+    refusals or caps applies to it.
+
+    Module-level and lazily created so tokenizing 104 questions does not
+    create and tear down a table 104 times; `fts5vocab` is a live view over
+    `_tok`'s current content, so clearing and re-inserting one row is enough
+    to retokenize.
+    """
+    global _TOKENIZER_CONN
+    if _TOKENIZER_CONN is None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE VIRTUAL TABLE _tok USING fts5(body, tokenize='porter unicode61')")
+        conn.execute("CREATE VIRTUAL TABLE _tokv USING fts5vocab('_tok', 'row')")
+        _TOKENIZER_CONN = conn
+    return _TOKENIZER_CONN
+
+
+def fts5_stems(text: str) -> frozenset[str]:
+    """The distinct stems `text` tokenizes to, under the corpus's own
+    `porter unicode61` FTS5 tokenizer.
+
+    Order and multiplicity are not preserved -- callers here only ever test
+    set membership (`question_in_domain`) or use this to fold a hand-written
+    word list into the same stemmed space the corpus vocabulary lives in
+    (`_excluded_stems`). Porter stemming is not the identity function on
+    common words: measured against the #22 stopword list, 8 of 69 entries
+    change on stemming (``does`` -> ``doe``, ``are`` -> ``ar``, ``was`` ->
+    ``wa``, ``has`` -> ``ha``, ``its`` -> ``it``, ``this`` -> ``thi``,
+    ``they`` -> ``thei``, ``being`` -> ``be``) -- so excluding a raw string
+    against stemmed corpus vocabulary would silently fail to exclude most of
+    those 8, and every one of them would otherwise be common enough in any
+    corpus to pass a >=3-chunks bar easily.
+    """
+    if not text or not text.strip():
+        return frozenset()
+    conn = _tokenizer_connection()
+    conn.execute("DELETE FROM _tok")
+    conn.execute("INSERT INTO _tok(body) VALUES (?)", (text,))
+    return frozenset(row[0] for row in conn.execute("SELECT term FROM _tokv"))
+
+
+_EXCLUDED_STEMS_CACHE: frozenset[str] | None = None
+
+
+def _excluded_stems() -> frozenset[str]:
+    """The #22 stopwords plus the 20 generic question words, in stem space.
+
+    Cached: the input word lists are module constants, so this is invariant
+    for the life of the process.
+    """
+    global _EXCLUDED_STEMS_CACHE
+    if _EXCLUDED_STEMS_CACHE is None:
+        stems: set[str] = set()
+        for word in _STOPWORDS | _GENERIC_QUESTION_WORDS:
+            stems |= fts5_stems(word)
+        _EXCLUDED_STEMS_CACHE = frozenset(stems)
+    return _EXCLUDED_STEMS_CACHE
+
+
+def _chunk_term_stats(conn: sqlite3.Connection) -> tuple[dict[str, int], int]:
+    """``(stem -> number of chunks it appears in, total chunk count)`` for one
+    already-open corpus connection's ``chunks`` FTS5 table.
+
+    Uses `fts5vocab`'s ``row`` mode directly against `chunks` -- the corpus is
+    already indexed with `tokenize='porter unicode61'`
+    (`corpus_build.CORPUS_SCHEMA`), so this reads the SAME stemmed vocabulary
+    `cite`'s own `MATCH` queries run against, rather than re-tokenizing the
+    chunk bodies through a second, potentially divergent path. ``doc`` in
+    `fts5vocab`'s ``row`` mode is the number of rows (chunks) containing the
+    term at least once -- exactly "appears in N corpus chunks" in the brief's
+    own words, not `cnt` (total occurrences, which would let one chunk that
+    repeats a word inflate its count).
+    """
+    total = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+    # The 3-argument form (schema, table, type) is required here, not the
+    # 2-argument (table, type) shorthand: `fts5vocab`'s 2-argument form looks
+    # for the source table IN THE SAME SCHEMA AS THE VOCAB TABLE ITSELF.
+    # `chunks` lives in `main`; putting the vocab table in `temp` (so it never
+    # collides across the several corpus connections this module may hold
+    # open at once, and never leaves anything behind in a read-only main
+    # schema) means the shorthand resolves to the nonexistent `temp.chunks`
+    # and fails with "no such fts5 table" -- measured directly, both forms.
+    conn.execute(
+        "CREATE VIRTUAL TABLE temp.__domain_vocab USING fts5vocab(main, chunks, 'row')")
+    try:
+        freqs = {term: int(doc) for term, doc in
+                 conn.execute("SELECT term, doc FROM temp.__domain_vocab")}
+    finally:
+        conn.execute("DROP TABLE temp.__domain_vocab")
+    return freqs, total
+
+
+def domain_lexicon(
+    evidence_conn: sqlite3.Connection,
+    control_conns: Sequence[sqlite3.Connection],
+    *,
+    min_chunks: int = DOMAIN_LEXICON_MIN_CHUNKS,
+    rate_multiple: float = DOMAIN_LEXICON_RATE_MULTIPLE,
+) -> frozenset[str]:
+    """The corpus-derived domain lexicon: trigger A, decision brief
+    2026-09-25.
+
+    A stem is admitted iff:
+
+    1. it appears in at least ``min_chunks`` chunks of ``evidence_conn``'s
+       ``chunks`` table (default 3);
+    2. it is not one of the #22 stopwords or the 20 generic question words
+       (`_excluded_stems`); and
+    3. its document-frequency RATE in ``evidence_conn`` (chunks containing it
+       / total chunks) is at least ``rate_multiple`` times (default 2x) its
+       rate in ``control_conns`` POOLED INTO ONE CORPUS -- every control's
+       chunk-containing-the-stem counts summed, divided by every control's
+       chunk count summed. See `DOMAIN_LEXICON_RATE_MULTIPLE`'s own comment
+       for why pooled rather than a separate 2x bar against each control: it
+       is the reading measured to reproduce the brief's own 2,026-term
+       lexicon (2,024 here; 1,559 for the per-control alternative also
+       tried). A stem absent from every control (pooled rate 0.0) always
+       clears the bar.
+
+    ``control_conns`` is a sequence of already-open connections, not paths:
+    this function does no I/O of its own and holds no opinion about where the
+    controls come from (a build-time set of files, a test fixture, an
+    in-memory corpus) -- see `corpus_build.build_corpus`'s
+    ``control_corpus_paths`` for the production build-time caller, and
+    `tests/test_analyst_corpus.py` for a hermetic in-memory caller. An empty
+    sequence pools to a total of 0, so every stem's control rate is 0.0 and
+    the rate check admits everything that clears ``min_chunks`` and the
+    exclusion list -- callers that mean "no contrast available" must not call
+    this with an empty sequence (see `corpus_build.build_corpus`, which
+    refuses to compute or store a lexicon at all in that case, on exactly
+    this basis: the brief measured that a lexicon with no contrast is not
+    a lexicon that discriminates anything).
+
+    Pure with respect to its inputs -- no clock, no randomness, no dict
+    iteration order in what it returns (a `frozenset`, compared by contents
+    at every call site that matters, never by insertion order).
+    """
+    excluded = _excluded_stems()
+    evidence_freqs, evidence_total = _chunk_term_stats(evidence_conn)
+    if evidence_total <= 0:
+        raise ValueError(
+            "domain_lexicon: evidence corpus has no chunks; there is nothing "
+            "to derive a lexicon from")
+
+    pooled_doc_counts: dict[str, int] = {}
+    pooled_total = 0
+    for conn in control_conns:
+        freqs, total = _chunk_term_stats(conn)
+        pooled_total += total
+        for term, doc_count in freqs.items():
+            pooled_doc_counts[term] = pooled_doc_counts.get(term, 0) + doc_count
+
+    lexicon: set[str] = set()
+    for term, doc_count in evidence_freqs.items():
+        if doc_count < min_chunks:
+            continue
+        if term in excluded:
+            continue
+        evidence_rate = doc_count / evidence_total
+        control_rate = (
+            pooled_doc_counts.get(term, 0) / pooled_total if pooled_total else 0.0)
+        if evidence_rate >= rate_multiple * control_rate:
+            lexicon.add(term)
+    return frozenset(lexicon)
+
+
+def question_in_domain(question: str, lexicon: frozenset[str]) -> bool:
+    """True iff ``question`` contains at least one stem of ``lexicon``.
+
+    Refuses (returns ``False``) when the intersection is empty -- including
+    when ``lexicon`` itself is empty, which is the safe reading of "no
+    lexicon is available yet" (never treat "nothing to check against" as
+    "everything passes"). Tokenizes ``question`` the same way the lexicon's
+    own terms were derived (`fts5_stems`, the corpus's ``porter unicode61``
+    tokenizer) so a plural or inflected form in the question matches a
+    singular/base stem in the lexicon and vice versa.
+
+    This checks the USER'S QUESTION, never a query the model constructs from
+    it (decision brief 2026-09-25, recommendation 1: "a deterministic check
+    on the user's question (not on the model's query)") -- callers must pass
+    the question text itself, not a `cite()` query string.
+    """
+    if not lexicon:
+        return False
+    return bool(fts5_stems(question) & lexicon)
+
+
+def load_domain_lexicon(corpus_conn: sqlite3.Connection) -> frozenset[str] | None:
+    """The lexicon `corpus_build` stamped into this corpus, or ``None``.
+
+    ``None`` covers two cases a caller must treat identically -- refuse to
+    trust a lexicon that is not there rather than guess: no
+    `DOMAIN_LEXICON_META_KEY` row at all (a corpus built before this feature
+    existed), and `DOMAIN_LEXICON_STATUS_KEY` reading
+    `DOMAIN_LEXICON_STATUS_NO_CONTROLS` (a build that ran without control
+    corpora and deliberately left the lexicon unwritten -- see
+    `corpus_build.build_corpus`). A malformed value (not a JSON list) is also
+    ``None``, not a crash: a retrieval-time reader must degrade to "no
+    lexicon", never raise, because a stale-schema corpus_meta row is not a
+    reason to take the whole retrieval path down.
+    """
+    row = corpus_conn.execute(
+        "SELECT value FROM corpus_meta WHERE key = ?",
+        (DOMAIN_LEXICON_META_KEY,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        terms = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(terms, list) or not all(isinstance(t, str) for t in terms):
+        return None
+    return frozenset(terms)
 
 
 class CiteRefusal(Exception):

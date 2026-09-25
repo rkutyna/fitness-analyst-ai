@@ -216,37 +216,44 @@ def test_state_is_constrained_to_the_two_legal_values(conn):
 
 # --- assertions 2-7a: the server wire and guards ---------------------------
 
-def test_settled_daily_total_post_is_rejected_with_evidence(
+def test_settled_daily_total_post_is_skipped_with_evidence(
         conn, vault, vault_path, monkeypatch, capsys):
-    """2. A fresh batch cannot rewrite a settled day or log its value."""
+    """2. A fresh batch cannot rewrite a settled day or log its value.
+
+    #501: the re-pull is SKIPPED, not refused — 200, the stored value and its
+    revision history untouched, the skip counted in the response and in
+    ingest_diagnostics without the arriving value.
+    """
     dbmod.insert_daily_totals(conn, [_total(state="settled")], batch_id="seed")
     conn.commit()
 
     with _client(vault, monkeypatch) as client:
         response = _post(client, _wire_total(state="provisional", value=9999),
-                         batch_id="settled-refusal")
+                         batch_id="settled-skip")
 
-    assert response.status_code == 409
-    assert response.json()["detail"].startswith("daily total already settled")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["daily_totals_added"] == 0
+    assert body["daily_totals_skipped_settled"] == 1
     trace = capsys.readouterr().err
-    assert "ingest-trace reject-409-settled" in trace
+    assert "ingest-trace skip-settled" in trace
     assert "9999" not in trace
     assert conn.execute(
         "SELECT value, state FROM hk_daily_totals WHERE metric = 'step_count' "
         "AND local_date = '2026-08-25'").fetchone()[:] == (10173.0, "settled")
     assert conn.execute("SELECT COUNT(*) FROM hk_daily_total_revisions").fetchone()[0] == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM commit_log WHERE key = 'healthkit:dev-1:settled-refusal'"
-    ).fetchone()[0] == 0
     fresh = dbmod.connect(vault_path, read_only=True)
     try:
-        evidence = fresh.execute(
-            "SELECT source, kind, rows_seen, rows_added, detail FROM ingest_log"
-        ).fetchone()
-        assert tuple(evidence[:4]) == ("receiver", "reject", 0, 0)
-        assert "settled_guard" in evidence["detail"]
-        assert "settled-refusal" in evidence["detail"]
-        assert "9999" not in evidence["detail"]
+        diag = fresh.execute(
+            "SELECT point_kind, metric, local_date, reason, detail "
+            "FROM ingest_diagnostics WHERE batch_id = 'settled-skip'").fetchall()
+        assert [tuple(row[:4]) for row in diag] == [
+            ("daily_total", "step_count", "2026-08-25", "settled_skip")]
+        assert "9999" not in diag[0]["detail"]
+        ingest = fresh.execute(
+            "SELECT detail FROM ingest_log WHERE kind = 'ingest'").fetchone()
+        assert "daily_totals_skipped_settled=1" in ingest["detail"]
+        assert "9999" not in ingest["detail"]
     finally:
         fresh.close()
 
@@ -275,7 +282,7 @@ def test_provisional_daily_total_post_accepts_update(conn, vault, monkeypatch):
 
 
 def test_settle_transition_is_one_way(conn, vault, monkeypatch):
-    """4. Settling stamps the row, after which a fresh pull is refused."""
+    """4. Settling stamps the row, after which a fresh pull is skipped (#501)."""
     with _client(vault, monkeypatch) as client:
         first = _post(client, _wire_total(), batch_id="settle-provisional")
         settled = _post(
@@ -283,20 +290,23 @@ def test_settle_transition_is_one_way(conn, vault, monkeypatch):
             _wire_total(state="settled", value=10173.0,
                         queried_at="2026-08-28T09:00:00-04:00"),
             batch_id="settle-final", sequence=2)
-        refused = _post(
+        skipped = _post(
             client,
-            _wire_total(state="settled", value=10173.0,
+            _wire_total(state="settled", value=10100.0,
                         queried_at="2026-08-29T09:00:00-04:00"),
             batch_id="settle-after", sequence=3)
 
     assert first.status_code == 200
     assert settled.status_code == 200
-    assert refused.status_code == 409
+    assert skipped.status_code == 200
+    assert skipped.json()["daily_totals_skipped_settled"] == 1
+    assert skipped.json()["daily_totals_added"] == 0
     row = conn.execute(
-        "SELECT state, settled_at FROM hk_daily_totals WHERE metric = 'step_count' "
-        "AND local_date = '2026-08-25'").fetchone()
+        "SELECT state, settled_at, value FROM hk_daily_totals "
+        "WHERE metric = 'step_count' AND local_date = '2026-08-25'").fetchone()
     assert row["state"] == "settled"
     assert row["settled_at"] is not None
+    assert row["value"] == 10173.0
 
 
 def test_settling_a_changed_total_leaves_prior_insights_byte_identical(conn):
@@ -373,9 +383,9 @@ def test_daily_total_watermark_guard_wins(conn, vault, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM commit_log").fetchone()[0] == 0
 
 
-def test_daily_total_409_details_are_distinguishable_and_watermark_parseable(
+def test_daily_total_settled_skip_and_watermark_409_are_distinguishable(
         conn, vault, monkeypatch):
-    """7. Both prefixes are stable; the client-compatible date slice is exact."""
+    """7. A settled day is a 200 skip (#501); the watermark 409 prefix is exact."""
     dbmod.insert_daily_totals(conn, [_total(state="settled")], batch_id="seed")
     vault_mod.set_history_imported_through(conn, "2026-08-21")
     conn.commit()
@@ -385,22 +395,33 @@ def test_daily_total_409_details_are_distinguishable_and_watermark_parseable(
             client, _wire_total(local_date="2026-08-21"),
             batch_id="different-watermark")
 
-    settled_detail = settled.json()["detail"]
+    assert settled.status_code == 200
+    assert settled.json()["daily_totals_skipped_settled"] == 1
+    assert watermark.status_code == 409
     watermark_detail = watermark.json()["detail"]
-    assert settled_detail.startswith("daily total already settled")
     prefix = "history imported through "
     watermark = "2026-08-21"
     assert watermark_detail[:len(prefix) + len(watermark) + 1] == \
         f"{prefix}{watermark};"
     assert watermark_detail[len(prefix):len(prefix) + 10] == watermark
-    assert settled_detail.split(" ", 1)[0] != watermark_detail.split(" ", 1)[0]
 
 
-def test_mixed_daily_total_batch_is_refused_atomically(conn, vault, monkeypatch):
-    """7a. One settled row refuses every other row in the same transaction."""
+def test_mixed_batch_writes_provisional_and_skips_settled(
+        conn, vault, vault_path, monkeypatch):
+    """7a (#501). A settled day in a batch is skipped; the rest applies.
+
+    Before #501 one settled row refused every other row in the transaction,
+    so a lag-14 re-pull reaching a closed day took the provisional days in
+    the same payload down with it. Now: provisional day written, settled day
+    untouched (value, state, revision count), 200, skip counted.
+    """
     dbmod.insert_daily_totals(
-        conn, [_total(local_date="2026-08-26", state="settled")], batch_id="seed")
+        conn, [_total(local_date="2026-08-26", state="settled",
+                      queried_at="2026-08-29T09:00:00")], batch_id="seed")
     conn.commit()
+    settled_before = tuple(conn.execute(
+        "SELECT value, state, settled_at, queried_at FROM hk_daily_totals "
+        "WHERE local_date = '2026-08-26'").fetchone())
     with _client(vault, monkeypatch) as client:
         response = _post(
             client,
@@ -408,16 +429,32 @@ def test_mixed_daily_total_batch_is_refused_atomically(conn, vault, monkeypatch)
             _wire_total(local_date="2026-08-26", value=2222, state="provisional"),
             batch_id="mixed-settled")
 
-    assert response.status_code == 409
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["applied"] is True
+    assert body["daily_totals_seen"] == 2
+    assert body["daily_totals_added"] == 1
+    assert body["daily_totals_skipped_settled"] == 1
+    assert tuple(conn.execute(
+        "SELECT value, state FROM hk_daily_totals WHERE local_date = '2026-08-25'"
+    ).fetchone()) == (1111.0, "provisional")
+    assert tuple(conn.execute(
+        "SELECT value, state, settled_at, queried_at FROM hk_daily_totals "
+        "WHERE local_date = '2026-08-26'").fetchone()) == settled_before
     assert conn.execute(
-        "SELECT COUNT(*) FROM hk_daily_totals WHERE local_date = '2026-08-25'"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM hk_daily_total_revisions WHERE local_date = '2026-08-25'"
-    ).fetchone()[0] == 0
+        "SELECT COUNT(*) FROM hk_daily_total_revisions WHERE local_date = '2026-08-26'"
+    ).fetchone()[0] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM commit_log WHERE key = 'healthkit:dev-1:mixed-settled'"
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
+    fresh = dbmod.connect(vault_path, read_only=True)
+    try:
+        diag = [tuple(row) for row in fresh.execute(
+            "SELECT point_kind, point_index, local_date, reason "
+            "FROM ingest_diagnostics WHERE batch_id = 'mixed-settled'")]
+    finally:
+        fresh.close()
+    assert diag == [("daily_total", 1, "2026-08-26", "settled_skip")]
 
 
 # --- health_advisor#220: the re-pull is bounded, never a backfill ------------

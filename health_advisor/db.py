@@ -2233,8 +2233,9 @@ def insert_daily_totals(
 
     Does NOT enforce the settle guard. A settled row is immutable in the storage
     engine (the `hk_daily_totals_settled_immutable` trigger), so an attempt to
-    overwrite one raises sqlite3.IntegrityError from here; the receiver refuses
-    it earlier and more politely, with a 409 and no database evidence.
+    overwrite one raises sqlite3.IntegrityError from here; the receiver filters
+    settled days out of a batch before calling this, skipping them with a
+    diagnostic rather than failing the batch (#501).
     """
     now = utcnow_iso()
     written = 0

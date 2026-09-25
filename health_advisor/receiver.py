@@ -810,6 +810,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     records_touched: set[tuple[str, str]] = set()
     rec_added = 0
     daily_totals_added = 0
+    daily_totals_skipped_settled = 0
     routes_added = 0
     routes_unmatched = 0
     routes_empty = sum(
@@ -927,10 +928,17 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                         nbytes=len(raw),
                     )
 
-            # This sibling guard is deliberately before every mutation. It is
-            # batch-atomic: a settled row anywhere in a multi-day payload
-            # refuses the whole transaction, including rows that were otherwise
-            # still provisional.
+            # A re-pull that reaches a SETTLED day is skipped, not refused
+            # (#501). Until then this guard refused the whole batch with a 409,
+            # so one closed day took every provisional day in the same payload
+            # down with it. A settled consolidated total is immutable (D19/#220,
+            # enforced by the hk_daily_totals_settled_immutable trigger), so the
+            # stored value is kept and the arriving row is dropped here, before
+            # any mutation; the rest of the batch applies. Each skip is counted
+            # in ingest_diagnostics (reason 'settled_skip') and in the response,
+            # never with the arriving value: a re-pull of a closed day is not a
+            # correction and must not be logged as a candidate one.
+            writable_totals: list[dict] = []
             for row in parsed["daily_totals"]:
                 prior = conn.execute(
                     "SELECT state FROM hk_daily_totals "
@@ -938,24 +946,30 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     (row["metric"], row["local_date"]),
                 ).fetchone()
                 if prior is not None and prior["state"] == "settled":
-                    _trace("reject-409-settled", metric=row["metric"],
+                    _trace("skip-settled", metric=row["metric"],
                            day=row["local_date"], batch_id=parsed["batch_id"])
-                    _refuse_guard(
-                        ctx, conn,
-                        detail=(
-                            f"daily total already settled for {row['metric']} on "
-                            f"{row['local_date']}; a settled consolidated total "
-                            "is immutable (D19/#220) — this day is closed and the "
-                            "client should advance past it, not retry"
+                    diagnostic_rows.append({
+                        "batch_id": parsed["batch_id"],
+                        "point_kind": "daily_total",
+                        "point_index": row["_point_index"],
+                        "metric": row["metric"],
+                        "type_identifier": None,
+                        "local_date": row["local_date"],
+                        "source": None,
+                        "device_id": row["device_id"],
+                        "hk_uuid": None,
+                        "unit": row["unit"],
+                        "reason": "settled_skip",
+                        "detail": (
+                            "daily total already settled; a settled "
+                            "consolidated total is immutable (D19/#220), so "
+                            "this re-pull was skipped and the stored value "
+                            "kept (#501)"
                         ),
-                        evidence=(
-                            f"settled_guard metric={row['metric']} "
-                            f"day={row['local_date']} "
-                            f"batch_id={parsed['batch_id']} "
-                            f"device={parsed.get('device_id')}"
-                        ),
-                        nbytes=len(raw),
-                    )
+                    })
+                    daily_totals_skipped_settled += 1
+                    continue
+                writable_totals.append(row)
 
             # A tombstone is durable before the add filter is evaluated. A
             # deletion for an unknown UUID therefore still protects against a
@@ -1117,10 +1131,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # The parser assigns wire indexes while walking the list. Keep the
             # same positional traversal here; accepted totals are not copied
             # into the rejection-only diagnostics table.
-            for _, row in enumerate(parsed["daily_totals"]):
+            for _, row in enumerate(writable_totals):
                 affected.add((row["metric"], row["local_date"]))
             daily_totals_added = db.insert_daily_totals(
-                conn, parsed["daily_totals"], batch_id=parsed["batch_id"])
+                conn, writable_totals, batch_id=parsed["batch_id"])
             db.log_ingest_diagnostics(conn, diagnostic_rows)
             dm = db.recompute_daily_metrics(conn, pairs=sorted(affected))
 
@@ -1270,6 +1284,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 + f"deleted={deleted} tombstones={tombstones_added} "
                 f"daily_totals_seen={len(parsed['daily_totals'])} "
                 f"daily_totals_added={daily_totals_added} "
+                f"daily_totals_skipped_settled={daily_totals_skipped_settled} "
                 f"daily_pairs={dm} derived={derived} "
                 f"history_imported_through={history or '-'} "
                 f"unhandled={len(parsed['unhandled'])} "
@@ -1313,6 +1328,11 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             "workout_elevation_updated": workout_elevation_updated,
             "workout_elevation_unmatched": workout_elevation_unmatched,
         })
+    if daily_totals_skipped_settled:
+        # A settled day re-pulled in this batch was skipped, not written
+        # (consumer #501). Present only when non-zero, so an ordinary batch's
+        # response bytes are unchanged.
+        response["daily_totals_skipped_settled"] = daily_totals_skipped_settled
     if parsed["rejected_anchors"]:
         response["anchor_results"] = parsed["anchor_results"]
     if parsed["routes_present"]:

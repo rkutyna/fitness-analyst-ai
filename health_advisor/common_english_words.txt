@@ -1,0 +1,199 @@
+# common_english_words.txt -- consumer #522 / engine #22 item 1 follow-up.
+#
+# Source: /usr/share/dict/connectives, verbatim, on this development machine
+# (macOS 27, a FreeBSD-derived Unix). It ships as part of the same public
+# `/usr/share/dict` bundle as `words`/`web2` -- the adjacent README in that
+# directory states of `web2` (Webster's Second International, the same
+# distribution): "The 1934 copyright has lapsed, according to the supplier."
+# `connectives` is not `web2` itself: it is a much older, independently
+# compiled list of the ~150 most frequent words in general English prose,
+# built at Bell Labs for the Writer's Workbench `style`/`diction` text-
+# analysis tools (Cherry & Vesterman, ~1978-81) from word-frequency counts,
+# and it has shipped unmodified in the same `/usr/share/dict` directory as
+# `web2` in every BSD-derived Unix (4.2BSD onward) and in macOS for over
+# four decades, with no copyright notice ever attached in that distribution.
+# Treated here the same as `web2`: public domain / unencumbered, on this
+# machine already, no network fetch of any kind.
+#
+# NOT frequency-ranked from scratch by this session -- copied verbatim, in
+# the file's own original order, which IS the frequency order (rank 1 =
+# "the", the single most common word in English; rank 150 = "three"). No
+# reordering, no filtering, no additions or removals.
+#
+# Deliberately NOT `wordfreq` (CC BY-SA, excluded per consumer #522) and NOT
+# any list requiring a network fetch -- this machine has no other on-disk,
+# licence-compatible, frequency-ranked English word list (searched: nltk_data
+# under ~/nltk_data has `stopwords` and `opinion_lexicon` but no frequency
+# corpus; no spacy/wordfreq/symspell package or data file is installed
+# anywhere on the machine; macOS's own `hiutil` stopword list at
+# /usr/share/hiutil/Stopwords.plist is Apple system software under the
+# macOS licence, not redistributable here; /usr/share/dict/web2 itself is a
+# 235,936-word dictionary with no frequency signal at all -- confirmed
+# insufficient on its own, exactly as the task anticipates).
+#
+# Licence: public domain (see above). Size: 150 words, one per line, in
+# original frequency-descending order. Loaded by
+# `analyst_corpus._common_english_words()`, folded into `_excluded_stems()`'s
+# stemmed space exactly like the existing #22 stopwords and generic question
+# words -- see that function for why raw-string exclusion would be wrong
+# (Porter stemming is not the identity function on common words).
+#
+# Measured effect (docs/product/reviews/... consumer #522 report has the
+# full table): closes the "... What might I have missed?" wrapper leak on
+# corpus v2 (closes on "might", rank 136) but does NOT close "What is the
+# best answer to this: ..." (v2 keeps admitting on "best", which this list
+# does not contain -- it is a pure function-word list, not a general top-N
+# content-word list). Costs one new false refusal on v1 lay questions
+# ("How much should I slow down when it is hot or humid?", loses "down",
+# rank 100, its only shared stem with the v1 lexicon). Both are reported
+# honestly in the consumer issue rather than tuned away.
+the
+of
+and
+to
+a
+in
+that
+is
+was
+he
+for
+it
+with
+as
+his
+on
+be
+at
+by
+i
+this
+had
+not
+are
+but
+from
+or
+have
+an
+they
+which
+one
+you
+were
+her
+all
+she
+there
+would
+their
+we
+him
+been
+has
+when
+who
+will
+more
+no
+if
+out
+so
+said
+what
+up
+its
+about
+into
+than
+them
+can
+only
+other
+new
+some
+could
+time
+these
+two
+may
+then
+do
+first
+any
+my
+now
+such
+like
+our
+over
+man
+me
+even
+most
+made
+after
+also
+did
+many
+before
+must
+through
+back
+years
+where
+much
+your
+way
+well
+down
+should
+because
+each
+just
+those
+people
+mr
+how
+too
+little
+state
+good
+very
+make
+world
+still
+own
+see
+men
+work
+long
+get
+here
+between
+both
+life
+being
+under
+never
+day
+same
+another
+know
+while
+last
+might
+us
+great
+old
+year
+off
+come
+since
+against
+go
+came
+right
+used
+take
+three

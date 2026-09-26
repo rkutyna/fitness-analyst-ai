@@ -256,32 +256,48 @@ assert len(_GENERIC_QUESTION_WORDS) == 20
 
 # The lexicon build's thresholds, named so a caller need not memorise two bare
 # numbers: a stem needs >= 3 corpus chunks (design brief's own trigger-A
-# definition) and an evidence-corpus rate at least 2x ITS RATE IN THE TWO
-# CONTROL CORPORA POOLED INTO ONE -- read as a single combined rate over
-# "the two control corpora" taken together (sum of the chunks each stem
-# appears in across every control, divided by the sum of their chunk counts),
-# not a separate 2x bar against each control individually.
+# definition) and an evidence-corpus rate at least ``DOMAIN_LEXICON_RATE_
+# MULTIPLE`` times ITS RATE IN THE TWO CONTROL CORPORA POOLED INTO ONE --
+# read as a single combined rate over "the two control corpora" taken
+# together (sum of the chunks each stem appears in across every control,
+# divided by the sum of their chunk counts), not a separate bar against each
+# control individually.
 #
-# THIS WAS MEASURED, NOT ASSUMED -- the brief's own English is ambiguous
-# between the two readings, and this session tried both against the real
-# corpora (`data/corpus/{corpus,corpus-nearmiss,corpus-null}.db`) before
-# picking one. Per-control (a stem must clear 2x against EACH control
-# separately) gives a lexicon of 1,559 terms; pooled gives 2,024 -- against
-# the brief's own measured 2,026. Pooled is both closer by two orders of
-# magnitude and the plainer reading of "their rate in the two control
-# corpora" as one combined figure, so it is what is implemented. The
-# remaining gap of 2 terms is very likely the 20 generic question words,
-# which are this session's reconstruction, not the original uncommitted
-# list (see `_GENERIC_QUESTION_WORDS` above) -- see the tests and
-# `PROGRESS.md`/the session report for the full comparison, including that
-# per-control was tried and measured, not merely considered.
+# POOLED VS PER-CONTROL WAS MEASURED, NOT ASSUMED -- the original i394 brief's
+# own English was ambiguous between the two readings, and that session tried
+# both against the real corpora (`data/corpus/{corpus,corpus-nearmiss,
+# corpus-null}.db`) before picking one, at the THEN-default of 2x: per-control
+# (a stem must clear 2x against EACH control separately) gave a lexicon of
+# 1,559 terms; pooled gave 2,024 -- against the brief's own measured 2,026.
+# Pooled was both closer by two orders of magnitude and the plainer reading of
+# "their rate in the two control corpora" as one combined figure, so it is
+# what is implemented. The remaining gap of 2 terms is very likely the 20
+# generic question words, which are this session's reconstruction, not the
+# original uncommitted list (see `_GENERIC_QUESTION_WORDS` above) -- see the
+# tests and `PROGRESS.md`/the session report for the full comparison,
+# including that per-control was tried and measured, not merely considered.
 #
 # A term absent from every control entirely has a pooled rate of 0.0, so the
-# 2x comparison is satisfied trivially and by construction -- exactly right,
-# since "never seen in either control" is the strongest possible contrast
-# signal, not a gap in the check.
+# rate comparison is satisfied trivially and by construction at ANY multiple
+# -- exactly right, since "never seen in either control" is the strongest
+# possible contrast signal, not a gap in the check.
+#
+# THE MULTIPLE ITSELF WAS RAISED FROM 2.0 TO 3.0, consumer #522, the owner's
+# decision, 2026-09-26 -- measured on this branch (150-word common-English
+# exclusion already applied) after the exclusion list alone still left a
+# larger residual lay false-refusal count than wanted on both corpora. At
+# 3.0: v2 lexicon 2,305 (was 2,738 at 2.0), out-of-domain 22/24, all 8
+# wrapper probes (the 2 known plus 6 held-out, see
+# `tests/fixtures/held_out_domain_wrappers.json`) 22/24, clinical 0/52,
+# new-topic 0/30, lay 3/52. v1 lexicon 1,608 (was 2,024/2,012 at 2.0 without
+# and with the word-list exclusion), out-of-domain 21/24, all 8 wrappers
+# 21/24, clinical 0/52, lay 3/52. `corpus_meta`'s stored
+# `domain_lexicon_params` already records whichever multiple built a given
+# corpus (see `build_corpus` below), so a lexicon built before this change
+# stays traceable to the value that produced it rather than silently
+# reinterpreted under the new default.
 DOMAIN_LEXICON_MIN_CHUNKS = 3
-DOMAIN_LEXICON_RATE_MULTIPLE = 2.0
+DOMAIN_LEXICON_RATE_MULTIPLE = 3.0
 
 # corpus_meta keys (decision 4: rebuilt by corpus_build, versioned with
 # corpus_version -- corpus_meta already carries corpus_version, built_at and
@@ -374,19 +390,61 @@ def fts5_stems(text: str) -> frozenset[str]:
     return frozenset(row[0] for row in conn.execute("SELECT term FROM _tokv"))
 
 
+#: Path to the vendored common-English word list -- see that file's own
+#: header for provenance, licence and size. Shipped INSIDE the package
+#: (`pyproject.toml`'s `[tool.setuptools.package-data]`), the same pattern
+#: `db.SCHEMA_PATH` uses for `schema.sql`, so it resolves identically
+#: whether this module is imported from a checkout or an installed wheel.
+COMMON_ENGLISH_WORDS_PATH = Path(__file__).resolve().parent / "common_english_words.txt"
+
+#: The list's documented size (Method step 2, consumer #522): 150 words,
+#: copied verbatim from `/usr/share/dict/connectives`. Asserted in
+#: `_common_english_words()` so a future accidental edit to the data file
+#: (an added or dropped line) fails loudly rather than silently changing
+#: the domain gate's behaviour.
+COMMON_ENGLISH_WORDS_COUNT = 150
+
+_COMMON_ENGLISH_WORDS_CACHE: frozenset[str] | None = None
+
+
+def _common_english_words() -> frozenset[str]:
+    """The vendored common-English word list, raw strings (not yet stemmed).
+
+    Blank lines and lines starting with ``#`` (the provenance header) are
+    skipped. Cached: the file is a static package resource, read once per
+    process. Raises if the file is missing or its word count has drifted
+    from `COMMON_ENGLISH_WORDS_COUNT` -- a silently truncated or padded list
+    would change what the domain gate excludes without anyone deciding that.
+    """
+    global _COMMON_ENGLISH_WORDS_CACHE
+    if _COMMON_ENGLISH_WORDS_CACHE is None:
+        lines = COMMON_ENGLISH_WORDS_PATH.read_text(encoding="utf-8").splitlines()
+        words = frozenset(
+            line.strip() for line in lines
+            if line.strip() and not line.lstrip().startswith("#"))
+        if len(words) != COMMON_ENGLISH_WORDS_COUNT:
+            raise ValueError(
+                f"common_english_words.txt: expected {COMMON_ENGLISH_WORDS_COUNT} "
+                f"words, found {len(words)} -- the file was edited without "
+                f"updating COMMON_ENGLISH_WORDS_COUNT (or vice versa)")
+        _COMMON_ENGLISH_WORDS_CACHE = words
+    return _COMMON_ENGLISH_WORDS_CACHE
+
+
 _EXCLUDED_STEMS_CACHE: frozenset[str] | None = None
 
 
 def _excluded_stems() -> frozenset[str]:
-    """The #22 stopwords plus the 20 generic question words, in stem space.
+    """The #22 stopwords, the 20 generic question words, and the vendored
+    common-English word list (consumer #522), all in stem space.
 
-    Cached: the input word lists are module constants, so this is invariant
-    for the life of the process.
+    Cached: the input word lists are module constants / a static package
+    resource, so this is invariant for the life of the process.
     """
     global _EXCLUDED_STEMS_CACHE
     if _EXCLUDED_STEMS_CACHE is None:
         stems: set[str] = set()
-        for word in _STOPWORDS | _GENERIC_QUESTION_WORDS:
+        for word in _STOPWORDS | _GENERIC_QUESTION_WORDS | _common_english_words():
             stems |= fts5_stems(word)
         _EXCLUDED_STEMS_CACHE = frozenset(stems)
     return _EXCLUDED_STEMS_CACHE
@@ -439,18 +497,21 @@ def domain_lexicon(
 
     1. it appears in at least ``min_chunks`` chunks of ``evidence_conn``'s
        ``chunks`` table (default 3);
-    2. it is not one of the #22 stopwords or the 20 generic question words
-       (`_excluded_stems`); and
+    2. it is not one of the #22 stopwords, the 20 generic question words, or
+       the vendored common-English word list (`_excluded_stems`, consumer
+       #522); and
     3. its document-frequency RATE in ``evidence_conn`` (chunks containing it
-       / total chunks) is at least ``rate_multiple`` times (default 2x) its
+       / total chunks) is at least ``rate_multiple`` times (default 3x,
+       raised from 2x by consumer #522, the owner's decision 2026-09-26) its
        rate in ``control_conns`` POOLED INTO ONE CORPUS -- every control's
        chunk-containing-the-stem counts summed, divided by every control's
        chunk count summed. See `DOMAIN_LEXICON_RATE_MULTIPLE`'s own comment
-       for why pooled rather than a separate 2x bar against each control: it
-       is the reading measured to reproduce the brief's own 2,026-term
-       lexicon (2,024 here; 1,559 for the per-control alternative also
-       tried). A stem absent from every control (pooled rate 0.0) always
-       clears the bar.
+       for why pooled rather than a separate bar against each control (that
+       comparison was made at the original 2x default: pooled 2,024,
+       per-control 1,559, against the i394 brief's own measured 2,026), and
+       for the #522 multiple change's own measured effect. A stem absent
+       from every control (pooled rate 0.0) always clears the bar at any
+       multiple.
 
     ``control_conns`` is a sequence of already-open connections, not paths:
     this function does no I/O of its own and holds no opinion about where the

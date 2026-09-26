@@ -283,6 +283,92 @@ def test_domain_lexicon_rejects_empty_evidence_corpus(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# The 2x -> 3x threshold raise (consumer #522, the owner's decision 2026-09-26)
+# --------------------------------------------------------------------------- #
+
+def _hand_built_chunks_conn(rows: list[str]) -> sqlite3.Connection:
+    """An in-memory connection with a `chunks` FTS5 table, one chunk per
+    string in `rows` -- built directly (not through `corpus_build.build_corpus`,
+    whose chunker splits on character count, not on a caller-chosen number of
+    chunks) so a test can put an exact term in an exact fraction of chunks.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "CREATE VIRTUAL TABLE chunks USING fts5(doc_id UNINDEXED, "
+        "chunk_ix UNINDEXED, body, tokenize='porter unicode61');")
+    conn.executemany(
+        "INSERT INTO chunks(doc_id, chunk_ix, body) VALUES ('d', ?, ?)",
+        [(i, row) for i, row in enumerate(rows)])
+    return conn
+
+
+def test_rate_multiple_default_is_now_three():
+    # Named and asserted directly, per Method: the default IS the decision.
+    assert ac.DOMAIN_LEXICON_RATE_MULTIPLE == 3.0
+
+
+def test_a_term_at_exactly_2_5x_contrast_moves_with_the_threshold():
+    """The threshold raise's whole point, made concrete: a stem that clears
+    the OLD 2x bar but not the NEW 3x default.
+
+    20 evidence chunks, "widgetword" in exactly 5 of them (rate 0.25). Two
+    control corpora of 10 chunks each, "widgetword" in exactly 1 chunk of
+    ONE of them (pooled: 1 of 20 chunks, rate 0.05)... adjusted below to land
+    the ratio at exactly 2.5x (0.25 / 0.10), not 5x, so the test exercises
+    the boundary the #522 change actually moved, not an unrelated one.
+    """
+    evidence_rows = (
+        ["widgetword fillerword domainword"] * 5
+        + ["fillerword domainword only"] * 15)
+    assert len(evidence_rows) == 20
+    evidence = _hand_built_chunks_conn(evidence_rows)
+
+    # Pooled control: 20 chunks total, "widgetword" in exactly 2 of them ->
+    # pooled rate 2/20 = 0.10. Evidence rate 5/20 = 0.25. 0.25 / 0.10 = 2.5x
+    # exactly: admitted when rate_multiple <= 2.5, excluded above it.
+    control_a = _hand_built_chunks_conn(
+        ["widgetword offtopic"] * 1 + ["offtopic only"] * 9)
+    control_b = _hand_built_chunks_conn(
+        ["widgetword offtopic"] * 1 + ["offtopic only"] * 9)
+
+    lexicon_at_2x = ac.domain_lexicon(
+        evidence, [control_a, control_b], rate_multiple=2.0)
+    lexicon_at_3x = ac.domain_lexicon(
+        evidence, [control_a, control_b], rate_multiple=3.0)
+
+    assert "widgetword" in lexicon_at_2x, (
+        "setup error: the term must clear the OLD 2x bar")
+    assert "widgetword" not in lexicon_at_3x, (
+        "the #522 raise from 2x to 3x must exclude a term at exactly 2.5x "
+        "contrast that the old default admitted")
+
+    # And the shipped DEFAULT (no explicit rate_multiple passed) must behave
+    # like the 3x call above, because the default IS 3.0 -- this is the line
+    # the required mutation test below flips back to red.
+    default_lexicon = ac.domain_lexicon(evidence, [control_a, control_b])
+    assert "widgetword" not in default_lexicon
+
+
+# THE MUTATION (Method: "a mutation ... turning it red"), performed and
+# recorded rather than encoded as a second in-process test:
+# `domain_lexicon(rate_multiple: float = DOMAIN_LEXICON_RATE_MULTIPLE)` binds
+# its default at function-definition time, i.e. at module import -- once per
+# fresh interpreter, which is once per pytest run. So the mutation that
+# actually exercises "the default reverted to 2.0" is editing the source
+# constant back to 2.0 and re-running the suite in a FRESH process (a
+# monkeypatch of the module attribute inside a running process would not
+# reach an already-bound default, and a test built to route around that by
+# passing the constant explicitly would not be testing the default at all).
+# Performed manually for consumer #522: with `DOMAIN_LEXICON_RATE_MULTIPLE`
+# changed back to `2.0` on this branch and the suite re-run fresh,
+# `test_a_term_at_exactly_2_5x_contrast_moves_with_the_threshold`'s last
+# assertion (`"widgetword" not in default_lexicon`) FAILED as expected --
+# "widgetword" was admitted at the reverted default, exactly reproducing the
+# pre-#522 behaviour the raise was meant to change. Reverted back to 3.0
+# immediately after; see the consumer issue for the transcript.
+
+
+# --------------------------------------------------------------------------- #
 # THE MUTATION TEST -- a lexicon of every term must admit GaAs.
 #
 # This is the discrimination proof the task asks for: it does not test

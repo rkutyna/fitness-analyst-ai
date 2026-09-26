@@ -61,6 +61,7 @@ from . import normalize as nz
 from . import vault
 from . import analyst_sandbox
 from . import analyst_corpus
+from . import deepdive_verify
 from . import push
 from . import ask_progress
 from . import body_aead
@@ -2037,6 +2038,53 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         loop = asyncio.get_running_loop()
         attachments: list[dict] = []
 
+        citation_state = None
+        citation_version = None
+
+        def internal_citation(question: str, *, k=5, doc_id=None) -> dict:
+            """Retrieve parent-owned evidence without exposing its path.
+
+            The corpus connection is opened AND closed inside this call.  It
+            must be: this runs under ``asyncio.to_thread`` while the caller
+            below is the event loop, and a SQLite connection created on the
+            worker thread and closed on the loop raises ProgrammingError on
+            the first live request.  ``CiteState`` is the per-turn thing worth
+            keeping, and it is not bound to a connection.
+            """
+            nonlocal citation_state, citation_version
+            if analyst_corpus_path is None:
+                return {"refused": True, "reason": "cite is unavailable"}
+            conn = None
+            try:
+                conn = analyst_corpus.open_corpus(analyst_corpus_path)
+                version_row = conn.execute(
+                    "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
+                ).fetchone()
+                citation_version = int(version_row[0]) if version_row else None
+                if citation_version is None:
+                    raise analyst_corpus.CiteRefusal(
+                        "corpus_version", "the corpus has no readable version")
+                if citation_state is None:
+                    citation_state = analyst_corpus.CiteState()
+                passages = analyst_corpus.cite(
+                    conn, question, k, state=citation_state, doc_id=doc_id)
+                return {
+                    "corpus_version": citation_version,
+                    "passages": [passage.as_dict() for passage in passages],
+                }
+            except analyst_corpus.CiteRefusal as exc:
+                return {"refused": True, "reason": exc.reason}
+            except (OSError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+                return {"refused": True,
+                        "reason": f"cite failed: {type(exc).__name__}"}
+            finally:
+                if conn is not None:
+                    conn.close()
+
+        def internal_citation_verify(prose: str, claims: list[dict]) -> dict:
+            return deepdive_verify.verify_citation_claims(
+                prose, claims, analyst_corpus_path)
+
         def internal_analyst_query(question: str) -> dict:
             """Run analyst from chat while sharing /v1/analyst's permit.
 
@@ -2138,6 +2186,22 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             "analyst_query_fn": internal_analyst_query,
             "attachments": attachments,
         }
+        # Trigger A (#394 step 2, decision brief 2026-09-25): `cite` is
+        # registered for this turn only when a corpus is configured, it
+        # carries a built domain lexicon, and the USER'S QUESTION (never a
+        # model-constructed retrieval query) shares a stem with it. Every
+        # other case withholds `cite` for this turn only and publishes a
+        # status the model must not go quiet around ("absence is not a
+        # fact") -- see `analyst_corpus.evidence_gate`.
+        cite_available, evidence_status = analyst_corpus.evidence_gate(
+            payload["question"], analyst_corpus_path)
+        if cite_available:
+            answer_kwargs.update({
+                "citation_fn": internal_citation,
+                "citation_verify_fn": internal_citation_verify,
+            })
+        if evidence_status is not None:
+            answer_kwargs["evidence_status"] = evidence_status
         if progress_callback is not None:
             answer_kwargs["on_tool_call"] = progress_callback
         try:

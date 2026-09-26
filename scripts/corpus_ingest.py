@@ -101,6 +101,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="validate the registry and report, writing nothing")
+    parser.add_argument(
+        "--control-corpus", action="append", default=[], dest="control_corpus",
+        metavar="PATH",
+        help="an already-built corpus file to contrast against when deriving "
+             "the domain lexicon (health_advisor#394 / engine #22 item 1, "
+             "decision 4). Repeatable -- pass it once per control corpus; "
+             "each is opened read-only and only read, never modified. "
+             "Omitting it entirely leaves the lexicon UNBUILT "
+             "(domain_lexicon_status=unavailable_no_control_corpora) -- the "
+             "state of every deployed corpus.db as of 2026-09-25, and not a "
+             "degraded fallback: a lexicon with no contrast to check against "
+             "was measured to refuse 0 of 12 out-of-domain questions.")
     return parser
 
 
@@ -204,6 +216,7 @@ def run(argv: list[str] | None = None) -> int:
         corpus_version=version,
         shippable=args.shippable,
         read_only=not args.writable,
+        control_corpus_paths=args.control_corpus,
     )
     print(f"built {result.path}")
     print(f"  corpus_version : {result.corpus_version}")
@@ -217,6 +230,9 @@ def run(argv: list[str] | None = None) -> int:
              if result.excluded_doc_ids else ""))
     print(f"  mode           : {oct(result.mode)}")
     print(f"  corpus_sha256  : {result.corpus_sha256}")
+    print(f"  domain_lexicon : {result.domain_lexicon_status}"
+          + (f" ({result.domain_lexicon_size} terms)"
+             if result.domain_lexicon_size is not None else ""))
     return 0
 
 

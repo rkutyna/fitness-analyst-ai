@@ -83,15 +83,19 @@ __all__ = [
     "DOMAIN_LEXICON_STATUS_BUILT",
     "DOMAIN_LEXICON_STATUS_KEY",
     "DOMAIN_LEXICON_STATUS_NO_CONTROLS",
+    "EVIDENCE_STATUS_LEXICON_UNVERIFIED",
+    "EVIDENCE_STATUS_OUT_OF_DOMAIN",
     "CiteCaps",
     "CiteRefusal",
     "CiteState",
+    "DomainLexiconCache",
     "EmbeddingIndex",
     "Passage",
     "build_match_expression",
     "child_source_with_cite",
     "cite",
     "domain_lexicon",
+    "evidence_gate",
     "fts5_stems",
     "load_domain_lexicon",
     "normalize_span",
@@ -543,6 +547,99 @@ def load_domain_lexicon(corpus_conn: sqlite3.Connection) -> frozenset[str] | Non
     if not isinstance(terms, list) or not all(isinstance(t, str) for t in terms):
         return None
     return frozenset(terms)
+
+
+class DomainLexiconCache:
+    """Thread-safe, load-once-per-corpus cache for :func:`load_domain_lexicon`.
+
+    Keyed by ``(corpus_path, corpus_version)``: a corpus rebuilt at the same
+    path carries a new ``corpus_version`` (`corpus_build.build_corpus`), so a
+    rebuild invalidates the entry rather than serving a stale lexicon past
+    it. The cache stores only the plain ``frozenset[str] | None`` result --
+    never a connection -- so it is safe to read from any thread: this keeps
+    the same discipline the cross-thread fix in ``receiver.internal_citation``
+    already enforces for `cite` itself (health_advisor#394), open and close
+    a connection within one call, never hold one across calls or threads.
+
+    A lookup that cannot even open the corpus or read its version (a bad
+    path, a locked or corrupt file) degrades to ``None`` -- "no lexicon" --
+    rather than raising or caching a wrong answer: a corpus that cannot be
+    read is not evidence that every question is in-domain.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, int | None], frozenset[str] | None] = {}
+
+    def get(self, corpus_path: str | Path) -> frozenset[str] | None:
+        path_key = str(corpus_path)
+        conn = None
+        try:
+            conn = open_corpus(corpus_path)
+            row = conn.execute(
+                "SELECT value FROM corpus_meta WHERE key = 'corpus_version'"
+            ).fetchone()
+            version = int(row[0]) if row else None
+            cache_key = (path_key, version)
+            with self._lock:
+                if cache_key in self._entries:
+                    return self._entries[cache_key]
+            lexicon = load_domain_lexicon(conn)
+        except (OSError, TypeError, ValueError, sqlite3.DatabaseError,
+                CiteRefusal):
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        with self._lock:
+            self._entries[cache_key] = lexicon
+        return lexicon
+
+
+_DEFAULT_DOMAIN_LEXICON_CACHE = DomainLexiconCache()
+
+EVIDENCE_STATUS_OUT_OF_DOMAIN = "out_of_corpus_domain"
+EVIDENCE_STATUS_LEXICON_UNVERIFIED = "corpus_domain_unverified"
+
+
+def evidence_gate(
+    question: str,
+    corpus_path: str | Path | None,
+    *,
+    cache: "DomainLexiconCache | None" = None,
+) -> tuple[bool, str | None]:
+    """Trigger A, applied once per turn (decision brief 2026-09-25).
+
+    Returns ``(cite_available, status)``:
+
+    * ``corpus_path is None`` -- no corpus configured at all. ``(False,
+      None)``, unchanged from `0b553f4`: there is nothing to say about a
+      surface that was never wired up.
+    * a corpus is configured but carries no built lexicon (a corpus built
+      before this feature existed, or built with
+      ``domain_lexicon_status == unavailable_no_control_corpora`` --
+      :func:`load_domain_lexicon` already treats both identically). FAILS
+      CLOSED: ``(False, EVIDENCE_STATUS_LEXICON_UNVERIFIED)``. A lexicon
+      that cannot be verified is never treated as "admit everything".
+    * a lexicon is built but ``question`` (the USER'S question, never a
+      model-constructed retrieval query -- see :func:`question_in_domain`)
+      shares no stem with it: ``(False, EVIDENCE_STATUS_OUT_OF_DOMAIN)``.
+    * the question passes: ``(True, None)`` -- `cite` is registered for
+      this turn and nothing needs to be published.
+
+    The lexicon lookup goes through a shared, thread-safe
+    :class:`DomainLexiconCache` (module-level by default) so it loads once
+    per corpus rather than once per turn.
+    """
+    if corpus_path is None:
+        return False, None
+    lexicon_cache = cache if cache is not None else _DEFAULT_DOMAIN_LEXICON_CACHE
+    lexicon = lexicon_cache.get(corpus_path)
+    if lexicon is None:
+        return False, EVIDENCE_STATUS_LEXICON_UNVERIFIED
+    if not question_in_domain(question, lexicon):
+        return False, EVIDENCE_STATUS_OUT_OF_DOMAIN
+    return True, None
 
 
 class CiteRefusal(Exception):

@@ -26,6 +26,7 @@ _ATTACHMENT_KEY_PART_RE = re.compile(r"^(table|column|row|trend)=(.*)$")
 _WORKOUT_KEY_PART_RE = re.compile(r"^(workout|field)=(.*)$")
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\}")
 _ADVICE_PREFIX = "advice:"
+_CITE_PREFIX = "cite:"
 _COLD_START_FIELDS = frozenset({
     "status_text", "starts_on_day", "day_now", "starts_on_date", "status",
 })
@@ -1526,6 +1527,93 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
     return _publish_unambiguous(candidates)
 
 
+def citation_fact_key(sequence, doc_id: str, chunk_ix) -> str:
+    """Return the exact slot key for one Python-retrieved passage."""
+    enc = lambda value: quote(str(value), safe="-_.~:")
+    return _CITE_PREFIX + "|".join((
+        "sequence=" + enc(sequence), "doc_id=" + enc(doc_id),
+        "chunk_ix=" + enc(chunk_ix)))
+
+
+def build_citation_facts(ledger: list[dict]) -> dict[str, dict]:
+    """Build closed citation slots from parent-returned retrieval results."""
+    facts = {}
+    for record in ledger if isinstance(ledger, list) else ():
+        if (not isinstance(record, dict)
+                or record.get("tool_name") != "cite"
+                or record.get("result_elided")):
+            continue
+        result = record.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("passages"), list):
+            continue
+        for passage in result["passages"]:
+            if not isinstance(passage, dict):
+                continue
+            doc_id = passage.get("doc_id")
+            chunk_ix = passage.get("chunk_ix")
+            span = passage.get("span")
+            version = result.get("corpus_version")
+            if (not isinstance(doc_id, str) or not doc_id.strip()
+                    or not isinstance(chunk_ix, int)
+                    or not isinstance(span, str) or not span.strip()
+                    or version is None):
+                continue
+            metadata = [passage.get("title") or doc_id]
+            if passage.get("authors"):
+                metadata.append(str(passage["authors"]))
+            if passage.get("year") is not None:
+                metadata.append(str(passage["year"]))
+            if passage.get("doi"):
+                metadata.append("doi:" + str(passage["doi"]))
+            if passage.get("pmid"):
+                metadata.append("pmid:" + str(passage["pmid"]))
+            key = citation_fact_key(record.get("sequence"), doc_id, chunk_ix)
+            facts[key] = {
+                "key": key,
+                "display": "[" + "; ".join(metadata) + "]",
+                "source": {
+                    "doc_id": doc_id, "chunk_ix": chunk_ix, "span": span,
+                    "corpus_version": version,
+                },
+            }
+    return facts
+
+
+_EVIDENCE_STATUS_KEY = "evidence:status"
+
+
+def build_evidence_status_fact(status: str | None) -> dict[str, dict]:
+    """Publish the Python-decided reason ``cite`` is withheld this turn.
+
+    ``status`` comes from ``analyst_corpus.evidence_gate`` (#394 step 2,
+    decision brief 2026-09-25): a corpus is configured, but this turn's
+    QUESTION either failed the domain-vocabulary check
+    (``"out_of_corpus_domain"``) or the corpus carries no built lexicon to
+    check against (``"corpus_domain_unverified"``, the fail-closed case).
+    ``None`` -- no corpus configured at all, or the question passed and
+    `cite` is present -- publishes nothing, exactly as an unconfigured
+    corpus published nothing before this feature existed.
+
+    This follows the same "absence is not a fact" shape as
+    :func:`cold_start_guidance`'s ``status``/``status_text`` leaves: a
+    surface that has gone quiet must say so in a Python-owned sentence
+    instead of leaving the model to assert -- or worse, invent evidence for
+    -- the claim in its own words. Unlike a cold-start leaf this is not tied
+    to any ledger record (the gate runs before the loop, on the question
+    alone), so it is merged into the fact set directly rather than
+    harvested from the ledger.
+    """
+    if not status:
+        return {}
+    return {
+        _EVIDENCE_STATUS_KEY: {
+            "key": _EVIDENCE_STATUS_KEY,
+            "display": f"evidence: {status}",
+            "value": status,
+        },
+    }
+
+
 def render_fact_set(facts: dict[str, dict]) -> str:
     """Render facts for the final model turn in deterministic JSON."""
     return json.dumps(facts or {}, ensure_ascii=False, sort_keys=True,
@@ -1578,11 +1666,17 @@ def scan_template(template: str, facts: dict[str, dict]) -> dict:
     matches = list(_PLACEHOLDER_RE.finditer(text))
     stripped = _PLACEHOLDER_RE.sub("", text)
     advice_quantities = []
+    citation_keys = []
     keys = []
     advice_errors = []
     for match in matches:
         token = match.group(1)
-        if token.startswith(_ADVICE_PREFIX):
+        if token.startswith(_CITE_PREFIX):
+            if token in (facts or {}):
+                citation_keys.append(token)
+            else:
+                keys.append(token)
+        elif token.startswith(_ADVICE_PREFIX):
             content = token[len(_ADVICE_PREFIX):].strip()
             if not content:
                 advice_errors.append("empty advice slot")
@@ -1612,6 +1706,7 @@ def scan_template(template: str, facts: dict[str, dict]) -> dict:
         "ok": (not (malformed or unresolved or digits or advice_errors)
                and bool(text.strip())),
         "placeholders": keys,
+        "citations": citation_keys,
         "advice_quantities": advice_quantities,
         "unresolved": unresolved,
         "digits_outside_placeholders": digits,
@@ -1715,6 +1810,13 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
         return prefix + rendered + suffix
 
     return _PLACEHOLDER_RE.sub(_replace, template)
+
+
+    return _PLACEHOLDER_RE.sub(
+        lambda match: (
+            match.group(1)[len(_ADVICE_PREFIX):].strip()
+            if match.group(1).startswith(_ADVICE_PREFIX)
+            else str(facts[match.group(1)]["display"])), template)
 
 
 # Verbose aliases make the two safety boundaries easy to discover at call sites.

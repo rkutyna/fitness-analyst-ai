@@ -269,7 +269,7 @@ def test_the_documented_argument_surface_is_the_whole_surface():
     assert sorted(_option_strings(parser)) == sorted([
         "-h", "--help",
         "--corpus", "--registry", "--corpus-version", "--previous-corpus",
-        "--shippable", "--writable", "--dry-run",
+        "--shippable", "--writable", "--dry-run", "--control-corpus",
     ])
 
 
@@ -302,6 +302,100 @@ def test_ingest_builds_a_corpus(tmp_path, capsys):
     printed = capsys.readouterr().out
     assert "corpus_version : 1" in printed
     assert "mode           : 0o444" in printed
+    # No --control-corpus was given: the lexicon is deliberately left unbuilt
+    # (health_advisor#394 step 2) rather than degrading to "everything is
+    # in-domain" -- this is the state of every deployed corpus.db today.
+    assert "domain_lexicon : unavailable_no_control_corpora" in printed
+
+
+# --------------------------------------------------------------------------- #
+# --control-corpus (health_advisor#394 step 2 / engine #22 item 1, decision 4)
+# --------------------------------------------------------------------------- #
+
+_CONTROL_TEXT = (
+    "Gallium arsenide crystal growth and semiconductor wafer doping. "
+    "Photolithography, etching and thin-film deposition in fabrication. "
+) * 60
+
+# GOOD_TEXT above (35 chars x 60 = ~2.1k chars) is plenty for
+# `validate_entry`, but yields only ~2 chunks at CHUNK_CHARS=1200 /
+# CHUNK_OVERLAP=200 -- below `domain_lexicon`'s min_chunks=3 default, so its
+# own vocabulary would never be admitted regardless of contrast. This is a
+# separate, longer text for the lexicon-specific tests below.
+_LEXICON_EVIDENCE_TEXT = (
+    "Endurance training raises VO2max in distance runners. "
+    "Weekly running volume and injury risk in endurance athletes. "
+) * 60
+
+
+def _write_control_corpus(tmp_path: Path, name: str = "control.db") -> Path:
+    path = tmp_path / name
+    build_corpus([{
+        "doc_id": "ctrl-1", "title": "Control", "authors": "Author A",
+        "year": 2019, "doi": None, "pmid": None,
+        "source_url": "https://example.org/ctrl-1",
+        "retrieved_at": "2026-09-25T00:00:00Z",
+        "source_sha256": "b" * 64, "text_sha256": sha256_text(_CONTROL_TEXT),
+        "license": "CC-BY-4.0",
+        "license_url": "https://creativecommons.org/licenses/by/4.0/",
+        "redistributable": 1, "approver": "reviewer",
+        "approved_at": "2026-09-25", "notes": None,
+    }], [_CONTROL_TEXT], path, corpus_version=1, read_only=False)
+    return path
+
+
+def test_ingest_control_corpus_flag_stores_a_built_loadable_lexicon(
+        tmp_path, capsys):
+    from health_advisor import analyst_corpus as ac
+
+    control_path = _write_control_corpus(tmp_path)
+    registry = write_registry(tmp_path, [
+        (good("d1", text=_LEXICON_EVIDENCE_TEXT), _LEXICON_EVIDENCE_TEXT)])
+    out = tmp_path / "corpus.db"
+
+    code = ingest.main([
+        "--corpus", str(out), "--registry", str(registry),
+        "--control-corpus", str(control_path),
+    ])
+
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "domain_lexicon : built" in printed
+    conn = ac.open_corpus(out)
+    try:
+        lexicon = ac.load_domain_lexicon(conn)
+    finally:
+        conn.close()
+    assert lexicon is not None
+    # Evidence-only vocabulary, disjoint from the control corpus, must be
+    # admitted; control-only vocabulary must never leak in.
+    assert "endur" in lexicon
+    assert "vo2max" in lexicon
+    assert lexicon.isdisjoint({"semiconductor", "gallium", "arsenid"})
+
+
+def test_ingest_control_corpus_flag_is_repeatable(tmp_path, capsys):
+    from health_advisor import analyst_corpus as ac
+
+    control_one = _write_control_corpus(tmp_path, "control1.db")
+    control_two = _write_control_corpus(tmp_path, "control2.db")
+    registry = write_registry(tmp_path, [
+        (good("d1", text=_LEXICON_EVIDENCE_TEXT), _LEXICON_EVIDENCE_TEXT)])
+    out = tmp_path / "corpus.db"
+
+    code = ingest.main([
+        "--corpus", str(out), "--registry", str(registry),
+        "--control-corpus", str(control_one),
+        "--control-corpus", str(control_two),
+    ])
+
+    assert code == 0
+    conn = ac.open_corpus(out)
+    try:
+        lexicon = ac.load_domain_lexicon(conn)
+    finally:
+        conn.close()
+    assert lexicon is not None
 
 
 def test_ingest_refusal_is_a_typed_line_not_a_traceback(tmp_path, capsys):

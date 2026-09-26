@@ -16,6 +16,10 @@ Env:  HA_SECRET_FILE (preferred) or HA_SHARED_SECRET; HA_REQUIRE_SECRET=1 makes
       HA_DEVICE_REGISTRY_FILE: per-device request signatures, see
       device_auth.py; an invalid mode, or an enabled one without a usable
       registry, refuses at startup
+      HA_DEVICE_SECRET_MODE=instance|per_device (default instance, fully
+      inert) and HA_DEVICE_SECRETS_FILE: per-device D23 body secrets, see
+      device_secrets.py; per_device without device auth on, or an invalid
+      mode, refuses at startup
 
 The vault is an argument, never an environment variable: `create_app(ctx)` binds
 one receiver to one user's vault, and a process that serves two of them must not
@@ -39,6 +43,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from urllib.parse import quote
 from pathlib import Path
 
@@ -67,6 +72,7 @@ from . import push
 from . import ask_progress
 from . import body_aead
 from . import device_auth
+from . import device_secrets
 from . import enrol
 
 logger = logging.getLogger(__name__)
@@ -215,9 +221,31 @@ def _refresh_file_secret() -> None:
     _SECRET_FILE_RELOADS += 1
 
 
-def _shared_secret_for_request() -> str:
+def _instance_secret() -> str:
     _refresh_file_secret()
     return SHARED_SECRET
+
+
+# Set only for the lifetime of the downstream app call D23BodyAEADApp wraps
+# around, and only when that call's D23 secret was a per-device one (T5
+# piece 9, consumer #426) -- never touched at all in `instance` mode, so a
+# request in that mode is byte-identical to one from before this existed.
+# Sync routes reach it too: FastAPI's run_in_threadpool copies the current
+# context (`copy_context()`) onto the worker thread it schedules on.
+_REQUEST_SECRET: ContextVar[str | None] = ContextVar(
+    "_ha_request_secret", default=None)
+
+
+def _shared_secret_for_request() -> str:
+    """The secret this request's D23 body / X-Health-Secret token used.
+
+    A per-device secret while one is in scope for the request being served,
+    the instance secret otherwise -- including every call made outside a
+    request entirely (module-level use, a background task) and every
+    request when HA_DEVICE_SECRET_MODE is unset or 'instance'.
+    """
+    return _REQUEST_SECRET.get() or _instance_secret()
+
 
 # Keep individual executemany calls bounded without giving up the HealthKit
 # batch's one-transaction atomicity.
@@ -1536,8 +1564,9 @@ async def _enrol_raw_body(request: Request) -> bytes:
 
 
 def _enrol_qr(store: "enrol.TokenStore", devices: "device_auth.DeviceAuth",
-             secret_for_request: Callable[[], str], request: Request,
-             raw: bytes) -> Response:
+             secret_for_request: Callable[[], str],
+             device_secret_store: "device_secrets.DeviceSecretStore | None",
+             request: Request, raw: bytes) -> Response:
     """Handle one QR-pairing enrolment (T5 piece 2, consumer #426).
 
     The ordering below is load-bearing (see
@@ -1547,6 +1576,12 @@ def _enrol_qr(store: "enrol.TokenStore", devices: "device_auth.DeviceAuth",
     refusal -> burn the token under the store lock -> registry.enrol.
     Nothing before the burn step may consume the token, so a wrong signature
     or a revoked kid leaves it live for a legitimate retry.
+
+    ``device_secret_store`` is None in ``instance`` mode (T5 piece 9,
+    consumer #426): fully inert, same reply as before this module existed.
+    In ``per_device`` mode it mints a brand-new secret for this kid every
+    time this route completes -- including a same-key re-pair, which is
+    exactly the case that should rotate a possibly-leaked old secret away.
     """
     enrol_id = request.headers.get(enrol.HEADER_ENROL_ID)
     if not enrol_id:
@@ -1628,7 +1663,16 @@ def _enrol_qr(store: "enrol.TokenStore", devices: "device_auth.DeviceAuth",
         logger.warning("QR enrolment could not update the device registry: %s", exc)
         raise _enrol_refusal("device_registry_unreadable", 503)
 
-    secret = secret_for_request()
+    if device_secret_store is not None:
+        try:
+            secret = device_secret_store.issue(kid).secret
+        except OSError as exc:
+            logger.warning(
+                "QR enrolment could not write the per-device secret store: %s",
+                exc)
+            raise _enrol_refusal("device_secrets_unwritable", 503)
+    else:
+        secret = secret_for_request()
     response_plain = json.dumps({
         "kid": device.kid, "secret": secret, "created": created,
     }, separators=(",", ":")).encode("utf-8")
@@ -1731,11 +1775,13 @@ class D23BodyAEADApp:
     _OWN_ATTRS = frozenset({
         "_OWN_ATTRS", "app", "secret_for_request", "mode", "ctx",
         "routes", "protected_routes", "device_auth", "exempt_paths",
+        "device_secrets",
     })
 
     def __init__(self, app, secret_for_request: Callable[[], str], mode: str,
                  ctx=None, device_auth: "device_auth.DeviceAuth | None" = None,
-                 exempt_paths: frozenset = D23_EXEMPT_PATHS):
+                 exempt_paths: frozenset = D23_EXEMPT_PATHS,
+                 device_secrets: "device_secrets.DeviceSecretStore | None" = None):
         self.app = app
         self.secret_for_request = secret_for_request
         self.mode = mode
@@ -1743,6 +1789,9 @@ class D23BodyAEADApp:
         # None is HA_DEVICE_AUTH_MODE=off: not one header is read.
         self.device_auth = device_auth
         self.exempt_paths = exempt_paths
+        # None is HA_DEVICE_SECRET_MODE unset/'instance': fully inert, no
+        # store read, byte-identical to a receiver that predates this.
+        self.device_secrets = device_secrets
 
     def __setattr__(self, name, value):
         if name in type(self)._OWN_ATTRS:
@@ -1860,6 +1909,10 @@ class D23BodyAEADApp:
         request_body = None
         encrypted_request = False
         request_receive = receive
+        # 'instance' unless step 4 below moves it to a verified device's own
+        # secret. Read by the contextvar guard just before the app call, so
+        # it has to be defined even on the exempt path (never true there).
+        secret_source = "instance"
 
         if not exempt:
             # The body keys come from the server's own secret, never from the
@@ -1881,26 +1934,59 @@ class D23BodyAEADApp:
                 return
             # Device signatures are checked on the body as it crossed the
             # wire, before anything is decrypted. The enrolment route is the
-            # one exception: its key is not enrolled yet, so the route itself
-            # proves possession against the key in the (sealed) body.
+            # one exception: its key is not enrolled yet in general, so the
+            # route itself proves possession against the key in the (sealed)
+            # body -- but when per-device secrets are configured, a QR-paired
+            # phone re-confirming an already-enrolled key needs its OWN
+            # secret selected below (step 4) to open its own D23-sealed
+            # upgrade body, so authenticate there too, softly: an unenrolled
+            # newcomer, or any signature that doesn't verify, simply stays
+            # unsigned (kid None) exactly as when no store is configured.
             device_kid = None
             wire_body_sha256 = None
             if self.device_auth is not None:
                 wire_body_sha256 = device_auth.body_sha256(request_body)
-                if scope.get("path") != device_auth.ENROL_UPGRADE_PATH:
-                    headers = self._headers(scope)
+                headers = self._headers(scope)
 
-                    def _get(name: str) -> str | None:
-                        value = self._header(headers, name.encode("ascii"))
-                        return None if value is None else value.decode("latin-1")
+                def _get(name: str) -> str | None:
+                    value = self._header(headers, name.encode("ascii"))
+                    return None if value is None else value.decode("latin-1")
 
+                is_upgrade = scope.get("path") == device_auth.ENROL_UPGRADE_PATH
+                if not is_upgrade or self.device_secrets is not None:
                     try:
                         device_kid = self.device_auth.authenticate(
                             _get, method=scope["method"].upper(),
                             target=target, body=request_body)
                     except device_auth.DeviceAuthError as exc:
-                        await self._refusal(send, exc.code, status=exc.status)
+                        if is_upgrade:
+                            device_kid = None
+                        else:
+                            await self._refusal(send, exc.code, status=exc.status)
+                            return
+
+                # Only the DERIVED auth token in X-Health-Secret -- never a
+                # raw secret -- can move `secret` off the instance value, and
+                # only for a kid that just verified a signature and has a
+                # store entry. A signed phone presenting the instance secret
+                # (unmatched token) stays on it: the rollback-then-re-pair
+                # case needs that fallback, not a refusal.
+                if device_kid is not None and self.device_secrets is not None:
+                    try:
+                        per = self.device_secrets.get(device_kid)
+                    except (OSError, ValueError, TypeError) as exc:
+                        logger.warning(
+                            "per-device secret store unreadable: %s", exc)
+                        await self._refusal(send, "device_secrets_unreadable",
+                                            status=503)
                         return
+                    if per is not None:
+                        presented = self._header(headers, b"x-health-secret")
+                        if presented is not None and hmac.compare_digest(
+                                presented,
+                                body_aead.auth_token(per.secret).encode("ascii")):
+                            secret = per.secret
+                            secret_source = "device"
             if has_d23_content_type:
                 if request_body is None:
                     return
@@ -1936,6 +2022,8 @@ class D23BodyAEADApp:
                     "target": target,
                     "wire_body_sha256": wire_body_sha256,
                     "d23_sealed": encrypted_request,
+                    # Never the secret itself -- which secret, not what it is.
+                    "secret_source": secret_source,
                 }
 
         messages: list[dict] = []
@@ -1946,11 +2034,25 @@ class D23BodyAEADApp:
                 response_body.append(message.get("body", b""))
             messages.append(message)
 
+        # Only for a device-sourced secret, and only around the downstream
+        # app call: a sync route reaches this too (run_in_threadpool copies
+        # the current context onto its worker thread), an unsigned or
+        # instance-secret request never sets it at all, and it is reset in
+        # `finally` so it can never leak into a later request that reuses
+        # this task/context. No test can turn a dropped `reset()` red on its
+        # own (TestClient gives each request a fresh context) -- keep it
+        # anyway: production reuses worker threads and their contexts across
+        # requests in a way a single in-process TestClient session does not.
+        request_secret_token = (
+            _REQUEST_SECRET.set(secret) if secret_source == "device" else None)
         pending_error = None
         try:
             await self.app(scope, request_receive, capture)
         except BaseException as exc:  # ServerErrorMiddleware sends before re-raising.
             pending_error = exc
+        finally:
+            if request_secret_token is not None:
+                _REQUEST_SECRET.reset(request_secret_token)
 
         if not messages:
             if pending_error is not None:
@@ -2049,6 +2151,16 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 "HA_DEVICE_AUTH_MODE is 'off'; a QR-paired phone has "
                 "nothing to enrol into without device authentication active.")
         enrol_store = enrol.store_from_env()
+    secret_mode = device_secrets.device_secret_mode()  # likewise
+    device_secret_store = None
+    if secret_mode == "per_device":
+        if devices is None:
+            raise RuntimeError(
+                "per-device secrets refuse to start: HA_DEVICE_SECRET_MODE "
+                "is 'per_device' but HA_DEVICE_AUTH_MODE is 'off'; a "
+                "per-device secret has no verified signature to attach "
+                "itself to without device authentication active.")
+        device_secret_store = device_secrets.store_from_env()
     exempt_paths = D23_EXEMPT_PATHS | ({enrol.ENROL_PATH} if enrol_active else set())
     app = FastAPI(title="Health Advisor Receiver", docs_url=None,
                   redoc_url=None, openapi_url=None)
@@ -2098,7 +2210,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             # yet. The route is D23-exempt (exempt_paths, above) and its own
             # body carries every check this receiver needs.
             return _enrol_qr(enrol_store, devices, secret_for_request,
-                             request, raw)
+                             device_secret_store, request, raw)
 
     @app.get("/health")
     def health():
@@ -2466,7 +2578,8 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     # outer placement covers Starlette's ServerErrorMiddleware, including its
     # generated 500 body, as well as every route wired above.
     return D23BodyAEADApp(app, secret_for_request, mode, ctx,
-                          device_auth=devices, exempt_paths=exempt_paths)
+                          device_auth=devices, exempt_paths=exempt_paths,
+                          device_secrets=device_secret_store)
 
 
 def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:

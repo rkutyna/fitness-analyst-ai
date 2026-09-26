@@ -46,7 +46,13 @@ the job of a replay cache (a separate item), exactly as for D23 today.
               authenticate nor add a device.
 
 Anything else refuses at startup. In ``accept`` a revoked key is refused only
-when it signs; the shared secret still opens the door without a signature.
+when it signs; the shared secret still opens the door without a signature --
+true only for a phone on the instance secret. A per-device secret (T5 piece
+9, consumer #426, ``device_secrets.py``) is selected by the DERIVED auth
+token after a signature has already verified, never by the token alone, so
+once that signature is refused for a revoked key its own per-device secret
+is simply never chosen; the "signature only" carve-out above does not extend
+to it.
 Revocation is effective in ``required``, which is the point of that mode.
 
 The registry is a small JSON file per instance (``HA_DEVICE_REGISTRY_FILE``),

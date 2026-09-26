@@ -1,0 +1,17 @@
+{
+  "_comment": "T5 piece 6 interop fixture (#426). Forward: CryptoKit HPKE.Sender (Curve25519_SHA256_ChachaPoly) seals `request.plaintext_json` to `recipient_public_x25519_raw_b64url`, using `info_text`; health_advisor.enrol.open_sealed opens `request.wire_b64url` with `recipient_private_x25519_raw_b64url` and reproduces the same plaintext byte-for-byte -- proven by tests/test_t5_cryptokit_fixture.py against fa-t5 (engine branch t5-enrol). Reverse: health_advisor.enrol.seal_response sealed `response.plaintext_json` under `response.response_key_b64url` (AES-256-GCM, wire = nonce(12)||ct||tag) to produce `response.wire_b64url`; HealthAdvisorSyncTests/T5CryptoKitFixtureTests.swift opens it with AES.GCM using the same key and reproduces the same plaintext. A byte-identical copy of this file lives at ios/HealthAdvisorSync/HealthAdvisorSyncTests/Fixtures/t5_cryptokit_hpke_fixture.json -- keep the two in sync.",
+  "hpke_suite": "DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305",
+  "enrol_id": "fx-t5-fixture-01",
+  "info_text": "ha-enrol-v1\nfx-t5-fixture-01",
+  "recipient_private_x25519_raw_b64url": "oHL7oEq0ufebEJ9OrerSJobP7WCc3eNspJBzqw8tzWY",
+  "recipient_public_x25519_raw_b64url": "q191fQMfI24l6sO8EnxxghBjxRxOIZYmreWoMyjR0To",
+  "request": {
+    "wire_b64url": "I8sY-DxUwu8M-tAe9CJ2WdDTb1291vsfEdSZptz5iXQPW2Vr2usfo7Ciyle_xP4AFPzzyiaSFNvBaUqAobZN9Sme20yA09mXGrh9T6cqSKVPs6t2MtxAPC74ZzauoRFPAcGz9_Xr9DQSKtzhwwQuZjhCBpPdF3w0UPiwadglzOLZiVQoKLaMEJN7ATsbjRxC4e11rGIAN_uUn5bVZkZeH9wxK-GgTQa0t3HejqHf-3r4836WlEiPpcewhGA2Yd-dUdpZqDv8Dv148ncKtNf15Kljs1jdImhvNyPpwJMh4pKdRvWxBAGlg84pPNpV4ktoqD_boOtpevSmp5qYUm81sU6SUXqcmgCgSvhqNRynU9InB45IbUtv09TXtHl6wgQtkEaTqwwtCkKcKtyn6MxlX0H0b7Bbb5og9lfghmtXJrafmC0",
+    "plaintext_json": "{\"v\":1,\"token\":\"Zml4dHVyZS10b2tlbi0zMi1ieXRlcy1leGFjdGx5ISE\",\"device_pub\":\"BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU\",\"key_storage\":\"secure_enclave\",\"response_key\":\"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\",\"attestation\":null}"
+  },
+  "response": {
+    "response_key_b64url": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+    "wire_b64url": "wtvRheWRlQycJE8X-_36mG01IIQ2N505UiiFrH-pXpscfir8vpB7e_0pBWBxykDkyBh77j3rWEHreAFWx125GqWz0xFk1Ll7FIcCqxWorRtEos9A1erCe4U90828uja-4b7kdOoPx79b87M",
+    "plaintext_json": "{\"kid\":\"aYvqY9xEo0RmP_FCmuoQhA\",\"secret\":\"fixture-secret-value\",\"created\":true}"
+  }
+}

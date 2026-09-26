@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from pathlib import Path
 import os
 import stat
 import threading
@@ -302,12 +303,27 @@ def test_rfc9180_a2_suite_round_trip():
     assert opened == plaintext
 
 
-@pytest.mark.skip(reason="T5 piece 6 (iOS) has not landed yet; this fixture "
-                         "will exercise a real CryptoKit-sealed HPKE body "
-                         "captured from the iOS client, proving cross-stack "
-                         "interop rather than a Python-only round trip.")
 def test_hpke_open_a_cryptokit_sealed_fixture_from_ios():
-    pass
+    """Cross-stack interop: bytes sealed by the iOS client's CryptoKit
+    ``HPKE.Sender`` (``.Curve25519_SHA256_ChachaPoly``) to a fixed recipient
+    key open here to the identical plaintext, and a response sealed by
+    ``seal_response`` opens with its ``response_key``. If this goes red the
+    two wire formats have drifted apart (consumer #426 T5, piece 6)."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "t5_cryptokit_hpke_fixture.json")
+        .read_text(encoding="utf-8"))
+    info = enrol.info_for(fixture["enrol_id"])
+    assert info == fixture["info_text"].encode("ascii")
+    wire = enrol._b64url_decode(fixture["request"]["wire_b64url"])
+    opened = enrol.open_sealed(fixture["recipient_private_x25519_raw_b64url"], info, wire)
+    assert opened == fixture["request"]["plaintext_json"].encode("utf-8")
+    tampered = wire[:-1] + bytes([wire[-1] ^ 1])
+    with pytest.raises(Exception):
+        enrol.open_sealed(fixture["recipient_private_x25519_raw_b64url"], info, tampered)
+    response_key = enrol._b64url_decode(fixture["response"]["response_key_b64url"])
+    response_wire = enrol._b64url_decode(fixture["response"]["wire_b64url"])
+    assert enrol.open_response(response_key, response_wire) == \
+        fixture["response"]["plaintext_json"].encode("utf-8")
 
 
 # ------------------------------------------------------------------- CLI

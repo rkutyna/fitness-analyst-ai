@@ -61,7 +61,7 @@ STORE_VERSION = 1
 TOKEN_BYTES = 32          # 256-bit single-use token
 RESPONSE_KEY_BYTES = 32   # AES-256-GCM key the phone supplies for the reply
 MAX_TTL_SECONDS = 900     # the engine's hard cap; a caller cannot ask for more
-DEFAULT_TTL_SECONDS = 900
+ENROL_TOKEN_TTL_SECONDS = 900
 NONCE_BYTES = 12
 STATES = ("live", "used", "cancelled", "expired")
 HPKE_INFO_PREFIX = b"ha-enrol-v1\n"
@@ -261,7 +261,7 @@ class TokenStore:
         }, indent=2, sort_keys=True) + "\n"
         device_auth.atomic_write_json(self.path, payload, temp_prefix=".enrol-tokens.")
 
-    def mint(self, *, ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    def mint(self, *, ttl_seconds: int = ENROL_TOKEN_TTL_SECONDS,
              now: float | None = None) -> tuple[EnrolToken, str]:
         """Create a token; return (record, plaintext token). Never re-read
         by the caller: the plaintext exists nowhere in the store."""
@@ -428,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     mint = sub.add_parser("mint", help="create a token and print it once, as JSON")
-    mint.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS,
+    mint.add_argument("--ttl", type=int, default=ENROL_TOKEN_TTL_SECONDS,
                       help=f"seconds until expiry, capped at {MAX_TTL_SECONDS}")
 
     status = sub.add_parser("status", help="show one token's current state")

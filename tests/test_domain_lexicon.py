@@ -18,16 +18,13 @@ on purpose:
    and specific to whichever machine has them checked out.
 2. The consumer repo's question fixtures (`questions-lay.json`,
    `questions-clinical.json`) and the decision brief's own out-of-domain
-   question list -- these live in `healthAI/ha-client`/`healthAI/ha-i394`, a
-   PRIVATE sibling repo. A public engine test that hard-codes that sibling's
-   path (as an earlier version of this file did) puts a private repo's
-   directory layout into public source and only resolves on one machine.
+   question list -- these live in the consuming application's repository,
+   not here. A public engine test that hard-codes a sibling checkout's path
+   only resolves on one machine and publishes another repo's layout.
 
 The real-data reproduction of the decision brief's oracle table (lexicon
 size ~2,024, lay 1/52 refused, clinical 0/52, out-of-domain 21/24 including
-gallium arsenide) lives in the CONSUMER repo instead
-(`healthAI/ha-i394/tests/test_i394_domain_lexicon_oracle.py`, run with
-`PYTHONPATH` pointed at this engine checkout) -- that is where the private
+gallium arsenide) lives in the consuming application's own tests instead -- that is where the private
 question fixtures and the gitignored corpora already are, and it is the
 right side of the boundary for a test that only makes sense with both.
 """

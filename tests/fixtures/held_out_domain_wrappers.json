@@ -1,0 +1,11 @@
+{
+  "_provenance": "consumer #522 / engine #22 item 1 follow-up. Written and committed BEFORE any common-English exclusion list was chosen or measured, per the task's own ordering requirement: the oracle must not be written after seeing the answer. Each entry is a natural-language wrapper TEMPLATE with a single `{q}` placeholder for an out-of-domain question (the consumer repo's `questions-outofdomain.json`, not duplicated here -- this engine repo holds no private question fixtures, per tests/test_domain_lexicon.py's own stated boundary). These six are new: distinct from the two wrappers already named in docs/product/reviews/i394-decision-brief-20260925.md and corpus-v2-proposal-20260926.md ('What is the best answer to this: ...' and '... What might I have missed?'), which are not held out and already have a measured baseline. No lexicon was inspected and no measurement was run against these six before this file was committed.",
+  "wrappers": [
+    "Can you explain {q}",
+    "Quick question: {q}",
+    "I was wondering, {q}",
+    "Just curious -- {q}",
+    "Do you happen to know {q}",
+    "Out of curiosity, {q}"
+  ]
+}

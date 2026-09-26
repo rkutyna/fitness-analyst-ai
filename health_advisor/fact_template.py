@@ -1535,6 +1535,99 @@ def citation_fact_key(sequence, doc_id: str, chunk_ix) -> str:
         "chunk_ix=" + enc(chunk_ix)))
 
 
+_AUTHOR_INITIALS_RE = re.compile(r"^[A-Z]{1,3}\.?$")
+
+
+def _citation_author_surname(entry: str) -> str:
+    """Return one PubMed-style author entry's surname.
+
+    The corpus's ``authors`` string is comma-separated PubMed style,
+    ``"Surname Initials, Surname Initials, ... ."``. This drops a trailing
+    initials token (1-3 uppercase letters, optional period, e.g. ``SJ``,
+    ``E.``, ``ERM``) from one entry; an entry with no such token -- an
+    organisation, e.g. ``World Health Organization`` -- is kept whole.
+    Surnames may themselves be multi-word and non-ASCII (``Sáez de
+    Villarreal E.`` -> ``Sáez de Villarreal``).
+    """
+    tokens = entry.split(" ")
+    if len(tokens) > 1 and _AUTHOR_INITIALS_RE.match(tokens[-1]):
+        return " ".join(tokens[:-1]).strip()
+    return entry.strip()
+
+
+def _citation_author_short(authors) -> str:
+    """Return the short author form for a citation display string.
+
+    1 surname -> ``First``; 2 -> ``First and Second``; 3+ ->
+    ``First et al.``. Empty (no authors at all) returns ``""``, which the
+    caller treats as "omit the author part and its trailing comma".
+    """
+    if not authors:
+        return ""
+    text = str(authors).strip()
+    if text.endswith("."):
+        text = text[:-1]
+    surnames = [
+        surname for surname in (
+            _citation_author_surname(part.strip())
+            for part in text.split(",") if part.strip())
+        if surname
+    ]
+    if not surnames:
+        return ""
+    if len(surnames) == 1:
+        return surnames[0]
+    if len(surnames) == 2:
+        return f"{surnames[0]} and {surnames[1]}"
+    return f"{surnames[0]} et al."
+
+
+def _citation_url(doi, pmid) -> str | None:
+    """Return a citation's markdown link destination, or ``None``.
+
+    A DOI wins when both are present. ``quote`` never touches letters,
+    digits or ``_.-~`` regardless of ``safe``, so passing ``safe="/"`` keeps
+    a DOI's slashes AND its periods literal while percent-encoding anything
+    else that would break a markdown link destination -- at least space,
+    ``(``, ``)``, ``<``, ``>``.
+    """
+    if doi:
+        return "https://doi.org/" + quote(str(doi), safe="/")
+    if pmid:
+        return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+    return None
+
+
+def _citation_display(title, authors, year, doi, pmid) -> str:
+    """Return the Python-built markdown citation string for one passage.
+
+    ``[<title> — <author short>, <year>](<url>)``: a markdown link when a
+    DOI or PMID resolves a URL, else the bracketed text alone. The title
+    has one trailing "." stripped if present, and any "[" or "]" in it is
+    backslash-escaped so the link text cannot break out of its own span.
+    """
+    text = str(title)
+    if text.endswith("."):
+        text = text[:-1]
+    text = text.replace("[", "\\[").replace("]", "\\]")
+
+    author_short = _citation_author_short(authors)
+    has_year = year is not None
+    if author_short and has_year:
+        bracket_text = f"{text} — {author_short}, {year}"
+    elif author_short:
+        bracket_text = f"{text} — {author_short}"
+    elif has_year:
+        bracket_text = f"{text}, {year}"
+    else:
+        bracket_text = text
+
+    url = _citation_url(doi, pmid)
+    if url:
+        return f"[{bracket_text}]({url})"
+    return f"[{bracket_text}]"
+
+
 def build_citation_facts(ledger: list[dict]) -> dict[str, dict]:
     """Build closed citation slots from parent-returned retrieval results."""
     facts = {}
@@ -1558,19 +1651,13 @@ def build_citation_facts(ledger: list[dict]) -> dict[str, dict]:
                     or not isinstance(span, str) or not span.strip()
                     or version is None):
                 continue
-            metadata = [passage.get("title") or doc_id]
-            if passage.get("authors"):
-                metadata.append(str(passage["authors"]))
-            if passage.get("year") is not None:
-                metadata.append(str(passage["year"]))
-            if passage.get("doi"):
-                metadata.append("doi:" + str(passage["doi"]))
-            if passage.get("pmid"):
-                metadata.append("pmid:" + str(passage["pmid"]))
+            display = _citation_display(
+                passage.get("title") or doc_id, passage.get("authors"),
+                passage.get("year"), passage.get("doi"), passage.get("pmid"))
             key = citation_fact_key(record.get("sequence"), doc_id, chunk_ix)
             facts[key] = {
                 "key": key,
-                "display": "[" + "; ".join(metadata) + "]",
+                "display": display,
                 "source": {
                     "doc_id": doc_id, "chunk_ix": chunk_ix, "span": span,
                     "corpus_version": version,

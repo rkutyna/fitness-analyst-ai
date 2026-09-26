@@ -1220,17 +1220,42 @@ def _history_at(
         try:
             existing_totals = conn.execute(
                 "SELECT COUNT(*) FROM hk_daily_totals").fetchone()[0]
-            total_rows = [tuple(r) for r in conn.execute(
-                "SELECT metric, local_date, value, unit, interval, state, "
-                "device_id, queried_at, first_seen_at, settled_at "
-                "FROM hk_daily_totals")]
+            # consumer #430: migration_id must survive a rebuild, or a
+            # migrated row comes back with migration_id NULL -- which the
+            # settled trigger then protects forever, making the migration
+            # irreversible (revert_historical_migration can no longer find it,
+            # and hk_daily_totals_settled_no_delete refuses the DELETE).
+            # `_columns` (PRAGMA table_info) rather than a query-and-catch: a
+            # vault that predates the column must read as NULL -- an ordinary
+            # live pull -- not silently drop every row the way catching
+            # sqlite3.Error around the whole SELECT would (that except exists
+            # for the table not existing at all, a vault predating D19).
+            select_migration_id = (
+                "migration_id" in _columns(conn, "hk_daily_totals"))
+            total_rows = [
+                tuple(r) + (() if select_migration_id else (None,))
+                for r in conn.execute(
+                    "SELECT metric, local_date, value, unit, interval, state, "
+                    "device_id, queried_at, first_seen_at, settled_at"
+                    + (", migration_id" if select_migration_id else "")
+                    + " FROM hk_daily_totals")]
         except sqlite3.Error:          # a vault predating D19
             existing_totals, total_rows = 0, []
         try:
-            revision_rows = [tuple(r) for r in conn.execute(
-                "SELECT id, metric, local_date, from_value, to_value, "
-                "from_state, to_state, lag_days, batch_id, recorded_at "
-                "FROM hk_daily_total_revisions")]
+            # consumer #430: prior_sum/prior_source_kind must also survive --
+            # they are the only record of what a migration overwrote, and
+            # revert_historical_migration cannot restore a frozen pair (D3,
+            # consumer #37) without them. Same `_columns` reasoning as above.
+            rev_cols = _columns(conn, "hk_daily_total_revisions")
+            select_migration_cols = "migration_id" in rev_cols
+            revision_rows = [
+                tuple(r) + (() if select_migration_cols else (None, None, None))
+                for r in conn.execute(
+                    "SELECT id, metric, local_date, from_value, to_value, "
+                    "from_state, to_state, lag_days, batch_id, recorded_at"
+                    + (", migration_id, prior_sum, prior_source_kind"
+                       if select_migration_cols else "")
+                    + " FROM hk_daily_total_revisions")]
         except sqlite3.Error:          # a vault predating D19
             revision_rows = []
         try:
@@ -1724,17 +1749,27 @@ def build_vault(
                 "VALUES (?, ?, ?, ?)", existing_commits)
 
         if existing_total_rows:
+            # migration_id (consumer #430) is carried through here even though
+            # `target` always has the current schema: `_history_at` already
+            # backfilled NULL for a source vault that predates the column, so
+            # this INSERT's column list and its tuples agree regardless of the
+            # source's age.
             target.executemany(
                 "INSERT INTO hk_daily_totals "
                 "(metric, local_date, value, unit, interval, state, device_id, "
-                "queried_at, first_seen_at, settled_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", existing_total_rows)
+                "queried_at, first_seen_at, settled_at, migration_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", existing_total_rows)
         if existing_revision_rows:
+            # prior_sum/prior_source_kind (consumer #430) likewise -- dropping
+            # them here is what would make a migrated day's revert silently
+            # forget what it overwrote after the vault's next rebuild.
             target.executemany(
                 "INSERT INTO hk_daily_total_revisions "
                 "(id, metric, local_date, from_value, to_value, from_state, "
-                "to_state, lag_days, batch_id, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", existing_revision_rows)
+                "to_state, lag_days, batch_id, recorded_at, migration_id, "
+                "prior_sum, prior_source_kind) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                existing_revision_rows)
         if existing_expected:
             target.executemany(
                 "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",

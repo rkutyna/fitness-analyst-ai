@@ -2468,6 +2468,19 @@ def write_historical_consolidated_totals(
     hk_daily_totals/hk_daily_total_revisions row this writes; NULL stays
     reserved for an ordinary live pull (schema.sql).
 
+    **Refuses the whole batch if ANY (metric, local_date) already has an
+    `hk_daily_totals` row of any kind** (#430 review, defect 1) — an ordinary
+    PROVISIONAL row (`migration_id IS NULL`, `state='provisional'`), an
+    ordinary settled row, or a previous migration's row. The first draft of
+    this function let the UPDATE branch silently take over any of those: a
+    provisional row is not trigger-protected at all, and two migrations
+    writing the same day meant whichever reverted LAST won, restoring
+    `daily_metrics` to a state that was never the true "before" for the other
+    migration. There is no partial-overwrite case that is safe to allow here,
+    so this never UPDATEs an existing `hk_daily_totals` row — "revert the
+    migration (or clear the ordinary row) first, then re-migrate" is the only
+    path to redo a batch, including re-running this exact `migration_id`.
+
     Before writing, this reads each (metric, local_date)'s CURRENT
     `daily_metrics.sum`/`source_kind` and records them on the revision row as
     `prior_sum`/`prior_source_kind` — the one thing a migration id alone cannot
@@ -2485,34 +2498,62 @@ def write_historical_consolidated_totals(
     authoritative even where the raw rows behind the old sum are gone, which is
     the whole reason `prior_sum` exists — to make that overwrite reversible.
 
-    `hk_daily_totals_settled_immutable`/`_settled_no_delete` (schema.sql) let
-    this UPDATE a row this same function wrote earlier under a different
-    (corrected) `migration_id`, because the trigger's guard is `OLD.migration_id
-    IS NULL`, never the value. They still refuse outright if `(metric,
-    local_date)` already holds an ORDINARY settled row (`migration_id IS
-    NULL`) — which should never happen given M6's scope stops at 2026-08-18 and
-    D19 live pulls start 2026-08-21, but if it ever does, the trigger's
-    IntegrityError is the correct outcome, not something to catch here
-    (storage-engine enforcement is the point of the trigger).
+    Does NOT touch `vault_meta.daily_totals_expected_from:<metric>` (#430
+    review, defect 2). That key records where THIS deployment started
+    receiving LIVE totals, and `verify_daily_metrics` check 6 reads it as an
+    affirmative expectation: every day from it onward should have a
+    consolidated total. A historical migration covers only specific
+    multi-source days in the past; writing that key here on a vault that
+    never had it would move the marker back years and make check 6 demand a
+    total for every single-source day since — see `insert_daily_totals`'s
+    docstring, which this deliberately does not replicate.
 
-    Returns the number of days written. Every write scopes by the single
-    `migration_id` string, never by an IN-list of (metric, date) pairs, so the
-    bind count is independent of batch size (production's 32,766-bind limit
-    differs from a Mac's; #430 review note).
+    Wrapped in one SAVEPOINT (#430 review, defect 4): if any row after the
+    first raises, everything this call did — writes and the
+    `apply_consolidated_totals` pass — is rolled back, leaving zero partial
+    rows regardless of what the caller does with the exception.
+
+    Returns the number of days written. Every check and write scopes by the
+    single `migration_id` string or a per-row lookup, never by an IN-list of
+    (metric, date) pairs sized to the batch, so the bind count is independent
+    of batch size (production's 32,766-bind limit differs from a Mac's; #430
+    review note).
     """
+    rows = list(rows)
     now = utcnow_iso()
-    written = 0
-    pairs: list[tuple[str, str]] = []
-    for row in rows:
-        metric, day = row["metric"], row["local_date"]
-        prior_total = conn.execute(
-            "SELECT value, state FROM hk_daily_totals "
-            "WHERE metric = ? AND local_date = ?", (metric, day)).fetchone()
-        prior_dm = conn.execute(
-            "SELECT sum, source_kind FROM daily_metrics "
-            "WHERE metric = ? AND date = ?", (metric, day)).fetchone()
-        lag_days = daily_total_lag_days(row["queried_at"], day)
-        if prior_total is None:
+
+    conn.execute("SAVEPOINT write_historical_consolidated_totals")
+    try:
+        # Pre-check EVERY pair before writing anything. One SELECT per row —
+        # not an IN-list sized to the batch — so this still costs a bind per
+        # row rather than per row squared, and stays under the production bind
+        # limit regardless of batch size.
+        conflicts: list[tuple[str, str]] = []
+        for row in rows:
+            exists = conn.execute(
+                "SELECT 1 FROM hk_daily_totals "
+                "WHERE metric = ? AND local_date = ?",
+                (row["metric"], row["local_date"])).fetchone()
+            if exists is not None:
+                conflicts.append((row["metric"], row["local_date"]))
+        if conflicts:
+            shown = ", ".join(f"{m}@{d}" for m, d in conflicts[:8])
+            more = (f", and {len(conflicts) - 8} more"
+                    if len(conflicts) > 8 else "")
+            raise ValueError(
+                f"write_historical_consolidated_totals: {len(conflicts)} "
+                f"pair(s) already have an hk_daily_totals row: {shown}{more} "
+                "-- revert the migration (or clear the ordinary row) that "
+                "holds them first; this never overwrites an existing row")
+
+        written = 0
+        pairs: list[tuple[str, str]] = []
+        for row in rows:
+            metric, day = row["metric"], row["local_date"]
+            prior_dm = conn.execute(
+                "SELECT sum, source_kind FROM daily_metrics "
+                "WHERE metric = ? AND date = ?", (metric, day)).fetchone()
+            lag_days = daily_total_lag_days(row["queried_at"], day)
             conn.execute(
                 "INSERT INTO hk_daily_totals (metric, local_date, value, unit, "
                 "interval, state, device_id, queried_at, first_seen_at, "
@@ -2520,30 +2561,27 @@ def write_historical_consolidated_totals(
                 "VALUES (?, ?, ?, ?, ?, 'settled', ?, ?, ?, ?, ?)",
                 (metric, day, row["value"], row["unit"], row["interval"],
                  row["device_id"], row["queried_at"], now, now, migration_id))
-        else:
+            # from_value/from_state are always NULL: the pre-check above
+            # guarantees no hk_daily_totals row existed for this pair before
+            # this INSERT.
             conn.execute(
-                "UPDATE hk_daily_totals SET value = ?, unit = ?, interval = ?, "
-                "state = 'settled', device_id = ?, queried_at = ?, "
-                "settled_at = ?, migration_id = ? "
-                "WHERE metric = ? AND local_date = ?",
-                (row["value"], row["unit"], row["interval"], row["device_id"],
-                 row["queried_at"], now, migration_id, metric, day))
-        conn.execute(
-            "INSERT INTO hk_daily_total_revisions (metric, local_date, "
-            "from_value, to_value, from_state, to_state, lag_days, batch_id, "
-            "recorded_at, migration_id, prior_sum, prior_source_kind) "
-            "VALUES (?, ?, ?, ?, ?, 'settled', ?, ?, ?, ?, ?, ?)",
-            (metric, day, prior_total["value"] if prior_total else None,
-             row["value"], prior_total["state"] if prior_total else None,
-             lag_days, migration_id, now, migration_id,
-             prior_dm["sum"] if prior_dm else None,
-             prior_dm["source_kind"] if prior_dm else None))
-        conn.execute(
-            "INSERT OR IGNORE INTO vault_meta (key, value) VALUES "
-            "(?, ?)", (f"daily_totals_expected_from:{metric}", day))
-        pairs.append((metric, day))
-        written += 1
-    apply_consolidated_totals(conn, pairs=pairs)
+                "INSERT INTO hk_daily_total_revisions (metric, local_date, "
+                "from_value, to_value, from_state, to_state, lag_days, "
+                "batch_id, recorded_at, migration_id, prior_sum, "
+                "prior_source_kind) "
+                "VALUES (?, ?, NULL, ?, NULL, 'settled', ?, ?, ?, ?, ?, ?)",
+                (metric, day, row["value"], lag_days, migration_id, now,
+                 migration_id, prior_dm["sum"] if prior_dm else None,
+                 prior_dm["source_kind"] if prior_dm else None))
+            pairs.append((metric, day))
+            written += 1
+        apply_consolidated_totals(conn, pairs=pairs)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT write_historical_consolidated_totals")
+        conn.execute("RELEASE SAVEPOINT write_historical_consolidated_totals")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT write_historical_consolidated_totals")
     return written
 
 
@@ -2574,35 +2612,49 @@ def revert_historical_migration(conn: sqlite3.Connection, migration_id: str) -> 
     decade of days costs the same bind count as reverting one (#430 review
     note on the 32,766-bind production limit).
 
+    Wrapped in one SAVEPOINT (#430 review, defect 4), matching
+    `write_historical_consolidated_totals`: a mid-loop failure leaves neither
+    `daily_metrics` nor `hk_daily_totals`/`hk_daily_total_revisions` partially
+    reverted.
+
     Returns `{"restored": n, "deleted": n}` — daily_metrics rows put back to a
     real prior value vs. removed because none existed before the migration.
     Does nothing, and returns zeros, for an unknown `migration_id` (including
     one that was never applied, or already reverted).
     """
-    revisions = conn.execute(
-        "SELECT metric, local_date, prior_sum, prior_source_kind "
-        "FROM hk_daily_total_revisions WHERE migration_id = ?",
-        (migration_id,)).fetchall()
-    restored = 0
-    deleted = 0
-    for row in revisions:
-        metric, day = row["metric"], row["local_date"]
-        if row["prior_source_kind"] is None:
-            conn.execute(
-                "DELETE FROM daily_metrics WHERE metric = ? AND date = ?",
-                (metric, day))
-            deleted += 1
-        else:
-            conn.execute(
-                "UPDATE daily_metrics SET sum = ?, source_kind = ? "
-                "WHERE metric = ? AND date = ?",
-                (row["prior_sum"], row["prior_source_kind"], metric, day))
-            restored += 1
-    conn.execute(
-        "DELETE FROM hk_daily_totals WHERE migration_id = ?", (migration_id,))
-    conn.execute(
-        "DELETE FROM hk_daily_total_revisions WHERE migration_id = ?",
-        (migration_id,))
+    conn.execute("SAVEPOINT revert_historical_migration")
+    try:
+        revisions = conn.execute(
+            "SELECT metric, local_date, prior_sum, prior_source_kind "
+            "FROM hk_daily_total_revisions WHERE migration_id = ?",
+            (migration_id,)).fetchall()
+        restored = 0
+        deleted = 0
+        for row in revisions:
+            metric, day = row["metric"], row["local_date"]
+            if row["prior_source_kind"] is None:
+                conn.execute(
+                    "DELETE FROM daily_metrics WHERE metric = ? AND date = ?",
+                    (metric, day))
+                deleted += 1
+            else:
+                conn.execute(
+                    "UPDATE daily_metrics SET sum = ?, source_kind = ? "
+                    "WHERE metric = ? AND date = ?",
+                    (row["prior_sum"], row["prior_source_kind"], metric, day))
+                restored += 1
+        conn.execute(
+            "DELETE FROM hk_daily_totals WHERE migration_id = ?",
+            (migration_id,))
+        conn.execute(
+            "DELETE FROM hk_daily_total_revisions WHERE migration_id = ?",
+            (migration_id,))
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT revert_historical_migration")
+        conn.execute("RELEASE SAVEPOINT revert_historical_migration")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT revert_historical_migration")
     return {"restored": restored, "deleted": deleted}
 
 

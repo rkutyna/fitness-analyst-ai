@@ -11,6 +11,17 @@ flag.
 
 Step 1 only: the history pull, staging import, report script and `--apply`
 (build steps 2-4 of the brief's "what happens next") are not built here.
+
+A first-round review found four defects in the initial version of this step,
+fixed in the same commit series as the tests that name them below: (1) the
+write primitive silently overwrote ANY pre-existing hk_daily_totals row
+(ordinary provisional, or another migration's); (2) it moved
+vault_meta.daily_totals_expected_from:<metric>, a marker that belongs to the
+live D19 path only; (3) vault._history_at/build_vault carried
+hk_daily_totals/hk_daily_total_revisions forward with a fixed column list that
+predated migration_id/prior_sum/prior_source_kind, so a rebuild silently
+dropped them; (4) neither write nor revert was wrapped in a SAVEPOINT, so a
+mid-batch failure could leave a partial migration.
 """
 from __future__ import annotations
 
@@ -214,20 +225,235 @@ def test_ordinary_settled_row_still_rejects_update_and_delete(conn):
             "WHERE metric = 'step_count' AND local_date = '2026-08-25'")
 
 
-def test_migration_row_permits_update_and_delete(conn):
-    """The other side of the same trigger: a migration_id row is not stuck."""
+def test_migration_row_permits_delete(conn):
+    """The other side of the same trigger: a migration_id row is not stuck --
+    revert_historical_migration's DELETE succeeds where an ordinary settled
+    row's would be refused."""
     db.write_historical_consolidated_totals(
         conn, [_historical("step_count", "2019-01-01", 100.0)],
         migration_id="i430-c")
-    # Re-run under the same id with a corrected value -- an UPDATE the OLD
-    # trigger body would have refused outright.
-    db.write_historical_consolidated_totals(
-        conn, [_historical("step_count", "2019-01-01", 150.0)],
-        migration_id="i430-c")
-    assert _hk_totals_row(conn, "step_count", "2019-01-01")["value"] == 150.0
-    # And a revert, which DELETEs it.
+    assert _hk_totals_row(conn, "step_count", "2019-01-01")["value"] == 100.0
     db.revert_historical_migration(conn, "i430-c")
     assert _hk_totals_row(conn, "step_count", "2019-01-01") is None
+
+
+# --------------------------------------------------------------------------- #
+# Defect 1 (#430 review): refuse to write over ANY existing hk_daily_totals
+# row -- an ordinary provisional row, another migration's row, or the same
+# migration_id re-run. The first draft let the UPDATE branch silently take
+# any of those over, which meant an ordinary live row could be lost, and two
+# migrations over one day reverted order-dependently.
+# --------------------------------------------------------------------------- #
+def test_write_refuses_an_ordinary_provisional_row(conn):
+    """A live pull that hasn't settled yet is not trigger-protected at all
+    (the settled triggers only fire on state='settled'), so the Python-side
+    pre-check is the only thing standing between it and being overwritten."""
+    db.insert_daily_totals(conn, [{
+        "metric": "step_count", "local_date": "2019-06-01", "value": 500.0,
+        "unit": "count", "interval": "day", "state": "provisional",
+        "device_id": "dev-1", "queried_at": "2019-06-02T09:00:00"}],
+        batch_id="live-b1")
+    before = _hk_totals_row(conn, "step_count", "2019-06-01")
+
+    with pytest.raises(ValueError, match="already have an hk_daily_totals row"):
+        db.write_historical_consolidated_totals(
+            conn, [_historical("step_count", "2019-06-01", 7200.0)],
+            migration_id="i430-d")
+
+    assert _hk_totals_row(conn, "step_count", "2019-06-01") == before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_total_revisions "
+        "WHERE migration_id = 'i430-d'").fetchone()[0] == 0
+
+
+def test_write_refuses_a_second_migration_over_an_already_migrated_day(conn):
+    db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-02", 100.0)],
+        migration_id="i430-e1")
+    before = _hk_totals_row(conn, "step_count", "2019-06-02")
+
+    with pytest.raises(ValueError, match="already have an hk_daily_totals row"):
+        db.write_historical_consolidated_totals(
+            conn, [_historical("step_count", "2019-06-02", 999.0)],
+            migration_id="i430-e2")
+
+    # migration "e1"'s row is exactly as it was; "e2" wrote nothing at all --
+    # not even a revision row, so replaying "e2" costs nothing to retry.
+    assert _hk_totals_row(conn, "step_count", "2019-06-02") == before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_total_revisions "
+        "WHERE migration_id = 'i430-e2'").fetchone()[0] == 0
+
+
+def test_write_refuses_rerunning_the_same_migration_id(conn):
+    """Revert first, then re-migrate under the same or a new id -- is now the
+    only way to redo a batch."""
+    db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-03", 100.0)],
+        migration_id="i430-f")
+    before = _hk_totals_row(conn, "step_count", "2019-06-03")
+
+    with pytest.raises(ValueError, match="already have an hk_daily_totals row"):
+        db.write_historical_consolidated_totals(
+            conn, [_historical("step_count", "2019-06-03", 150.0)],
+            migration_id="i430-f")
+    assert _hk_totals_row(conn, "step_count", "2019-06-03") == before
+
+    db.revert_historical_migration(conn, "i430-f")
+    written = db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-03", 150.0)],
+        migration_id="i430-f")
+    assert written == 1
+    assert _hk_totals_row(conn, "step_count", "2019-06-03")["value"] == 150.0
+
+
+# --------------------------------------------------------------------------- #
+# Defect 2 (#430 review): never touch
+# vault_meta.daily_totals_expected_from:<metric> -- that key records where
+# THIS deployment started receiving LIVE totals, and verify_daily_metrics
+# check 6 reads it as an affirmative "expect a total every day from here on."
+# A historical migration must not create or move it.
+# --------------------------------------------------------------------------- #
+def test_write_does_not_create_the_expected_from_marker(conn):
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vault_meta "
+        "WHERE key = 'daily_totals_expected_from:step_count'"
+    ).fetchone()[0] == 0
+
+    db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-04", 100.0)],
+        migration_id="i430-g")
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vault_meta "
+        "WHERE key = 'daily_totals_expected_from:step_count'"
+    ).fetchone()[0] == 0
+
+
+def test_write_does_not_move_an_existing_expected_from_marker(conn):
+    db.insert_daily_totals(conn, [{
+        "metric": "step_count", "local_date": "2026-08-21", "value": 100.0,
+        "unit": "count", "interval": "day", "state": "settled",
+        "device_id": "dev-1", "queried_at": "2026-08-22T09:00:00"}],
+        batch_id="live-b2")
+    marker_before = conn.execute(
+        "SELECT value FROM vault_meta "
+        "WHERE key = 'daily_totals_expected_from:step_count'").fetchone()[0]
+    assert marker_before == "2026-08-21"
+
+    db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-05", 100.0)],
+        migration_id="i430-h")
+
+    marker_after = conn.execute(
+        "SELECT value FROM vault_meta "
+        "WHERE key = 'daily_totals_expected_from:step_count'").fetchone()[0]
+    assert marker_after == marker_before
+
+
+# --------------------------------------------------------------------------- #
+# Defect 4 (#430 review): atomicity, and a migration into an empty pair
+# --------------------------------------------------------------------------- #
+def test_write_is_atomic_when_a_later_row_fails(conn):
+    """Two rows for the SAME pair in one batch: the pre-check cannot catch an
+    intra-batch collision (neither exists beforehand), so the second INSERT
+    for that pair hits the (metric, local_date) primary key and raises. The
+    SAVEPOINT must leave zero rows behind, not just the first row written."""
+    rows = [
+        _historical("step_count", "2019-06-06", 100.0),
+        _historical("distance_walking_running", "2019-06-06", 5000.0, unit="m"),
+        _historical("step_count", "2019-06-06", 999.0),  # duplicate pair -> raises
+    ]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.write_historical_consolidated_totals(conn, rows, migration_id="i430-i")
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_totals WHERE migration_id = 'i430-i'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_total_revisions "
+        "WHERE migration_id = 'i430-i'").fetchone()[0] == 0
+    assert _dm(conn, "step_count", "2019-06-06") is None
+    assert _dm(conn, "distance_walking_running", "2019-06-06") is None
+
+
+def test_migration_into_a_day_with_no_daily_metrics_row_reverts_to_nothing(conn):
+    """apply_consolidated_totals' INSERT branch: a consolidated total for a day
+    with no raw samples at all is legitimate (D19). Revert must delete the row
+    it created, restoring "no row" exactly, not some placeholder."""
+    assert _dm(conn, "step_count", "2019-06-07") is None
+
+    db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-07", 100.0)],
+        migration_id="i430-j")
+    created = _dm(conn, "step_count", "2019-06-07")
+    assert created == {"count": 0, "sum": 100.0, "avg": None, "min": None,
+                       "max": None, "last": None, "unit": "count",
+                       "source_kind": "apple_consolidated"}
+
+    result = db.revert_historical_migration(conn, "i430-j")
+    assert result == {"restored": 0, "deleted": 1}
+    assert _dm(conn, "step_count", "2019-06-07") is None
+
+
+# --------------------------------------------------------------------------- #
+# Defect 3 (#430 review): a vault rebuild must carry migration_id/prior_sum/
+# prior_source_kind forward. `vault._history_at` reads hk_daily_totals/
+# hk_daily_total_revisions with a fixed column list, and `build_vault`'s
+# write-back had a matching fixed list -- dropping the three #430 columns
+# there would turn a migrated row into an ordinary settled one (migration_id
+# NULL), which the settled trigger then protects forever: the migration
+# becomes irreversible the moment the vault is rebuilt.
+# --------------------------------------------------------------------------- #
+def _plain_record(metric, value, day, n, source="test"):
+    start = f"{day}T00:00:{n:02d}+00:00"
+    return {"metric": metric, "value": value, "unit": "count",
+            "start_utc": start, "end_utc": start, "start_local": start[:-6],
+            "local_date": day, "source": source, "origin": "backfill",
+            "dedupe_key": f"{metric}-{day}-{n}-{source}"}
+
+
+def test_migration_survives_a_vault_rebuild_then_reverts_byte_identical(tmp_path):
+    source = tmp_path / "source.db"
+    vault_path = tmp_path / "vault.db"
+    src = db.connect(source)
+    db.init_db(src)
+    db.insert_records(src, [_plain_record("step_count", 8000.0, "2019-06-08", 1)])
+    db.recompute_daily_metrics(src, full=True)
+    src.commit()
+    src.close()
+
+    V.build_vault(source, vault_path, measure_gzip=False)
+
+    conn = db.connect(vault_path)
+    before = _dm(conn, "step_count", "2019-06-08")
+    assert before["sum"] == 8000.0 and before["source_kind"] == "records"
+
+    db.write_historical_consolidated_totals(
+        conn, [_historical("step_count", "2019-06-08", 7200.0)],
+        migration_id="i430-rebuild-v1")
+    conn.commit()
+    migrated = _dm(conn, "step_count", "2019-06-08")
+    assert migrated["sum"] == 7200.0
+    conn.close()
+
+    # The real rebuild path -- not a hand-copied row.
+    V.build_vault(source, vault_path, replace=True, measure_gzip=False)
+
+    conn = db.connect(vault_path)
+    rebuilt = _dm(conn, "step_count", "2019-06-08")
+    # The rebuild carried the migration's hk_daily_totals row forward and
+    # re-applied it: the migrated value survives, not the source's raw sum.
+    assert rebuilt["sum"] == 7200.0
+    assert rebuilt["source_kind"] == "apple_consolidated"
+    totals_row = _hk_totals_row(conn, "step_count", "2019-06-08")
+    assert totals_row["migration_id"] == "i430-rebuild-v1"
+
+    result = db.revert_historical_migration(conn, "i430-rebuild-v1")
+    conn.commit()
+    assert result == {"restored": 1, "deleted": 0}
+    assert _dm(conn, "step_count", "2019-06-08") == before
+    conn.close()
 
 
 # --------------------------------------------------------------------------- #

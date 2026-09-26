@@ -101,10 +101,9 @@ EVIDENCE_CITATION_INSTRUCTIONS = (
 )
 
 EVIDENCE_STATUS_INSTRUCTIONS = (
-    "EVIDENCE STATUS: retrieval was not run for this turn -- there is no "
-    "`cite` tool available -- because Python decided the question outside "
-    "trigger A (#394). See the `evidence:status` fact for the published "
-    "reason. Do not claim a source was checked and do not fabricate a "
+    "EVIDENCE STATUS: no evidence search ran for this turn, so there is no "
+    "`cite` tool. The `evidence:status` fact gives the reason. Do not claim "
+    "a source was checked and do not fabricate a "
     "citation; any evidence-flavored claim stays unsourced, behind the "
     "coaching-guidance label, exactly as when `cite` returns nothing."
 )

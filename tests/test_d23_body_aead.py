@@ -5,7 +5,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -448,3 +450,77 @@ def test_refusal_bytes_do_not_echo_request(case):
         assert request_bytes not in body
     if case["name"] == "neg_plaintext_json_body":
         assert b"sent in the clear" not in body
+
+
+# ------------------------------------------------------ derived-cache race
+
+
+def test_derived_cache_survives_eviction_from_another_thread(monkeypatch):
+    """T5 piece 9, E1 (consumer #426): the wrapper derives on the event loop
+    while routes call ``auth_token``/``derive_keys`` from worker threads
+    (FastAPI's ``run_in_threadpool``). Without a lock around the whole of
+    ``_derived_material``, a cache hit's ``get()`` can be followed by another
+    thread evicting that exact entry before this thread's own
+    ``move_to_end()`` runs on it -- and ``OrderedDict.move_to_end`` on a
+    missing key raises ``KeyError``.
+
+    The ``RacyOrderedDict`` below reproduces the race deterministically
+    instead of hoping for unlucky thread scheduling: the first time the
+    cache-hit path calls ``move_to_end`` for the primed secret, it starts a
+    second thread that derives 65 *new* secrets (one more than
+    ``_DERIVED_CACHE_LIMIT``, guaranteeing exactly one eviction) before
+    letting the original ``move_to_end`` proceed.
+
+    Mutation: remove ``body_aead._DERIVED_CACHE_LOCK`` from
+    ``_derived_material`` (or replace the ``with`` block with a no-op). Then
+    the storm thread runs unimpeded — with no lock contention, 65 lightweight
+    HKDF derivations finish well inside this test's 0.3s join window, evict
+    the primed secret (still the least-recently-used entry), and the
+    primed call's own ``move_to_end`` raises ``KeyError``. With the lock,
+    the storm's derivations cannot even start until this call's whole
+    critical section (including its own ``move_to_end``) has returned, so
+    they run strictly after and never touch the entry this call already
+    returned.
+    """
+    monkeypatch.setattr(body_aead, "_DERIVED_CACHE_LIMIT", 64)
+    monkeypatch.setattr(body_aead, "_DERIVED_CACHE", OrderedDict())
+
+    primed_secret = "p9-e1-cache-hit-secret"
+    body_aead._derived_material(primed_secret)  # ordinary miss + insert
+    primed_key = body_aead._secret_bytes(primed_secret)
+
+    storm_started = threading.Event()
+    storm_finished = threading.Event()
+    armed = True
+
+    class RacyOrderedDict(OrderedDict):
+        def move_to_end(self, key, last=True):
+            nonlocal armed
+            if armed and key == primed_key:
+                armed = False
+
+                def storm():
+                    storm_started.set()
+                    for i in range(65):
+                        body_aead._derived_material(f"p9-e1-storm-secret-{i}")
+                    storm_finished.set()
+
+                thread = threading.Thread(target=storm)
+                thread.start()
+                storm_started.wait(5)
+                # Bounded, not blocking forever: under the fix the storm
+                # cannot make progress until this whole call returns (it
+                # blocks on the same module lock), so this wait always times
+                # out in that case. Without the fix, 65 HKDF derivations
+                # finish in well under this window and the thread is already
+                # done by the time we get here.
+                thread.join(0.3)
+            super().move_to_end(key, last=last)
+
+    racy = RacyOrderedDict()
+    racy.update(body_aead._DERIVED_CACHE)
+    monkeypatch.setattr(body_aead, "_DERIVED_CACHE", racy)
+
+    material = body_aead._derived_material(primed_secret)  # must not raise
+    assert material is not None
+    assert storm_finished.wait(5), "the storm thread never finished"

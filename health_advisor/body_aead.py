@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import os
 import struct
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -72,8 +73,15 @@ class _DerivedMaterial:
     auth_token: str
 
 
-_DERIVED_CACHE_LIMIT = 4
+_DERIVED_CACHE_LIMIT = 64
 _DERIVED_CACHE: OrderedDict[bytes, _DerivedMaterial] = OrderedDict()
+# Guards every read-modify-write of _DERIVED_CACHE. Routes call auth_token /
+# derive_keys from worker threads (FastAPI's run_in_threadpool), so a cache
+# hit's get()+move_to_end() must be atomic with a concurrent miss's
+# insert+evict: without the lock, a hit's move_to_end() can run after another
+# thread has already evicted that exact entry, and OrderedDict.move_to_end on
+# a missing key raises KeyError (a live 500, not a hypothetical).
+_DERIVED_CACHE_LOCK = threading.Lock()
 
 
 def _secret_bytes(secret: str) -> bytes:
@@ -89,28 +97,29 @@ def _hkdf(secret: str, info: bytes, length: int) -> bytes:
 def _derived_material(secret: str) -> _DerivedMaterial:
     """Return cached derivations keyed by the exact trimmed secret bytes."""
     secret_b = _secret_bytes(secret)
-    material = _DERIVED_CACHE.get(secret_b)
-    if material is not None:
-        _DERIVED_CACHE.move_to_end(secret_b)
-        return material
+    with _DERIVED_CACHE_LOCK:
+        material = _DERIVED_CACHE.get(secret_b)
+        if material is not None:
+            _DERIVED_CACHE.move_to_end(secret_b)
+            return material
 
-    material = _DerivedMaterial(
-        keys=DerivedKeys(
-            request=_hkdf(secret, INFO_REQUEST, KEY_BYTES),
-            response=_hkdf(secret, INFO_RESPONSE, KEY_BYTES),
-        ),
-        key_id=base64.urlsafe_b64encode(
-            _hkdf(secret, INFO_KEY_ID, KEY_ID_BYTES)
-        ).decode("ascii").rstrip("="),
-        auth_token=base64.urlsafe_b64encode(
-            _hkdf(secret, INFO_AUTH_TOKEN, AUTH_TOKEN_BYTES)
-        ).decode("ascii").rstrip("="),
-    )
-    _DERIVED_CACHE[secret_b] = material
-    _DERIVED_CACHE.move_to_end(secret_b)
-    while len(_DERIVED_CACHE) > _DERIVED_CACHE_LIMIT:
-        _DERIVED_CACHE.popitem(last=False)
-    return material
+        material = _DerivedMaterial(
+            keys=DerivedKeys(
+                request=_hkdf(secret, INFO_REQUEST, KEY_BYTES),
+                response=_hkdf(secret, INFO_RESPONSE, KEY_BYTES),
+            ),
+            key_id=base64.urlsafe_b64encode(
+                _hkdf(secret, INFO_KEY_ID, KEY_ID_BYTES)
+            ).decode("ascii").rstrip("="),
+            auth_token=base64.urlsafe_b64encode(
+                _hkdf(secret, INFO_AUTH_TOKEN, AUTH_TOKEN_BYTES)
+            ).decode("ascii").rstrip("="),
+        )
+        _DERIVED_CACHE[secret_b] = material
+        _DERIVED_CACHE.move_to_end(secret_b)
+        while len(_DERIVED_CACHE) > _DERIVED_CACHE_LIMIT:
+            _DERIVED_CACHE.popitem(last=False)
+        return material
 
 
 def derive_keys(secret: str) -> DerivedKeys:

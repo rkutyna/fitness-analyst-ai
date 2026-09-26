@@ -13,7 +13,7 @@ from fastapi import Request
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
 
-from health_advisor import body_aead, receiver
+from health_advisor import body_aead, device_auth, enrol, receiver
 
 
 VECTOR_FILE = Path(__file__).parent / "fixtures" / "d23_body_aead_v1.json"
@@ -163,7 +163,7 @@ def test_buffered_body_is_cached_for_a_second_request_read():
     assert source_calls == [1]
 
 
-def test_route_coverage_is_the_completed_router(monkeypatch, vault):
+def test_route_coverage_is_the_completed_router(monkeypatch, vault, tmp_path):
     app = _app(monkeypatch, vault, "required")
     assert isinstance(app, receiver.D23BodyAEADApp)
     assert app.app.docs_url is None
@@ -172,7 +172,8 @@ def test_route_coverage_is_the_completed_router(monkeypatch, vault):
     routes = [route for route in app.routes if hasattr(route, "path")]
     assert routes
     # The outer wrapper owns every route in the completed router. /health is
-    # the sole route whose request and response remain plaintext by contract.
+    # the sole route whose request and response remain plaintext by contract
+    # -- unless HA_ENROL_MODE is on, when /v1/enrol joins it (below).
     assert all(route.path == "/health" or route in app.protected_routes
                for route in routes)
     assert all(route.path != "/health" or route not in app.protected_routes
@@ -180,6 +181,29 @@ def test_route_coverage_is_the_completed_router(monkeypatch, vault):
     assert {route.path for route in routes if route.path in {
         "/docs", "/redoc", "/openapi.json"
     }} == set()
+
+    # With QR enrolment on, /v1/enrol is exempt from D23 the same way /health
+    # is -- named in receiver.D23_EXEMPT_PATHS -- while every other route,
+    # including its own sibling /v1/enrol/upgrade, stays protected.
+    monkeypatch.setenv("HA_DEVICE_AUTH_MODE", "required")
+    monkeypatch.setenv("HA_DEVICE_REGISTRY_FILE", str(tmp_path / "devices.json"))
+    monkeypatch.setenv("HA_ENROL_MODE", "on")
+    monkeypatch.setenv("HA_ENROL_TOKEN_FILE", str(tmp_path / "enrol-tokens.json"))
+    enrol_app = _app(monkeypatch, vault, "required")
+    enrol_routes = [route for route in enrol_app.routes if hasattr(route, "path")]
+    enrol_paths = {route.path for route in enrol_routes}
+    assert enrol.ENROL_PATH in enrol_paths
+    assert device_auth.ENROL_UPGRADE_PATH in enrol_paths
+    exempt = {"/health", enrol.ENROL_PATH}
+    assert all(route.path in exempt or route in enrol_app.protected_routes
+               for route in enrol_routes)
+    assert all(route.path not in exempt or route not in enrol_app.protected_routes
+               for route in enrol_routes)
+    # The upgrade route is NOT D23-exempt: its whole contract is that the
+    # body must arrive D23-sealed (see _enrol_upgrade's docstring).
+    assert any(route.path == device_auth.ENROL_UPGRADE_PATH
+              and route in enrol_app.protected_routes
+              for route in enrol_routes)
 
 
 def test_health_docs_and_generated_500(monkeypatch, vault):

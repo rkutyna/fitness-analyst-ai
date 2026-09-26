@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeoutError
+import hashlib
 import hmac
 import io
 import json
@@ -66,6 +67,7 @@ from . import push
 from . import ask_progress
 from . import body_aead
 from . import device_auth
+from . import enrol
 
 logger = logging.getLogger(__name__)
 
@@ -1475,6 +1477,165 @@ def _enrol_refusal(code: str, status: int) -> HTTPException:
     return HTTPException(status_code=status, detail={"error": code})
 
 
+def _enrol_mode() -> str:
+    """Return the configured QR-enrolment mode, refusing an invalid value."""
+    mode = os.environ.get("HA_ENROL_MODE", "")
+    if mode == "":
+        return "off"
+    if mode in ("off", "on"):
+        return mode
+    raise RuntimeError(
+        "QR enrolment refuses to start: HA_ENROL_MODE is set to invalid "
+        f"value {mode!r}; set it to 'off' or 'on', or leave it unset for "
+        "'off'."
+    )
+
+
+def _request_target(scope: dict) -> bytes:
+    """The exact bytes a device signature is computed over for this request.
+
+    Mirrors ``D23BodyAEADApp._target``; kept as a free function here because
+    ``/v1/enrol`` is D23-exempt and so never passes through that layer at
+    all -- its own signature check has to derive the target itself.
+    """
+    raw_path = scope.get("raw_path")
+    if raw_path is None:
+        decoded_path = scope.get("root_path", "") + scope.get("path", "")
+        raw_path = quote(
+            decoded_path, safe="/:@-._~!$&'()*+,;="
+        ).encode("ascii")
+    query = scope.get("query_string", b"")
+    return raw_path + (b"?" + query if query else b"")
+
+
+async def _enrol_raw_body(request: Request) -> bytes:
+    """The QR-enrolment body, capped at 4 KiB -- far below MAX_BODY_BYTES.
+
+    The route is D23-exempt (no framing, no encrypted-wire size floor to
+    respect) and its payload is a handful of short fields, so a generous cap
+    would only widen the window for someone to point a large POST at an
+    endpoint that authenticates nothing until the body is opened.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > enrol.ENROL_MAX_BODY_BYTES:
+                raise HTTPException(status_code=413,
+                                    detail={"error": "enrol_body_too_large"})
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > enrol.ENROL_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413,
+                                detail={"error": "enrol_body_too_large"})
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _enrol_qr(store: "enrol.TokenStore", devices: "device_auth.DeviceAuth",
+             secret_for_request: Callable[[], str], request: Request,
+             raw: bytes) -> Response:
+    """Handle one QR-pairing enrolment (T5 piece 2, consumer #426).
+
+    The ordering below is load-bearing (see
+    docs/product/reviews/t5-qr-pairing-plan-20260926.md, "Build plan" piece 2):
+    lookup -> expiry -> HPKE open -> constant-time token-hash compare -> kid
+    matches device_pub -> signature (proof of possession) -> revoked-kid
+    refusal -> burn the token under the store lock -> registry.enrol.
+    Nothing before the burn step may consume the token, so a wrong signature
+    or a revoked kid leaves it live for a legitimate retry.
+    """
+    enrol_id = request.headers.get(enrol.HEADER_ENROL_ID)
+    if not enrol_id:
+        raise _enrol_refusal("enrol_token_unknown", 401)
+
+    try:
+        record = store.get_live(enrol_id)
+    except enrol.EnrolError as exc:
+        raise _enrol_refusal(exc.code, exc.status)
+
+    try:
+        plaintext = enrol.open_sealed(record.x25519_private,
+                                      enrol.info_for(enrol_id), raw)
+        payload = json.loads(plaintext)
+        if not isinstance(payload, dict) or payload.get("v") != 1:
+            raise ValueError("version")
+        token_text = payload["token"]
+        if not isinstance(token_text, str):
+            raise ValueError("token")
+        device_pub = device_auth._b64url_decode(payload["device_pub"])
+        device_auth.load_public_key(device_pub)
+        key_storage = payload.get("key_storage")
+        if key_storage not in device_auth.KEY_STORAGE_VALUES:
+            raise ValueError("key_storage")
+        response_key = enrol._b64url_decode(payload["response_key"])
+        if len(response_key) != enrol.RESPONSE_KEY_BYTES:
+            raise ValueError("response_key")
+        # attestation is reserved for T10 (D4: deferred). `null` is accepted
+        # and the device is simply enrolled unattested -- Device gains no
+        # new field for this now, for the same reason it gains none for the
+        # enrolling token's id (see enrol.py's module docstring).
+        payload.get("attestation")
+    except enrol.EnrolError:
+        raise _enrol_refusal("enrol_undecryptable", 400)
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError,
+            json.JSONDecodeError):
+        raise _enrol_refusal("enrol_undecryptable", 400)
+
+    if not hmac.compare_digest(enrol.token_hash(token_text), record.token_sha256):
+        raise _enrol_refusal("enrol_token_unknown", 401)
+
+    kid = device_auth.kid_for(device_pub)
+    try:
+        signed = device_auth.parse_headers(request.headers.get)
+        if signed is None:
+            raise device_auth.DeviceAuthError("device_sig_missing")
+        if signed.kid != kid:
+            raise device_auth.DeviceAuthError("device_sig_bad")
+        target = _request_target(request.scope)
+        device_auth.check_signature(
+            device_pub, signed, method=request.method, target=target,
+            body_hash=hashlib.sha256(raw).hexdigest())
+    except device_auth.DeviceAuthError as exc:
+        raise _enrol_refusal(exc.code, exc.status)
+
+    try:
+        existing = devices.registry.get(kid)
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("QR enrolment could not read the device registry: %s", exc)
+        raise _enrol_refusal("device_registry_unreadable", 503)
+    if existing is not None and not existing.active:
+        raise _enrol_refusal("device_revoked", 403)
+
+    try:
+        store.burn(enrol_id, kid=kid)
+    except enrol.EnrolError as exc:
+        raise _enrol_refusal(exc.code, exc.status)
+
+    try:
+        device, created = devices.registry.enrol(
+            device_pub, via="qr", key_storage=key_storage, allow_new=True)
+    except device_auth.DeviceAuthError as exc:
+        # The token is already burned by this point; a revoked-kid race here
+        # is the same window DeviceRegistry.enrol always has, not one new to
+        # QR pairing (the pre-check above closes the common case: a kid
+        # revoked before this request started).
+        raise _enrol_refusal(exc.code, exc.status)
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("QR enrolment could not update the device registry: %s", exc)
+        raise _enrol_refusal("device_registry_unreadable", 503)
+
+    secret = secret_for_request()
+    response_plain = json.dumps({
+        "kid": device.kid, "secret": secret, "created": created,
+    }, separators=(",", ":")).encode("utf-8")
+    sealed = enrol.seal_response(response_key, response_plain)
+    return Response(content=sealed, media_type=enrol.ENROL_CONTENT_TYPE)
+
+
 def _enrol_upgrade(devices: "device_auth.DeviceAuth", request: Request,
                    raw: bytes) -> dict:
     """Record a phone's device key, on the shared-secret channel (T4).
@@ -1556,22 +1717,32 @@ class _D23BodyTooLarge(Exception):
         self.nbytes = nbytes
 
 
+# The routes whose request and response stay plaintext by contract, at the
+# D23 layer. /health always has; /v1/enrol joins it only when HA_ENROL_MODE
+# is 'on' (create_app computes that union -- a phone with no shared secret
+# yet cannot D23-seal anything, so QR pairing has to bypass this layer
+# entirely, the same way /health does).
+D23_EXEMPT_PATHS = frozenset({"/health"})
+
+
 class D23BodyAEADApp:
     """Raw ASGI body encryption around a fully constructed receiver app."""
 
     _OWN_ATTRS = frozenset({
         "_OWN_ATTRS", "app", "secret_for_request", "mode", "ctx",
-        "routes", "protected_routes", "device_auth",
+        "routes", "protected_routes", "device_auth", "exempt_paths",
     })
 
     def __init__(self, app, secret_for_request: Callable[[], str], mode: str,
-                 ctx=None, device_auth: "device_auth.DeviceAuth | None" = None):
+                 ctx=None, device_auth: "device_auth.DeviceAuth | None" = None,
+                 exempt_paths: frozenset = D23_EXEMPT_PATHS):
         self.app = app
         self.secret_for_request = secret_for_request
         self.mode = mode
         self.ctx = ctx
         # None is HA_DEVICE_AUTH_MODE=off: not one header is read.
         self.device_auth = device_auth
+        self.exempt_paths = exempt_paths
 
     def __setattr__(self, name, value):
         if name in type(self)._OWN_ATTRS:
@@ -1586,7 +1757,7 @@ class D23BodyAEADApp:
     @property
     def protected_routes(self):
         return tuple(route for route in self.app.routes
-                     if getattr(route, "path", None) != "/health")
+                     if getattr(route, "path", None) not in self.exempt_paths)
 
     def __getattr__(self, name):
         return getattr(self.app, name)
@@ -1685,7 +1856,7 @@ class D23BodyAEADApp:
             return
 
         target = self._target(scope)
-        exempt = scope.get("path") == "/health"
+        exempt = scope.get("path") in self.exempt_paths
         request_body = None
         encrypted_request = False
         request_receive = receive
@@ -1869,6 +2040,16 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     if device_mode != "off":
         devices = device_auth.DeviceAuth(device_mode,
                                          device_auth.registry_from_env())
+    enrol_active = _enrol_mode() == "on"  # likewise: fails closed at startup
+    enrol_store = None
+    if enrol_active:
+        if devices is None:
+            raise RuntimeError(
+                "QR enrolment refuses to start: HA_ENROL_MODE is 'on' but "
+                "HA_DEVICE_AUTH_MODE is 'off'; a QR-paired phone has "
+                "nothing to enrol into without device authentication active.")
+        enrol_store = enrol.store_from_env()
+    exempt_paths = D23_EXEMPT_PATHS | ({enrol.ENROL_PATH} if enrol_active else set())
     app = FastAPI(title="Health Advisor Receiver", docs_url=None,
                   redoc_url=None, openapi_url=None)
     analyst_permit = asyncio.Semaphore(1)
@@ -1909,6 +2090,15 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                           x_health_secret: str | None = Header(default=None)):
             _require_ask_secret(x_health_secret)
             return _enrol_upgrade(devices, request, raw)
+
+    if enrol_store is not None:
+        @app.post(enrol.ENROL_PATH)
+        def enrol_qr(request: Request, raw: bytes = Depends(_enrol_raw_body)):
+            # No X-Health-Secret, no D23: a QR-paired phone holds neither
+            # yet. The route is D23-exempt (exempt_paths, above) and its own
+            # body carries every check this receiver needs.
+            return _enrol_qr(enrol_store, devices, secret_for_request,
+                             request, raw)
 
     @app.get("/health")
     def health():
@@ -2276,7 +2466,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     # outer placement covers Starlette's ServerErrorMiddleware, including its
     # generated 500 body, as well as every route wired above.
     return D23BodyAEADApp(app, secret_for_request, mode, ctx,
-                          device_auth=devices)
+                          device_auth=devices, exempt_paths=exempt_paths)
 
 
 def main(argv: list[str] | None = None, *, app_factory=create_app) -> int:

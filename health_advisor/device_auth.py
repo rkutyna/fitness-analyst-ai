@@ -272,6 +272,57 @@ def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+@contextlib.contextmanager
+def exclusive_lock(path: str | os.PathLike):
+    """An exclusive ``flock`` on ``path``'s sidecar lock file.
+
+    Shared with ``enrol.TokenStore`` (T5, #426): both files live beside a
+    user's vault and need the same reader/writer discipline, so the locking
+    primitive is factored here rather than duplicated. flock is scoped to the
+    open file description, so two callers in the same process each get their
+    own fd and correctly serialise against each other, not just across
+    processes.
+    """
+    lock_path = os.fspath(path) + ".lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write_json(path: str | os.PathLike, payload: str, *,
+                       temp_prefix: str = ".tmp.") -> None:
+    """Write ``payload`` to ``path`` atomically, mode 600, fsynced through the directory.
+
+    Shared with ``enrol.TokenStore``: write-then-``os.replace`` under the
+    caller's own ``exclusive_lock`` is the pattern both registries need, so it
+    lives here once rather than twice. Caller is responsible for holding the
+    lock; this function only does the write.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temp_path = tempfile.mkstemp(prefix=temp_prefix, dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_path)
+        raise
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class DeviceRegistry:
     """The enrolled devices of one instance, in one JSON file."""
 
@@ -328,40 +379,15 @@ class DeviceRegistry:
 
     # -- writing
 
-    @contextlib.contextmanager
     def _exclusive(self):
-        lock_path = self.path + ".lock"
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+        return exclusive_lock(self.path)
 
     def _write(self, devices: dict[str, Device]) -> None:
         payload = json.dumps({
             "v": REGISTRY_VERSION,
             "devices": [asdict(device) for device in devices.values()],
         }, indent=2, sort_keys=True) + "\n"
-        directory = os.path.dirname(os.path.abspath(self.path))
-        fd, temp_path = tempfile.mkstemp(prefix=".devices.", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temp_path, 0o600)
-            os.replace(temp_path, self.path)
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temp_path)
-            raise
-        dir_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        atomic_write_json(self.path, payload, temp_prefix=".devices.")
 
     def enrol(self, public_key_x963: bytes, *, via: str, key_storage: str,
               allow_new: bool) -> tuple[Device, bool]:

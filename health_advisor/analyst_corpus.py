@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 from collections import Counter
@@ -297,7 +298,7 @@ DOMAIN_LEXICON_STATUS_BUILT = "built"
 DOMAIN_LEXICON_STATUS_NO_CONTROLS = "unavailable_no_control_corpora"
 
 
-_TOKENIZER_CONN: sqlite3.Connection | None = None
+_TOKENIZER_LOCAL = threading.local()
 
 
 def _tokenizer_connection() -> sqlite3.Connection:
@@ -313,19 +314,36 @@ def _tokenizer_connection() -> sqlite3.Connection:
     nothing here touches a corpus file; nothing about `cite`'s query-syntax
     refusals or caps applies to it.
 
-    Module-level and lazily created so tokenizing 104 questions does not
-    create and tear down a table 104 times; `fts5vocab` is a live view over
-    `_tok`'s current content, so clearing and re-inserting one row is enough
-    to retokenize.
+    ONE CONNECTION PER THREAD, not one per process. `question_in_domain`
+    (through `fts5_stems`) is called from the receiver's request-thread
+    pool, never only from the thread that first imported this module.
+    `sqlite3.connect` defaults to `check_same_thread=True`, so a single
+    module-level connection created on whichever thread happened to call in
+    first raises `ProgrammingError` the moment any OTHER thread touches it --
+    the same CLASS of defect (a cross-thread SQLite handle) that got #394's
+    first `cite` landing reverted, one layer down in this module instead of
+    in the corpus connection. `check_same_thread=False` on a SHARED
+    connection would silence that error but not fix the underlying hazard:
+    "clear `_tok`, insert one row, read `_tokv` back" is three separate
+    statements with no lock between them, so two threads tokenizing
+    different text at once could read back a mix of each other's rows.
+    `threading.local` gives each thread its own connection and its own
+    `_tok`/`_tokv` pair, so there is no shared mutable state to race on at
+    all -- not a narrower race window, no race.
+
+    Lazily created per thread so tokenizing 104 questions on one thread does
+    not create and tear down a table 104 times; `fts5vocab` is a live view
+    over that thread's `_tok` content, so clearing and re-inserting one row
+    is enough to retokenize.
     """
-    global _TOKENIZER_CONN
-    if _TOKENIZER_CONN is None:
+    conn = getattr(_TOKENIZER_LOCAL, "conn", None)
+    if conn is None:
         conn = sqlite3.connect(":memory:")
         conn.execute(
             "CREATE VIRTUAL TABLE _tok USING fts5(body, tokenize='porter unicode61')")
         conn.execute("CREATE VIRTUAL TABLE _tokv USING fts5vocab('_tok', 'row')")
-        _TOKENIZER_CONN = conn
-    return _TOKENIZER_CONN
+        _TOKENIZER_LOCAL.conn = conn
+    return conn
 
 
 def fts5_stems(text: str) -> frozenset[str]:

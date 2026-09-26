@@ -610,6 +610,27 @@ def build_corpus(
                     control_conn.close()
             domain_lexicon_status = DOMAIN_LEXICON_STATUS_BUILT
             domain_lexicon_size = len(lexicon)
+            # Provenance: WHICH controls this lexicon was contrasted against,
+            # not just how many. Without this a lexicon cannot be traced back
+            # to its controls -- two builds with the same count but different
+            # (or updated) control corpora would be indistinguishable from
+            # `domain_lexicon_params` alone. `corpus_file_sha256` and
+            # `read_corpus_version` are this same module's own helpers, read
+            # directly from each control file (not through the connections
+            # above, which are about to close) -- a control corpus need not
+            # have a `corpus_version` stamped at all (`read_corpus_version`
+            # returns `None` for a corpus with no `corpus_meta` row or none
+            # readable), so this is `None` rather than omitted or coerced to
+            # a fake int. Deliberately no path or filename here: a corpus_meta
+            # row ships with the corpus file and must not carry a builder's
+            # local filesystem layout.
+            control_provenance = [
+                {
+                    "corpus_sha256": corpus_file_sha256(p),
+                    "corpus_version": read_corpus_version(p),
+                }
+                for p in control_corpus_paths
+            ]
             conn.executemany(
                 "INSERT INTO corpus_meta(key, value) VALUES (?, ?)",
                 [(DOMAIN_LEXICON_META_KEY,
@@ -619,6 +640,7 @@ def build_corpus(
                      "min_chunks": DOMAIN_LEXICON_MIN_CHUNKS,
                      "rate_multiple": DOMAIN_LEXICON_RATE_MULTIPLE,
                      "control_corpus_count": len(control_corpus_paths),
+                     "control_corpora": control_provenance,
                  }))],
             )
         else:

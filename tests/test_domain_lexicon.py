@@ -1,29 +1,41 @@
 """#394 / engine #22 item 1 — the corpus-derived domain lexicon (trigger A).
 
-Decision brief `docs/product/reviews/i394-decision-brief-20260925.md`,
-accepted 2026-09-25 (all four recommendations, consumer #394): a question is
-refused (no `cite` for that turn) when it contains none of a lexicon of
-stems that are common in the evidence corpus and rare in two control
-corpora. This file tests `analyst_corpus.domain_lexicon`,
-`analyst_corpus.question_in_domain`, and `corpus_build.build_corpus`'s
-storage of the lexicon in `corpus_meta` (decision 4).
+Decision brief `docs/product/reviews/i394-decision-brief-20260925.md`
+(consumer repo, not present in this engine checkout), accepted 2026-09-25
+(all four recommendations, consumer #394): a question is refused (no `cite`
+for that turn) when it contains none of a lexicon of stems that are common
+in the evidence corpus and rare in two control corpora. This file tests
+`analyst_corpus.domain_lexicon`, `analyst_corpus.question_in_domain`, and
+`corpus_build.build_corpus`'s storage of the lexicon in `corpus_meta`
+(decision 4).
 
-Two kinds of test, on purpose (task instruction: a test that skips silently
-when the corpus is absent measures nothing):
+HERMETIC ONLY, DELIBERATELY. Every test here builds its own tiny evidence
+and/or control corpus under `tmp_path` with `corpus_build.build_corpus` and
+touches nothing outside this checkout. Two things that do NOT belong here,
+on purpose:
 
-- HERMETIC — build tiny evidence/control corpora under `tmp_path` with
-  `corpus_build.build_corpus`. These always run; nothing here depends on
-  `data/corpus` existing.
-- REAL-CORPUS — reproduce the decision brief's own measured numbers against
-  `data/corpus/{corpus,corpus-nearmiss,corpus-null}.db`. These skip
-  EXPLICITLY (a visible `pytest.skip`, not a silent no-op) when that data is
-  not present, exactly the way `tests/test_analyst_corpus.py`'s `corpus`
-  fixture does.
+1. `data/corpus/{corpus,corpus-nearmiss,corpus-null}.db` -- gitignored, real,
+   and specific to whichever machine has them checked out.
+2. The consumer repo's question fixtures (`questions-lay.json`,
+   `questions-clinical.json`) and the decision brief's own out-of-domain
+   question list -- these live in `healthAI/ha-client`/`healthAI/ha-i394`, a
+   PRIVATE sibling repo. A public engine test that hard-codes that sibling's
+   path (as an earlier version of this file did) puts a private repo's
+   directory layout into public source and only resolves on one machine.
+
+The real-data reproduction of the decision brief's oracle table (lexicon
+size ~2,024, lay 1/52 refused, clinical 0/52, out-of-domain 21/24 including
+gallium arsenide) lives in the CONSUMER repo instead
+(`healthAI/ha-i394/tests/test_i394_domain_lexicon_oracle.py`, run with
+`PYTHONPATH` pointed at this engine checkout) -- that is where the private
+question fixtures and the gitignored corpora already are, and it is the
+right side of the boundary for a test that only makes sense with both.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -31,92 +43,7 @@ import pytest
 from health_advisor import analyst_corpus as ac
 from health_advisor.corpus_build import build_corpus, sha256_text
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CORPUS_DIR = REPO_ROOT / "data" / "corpus"
-REAL_EVIDENCE = CORPUS_DIR / "corpus.db"
-REAL_NEARMISS = CORPUS_DIR / "corpus-nearmiss.db"
-REAL_NULL = CORPUS_DIR / "corpus-null.db"
-
 GAAS_QUESTION = "What is the boiling point of gallium arsenide?"
-
-# The brief's own 24 out-of-domain questions (12 "far", 12 "near-miss
-# medical"), taken verbatim from
-# `docs/product/reviews/i394-decision-brief-20260925.md`'s lists -- the
-# consumer repo's `.claude/i394-artifacts/q-outofdomain.txt` holds only the
-# GaAs question (a smaller smoke fixture), not the full 24, so this list is
-# reconstructed from the brief's prose rather than read from a file.
-OUT_OF_DOMAIN_24 = (
-    "What is the boiling point of gallium arsenide?",
-    "What is the capital of Australia?",
-    "How do I start a sourdough starter?",
-    "Who won the 1998 World Cup?",
-    "How do I reverse a linked list in Python?",
-    "What is the half-life of carbon-14?",
-    "How do freelancer taxes work?",
-    "How do I learn guitar chords?",
-    "How tall is Mount Everest?",
-    "What is the speed of light in glass?",
-    "How do I change a car tyre?",
-    "What caused the fall of the Roman Empire?",
-    "What is the correct levothyroxine dose?",
-    "How often should I get a colonoscopy?",
-    "How long does shingles last?",
-    "What is a celiac blood test?",
-    "What are migraine aura symptoms?",
-    "How is a tooth cavity treated?",
-    "Can I take ibuprofen with blood-pressure medication?",
-    "What causes kidney stones?",
-    "How is glaucoma diagnosed?",
-    "What adult vaccines do I need?",
-    "What are early signs of Parkinson's?",
-    "How do I treat acne scars?",
-)
-
-
-def _require_real_corpora():
-    missing = [p for p in (REAL_EVIDENCE, REAL_NEARMISS, REAL_NULL) if not p.exists()]
-    if missing:
-        pytest.skip(
-            "real corpus/control corpora not present: "
-            + ", ".join(str(p) for p in missing))
-
-
-@pytest.fixture()
-def real_lexicon():
-    """The lexicon `domain_lexicon` derives from the real corpus + controls.
-
-    Built once per test via this fixture (not module-scoped): each test gets
-    its own connections and closes them, so a test that also wants to poke at
-    an open corpus connection is never surprised by one already closed
-    elsewhere.
-    """
-    _require_real_corpora()
-    evidence = sqlite3.connect(f"file:{REAL_EVIDENCE}?mode=ro", uri=True)
-    nearmiss = sqlite3.connect(f"file:{REAL_NEARMISS}?mode=ro", uri=True)
-    null = sqlite3.connect(f"file:{REAL_NULL}?mode=ro", uri=True)
-    try:
-        yield ac.domain_lexicon(evidence, [nearmiss, null])
-    finally:
-        evidence.close()
-        nearmiss.close()
-        null.close()
-
-
-def _questions(name: str) -> list[dict]:
-    """A question-set fixture from the CONSUMER repo, read-only.
-
-    These 52+52 questions live in `healthAI/ha-client`, a private sibling
-    repo to this public engine checkout -- not duplicated into this tree.
-    Reached the same way `data/corpus` already is (that path is a symlink
-    into the very same sibling checkout): assume the sibling layout, and
-    skip explicitly, visibly, when it is not there (a different machine, or
-    a CI runner for this public repo that never clones the private one).
-    """
-    path = (REPO_ROOT.parent / "healthAI" / "ha-client" / "docs" / "product"
-            / "corpus" / name)
-    if not path.exists():
-        pytest.skip(f"consumer-repo question fixture not found: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +87,81 @@ def test_fts5_stems_is_order_and_case_insensitive():
     assert ac.fts5_stems("Running Runs RUN") == frozenset({"run"})
     assert ac.fts5_stems("") == frozenset()
     assert ac.fts5_stems("   ") == frozenset()
+
+
+def test_fts5_stems_works_from_a_second_thread():
+    """`fts5_stems` (and therefore `question_in_domain`) is called from the
+    receiver's request-thread pool at retrieval time, never only from the
+    thread that first imported this module. A tokenizer connection created
+    on the main thread with `sqlite3.connect`'s default
+    `check_same_thread=True` raises `ProgrammingError` the first time any
+    OTHER thread touches it -- the same CLASS of defect (a cross-thread
+    SQLite handle) that got #394's first `cite` landing reverted, one layer
+    down in this module instead of in the corpus connection.
+    """
+
+    result: dict[str, object] = {}
+    error: list[BaseException] = []
+
+    def worker():
+        try:
+            result["stems"] = ac.fts5_stems("Running Runs RUN")
+            result["in_domain"] = ac.question_in_domain(
+                "Does running increase injury risk?", frozenset({"injuri"}))
+        except BaseException as exc:  # noqa: BLE001 -- capture to assert on
+            error.append(exc)
+
+    main_thread_stems = ac.fts5_stems("Running Runs RUN")
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive(), "worker thread did not finish"
+    assert error == [], f"worker thread raised: {error}"
+    assert result["stems"] == main_thread_stems == frozenset({"run"})
+    assert result["in_domain"] is True
+
+
+def test_fts5_stems_is_consistent_across_concurrent_threads():
+    """Several threads calling in at once must each get the tokenization of
+    THEIR OWN text, never another thread's -- the property a shared,
+    cleared-and-reinserted table would put at risk even with
+    `check_same_thread=False`, because "clear the table, insert my row, read
+    it back" is three separate statements with no lock between them.
+    """
+
+    words = ["running", "training", "recovery", "cadence", "injury",
+             "sleeping", "pacing", "fueling", "stretching", "climbing"]
+    expected = [ac.fts5_stems(w) for w in words]  # sequential ground truth
+
+    results: list = [None] * len(words)
+    errors: list[BaseException] = []
+
+    def worker(index: int, word: str) -> None:
+        try:
+            got = None
+            for _ in range(20):  # repeat to make a race likelier to surface
+                got = ac.fts5_stems(word)
+                if got != expected[index]:
+                    errors.append(AssertionError(
+                        f"thread for {word!r} got {got!r}, expected "
+                        f"{expected[index]!r}"))
+                    return
+            results[index] = got
+        except BaseException as exc:  # noqa: BLE001 -- capture to assert on
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i, w))
+               for i, w in enumerate(words)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not any(t.is_alive() for t in threads)
+    assert errors == [], f"{len(errors)} thread error(s): {errors[:3]}"
+    assert results == expected
 
 
 def test_question_in_domain_refuses_on_empty_lexicon():
@@ -300,102 +302,87 @@ def test_degenerate_lexicon_of_every_stem_admits_gaas():
     "always True" shape stated as a lexicon rather than as a monkeypatched
     predicate -- it holds for ANY question, which is exactly why it proves
     nothing about discrimination on its own and `domain_lexicon`'s contrast
-    step is what has to do the actual work (see the real-corpus version of
-    this test below, which is the one the task means).
+    step is what has to do the actual work (see the next test, which is the
+    one the task means).
     """
     every_stem_in_the_question = ac.fts5_stems(GAAS_QUESTION)
     assert ac.question_in_domain(GAAS_QUESTION, every_stem_in_the_question)
 
 
-def test_degenerate_every_word_lexicon_admits_gaas_on_the_real_corpus(real_lexicon):
+# An evidence corpus built to contain exactly one incidental, off-topic
+# mention of GaAs-question vocabulary -- landing in exactly ONE chunk
+# (verified: `chunk_text` puts it only in the final chunk of 8) alongside
+# heavy running/injury content spread across all of them. This is what makes
+# the mutation test below hermetic: `min_chunks=3` (the shipped default)
+# excludes a term seen in only one chunk, so the CONTRASTIVE reading refuses
+# GaAs, while `min_chunks=1` (equivalent to "any word the corpus has ever
+# seen", the brief's own rejected alternative) admits it. No real corpus
+# needed -- the same mechanism the brief measured against 1,923 real chunks,
+# reproduced at a scale a unit test can construct on purpose instead of
+# stumbling into.
+_EVIDENCE_WITH_INCIDENTAL_GAAS_MENTION = (
+    "Weekly running volume and injury risk in distance runners. "
+    "Cadence, stride length and running economy during endurance training. "
+    "Recovery, sleep and heart rate variability after hard running sessions. "
+) * 40 + (
+    "Incidentally, someone once asked about the boiling point of gallium "
+    "arsenide at trivia night."
+)
+
+
+def test_degenerate_every_word_lexicon_admits_gaas(tmp_path):
     """THE required mutation test: "any word the corpus has ever seen" (the
     brief's own rejected, non-contrastive alternative) must ADMIT the
-    out-of-domain GaAs question, where the real (contrastive) `real_lexicon`
-    fixture refuses it (`test_gaas_is_refused_against_the_real_corpus`).
+    out-of-domain GaAs question, where the shipped, contrastive default
+    (`min_chunks=3`) refuses it on the SAME corpus.
 
-    `min_chunks=1, control_conns=[]` is precisely that alternative:
-    `domain_lexicon` pools an EMPTY sequence of controls to a total of 0, so
-    every stem's control rate is 0.0 and the `rate_multiple` check admits
-    everything meeting `min_chunks` -- i.e. every word the corpus has ever
-    used at least once, no contrast at all.
+    `min_chunks=1` is precisely that alternative when paired with no control
+    corpora (`domain_lexicon` pools an empty sequence of controls to a total
+    of 0, so every stem's control rate is 0.0 and the `rate_multiple` check
+    admits everything meeting `min_chunks`) -- i.e. every word the corpus has
+    used at least once, no contrast and no repetition bar at all.
 
     This must go red if a future change made `domain_lexicon` (or
-    `question_in_domain`) discriminate on SOMETHING OTHER than the corpus
-    contrast -- e.g. if a naive reimplementation forgot the control pooling
-    entirely and treated "no controls supplied" as "refuse everything"
-    instead of "admit everything meeting the other bars." Requires the real
-    corpus because the mechanism is real FTS5 vocabulary breadth (the word
-    "point" turns out to occur somewhere in the 1,923-chunk real corpus, by
-    the ordinary breadth of a corpus that size) -- a small hermetic corpus
-    limited to running/injury vocabulary shares no word at all with the GaAs
-    question, so it cannot exhibit this leak and would prove nothing.
+    `question_in_domain`) discriminate on something other than the corpus
+    contrast -- e.g. a reimplementation that forgot `min_chunks` entirely, or
+    one that treats "no controls supplied" as "refuse everything" instead of
+    "admit everything meeting the other bars."
     """
-    evidence = sqlite3.connect(f"file:{REAL_EVIDENCE}?mode=ro", uri=True)
+    build_corpus([_entry("ev-1", _EVIDENCE_WITH_INCIDENTAL_GAAS_MENTION)],
+                 [_EVIDENCE_WITH_INCIDENTAL_GAAS_MENTION],
+                 tmp_path / "leaky.db", corpus_version=1)
+    conn = sqlite3.connect(f"file:{tmp_path / 'leaky.db'}?mode=ro", uri=True)
     try:
         every_word_the_corpus_has_ever_seen = ac.domain_lexicon(
-            evidence, [], min_chunks=1)
+            conn, [], min_chunks=1)
+        contrastive_default = ac.domain_lexicon(conn, [])  # min_chunks=3
     finally:
-        evidence.close()
+        conn.close()
+
     assert ac.question_in_domain(
         GAAS_QUESTION, every_word_the_corpus_has_ever_seen)
-    # The contrastive lexicon this file otherwise tests refuses it -- this is
-    # the comparison that shows the mutation actually changed the outcome,
-    # not merely that SOME lexicon admits SOME question.
-    assert not ac.question_in_domain(GAAS_QUESTION, real_lexicon)
+    # The shipped default, on the identical corpus, refuses it -- the
+    # comparison that shows the mutation actually changed the outcome, not
+    # merely that SOME lexicon admits SOME question.
+    assert not ac.question_in_domain(GAAS_QUESTION, contrastive_default)
 
 
 # --------------------------------------------------------------------------- #
-# Real corpus — reproducing the decision brief's oracle table
+# Hermetic — the shipped default refuses an out-of-domain question
 # --------------------------------------------------------------------------- #
 
-def test_gaas_is_refused_against_the_real_corpus(real_lexicon):
-    assert ac.question_in_domain(GAAS_QUESTION, real_lexicon) is False
-
-
-def test_all_52_clinical_questions_are_admitted(real_lexicon):
-    clinical = _questions("questions-clinical.json")
-    assert len(clinical) == 52
-    refused = [q["question"] for q in clinical
-               if not ac.question_in_domain(q["question"], real_lexicon)]
-    assert refused == [], f"clinical questions wrongly refused: {refused}"
-
-
-def test_lay_questions_have_exactly_one_false_refusal(real_lexicon):
-    """Pins the decision brief's own measured false refusal (2026-09-25):
-    'Is a low step count automatically a problem?' -- `step` is common in the
-    control corpora too. If this list ever grows, trigger A's false-refusal
-    rate has regressed and that is worth knowing by name, not just by count.
+def test_gaas_is_refused_by_the_contrastive_default(hermetic_corpora):
+    """The property `test_degenerate_every_word_lexicon_admits_gaas` exists to
+    show is NOT free: it must come from the contrast, not from `cite`-style
+    query sanitisation or from the question simply sharing no words at all
+    with a small corpus. `hermetic_corpora`'s evidence text never mentions
+    gallium/arsenide/boiling, so this also confirms the ordinary "no overlap
+    at all" case refuses, which is necessary but (per the test above) not
+    sufficient on its own.
     """
-    lay = _questions("questions-lay.json")
-    assert len(lay) == 52
-    refused = [q["question"] for q in lay
-               if not ac.question_in_domain(q["question"], real_lexicon)]
-    assert refused == ["Is a low step count automatically a problem?"]
-
-
-def test_most_out_of_domain_questions_are_refused(real_lexicon):
-    """Reproduces the brief's 21-of-24 out-of-domain refusal rate. Not 24 of
-    24 -- three leaks (`World Cup`/`footbal`+`cup`+`world`, `half-life`/half,
-    `speed of light`/speed) are measured and expected, not a bug to chase in
-    this pass.
-    """
-    refused = [q for q in OUT_OF_DOMAIN_24
-               if not ac.question_in_domain(q, real_lexicon)]
-    assert GAAS_QUESTION in refused
-    assert len(refused) == 21
-
-
-def test_real_lexicon_size_matches_the_brief_within_a_small_margin(real_lexicon):
-    """The brief measured 2,026 terms; this session's reconstruction of the
-    20 generic question words (not committed anywhere, confirmed absent from
-    both repos) is the one input that cannot be reproduced exactly, so this
-    checks "close", not "equal". See `analyst_corpus.DOMAIN_LEXICON_RATE_
-    MULTIPLE`'s comment for the full comparison, including that the
-    per-control alternative (1,559 terms) was tried and rejected in favour of
-    this pooled definition specifically because it reproduces the brief's
-    number far more closely.
-    """
-    assert abs(len(real_lexicon) - 2026) <= 10
+    evidence, control = hermetic_corpora
+    lexicon = ac.domain_lexicon(evidence, [control])
+    assert ac.question_in_domain(GAAS_QUESTION, lexicon) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -436,6 +423,66 @@ def test_build_with_controls_stores_a_loadable_lexicon(tmp_path):
         (ac.DOMAIN_LEXICON_PARAMS_KEY,)).fetchone()
     params = json.loads(params_row[0])
     assert params["control_corpus_count"] == 1
+
+
+def test_domain_lexicon_params_records_control_provenance(tmp_path):
+    """A lexicon must be traceable to the control corpora it was contrasted
+    against -- a count alone cannot distinguish "the same two controls" from
+    "two different controls that happen to also number two". Each control's
+    `corpus_file_sha256` (identifies the exact bytes) and `corpus_version`
+    (may be `None` -- a control need not be a versioned corpus at all) are
+    recorded, in `control_corpus_paths` order.
+    """
+    from health_advisor.corpus_build import corpus_file_sha256, read_corpus_version
+
+    build_corpus([_entry("ctrl-1", _CONTROL_TEXT)], [_CONTROL_TEXT],
+                 tmp_path / "control.db", corpus_version=7)
+    result = build_corpus(
+        [_entry("ev-1", _EVIDENCE_TEXT)], [_EVIDENCE_TEXT],
+        tmp_path / "evidence.db", corpus_version=1,
+        control_corpus_paths=[tmp_path / "control.db"])
+    assert result.domain_lexicon_status == ac.DOMAIN_LEXICON_STATUS_BUILT
+
+    conn = sqlite3.connect(f"file:{tmp_path / 'evidence.db'}?mode=ro", uri=True)
+    params = json.loads(conn.execute(
+        "SELECT value FROM corpus_meta WHERE key = ?",
+        (ac.DOMAIN_LEXICON_PARAMS_KEY,)).fetchone()[0])
+
+    assert params["control_corpus_count"] == 1
+    assert len(params["control_corpora"]) == 1
+    provenance = params["control_corpora"][0]
+    assert provenance["corpus_sha256"] == corpus_file_sha256(tmp_path / "control.db")
+    assert provenance["corpus_version"] == 7 == read_corpus_version(tmp_path / "control.db")
+    # No local path or filename leaks into a record that ships with the
+    # corpus file.
+    assert "control.db" not in json.dumps(provenance)
+    assert str(tmp_path) not in json.dumps(provenance)
+
+
+def test_domain_lexicon_params_control_version_is_none_when_unversioned(tmp_path):
+    """A control corpus need not be one this module's own versioning scheme
+    ever touched -- `read_corpus_version` returns `None` for a file with no
+    readable `corpus_version` row, and the provenance record must say so
+    plainly rather than coercing it to 0 or omitting the key.
+    """
+    build_corpus([_entry("ctrl-1", _CONTROL_TEXT)], [_CONTROL_TEXT],
+                 tmp_path / "control.db", corpus_version=1, read_only=False)
+    unversioned = sqlite3.connect(tmp_path / "control.db")
+    unversioned.execute("DELETE FROM corpus_meta WHERE key = 'corpus_version'")
+    unversioned.commit()
+    unversioned.close()
+
+    result = build_corpus(
+        [_entry("ev-1", _EVIDENCE_TEXT)], [_EVIDENCE_TEXT],
+        tmp_path / "evidence.db", corpus_version=1,
+        control_corpus_paths=[tmp_path / "control.db"])
+    assert result.domain_lexicon_status == ac.DOMAIN_LEXICON_STATUS_BUILT
+
+    conn = sqlite3.connect(f"file:{tmp_path / 'evidence.db'}?mode=ro", uri=True)
+    params = json.loads(conn.execute(
+        "SELECT value FROM corpus_meta WHERE key = ?",
+        (ac.DOMAIN_LEXICON_PARAMS_KEY,)).fetchone()[0])
+    assert params["control_corpora"][0]["corpus_version"] is None
 
 
 def test_load_domain_lexicon_tolerates_a_malformed_row(tmp_path):

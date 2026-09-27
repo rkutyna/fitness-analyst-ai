@@ -1536,7 +1536,7 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
 # emptiness as "you have no recorded health data" while every gate passed (0
 # figures, 0 claims, nothing to contradict) -- "absence is not a fact" again.
 #
-# Three leaves are published here, each keyed through the ordinary
+# Two leaves are published here, each keyed through the ordinary
 # (metric, period, field) identity so they flow through the same
 # ``_publish_unambiguous`` agreement/conflict machinery as every other fact:
 #
@@ -1544,41 +1544,52 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
 #   single day it happened. No other tool publishes this exact field for a
 #   single-day period, so this can never collide with (or be withheld
 #   against) a range-scoped figure for the same metric.
-# * ``readiness.components`` -- the per-input 0-100 subscores (hrv/rhr/sleep)
-#   that feed the composite. These are NOT the underlying vault metric (an
-#   hrv component score is not a heart-rate-variability reading in ms), so
-#   they publish under a distinctive pseudo-metric label
-#   (``briefing_readiness_<name>``) that is not, and will never collide
-#   with, a real catalogue metric -- a real metric name here would let
-#   ``_display_value`` apply that metric's unit to a dimensionless score.
-# * ``long_term`` -- each metric's rolling 30-day mean and its percent change
-#   against 3/6/12 months ago. The window is recomputed independently here
-#   from ``as_of`` via ``metrics.parse_period("30d", ...)``, the same spec
-#   ``analysis.long_term`` itself uses (kept in sync by
-#   ``_BRIEFING_LONGTERM_WINDOW_SPEC`` below -- if that tool's window ever
-#   changes, this must too). Field names (``briefing_month_avg``,
-#   ``briefing_vs_3mo_pct``, ...) are distinct from any other tool's field
-#   names for the same metric (e.g. ``summarize_metric``'s ``mean``/
-#   ``delta_pct``), so even a coincidentally identical window can never
-#   collide with, or be silently withheld against, a sibling tool's figure.
+# * ``long_term``'s ``this_month_avg`` -- a metric's rolling 30-day mean. The
+#   window is recomputed independently here from ``as_of`` via
+#   ``metrics.parse_period("30d", ...)``, the same spec ``analysis.long_term``
+#   itself uses (kept in sync by ``_BRIEFING_LONGTERM_WINDOW_SPEC`` below --
+#   if that tool's window ever changes, this must too). The field name
+#   (``briefing_month_avg``) is distinct from any other tool's field name for
+#   the same metric (e.g. ``summarize_metric``'s ``mean``), so even a
+#   coincidentally identical window can never collide with, or be silently
+#   withheld against, a sibling tool's figure.
 #
-# Deliberately NOT published: ``readiness.score``/``band`` (the daily 0-100
-# composite that ``get_weekly_readiness`` explicitly retired at the Week 7
-# review -- "both reachable bands licensed the same session" -- publishing it
-# here would put the retired headline number back as a citable fact through
-# a different door), and every ``workout_focus`` field (see the
-# ``_WORKOUT_TOOLS`` comment above: they duplicate ``list_workouts`` at a
-# coarser rounding). ``movers`` and ``talking_points`` are left for a
-# follow-up issue; the four sample denials in #525 all resolved without them.
+# Deliberately NOT published, and not merely left for later:
+#
+# * ``readiness.score``/``band`` -- the daily 0-100 composite that
+#   ``get_weekly_readiness`` explicitly retired at the Week 7 review ("both
+#   reachable bands licensed the same session"); publishing it here would put
+#   the retired headline number back as a citable fact through a different
+#   door.
+# * ``readiness.components`` (the per-input hrv/rhr/sleep 0-100 subscores) --
+#   tried in an earlier version of this fix and reverted after a live
+#   rendering: a distinctive pseudo-metric label (``briefing_readiness_rhr``)
+#   stops a KEY collision, but does not stop the MODEL reading a bare number
+#   next to "resting heart rate" as the physiological reading. A live sample
+#   narrated "a resting heart rate of {fact|metric=briefing_readiness_rhr|...}"
+#   -- rendering a 0-100 subscore, e.g. 54, as if it were a bpm figure. There
+#   is no field name that changes what the surrounding PROSE claims once the
+#   model chooses the sentence; excluding the leaf is the only fix that holds.
+# * ``long_term``'s ``vs_3mo``/``vs_6mo``/``vs_12mo`` -- two problems, not
+#   one. First, semantics: ``analysis.long_term`` (~line 1689 there) compares
+#   this month's mean against the single 30-day window ending 90/180/365 days
+#   ago -- one comparator month, not a 3/6/12-month AVERAGE -- but a live
+#   sample narrated it as "above your three-month average" regardless, and
+#   nothing in the raw figure makes the comparison window visible for a
+#   template to phrase correctly. Second, display: the value is a bare
+#   percent-change number with no sign convention or ``%`` marker recorded
+#   anywhere in the payload, so it rendered as bare digits ("59.18 above your
+#   three-month average") -- inventing a display convention for it here,
+#   with no percent-change rendering precedent to match (``summarize_metric``'s
+#   own ``delta_pct`` isn't unit-rendered either -- see ``_is_percent_change_field``
+#   and its callers), would be guessing rather than following an existing
+#   convention. Left unpublished until ``analysis.long_term`` itself names the
+#   comparator window and a percent display convention exists to follow.
+# * ``movers``/``talking_points`` -- left for a follow-up issue; not needed to
+#   resolve any of the four sample denials in #525.
 _BRIEFING_HIGHLIGHT_FIELD = "all_time_high"
-_BRIEFING_READINESS_COMPONENT_PREFIX = "briefing_readiness_"
 _BRIEFING_LONGTERM_WINDOW_SPEC = "30d"
-_BRIEFING_LONGTERM_FIELD_NAMES = {
-    "this_month_avg": "briefing_month_avg",
-    "vs_3mo": "briefing_vs_3mo_pct",
-    "vs_6mo": "briefing_vs_6mo_pct",
-    "vs_12mo": "briefing_vs_12mo_pct",
-}
+_BRIEFING_LONGTERM_FIELD = "briefing_month_avg"
 
 
 def _briefing_highlight_candidates(result: dict, *,
@@ -1611,36 +1622,10 @@ def _briefing_highlight_candidates(result: dict, *,
     return out
 
 
-def _briefing_readiness_candidates(result: dict, *,
-                                   sequence) -> list[tuple[str, dict]]:
-    readiness = result.get("readiness")
-    as_of = result.get("as_of")
-    if not isinstance(readiness, dict) or _period_date(as_of) is None:
-        return []
-    components = readiness.get("components")
-    if not isinstance(components, dict):
-        return []
-    out: list[tuple[str, dict]] = []
-    for name, value in components.items():
-        if (name == "field_metrics" or not isinstance(value, (int, float))
-                or isinstance(value, bool)):
-            continue
-        metric = _BRIEFING_READINESS_COMPONENT_PREFIX + str(name)
-        try:
-            key = fact_key(metric, as_of, "value")
-        except (TypeError, ValueError):
-            continue
-        out.append((key, {
-            "key": key, "metric": metric, "period": as_of, "field": "value",
-            "value": value, "unit": None, "display": _display_value(value),
-            "source": {"sequence": sequence,
-                       "path": f"$.result.readiness.components.{name}"},
-        }))
-    return out
-
-
 def _briefing_longterm_candidates(result: dict, *,
                                   sequence) -> list[tuple[str, dict]]:
+    """``this_month_avg`` only -- see the module comment above for why the
+    ``vs_3mo``/``vs_6mo``/``vs_12mo`` comparison fields stay unpublished."""
     rows = result.get("long_term")
     as_of = result.get("as_of")
     if not isinstance(rows, list) or _period_date(as_of) is None:
@@ -1653,27 +1638,23 @@ def _briefing_longterm_candidates(result: dict, *,
         if not isinstance(row, dict):
             continue
         metric = row.get("metric")
-        if not isinstance(metric, str) or not metric.strip():
+        value = row.get("this_month_avg")
+        if (not isinstance(metric, str) or not metric.strip()
+                or not isinstance(value, (int, float))
+                or isinstance(value, bool)):
             continue
         unit = row.get("unit") or normalize.canonical_unit(metric, None)
-        for raw_field, out_field in _BRIEFING_LONGTERM_FIELD_NAMES.items():
-            value = row.get(raw_field)
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                continue
-            try:
-                key = fact_key(metric, period, out_field)
-            except (TypeError, ValueError):
-                continue
-            is_pct = raw_field != "this_month_avg"
-            out.append((key, {
-                "key": key, "metric": metric, "period": period,
-                "field": out_field, "value": value,
-                "unit": None if is_pct else unit,
-                "display": _display_value(
-                    value, unit=None if is_pct else unit),
-                "source": {"sequence": sequence,
-                           "path": f"$.result.long_term[{index}].{raw_field}"},
-            }))
+        try:
+            key = fact_key(metric, period, _BRIEFING_LONGTERM_FIELD)
+        except (TypeError, ValueError):
+            continue
+        out.append((key, {
+            "key": key, "metric": metric, "period": period,
+            "field": _BRIEFING_LONGTERM_FIELD, "value": value, "unit": unit,
+            "display": _display_value(value, unit=unit),
+            "source": {"sequence": sequence,
+                       "path": f"$.result.long_term[{index}].this_month_avg"},
+        }))
     return out
 
 
@@ -1698,8 +1679,6 @@ def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
             continue
         sequence = record.get("sequence")
         candidates.extend(_briefing_highlight_candidates(
-            result, sequence=sequence))
-        candidates.extend(_briefing_readiness_candidates(
             result, sequence=sequence))
         candidates.extend(_briefing_longterm_candidates(
             result, sequence=sequence))

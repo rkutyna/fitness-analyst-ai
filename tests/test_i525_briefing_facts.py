@@ -61,13 +61,20 @@ def test_build_briefing_facts_publishes_highlight():
     assert facts[key]["metric"] == "step_count"
 
 
-def test_build_briefing_facts_publishes_readiness_components():
+def test_build_briefing_facts_excludes_readiness_components():
+    """Reverted after a live rendering (orchestrator review of b1e218a):
+    a pseudo-metric key name stops a KEY collision, but not the model
+    reading a bare subscore next to "resting heart rate" as the
+    physiological value -- a live sample narrated "a resting heart rate of
+    {fact|metric=briefing_readiness_rhr|...}", rendering a 0-100 subscore
+    (e.g. 54) as if it were a bpm reading. See the module comment above
+    build_briefing_facts for the full reasoning."""
     facts = fact_template.build_briefing_facts([_rich_briefing_record()])
-    for name, value in (("hrv", 58.0), ("rhr", 71.0), ("sleep", 64.0)):
-        key = fact_template.fact_key(
-            "briefing_readiness_" + name, "2026-08-21", "value")
-        assert key in facts, sorted(facts)
-        assert facts[key]["value"] == value
+    assert not any(str(key).startswith("fact|metric=briefing_readiness_")
+                  for key in facts)
+    for fact in facts.values():
+        assert not str(fact.get("metric", "")).startswith(
+            "briefing_readiness_")
 
 
 def test_build_briefing_facts_excludes_daily_readiness_score_and_band():
@@ -82,24 +89,28 @@ def test_build_briefing_facts_excludes_daily_readiness_score_and_band():
     assert "field=band" not in keys_text
 
 
-def test_build_briefing_facts_publishes_long_term_window():
+def test_build_briefing_facts_publishes_long_term_month_avg():
     facts = fact_template.build_briefing_facts([_rich_briefing_record()])
     start, end = metrics.parse_period("30d", "2026-08-21")
     period = f"{start}:{end}"
     avg_key = fact_template.fact_key(
         "resting_heart_rate", period, "briefing_month_avg")
-    pct_key = fact_template.fact_key(
-        "resting_heart_rate", period, "briefing_vs_3mo_pct")
-    six_key = fact_template.fact_key(
-        "resting_heart_rate", period, "briefing_vs_6mo_pct")
     assert facts[avg_key]["value"] == 55.2
-    assert facts[pct_key]["value"] == -2.1
-    assert facts[six_key]["value"] == 3.4
-    # vs_12mo was absent from the row -- never invented.
-    assert not any(
-        fact_template.parse_fact_key(k)
-        and fact_template.parse_fact_key(k)[2] == "briefing_vs_12mo_pct"
-        for k in facts)
+
+
+def test_build_briefing_facts_excludes_long_term_comparison_fields():
+    """vs_3mo/vs_6mo/vs_12mo stay unpublished: analysis.long_term compares
+    this month to the single 30-day window 90/180/365 days ago (not a
+    3/6/12-month AVERAGE), and a live sample narrated it as "above your
+    three-month average" regardless -- plus the value has no recorded sign
+    convention or `%` marker, so it rendered as bare digits. See the module
+    comment above build_briefing_facts."""
+    facts = fact_template.build_briefing_facts([_rich_briefing_record()])
+    for key in facts:
+        parsed = fact_template.parse_fact_key(key)
+        if parsed is not None:
+            assert not parsed[2].startswith("briefing_vs_")
+    assert not any(fact["value"] in (-2.1, 3.4) for fact in facts.values())
 
 
 def test_build_briefing_facts_does_not_publish_workout_focus_fields():
@@ -136,6 +147,73 @@ def test_build_briefing_facts_conflicting_highlight_withheld():
     facts = fact_template.build_briefing_facts([a, b])
     key = fact_template.fact_key("step_count", "2026-08-19", "all_time_high")
     assert key not in facts
+
+
+# --- (a, cont'd) the two published leaves render like a sibling tool's -----
+#
+# A synthetic vault, the REAL get_briefing tool, and the REAL sibling tools
+# (get_latest, summarize_metric) that would answer a follow-up about the
+# same metric -- not hand-built ledger dicts -- so this is not just checking
+# that fact_template calls the same formatter, it is checking that the
+# actual rendered strings agree.
+def test_briefing_highlight_renders_like_get_latest(conn, tools):
+    # An unbroken rise with the peak on the LAST day, so the all-time-high
+    # date is the same day get_latest calls "latest" -- the two tools then
+    # describe the identical (metric, day, value) triple.
+    seed_metric(conn, "step_count", "2025-07-18",
+               list(range(7000, 7000 + 400 * 10, 10)))
+    out = tools.get_briefing(scope="deep", day="2026-08-21")
+    ledger = [{"sequence": 1, "tool_name": "get_briefing",
+              "result_elided": False, "result": out}]
+    facts = fact_template.build_briefing_facts(ledger)
+    key = fact_template.fact_key("step_count", "2026-08-21", "all_time_high")
+    assert key in facts, sorted(facts)
+
+    sibling = tools.get_latest(metric="step_count")
+    assert sibling["latest_day"]["date"] == "2026-08-21"
+    assert facts[key]["value"] == sibling["latest_day"]["value"]
+    assert (facts[key]["display"]
+           == sibling["latest_day"]["presentation"]["value"])
+
+
+def test_briefing_month_avg_renders_like_summarize_metric(conn, tools):
+    # A flat 400-day series: the requested 30d window and summarize_metric's
+    # own data-clamped window coincide exactly, so both tools average the
+    # identical rows.
+    seed_metric(conn, "vo2_max", "2025-07-18", [41.5] * 400)
+    out = tools.get_briefing(scope="deep", day="2026-08-21")
+    ledger = [{"sequence": 1, "tool_name": "get_briefing",
+              "result_elided": False, "result": out}]
+    facts = fact_template.build_briefing_facts(ledger)
+    start, end = metrics.parse_period("30d", "2026-08-21")
+    period = f"{start}:{end}"
+    key = fact_template.fact_key("vo2_max", period, "briefing_month_avg")
+    assert key in facts, sorted(facts)
+
+    sibling = tools.summarize_metric(metric="vo2_max", period="30d")
+    assert sibling["period"] == period
+    assert facts[key]["value"] == sibling["mean"]
+    assert facts[key]["display"] == sibling["presentations"]["mean"]["value"]
+
+
+def test_briefing_highlight_distance_renders_like_get_latest(conn, tools):
+    """A second highlight metric, with a non-integer unit-preserving value
+    (miles, one decimal place) -- distinct from step_count's bare count."""
+    seed_metric(conn, "distance_walking_running", "2025-07-18",
+               [round(3.0 + i * 0.01, 2) for i in range(400)])
+    out = tools.get_briefing(scope="deep", day="2026-08-21")
+    ledger = [{"sequence": 1, "tool_name": "get_briefing",
+              "result_elided": False, "result": out}]
+    facts = fact_template.build_briefing_facts(ledger)
+    key = fact_template.fact_key(
+        "distance_walking_running", "2026-08-21", "all_time_high")
+    assert key in facts, sorted(facts)
+
+    sibling = tools.get_latest(metric="distance_walking_running")
+    assert sibling["latest_day"]["date"] == "2026-08-21"
+    assert facts[key]["value"] == sibling["latest_day"]["value"]
+    assert (facts[key]["display"]
+           == sibling["latest_day"]["presentation"]["value"])
 
 
 # --- (b) data exists, nothing publishable -> Python-owned status fact ------

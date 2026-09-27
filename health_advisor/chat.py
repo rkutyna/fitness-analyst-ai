@@ -1496,17 +1496,31 @@ def _fact_template_tier_counts(scan: dict, facts: dict[str, dict]) -> dict:
 # "add weight ...") validated as a false no-data claim and fell back —
 # measured 2026-08-31, on a user's phone. A missed shrug is only a battery
 # statistic; a false positive here eats a real answer.
+#
+# health_advisor#525: the live production denial ("I don't have any recorded
+# health data in your vault to summarize") and two of four offline repro
+# samples ("I have no logged figures for your activity metrics, workout
+# sessions, or health trends"; "there are no specific health metrics
+# available in your records") all evaded this regex -- not because the
+# claim was ambiguous, but because "figures"/"metrics" were not in the noun
+# list, and the "no "/"don't have" branches required the noun immediately
+# after, with no room for a descriptive word in between ("no recorded
+# health data", "no logged figures"). _ABSENCE_NOUNS adds those two nouns,
+# and both branches now tolerate up to three filler words before the noun --
+# still anchored on an explicit data object, so the false-positive fix
+# above (a bare "cannot find"/"missing" with no noun at all) is unaffected.
+_ABSENCE_NOUNS = r"data|information|records?|measurements?|figures?|metrics?"
 _EMPTY_NARRATION_RE = re.compile(
-    r"\b(?:no\s+(?:data|information|records?|measurements?)|"
-    r"(?:do\s+not|don't)\s+have\s+(?:any\s+)?"
-    r"(?:data|information|records?|measurements?)|"
+    r"\b(?:no\s+(?:[\w-]+\s+){0,3}(?:" + _ABSENCE_NOUNS + r")|"
+    r"(?:do\s+not|don't)\s+have\s+(?:any\s+)?(?:[\w-]+\s+){0,3}"
+    r"(?:" + _ABSENCE_NOUNS + r")|"
     r"(?:do\s+not|don't|cannot|can't|could\s+not|couldn't|unable\s+to)\s+"
     r"(?:find|provide|see|access|give)\s+"
     r"(?:any\s+|the\s+|that\s+|your\s+)?"
-    r"(?:data|information|records?|figures?|measurements?)|"
-    r"(?:data|information|records?)\b[^.!?\n]{0,60}?"
+    r"(?:" + _ABSENCE_NOUNS + r")|"
+    r"(?:" + _ABSENCE_NOUNS + r")\b[^.!?\n]{0,60}?"
     r"(?:is|are)(?:n't|\s+not)\s+(?:available|recorded)|"
-    r"(?:data|information|records?)\s+(?:is|are)\s+missing)\b",
+    r"(?:" + _ABSENCE_NOUNS + r")\s+(?:is|are)\s+missing)\b",
     re.IGNORECASE,
 )
 _STATED_ABSENCE_RE = re.compile(
@@ -2569,6 +2583,10 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     metric_facts = fact_template.build_fact_set(ledger)
     withheld_fact_keys = fact_template.publish_completeness(
         ledger, metric_facts)
+    attachment_facts = fact_template.build_attachment_facts(ledger)
+    workout_facts = fact_template.build_workout_facts(ledger)
+    briefing_facts = fact_template.build_briefing_facts(ledger)
+    citation_facts = fact_template.build_citation_facts(ledger)
     # `data_facts` excludes the evidence-status fact on purpose: that fact
     # states an ABSENCE (why `cite` was withheld this turn), not gathered
     # data, and `has_gathered_data` below must not read "evidence:status is
@@ -2577,13 +2595,30 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # repair loop, demanding a figure that does not exist.
     data_facts = {
         **metric_facts,
-        **fact_template.build_attachment_facts(ledger),
-        **fact_template.build_workout_facts(ledger),
-        **fact_template.build_citation_facts(ledger),
+        **attachment_facts,
+        **workout_facts,
+        **briefing_facts,
+        **citation_facts,
     }
+    # health_advisor#525: computed once, up front, so a broad question whose
+    # only tool is get_briefing sees this status on the FIRST narration
+    # attempt, not only after a repair round -- `_ledger_has_successful_data`
+    # excludes the evidence-citation tool the same way `has_gathered_data`
+    # does further down, and that later computation reuses this exact value
+    # rather than re-deriving it.
+    ledger_has_data = _ledger_has_successful_data([
+        record for record in ledger
+        if isinstance(record, dict)
+        and record.get("tool_name") != llm.EVIDENCE_CITE_NAME])
+    gathered_data_status_fact = fact_template.build_gathered_data_status_fact(
+        ledger_has_data=ledger_has_data,
+        figures_published=bool(metric_facts or attachment_facts
+                               or workout_facts or briefing_facts),
+        tool_names=_successful_tool_names(ledger))
     facts = {
         **data_facts,
         **fact_template.build_evidence_status_fact(evidence_status),
+        **gathered_data_status_fact,
     }
 
     # The allowlist above is positive evidence that this turn requested no
@@ -2672,6 +2707,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
               if fact.get("period") is not None}, as_of)
 
     cold_start_guidance = fact_template.cold_start_guidance(facts)
+    gathered_data_guidance = fact_template.gathered_data_status_guidance(facts)
     # Prompt-cache layout (health_advisor#304). This call is deliberately a
     # FRESH, tool-less prompt, not a continuation of the gather transcript,
     # and its question-independent instruction block leads so that block is
@@ -2720,6 +2756,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         + (EVIDENCE_CITATION_INSTRUCTIONS + "\n\n"
            if citation_fn is not None else "")
         + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
+        + (gathered_data_guidance + "\n\n" if gathered_data_guidance else "")
         + "USER QUESTION:\n" + question.strip() + "\n\n"
         "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
         fact_template.render_fact_set(facts))
@@ -2843,11 +2880,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             "verification": verification,
         }
 
-    has_gathered_data = bool(data_facts) or _ledger_has_successful_data([
-        record for record in ledger
-        if isinstance(record, dict)
-        and record.get("tool_name") != llm.EVIDENCE_CITE_NAME
-    ])
+    has_gathered_data = bool(data_facts) or ledger_has_data
     # An advice-carrying answer is substance, not empty-handedness — without
     # this, every advice-only coaching answer (#264) burns the single retry.
     empty_with_gathered_data = (

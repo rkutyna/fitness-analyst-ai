@@ -1527,6 +1527,252 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
     return _publish_unambiguous(candidates)
 
 
+# --- get_briefing's own figures (health_advisor#525) ------------------------
+#
+# get_briefing is the natural first tool for a broad question ("tell me
+# about my health"), and its rich payload (highlights, readiness, long_term,
+# movers, talking_points...) published nothing at all before this: a
+# briefing-only turn had an empty fact set, and the model narrated the
+# emptiness as "you have no recorded health data" while every gate passed (0
+# figures, 0 claims, nothing to contradict) -- "absence is not a fact" again.
+#
+# Three leaves are published here, each keyed through the ordinary
+# (metric, period, field) identity so they flow through the same
+# ``_publish_unambiguous`` agreement/conflict machinery as every other fact:
+#
+# * ``highlights`` -- a real catalogue metric's all-time-high value, on the
+#   single day it happened. No other tool publishes this exact field for a
+#   single-day period, so this can never collide with (or be withheld
+#   against) a range-scoped figure for the same metric.
+# * ``readiness.components`` -- the per-input 0-100 subscores (hrv/rhr/sleep)
+#   that feed the composite. These are NOT the underlying vault metric (an
+#   hrv component score is not a heart-rate-variability reading in ms), so
+#   they publish under a distinctive pseudo-metric label
+#   (``briefing_readiness_<name>``) that is not, and will never collide
+#   with, a real catalogue metric -- a real metric name here would let
+#   ``_display_value`` apply that metric's unit to a dimensionless score.
+# * ``long_term`` -- each metric's rolling 30-day mean and its percent change
+#   against 3/6/12 months ago. The window is recomputed independently here
+#   from ``as_of`` via ``metrics.parse_period("30d", ...)``, the same spec
+#   ``analysis.long_term`` itself uses (kept in sync by
+#   ``_BRIEFING_LONGTERM_WINDOW_SPEC`` below -- if that tool's window ever
+#   changes, this must too). Field names (``briefing_month_avg``,
+#   ``briefing_vs_3mo_pct``, ...) are distinct from any other tool's field
+#   names for the same metric (e.g. ``summarize_metric``'s ``mean``/
+#   ``delta_pct``), so even a coincidentally identical window can never
+#   collide with, or be silently withheld against, a sibling tool's figure.
+#
+# Deliberately NOT published: ``readiness.score``/``band`` (the daily 0-100
+# composite that ``get_weekly_readiness`` explicitly retired at the Week 7
+# review -- "both reachable bands licensed the same session" -- publishing it
+# here would put the retired headline number back as a citable fact through
+# a different door), and every ``workout_focus`` field (see the
+# ``_WORKOUT_TOOLS`` comment above: they duplicate ``list_workouts`` at a
+# coarser rounding). ``movers`` and ``talking_points`` are left for a
+# follow-up issue; the four sample denials in #525 all resolved without them.
+_BRIEFING_HIGHLIGHT_FIELD = "all_time_high"
+_BRIEFING_READINESS_COMPONENT_PREFIX = "briefing_readiness_"
+_BRIEFING_LONGTERM_WINDOW_SPEC = "30d"
+_BRIEFING_LONGTERM_FIELD_NAMES = {
+    "this_month_avg": "briefing_month_avg",
+    "vs_3mo": "briefing_vs_3mo_pct",
+    "vs_6mo": "briefing_vs_6mo_pct",
+    "vs_12mo": "briefing_vs_12mo_pct",
+}
+
+
+def _briefing_highlight_candidates(result: dict, *,
+                                   sequence) -> list[tuple[str, dict]]:
+    highlights = result.get("highlights")
+    if not isinstance(highlights, list):
+        return []
+    out: list[tuple[str, dict]] = []
+    for index, item in enumerate(highlights):
+        if not isinstance(item, dict):
+            continue
+        metric, value, day = (item.get("metric"), item.get("value"),
+                              item.get("date"))
+        if (not isinstance(metric, str) or not metric.strip()
+                or not isinstance(value, (int, float))
+                or isinstance(value, bool) or _period_date(day) is None):
+            continue
+        try:
+            key = fact_key(metric, day, _BRIEFING_HIGHLIGHT_FIELD)
+        except (TypeError, ValueError):
+            continue
+        unit = normalize.canonical_unit(metric, None)
+        out.append((key, {
+            "key": key, "metric": metric, "period": day,
+            "field": _BRIEFING_HIGHLIGHT_FIELD, "value": value, "unit": unit,
+            "display": _display_value(value, unit=unit),
+            "source": {"sequence": sequence,
+                       "path": f"$.result.highlights[{index}].value"},
+        }))
+    return out
+
+
+def _briefing_readiness_candidates(result: dict, *,
+                                   sequence) -> list[tuple[str, dict]]:
+    readiness = result.get("readiness")
+    as_of = result.get("as_of")
+    if not isinstance(readiness, dict) or _period_date(as_of) is None:
+        return []
+    components = readiness.get("components")
+    if not isinstance(components, dict):
+        return []
+    out: list[tuple[str, dict]] = []
+    for name, value in components.items():
+        if (name == "field_metrics" or not isinstance(value, (int, float))
+                or isinstance(value, bool)):
+            continue
+        metric = _BRIEFING_READINESS_COMPONENT_PREFIX + str(name)
+        try:
+            key = fact_key(metric, as_of, "value")
+        except (TypeError, ValueError):
+            continue
+        out.append((key, {
+            "key": key, "metric": metric, "period": as_of, "field": "value",
+            "value": value, "unit": None, "display": _display_value(value),
+            "source": {"sequence": sequence,
+                       "path": f"$.result.readiness.components.{name}"},
+        }))
+    return out
+
+
+def _briefing_longterm_candidates(result: dict, *,
+                                  sequence) -> list[tuple[str, dict]]:
+    rows = result.get("long_term")
+    as_of = result.get("as_of")
+    if not isinstance(rows, list) or _period_date(as_of) is None:
+        return []
+    window_start, window_end = metrics.parse_period(
+        _BRIEFING_LONGTERM_WINDOW_SPEC, as_of)
+    period = f"{window_start}:{window_end}"
+    out: list[tuple[str, dict]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        metric = row.get("metric")
+        if not isinstance(metric, str) or not metric.strip():
+            continue
+        unit = row.get("unit") or normalize.canonical_unit(metric, None)
+        for raw_field, out_field in _BRIEFING_LONGTERM_FIELD_NAMES.items():
+            value = row.get(raw_field)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            try:
+                key = fact_key(metric, period, out_field)
+            except (TypeError, ValueError):
+                continue
+            is_pct = raw_field != "this_month_avg"
+            out.append((key, {
+                "key": key, "metric": metric, "period": period,
+                "field": out_field, "value": value,
+                "unit": None if is_pct else unit,
+                "display": _display_value(
+                    value, unit=None if is_pct else unit),
+                "source": {"sequence": sequence,
+                           "path": f"$.result.long_term[{index}].{raw_field}"},
+            }))
+    return out
+
+
+def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
+    """Publish ``get_briefing``'s own citable figures (health_advisor#525).
+
+    See the module comment above this function for exactly which leaves
+    publish and why the excluded ones (the daily composite readiness score,
+    and every ``workout_focus`` field) stay out. Duplicate reports of the
+    same key publish only when their values agree, exactly like every other
+    builder in this module.
+    """
+    if not isinstance(ledger, list):
+        return {}
+    candidates: list[tuple[str, dict]] = []
+    for record in ledger:
+        if (not isinstance(record, dict) or record.get("result_elided")
+                or record.get("tool_name") != "get_briefing"):
+            continue
+        result = record.get("result")
+        if not isinstance(result, dict):
+            continue
+        sequence = record.get("sequence")
+        candidates.extend(_briefing_highlight_candidates(
+            result, sequence=sequence))
+        candidates.extend(_briefing_readiness_candidates(
+            result, sequence=sequence))
+        candidates.extend(_briefing_longterm_candidates(
+            result, sequence=sequence))
+    return _publish_unambiguous(candidates)
+
+
+# --- a Python-owned status when data exists but nothing published it -------
+#
+# (health_advisor#525, item 2.) A closed fact set can go quiet for a
+# perfectly good reason (a genuinely thin vault) or a bad one (this turn's
+# tools returned real data, but none of it cleared the bar to publish -- the
+# defect this issue is about). The model cannot tell those apart from inside
+# the closed set; only Python, which saw the raw ledger, can. When it can,
+# this publishes a status fact naming specific follow-up tools, in exactly
+# the same shape as ``build_evidence_status_fact`` and ``cold_start``'s
+# ``status``/``status_text`` leaves: a Python-owned sentence the model is
+# told to use verbatim, never a claim it is left to invent in its own words.
+_GATHERED_DATA_STATUS_KEY = "status:gathered_data_uncited"
+_GATHERED_DATA_STATUS_FOLLOWUPS = (
+    "summarize_metric", "get_weekly_series", "list_workouts",
+)
+
+
+def build_gathered_data_status_fact(*, ledger_has_data: bool,
+                                    figures_published: bool,
+                                    tool_names) -> dict[str, dict]:
+    """Publish a status fact iff this turn gathered data but published none.
+
+    ``ledger_has_data`` and ``figures_published`` are supplied by the caller
+    (``chat._ledger_has_successful_data`` and whether the metric/attachment/
+    workout/briefing fact builders returned anything), not recomputed here --
+    this module has no ledger-walking helper of its own for "did a tool
+    return real data" and must not grow a second one that can drift from the
+    caller's (``_has_nonempty_result_data``'s "a {count:0} response is not
+    evidence" rule is exactly the kind of judgment call that belongs in one
+    place). ``figures_published`` deliberately excludes citation and status
+    facts: a turn that published only an evidence citation, or only this
+    status fact itself, has still published no figure.
+    """
+    if not ledger_has_data or figures_published:
+        return {}
+    names = sorted({str(name) for name in (tool_names or [])})
+    followups = ", ".join(_GATHERED_DATA_STATUS_FOLLOWUPS)
+    ran = (" (" + ", ".join(names) + ")") if names else ""
+    text = (
+        f"This turn's tools{ran} returned real vault data, but none of it "
+        "cleared the bar to publish as a citable figure. Do not say the "
+        "vault has no data or no history -- it has data. Say that a "
+        f"specific number needs a follow-up tool such as {followups}."
+    )
+    return {_GATHERED_DATA_STATUS_KEY: {
+        "key": _GATHERED_DATA_STATUS_KEY, "display": text,
+        "value": "data_gathered_not_cited",
+    }}
+
+
+def gathered_data_status_guidance(facts: dict[str, dict]) -> str:
+    """Instruct the model to narrate the gathered-data status verbatim.
+
+    Mirrors :func:`cold_start_guidance`'s pattern: a status leaf is
+    meaningless unless the model is told it exists and that it must be
+    quoted, not paraphrased.
+    """
+    if not isinstance(facts, dict) or _GATHERED_DATA_STATUS_KEY not in facts:
+        return ""
+    return (
+        "DATA STATUS: this turn's tools returned data, but nothing met the "
+        "bar to cite as a figure. Use "
+        "{" + _GATHERED_DATA_STATUS_KEY + "} as the sentence saying so; "
+        "never state or imply that the vault has no data."
+    )
+
+
 def citation_fact_key(sequence, doc_id: str, chunk_ix) -> str:
     """Return the exact slot key for one Python-retrieved passage."""
     enc = lambda value: quote(str(value), safe="-_.~:")

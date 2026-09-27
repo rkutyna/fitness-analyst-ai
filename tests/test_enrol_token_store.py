@@ -343,17 +343,17 @@ def test_cli_status_list_which_and_cancel(store_path, capsys):
     store = enrol.TokenStore(store_path)
     record, _ = store.mint()
 
-    rc = enrol.main(["--store", str(store_path), "status", record.id])
+    rc = enrol.main(["--store", str(store_path), "status", "--", record.id])
     assert rc == 0
     assert "live" in capsys.readouterr().out
 
     store.burn(record.id, kid="kid-xyz")
-    rc = enrol.main(["--store", str(store_path), "which", "kid-xyz"])
+    rc = enrol.main(["--store", str(store_path), "which", "--", "kid-xyz"])
     assert rc == 0
     assert record.id in capsys.readouterr().out
 
     record2, _ = store.mint()
-    rc = enrol.main(["--store", str(store_path), "cancel", record2.id])
+    rc = enrol.main(["--store", str(store_path), "cancel", "--", record2.id])
     assert rc == 0
     assert "cancelled" in capsys.readouterr().out
 
@@ -361,3 +361,17 @@ def test_cli_status_list_which_and_cancel(store_path, capsys):
     assert rc == 0
     listed = capsys.readouterr().out
     assert record.id in listed and record2.id in listed
+
+
+def test_cli_accepts_an_id_that_starts_with_a_dash(store, store_path, capsys):
+    """base64url ids start with '-' about 1 time in 64; argparse reads a bare
+    one as an option. Callers must pass `--` before the id (pair.py does)."""
+    record, _ = store.mint()
+    data = json.loads(store_path.read_text())
+    dashed = "-" + record.id[1:]
+    for row in (data if isinstance(data, list) else data.get("tokens", data.get("records", []))):
+        if row.get("id") == record.id:
+            row["id"] = dashed
+    store_path.write_text(json.dumps(data))
+    assert enrol.main(["--store", str(store_path), "status", "--", dashed]) == 0
+    assert dashed in capsys.readouterr().out

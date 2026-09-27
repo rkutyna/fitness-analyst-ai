@@ -210,3 +210,22 @@ def test_disapproved_apns_endpoints_are_refused(endpoint):
 def test_apns_configuration_has_no_ambient_defaults():
     with pytest.raises(RuntimeError, match="HA_APNS_KEY_PATH"):
         push.APNsConfig.from_env({})
+
+
+def test_default_client_speaks_http2_which_apns_requires(tmp_path, monkeypatch):
+    """APNs refuses HTTP/1.1: httpx's default client got RemoteProtocolError on
+    every real send (2026-09-27). The default client must ask for HTTP/2, and
+    the `h2` package that makes that possible must be installed."""
+    import h2  # noqa: F401 -- httpx silently needs this for http2=True
+
+    seen = {}
+    real_client = httpx.Client
+
+    def recording_client(*args, **kwargs):
+        seen.update(kwargs)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(push.httpx, "Client", recording_client)
+    sender, _ = _sender(tmp_path)
+    assert seen.get("http2") is True
+    assert sender._http_client._transport._pool._http2 is True

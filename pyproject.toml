@@ -67,6 +67,10 @@ dependencies = [
     "pycparser==3.0",
     # --- HTTP transport for the OpenRouter/Ollama LLM backends (llm.py) ---
     "httpx==0.28.1",
+    # --- HTTP/2 for APNs (push.py): Apple refuses HTTP/1.1 ---
+    "h2==4.4.1",
+    "hpack==4.2.0",
+    "hyperframe==6.1.0",
 ]
 
 [project.optional-dependencies]

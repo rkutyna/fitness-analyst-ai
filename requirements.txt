@@ -37,6 +37,11 @@ cryptography==50.0.0
 cffi==2.1.1
 pycparser==3.0
 
+# --- HTTP/2 for APNs (push.py): Apple refuses HTTP/1.1 ---
+h2==4.4.1
+hpack==4.2.0
+hyperframe==6.1.0
+
 # --- dev / testing ---
 httpx==0.28.1
 pytest==9.0.3

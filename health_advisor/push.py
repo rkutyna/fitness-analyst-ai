@@ -194,7 +194,10 @@ class APNsSender:
         if not isinstance(private_key.curve, ec.SECP256R1):
             raise ValueError("APNs key must use the P-256 curve")
         self._private_key = private_key
-        self._http_client = http_client or httpx.Client(timeout=10.0)
+        # APNs speaks HTTP/2 only; httpx defaults to HTTP/1.1, which Apple
+        # answers by closing the connection (RemoteProtocolError on every real
+        # send, 2026-09-27). http2=True needs the `h2` package (pinned).
+        self._http_client = http_client or httpx.Client(timeout=10.0, http2=True)
 
     @classmethod
     def from_env(

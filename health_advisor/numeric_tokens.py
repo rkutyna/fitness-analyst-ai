@@ -215,7 +215,30 @@ def _is_legitimate_joiner(text: str, index: int) -> bool:
     return all(ord(c) > 0x7F and not c.isspace() for c in (before, after))
 
 
+# A comma glued to the next word ("Thursday,which" after a placeholder renders)
+# reads as a typo. Only a comma directly before an ASCII letter matches, so
+# figures ("56,459": a digit follows) are never touched, and neither is any
+# placeholder: every fact key percent-escapes its components (a comma becomes
+# %2C), so a key cannot contain a comma-letter pair.
+_COMMA_BEFORE_LETTER_RE = re.compile(r",(?=[A-Za-z])")
+
+
 def normalise_model_prose(text):
+    """Remove invisible artifacts from model prose and space glued commas.
+
+    The invisible-artifact rules are :func:`_strip_invisible`'s; on top of
+    them, a comma immediately followed by an ASCII letter gets one space
+    (``"{fact|x},which"`` -> ``"{fact|x}, which"``). A comma before a digit
+    (``56,459``) is a number and is left alone. Non-string input is returned
+    as is.
+    """
+    text = _strip_invisible(text)
+    if not isinstance(text, str) or not text:
+        return text
+    return _COMMA_BEFORE_LETTER_RE.sub(", ", text)
+
+
+def _strip_invisible(text):
     """Remove invisible artifacts from model prose before it is verified.
 
     * Every format character (category Cf: U+200B-U+200D, U+2060, U+FEFF,

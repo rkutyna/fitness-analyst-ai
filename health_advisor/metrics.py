@@ -696,7 +696,9 @@ def impact_bucket_rows(conn, window_predicate: str,
 
 
 def bucket_series(conn, start_utc: str, end_utc: str, *,
-                  metric_units: bool = False) -> list[dict]:
+                  metric_units: bool = False,
+                  arbitration_window: tuple[str, str] | None = None
+                  ) -> list[dict]:
     """Per-bucket view of the jog/walk classification, over a UTC window.
 
     Same rule as analysis.impact_volume — that function aggregates these
@@ -707,6 +709,15 @@ def bucket_series(conn, start_utc: str, end_utc: str, *,
     `end_utc` is exclusive. Values are unrounded; round at the presentation
     edge. `speed_mph` is carried explicitly so no caller has to invert pace —
     efficiency is speed/HR, and a ratio built on pace moves the wrong way.
+
+    ``arbitration_window`` is an optional ``(start_utc, end_utc)`` pair, with
+    the end exclusive, that scopes device-source arbitration separately from
+    the read. By default it equals ``(start_utc, end_utc)``, so the call is
+    unchanged. Workout-window arbitration only matches a workout that starts
+    inside its window, so a caller reading a sub-span that opens after its
+    workout began (a block within a session) passes the whole session here:
+    the samples returned are still only ``[start_utc, end_utc)``, but the
+    winning source is decided over the session. Always interpreted as UTC.
     """
     if metric_units:
         from . import vault as V
@@ -714,7 +725,9 @@ def bucket_series(conn, start_utc: str, end_utc: str, *,
     bucket_min = IMPACT_BUCKET_SECONDS / 60.0
     rows = impact_bucket_rows(
         conn, "start_utc >= ? AND start_utc < ?", (start_utc, end_utc),
-        arbitration_window=(start_utc, end_utc),
+        arbitration_window=(arbitration_window
+                            if arbitration_window is not None
+                            else (start_utc, end_utc)),
         arbitration_window_kind="utc")
 
     out: list[dict] = []

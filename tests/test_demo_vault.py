@@ -13,6 +13,7 @@ two-device path is reachable.
 from __future__ import annotations
 
 import sqlite3
+from datetime import date, timedelta
 
 import pytest
 
@@ -333,3 +334,114 @@ def test_cli_rejects_a_nonsense_window(tmp_path):
         demo.build_demo_vault(tmp_path / "x.db", days=0)
     with pytest.raises(ValueError):
         demo.build_demo_vault(tmp_path / "x.db", days=5, end_date="not-a-date")
+
+
+# --------------------------------------------------------------------------- #
+# Profiles: the default is pinned draw for draw; a non-default one moves content
+# --------------------------------------------------------------------------- #
+# The generator draws from ONE random stream, so a single extra (or missing)
+# draw anywhere shifts everything after it. These digests are the whole guard on
+# that: they were measured on the generator before it took a profile, and a
+# change that moves them has changed the default vault, not just added a knob.
+PINNED_DIGESTS = {
+    (730, 42): "452d7a69d17d53d3c44dfb259812d897b933612581ceab08c07de4d7b54809b8",
+    (180, 7): "f6515971dd437e3e4b977a5167cdfcd7437d89969f01ab68aee2d31f9ec1e45c",
+}
+
+
+@pytest.mark.parametrize("days,seed", sorted(PINNED_DIGESTS))
+def test_default_vault_digest_is_pinned(tmp_path, days, seed):
+    path = tmp_path / "pinned.db"
+    demo.build_demo_vault(path, days=days, seed=seed)
+    assert demo.digest_file(path) == PINNED_DIGESTS[(days, seed)]
+
+
+def test_explicit_default_profile_is_the_historical_vault(tmp_path):
+    path = tmp_path / "explicit.db"
+    report = demo.build_demo_vault(path, days=180, seed=7,
+                                   profile=demo.DemoProfile())
+    assert demo.digest_file(path) == PINNED_DIGESTS[(180, 7)]
+    assert "profile" not in report
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        assert c.execute("SELECT COUNT(*) FROM vault_meta "
+                         "WHERE key = 'demo_profile'").fetchone()[0] == 0
+    finally:
+        c.close()
+
+
+def _workout_days(path, kind):
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return [r[0] for r in c.execute(
+            "SELECT local_date FROM workouts WHERE workout_type = ? "
+            "ORDER BY local_date", (kind,))]
+    finally:
+        c.close()
+
+
+def test_non_default_profile_changes_content_and_is_recorded(tmp_path):
+    base, other = tmp_path / "base.db", tmp_path / "other.db"
+    demo.build_demo_vault(base, days=40, seed=3)
+    report = demo.build_demo_vault(
+        other, days=40, seed=3,
+        profile=demo.DemoProfile(name="couch", rhr_base=72.0, steps_base=3000.0,
+                                 weekly_plan={}, watch_from=0))
+    assert demo.digest_file(base) != demo.digest_file(other)
+    assert report["profile"] == "couch"
+    assert report["watch_from"] == report["start_date"]
+    assert _workout_days(other, "running") == []
+    assert _workout_days(base, "running")
+    c = sqlite3.connect(f"file:{other}?mode=ro", uri=True)
+    try:
+        assert c.execute("SELECT value FROM vault_meta WHERE key = "
+                         "'demo_profile'").fetchone()[0] == "couch"
+    finally:
+        c.close()
+
+
+def test_callable_knobs_and_plan_resolve_per_day(tmp_path):
+    """A runner who stops: the plan and a numeric knob both change over time."""
+    path = tmp_path / "stops.db"
+    report = demo.build_demo_vault(
+        path, days=42, seed=11,
+        profile=demo.DemoProfile(
+            name="stops", watch_from=0, skip_probability=0.0,
+            weekly_plan=lambda i, d: (
+                {1: "running", 3: "running", 5: "running"} if i < 21 else
+                {1: "rest", 3: "walking"}),
+            rhr_base=lambda i, d: 52.0 if i < 21 else 66.0))
+    start = date.fromisoformat(report["start_date"])
+    cutoff = (start + timedelta(days=21)).isoformat()
+    runs = _workout_days(path, "running")
+    assert runs and all(day < cutoff for day in runs)
+    assert any(day >= cutoff for day in _workout_days(path, "walking"))
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        def mean_rhr(lo, hi):
+            return c.execute(
+                "SELECT AVG(last) FROM daily_metrics WHERE metric = "
+                "'resting_heart_rate' AND date >= ? AND date < ?",
+                (lo, hi)).fetchone()[0]
+        assert mean_rhr(cutoff, "9999") - mean_rhr("0000", cutoff) > 8.0
+    finally:
+        c.close()
+
+
+def test_a_rest_day_is_the_same_as_an_absent_weekday(tmp_path):
+    """"rest" must draw nothing, or a plan with explicit rest days would shift
+    the whole stream against one that simply leaves them out."""
+    plan = {1: "running", 3: "running"}
+    a, b = tmp_path / "a.db", tmp_path / "b.db"
+    demo.build_demo_vault(a, days=30, seed=8,
+                          profile=demo.DemoProfile(name="x", weekly_plan=plan))
+    demo.build_demo_vault(b, days=30, seed=8, profile=demo.DemoProfile(
+        name="x", weekly_plan={**plan, 0: "rest", 2: "rest", 4: "rest"}))
+    assert demo.digest_file(a) == demo.digest_file(b)
+
+
+def test_profile_rejects_an_unknown_activity_or_weekday():
+    with pytest.raises(ValueError):
+        demo.DemoProfile(weekly_plan={1: "skydiving"})
+    with pytest.raises(ValueError):
+        demo.DemoProfile(weekly_plan={9: "running"})

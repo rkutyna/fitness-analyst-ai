@@ -50,6 +50,7 @@ of the inserts. Compare :func:`content_digest`, never the bytes.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import math
 import random
@@ -58,6 +59,7 @@ import sys
 from datetime import date, datetime, timedelta
 import os
 from pathlib import Path
+from typing import Callable, Union
 
 from . import db
 from . import derive
@@ -125,8 +127,26 @@ def _align(dt: datetime) -> datetime:
 
 
 # --------------------------------------------------------------------------- #
-# The generator
+# Profiles: who the synthetic person is
 # --------------------------------------------------------------------------- #
+# A knob is a number or a callable ``(i, days) -> float`` resolved once per day,
+# where ``i`` is the 0-based day index. A callable is how a profile changes over
+# time (a runner who stops, a weight that drifts up after a lapse).
+Knob = Union[float, Callable[[int, int], float]]
+WeeklyPlan = dict  # weekday (Mon=0) -> activity name
+
+ACTIVITIES = ("running", "walking", "cycling", "traditional_strength_training",
+              "rest")
+
+
+def _default_fitness(i: int, days: int) -> float:
+    return i / max(1, days - 1)                      # 0 -> 1 over the window
+
+
+def _default_watch_from(days: int) -> int:
+    return min(days // 5, 240)
+
+
 # Monday-anchored weekly rhythm. Wednesday and Friday are deliberately empty:
 # a plan with no rest days produces a training-load series with no variance.
 _WEEKLY_PLAN = {
@@ -140,6 +160,111 @@ _WEEKLY_PLAN = {
 _SKIP_PROBABILITY = 0.12
 
 
+@dataclasses.dataclass(frozen=True)
+class DemoProfile:
+    """Every per-person literal the generator uses, as a knob.
+
+    The defaults ARE the historical generator, expression for expression:
+    ``build_demo_vault`` without a profile and with ``DemoProfile()`` make the
+    same RNG draws in the same order and so the same rows. A knob changes a
+    VALUE, never the number of draws, except where a field says otherwise; that
+    is what keeps the default content digest stable.
+
+    Numeric fields take a number or ``(i, days) -> float``. ``weekly_plan`` takes
+    a ``{weekday: activity}`` dict (Monday = 0; an absent weekday or ``"rest"``
+    is a day off and draws nothing) or ``(i, days) -> dict``. ``watch_from`` is
+    the day index at which the watch appears: an int, or ``(days) -> int``.
+    """
+    name: str = "default"
+    # -- the slow state everything below scales with ------------------------
+    fitness: Knob = _default_fitness
+    # -- runs ------------------------------------------------------------------
+    run_minutes_base: Knob = 24.0        # whole session, warm-up and cool-down incl.
+    run_minutes_slope: Knob = 26.0       # per unit of fitness
+    run_minutes_sd: Knob = 5.0
+    run_weekend_multiplier: Knob = 1.35
+    pace_base: Knob = 11.9               # min/mi while jogging
+    pace_slope: Knob = -1.9
+    cadence_base: Knob = 157.0           # steps/min while jogging
+    cadence_slope: Knob = 11.0
+    run_hr_base: Knob = 139.0            # bpm while jogging
+    run_hr_slope: Knob = 9.0
+    # -- resting physiology ------------------------------------------------------
+    rhr_base: Knob = 60.5                # the settled daily resting heart rate
+    rhr_slope: Knob = -6.0
+    hr_rest_base: Knob = 60.0            # the all-day heart-rate baseline
+    hr_rest_slope: Knob = -6.0
+    hrv_base: Knob = 42.0
+    hrv_slope: Knob = 14.0
+    vo2_base: Knob = 37.5
+    vo2_slope: Knob = 6.5
+    # -- body ----------------------------------------------------------------------
+    weight_base: Knob = 186.0            # lb
+    weight_slope: Knob = -13.0
+    # -- everyday movement ---------------------------------------------------------------
+    steps_base: Knob = 6200.0
+    steps_weekend: Knob = 1400.0
+    steps_season: Knob = 900.0
+    steps_fitness_bonus: Knob = 700.0
+    walk_minutes: Knob = 24.0            # the deliberate walk that is not a workout
+    walk_skip_probability: Knob = 0.15
+    # -- sleep --------------------------------------------------------------------------------
+    sleep_hours_mean: Knob = 7.5         # time in bed, before latency and wakings
+    sleep_hours_sd: Knob = 0.75
+    bedtime_centre_min: Knob = 22 * 60 + 40      # minutes after midnight, prev day
+    bedtime_spread_lo: Knob = -40        # uniform integer jitter, minutes
+    bedtime_spread_hi: Knob = 70
+    # -- the week ------------------------------------------------------------------------------------
+    skip_probability: Knob = _SKIP_PROBABILITY
+    weekly_plan: Union[WeeklyPlan, Callable[[int, int], WeeklyPlan]] = \
+        dataclasses.field(default_factory=lambda: dict(_WEEKLY_PLAN))
+    watch_from: Union[int, Callable[[int], int]] = _default_watch_from
+
+    def __post_init__(self) -> None:
+        if not callable(self.weekly_plan):
+            _check_plan(self.weekly_plan)
+
+    def watch_from_day(self, days: int) -> int:
+        v = self.watch_from(days) if callable(self.watch_from) else self.watch_from
+        return int(v)
+
+    def plan_for(self, i: int, days: int) -> WeeklyPlan:
+        plan = (self.weekly_plan(i, days) if callable(self.weekly_plan)
+                else self.weekly_plan)
+        if callable(self.weekly_plan):
+            _check_plan(plan)
+        return plan
+
+    def at(self, i: int, days: int) -> "_Day":
+        """Resolve every numeric knob for day index `i`."""
+        vals = {}
+        for f in _KNOB_FIELDS:
+            v = getattr(self, f)
+            vals[f] = float(v(i, days)) if callable(v) else v
+        return _Day(**vals)
+
+
+def _check_plan(plan: dict) -> None:
+    for weekday, kind in plan.items():
+        if weekday not in range(7):
+            raise ValueError(f"weekly_plan weekday {weekday!r} is not 0..6")
+        if kind not in ACTIVITIES:
+            raise ValueError(
+                f"weekly_plan activity {kind!r} is not one of {ACTIVITIES}")
+
+
+_KNOB_FIELDS = tuple(
+    f.name for f in dataclasses.fields(DemoProfile)
+    if f.name not in ("name", "weekly_plan", "watch_from"))
+_Day = dataclasses.make_dataclass(
+    "_Day", [(n, float) for n in _KNOB_FIELDS], frozen=True)
+
+DEFAULT_PROFILE = DemoProfile()
+
+
+# --------------------------------------------------------------------------- #
+# The generator
+# --------------------------------------------------------------------------- #
 class _Generator:
     """Holds the RNG and the slowly-moving state (fitness, weight, fatigue).
 
@@ -150,7 +275,8 @@ class _Generator:
     """
 
     def __init__(self, days: int, seed: int, end_date: str,
-                 arbitration_from: str):
+                 arbitration_from: str, profile: DemoProfile | None = None):
+        self.profile = profile if profile is not None else DEFAULT_PROFILE
         self.days = days
         self.rng = random.Random(seed)
         self.end = date.fromisoformat(end_date)
@@ -158,14 +284,17 @@ class _Generator:
         self.start = self.end - timedelta(days=days - 1)
         # Instrument era: a phone-only stretch, then a watch appears. Capped so
         # a ten-year vault does not spend three years without a heart rate.
-        self.watch_from = self.start + timedelta(days=min(days // 5, 240))
+        self.watch_from = self.start + timedelta(
+            days=self.profile.watch_from_day(days))
         self.records: list[dict] = []
         self.workouts: list[dict] = []
         self.subjective: list[tuple] = []
         # carry-over state
         self.prev_load = 0.0
         self.prev_sleep_h = 7.5
-        self.body_mass = 186.0
+        k0 = self.profile.at(0, days)
+        self.body_mass = k0.weight_base + k0.weight_slope * k0.fitness
+        self.k = k0                                 # today's resolved knobs
 
     # -- small deterministic helpers ---------------------------------------
     def _n(self, mu: float, sigma: float) -> float:
@@ -178,7 +307,9 @@ class _Generator:
     # -- one day ------------------------------------------------------------
     def _day(self, i: int, d: date) -> None:
         rng = self.rng
-        fitness = i / max(1, self.days - 1)          # 0 -> 1 over the window
+        self.i = i
+        self.k = k = self.profile.at(i, self.days)
+        fitness = k.fitness
         yday = d.timetuple().tm_yday
         season = math.sin(2 * math.pi * (yday - 80) / 365.25)   # peaks in summer
         weekend = d.weekday() >= 5
@@ -228,10 +359,12 @@ class _Generator:
     def _sessions(self, d: date, fitness: float, weekend: bool,
                   has_watch: bool, source: str) -> list[dict]:
         rng = self.rng
-        kind = _WEEKLY_PLAN.get(d.weekday())
+        kind = self.profile.plan_for(self.i, self.days).get(d.weekday())
         # In the phone-only era there is no watch to record a session; only the
         # occasional walk was logged. That is what an instrument era looks like.
-        if kind is None or rng.random() < _SKIP_PROBABILITY:
+        # A rest day draws nothing, exactly like a weekday absent from the plan.
+        if (kind is None or kind == "rest"
+                or rng.random() < self.k.skip_probability):
             return []
         if not has_watch:
             if kind != "walking":
@@ -254,14 +387,19 @@ class _Generator:
         """A run recorded the way a watch records one: 20-second distance, step
         and heart-rate samples, with a walking warm-up and cool-down."""
         rng = self.rng
-        total_min = _clamp(24 + 26 * fitness + self._n(0, 5), 16, 78)
+        k = self.k
+        total_min = _clamp(k.run_minutes_base + k.run_minutes_slope * fitness
+                           + self._n(0, k.run_minutes_sd), 16, 78)
         if weekend:
-            total_min *= 1.35
+            total_min *= k.run_weekend_multiplier
         warm, cool = 4.0, 3.0
         jog_min = max(6.0, total_min - warm - cool)
-        pace = _clamp(11.9 - 1.9 * fitness + self._n(0, 0.4), 7.6, 13.6)
-        cadence = _clamp(157 + 11 * fitness + self._n(0, 3.5), 145, 183)
-        hr_base = _clamp(139 + 9 * fitness + self._n(0, 4), 124, 160)
+        pace = _clamp(k.pace_base + k.pace_slope * fitness + self._n(0, 0.4),
+                      7.6, 13.6)
+        cadence = _clamp(k.cadence_base + k.cadence_slope * fitness
+                         + self._n(0, 3.5), 145, 183)
+        hr_base = _clamp(k.run_hr_base + k.run_hr_slope * fitness
+                         + self._n(0, 4), 124, 160)
 
         segs = [(warm, 18.5, 111.0, 108.0),       # (minutes, pace, cadence, hr)
                 (jog_min, pace, cadence, hr_base),
@@ -401,12 +539,12 @@ class _Generator:
         background samples are far too coarse to fall in the walking pace band.
         """
         rng = self.rng
-        if rng.random() < 0.15:
+        if rng.random() < self.k.walk_skip_probability:
             return None
         hour = 15 if weekend else 12
         start = _align(datetime(d.year, d.month, d.day, hour)
                        + timedelta(minutes=rng.randint(0, 50)))
-        minutes = _clamp(24 + self._n(0, 7), 12, 46)
+        minutes = _clamp(self.k.walk_minutes + self._n(0, 7), 12, 46)
         end = start + timedelta(seconds=int(minutes * 60 // BUCKET_S) * BUCKET_S)
         if any(s < end and start < e for s, e in busy):
             return None
@@ -427,8 +565,10 @@ class _Generator:
                     season: float, weekend: bool, source: str, busy) -> None:
         """Hourly steps / distance / energy for the rest of the waking day."""
         rng = self.rng
-        base = 6200 + 1400 * (1 if weekend else 0) + 900 * season \
-            + 700 * fitness + self._n(0, 900)
+        k = self.k
+        base = k.steps_base + k.steps_weekend * (1 if weekend else 0) \
+            + k.steps_season * season + k.steps_fitness_bonus * fitness \
+            + self._n(0, 900)
         base = max(900.0, base)
         hours = list(range(7, 23))
         # A fixed diurnal shape, jittered — mornings and early evenings move.
@@ -491,7 +631,7 @@ class _Generator:
                                low_wear: bool, busy, has_watch: bool) -> None:
         if not has_watch:
             return
-        rest = 60 - 6 * fitness
+        rest = self.k.hr_rest_base + self.k.hr_rest_slope * fitness
         # 20:00-22:00 is the charger. A vault where wear_hours is always 24 is
         # a vault where the wear filter can never be observed working.
         last = 14 if low_wear else 24
@@ -522,9 +662,12 @@ class _Generator:
         rng = self.rng
         prev = d - timedelta(days=1)
         weekend_night = prev.weekday() >= 4          # Fri/Sat nights run later
-        bed_min = 22 * 60 + 40 + (55 if weekend_night else 0) + rng.randint(-40, 70)
+        k = self.k
+        bed_min = int(k.bedtime_centre_min) + (55 if weekend_night else 0) \
+            + rng.randint(int(k.bedtime_spread_lo), int(k.bedtime_spread_hi))
         bed = datetime(prev.year, prev.month, prev.day) + timedelta(minutes=bed_min)
-        hours = _clamp(7.5 + self._n(0, 0.75) - (0.4 if weekend_night else 0.0),
+        hours = _clamp(k.sleep_hours_mean + self._n(0, k.sleep_hours_sd)
+                       - (0.4 if weekend_night else 0.0),
                        4.6, 10.2)
         wake = bed + timedelta(minutes=round(hours * 60))
         if wake.date() != d:                          # keep the invariant exact
@@ -582,7 +725,8 @@ class _Generator:
         untestable."""
         rng = self.rng
         day_s = d.isoformat()
-        settled = _clamp(60.5 - 6.0 * fitness + 0.9 * (self.prev_load / 40.0)
+        settled = _clamp(self.k.rhr_base + self.k.rhr_slope * fitness
+                         + 0.9 * (self.prev_load / 40.0)
                          + self._n(0, 2.1), 44, 78)
         for k, hours in enumerate((8, 16, 24)):
             draft = settled + (self._n(0, 1.6) if hours < 24 else 0.0)
@@ -601,7 +745,8 @@ class _Generator:
         t = midnight + timedelta(hours=6, minutes=45)
         self.records.append(_rec(
             "heart_rate_variability",
-            round(_clamp(42 + 14 * fitness - 5 * (self.prev_load / 60.0)
+            round(_clamp(self.k.hrv_base + self.k.hrv_slope * fitness
+                         - 5 * (self.prev_load / 60.0)
                          + self._n(0, 6), 12, 105), 1), t, t, DEMO_WATCH))
         self.records.append(_rec(
             "respiratory_rate", round(_clamp(14.6 + self._n(0, 0.9), 10, 20), 2),
@@ -617,7 +762,8 @@ class _Generator:
         if d.weekday() == 2:
             v = midnight + timedelta(hours=20)
             self.records.append(_rec(
-                "vo2_max", round(_clamp(37.5 + 6.5 * fitness + self._n(0, 0.5),
+                "vo2_max", round(_clamp(self.k.vo2_base + self.k.vo2_slope * fitness
+                                        + self._n(0, 0.5),
                                         28, 58), 1), v, v, DEMO_WATCH))
         if rng.random() < 0.2:
             m = midnight + timedelta(hours=21, minutes=rng.randint(0, 50))
@@ -632,7 +778,7 @@ class _Generator:
         (metric_source_months) without contending for the same movement."""
         if self.rng.random() > 0.72:
             return
-        target = 186.0 - 13.0 * fitness
+        target = self.k.weight_base + self.k.weight_slope * fitness
         self.body_mass += (target - self.body_mass) * 0.12 + self._n(0, 0.35)
         lb = round(_clamp(self.body_mass, 140, 240), 1)
         t = midnight + timedelta(hours=7, minutes=15)
@@ -707,11 +853,14 @@ def build_demo_vault(path: str | Path, *, days: int = DEFAULT_DAYS,
                      seed: int = DEFAULT_SEED,
                      end_date: str = DEFAULT_END_DATE,
                      replace: bool = True,
-                     read_only: bool = True) -> dict:
+                     read_only: bool = True,
+                     profile: DemoProfile | None = None) -> dict:
     """Build a synthetic vault at `path` and return a summary report.
 
-    Deterministic in `(days, seed, end_date)`: two builds with the same
-    arguments hold the same rows. See :func:`content_digest`.
+    Deterministic in `(days, seed, end_date, profile)`: two builds with the same
+    arguments hold the same rows. See :func:`content_digest`. With no profile
+    (or the default one) the content is the historical generator's, draw for
+    draw.
     """
     if days < 1:
         raise ValueError("days must be >= 1")
@@ -727,7 +876,8 @@ def build_demo_vault(path: str | Path, *, days: int = DEFAULT_DAYS,
                 side.unlink()
 
     arbitration_from = (date.fromisoformat(end_date) - timedelta(days=10)).isoformat()
-    gen = _Generator(days, seed, end_date, arbitration_from)
+    gen = _Generator(days, seed, end_date, arbitration_from, profile)
+    named = profile is not None and profile != DEFAULT_PROFILE
     gen.build()
 
     conn = db.connect(path)
@@ -739,7 +889,8 @@ def build_demo_vault(path: str | Path, *, days: int = DEFAULT_DAYS,
         conn.executemany(
             "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",
             [("demo_vault", "1"), ("demo_seed", str(seed)),
-             ("demo_days", str(days)), ("demo_end_date", end_date)])
+             ("demo_days", str(days)), ("demo_end_date", end_date)]
+            + ([("demo_profile", profile.name)] if named else []))
 
         for i in range(0, len(gen.records), _INSERT_CHUNK):
             db.insert_records(conn, gen.records[i:i + _INSERT_CHUNK])
@@ -774,6 +925,8 @@ def build_demo_vault(path: str | Path, *, days: int = DEFAULT_DAYS,
                    "start_date": gen.start.isoformat(), "end_date": end_date,
                    "watch_from": gen.watch_from.isoformat(),
                    "mode": oct(os.stat(path).st_mode & 0o777)})
+    if named:
+        report["profile"] = profile.name
     return report
 
 

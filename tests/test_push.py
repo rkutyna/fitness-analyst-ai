@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -229,3 +230,50 @@ def test_default_client_speaks_http2_which_apns_requires(tmp_path, monkeypatch):
     sender, _ = _sender(tmp_path)
     assert seen.get("http2") is True
     assert sender._http_client._transport._pool._http2 is True
+
+
+# health_advisor#526 -- httpx's INFO request line carries the APNs URL, and the
+# APNs URL carries the device token. The token is a stable device identifier
+# and must never reach a log; the delivery STATUS must.
+_TOKEN_64 = "0123456789abcdef" * 4
+
+
+def _all_log_text(caplog) -> str:
+    return "\n".join(
+        [caplog.text]
+        + [record.getMessage() for record in caplog.records]
+        + [repr(record.args) for record in caplog.records]
+    )
+
+
+@pytest.mark.parametrize("status", [200, 410, 503])
+def test_apns_send_logs_the_status_but_never_the_device_token(
+        tmp_path, caplog, status):
+    def handler(request):
+        assert _TOKEN_64 in str(request.url)   # the real URL does carry it
+        return httpx.Response(status, request=request)
+
+    sender, _ = _sender(tmp_path, handler=handler)
+    with caplog.at_level(logging.DEBUG):
+        assert sender.send_with_status(_TOKEN_64, "turn-123") == status
+
+    logged = _all_log_text(caplog)
+    assert _TOKEN_64 not in logged
+    assert not re.search(r"[0-9a-fA-F]{64}", logged)
+    assert any(record.name == push.__name__
+               and f"HTTP status {status}" in record.getMessage()
+               for record in caplog.records), logged
+    # httpx's own request line is still there, with the token redacted.
+    assert any(record.name == "httpx" and "/3/device/" in record.getMessage()
+               for record in caplog.records), logged
+
+
+def test_other_httpx_request_lines_are_not_rewritten(tmp_path, caplog):
+    sender, _ = _sender(
+        tmp_path, handler=lambda request: httpx.Response(200, request=request))
+    with caplog.at_level(logging.INFO):
+        httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, request=request))
+        ).get("https://openrouter.example/api/v1/chat/completions")
+    assert any("https://openrouter.example/api/v1/chat/completions"
+               in record.getMessage() for record in caplog.records)

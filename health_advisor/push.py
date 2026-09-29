@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -29,6 +30,35 @@ APPROVED_APNS_HOSTS = frozenset({
     "api.sandbox.push.apple.com",
 })
 APNS_ENVIRONMENTS = frozenset({"sandbox", "production"})
+
+_DEVICE_PATH_RE = re.compile(r"(/3/device/)[^\s\"'/?#]+")
+
+
+class _RedactDeviceToken(logging.Filter):
+    """Blank the device token in httpx's own request log line.
+
+    httpx logs every outbound request at INFO, URL included, and an APNs URL
+    is ``/3/device/<token>``. A device token is a stable identifier that no log
+    needs, so it is replaced before any handler sees the record. Every other
+    line httpx writes is left exactly as it was.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - never let a log filter raise
+            return True
+        redacted = _DEVICE_PATH_RE.sub(r"\1<redacted>", message)
+        if redacted != message:
+            record.msg, record.args = redacted, ()
+        return True
+
+
+def _redact_httpx_device_tokens() -> None:
+    """Install the redaction on the ``httpx`` logger, once per process."""
+    httpx_logger = logging.getLogger("httpx")
+    if not any(isinstance(f, _RedactDeviceToken) for f in httpx_logger.filters):
+        httpx_logger.addFilter(_RedactDeviceToken())
 
 
 def validate_apns_endpoint(endpoint: str) -> str:
@@ -194,6 +224,7 @@ class APNsSender:
         if not isinstance(private_key.curve, ec.SECP256R1):
             raise ValueError("APNs key must use the P-256 curve")
         self._private_key = private_key
+        _redact_httpx_device_tokens()
         # APNs speaks HTTP/2 only; httpx defaults to HTTP/1.1, which Apple
         # answers by closing the connection (RemoteProtocolError on every real
         # send, 2026-09-27). http2=True needs the `h2` package (pinned).
@@ -254,7 +285,10 @@ class APNsSender:
                     payload, separators=(",", ":"), ensure_ascii=True
                 ).encode("utf-8"),
             )
-            if not 200 <= response.status_code < 300:
+            if 200 <= response.status_code < 300:
+                logger.info("APNs push delivered with HTTP status %s",
+                            response.status_code)
+            else:
                 logger.warning("APNs push failed with HTTP status %s",
                                response.status_code)
             return response.status_code

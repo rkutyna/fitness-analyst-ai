@@ -50,8 +50,8 @@ _MARKER_RE = re.compile(
         r"\bout_of_corpus_domain\b",
         r"\bcorpus_domain_unverified\b",
         # A placeholder the interpolator did not consume: {fact|...},
-        # {pub:...}, {status:...}, {advice:...}, {cite:...}.
-        r"\{\s*(?:fact|pub|status|evidence|advice|cite)\s*[:|]",
+        # {pub:...}, {status:...}, {scale:...}, {advice:...}, {cite:...}.
+        r"\{\s*(?:fact|pub|status|evidence|advice|cite|scale)\s*[:|]",
     )),
     re.IGNORECASE,
 )

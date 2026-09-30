@@ -348,7 +348,20 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
             f"weekly buckets (Monday-anchored), each the {_agg(metric)} of its "
             "days; 'days' < 7 marks a partial week that is not comparable to a "
             "full one")
-    return {**out, "downsampled": downsampled, "n": len(points), "points": points}
+    result = {**out, "downsampled": downsampled, "n": len(points),
+              "points": points}
+    if dates and not downsampled:
+        # The window's own mean, so "what did I average" is a published
+        # figure and never a sum the model does over the points (#558, E).
+        # The same statistic, period and rounding summarize_metric publishes
+        # for that window, so the two tools agree fact for fact.
+        stats = _stats(dates, vals)
+        summary = {"metric": metric, "unit": unit,
+                   "period": f"{stats['start']}:{stats['end']}",
+                   "n_days": stats["n_days"], "mean": stats["mean"]}
+        _add_stat_presentations(summary, metric, summary["period"])
+        result["window_summary"] = summary
+    return result
 
 
 @tool
@@ -705,6 +718,92 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
     return out
 
 
+# Workout types a pace ("9:03 per mile") is a meaningful reading of.
+_PACE_WORKOUT_TYPES = frozenset({"running", "walking", "hiking"})
+# The key a tool result publishes its own citable facts under; pinned equal to
+# ``fact_template.DECLARED_FACTS_RESULT_KEY`` by a test (that module imports
+# this one's siblings, so the literal lives here).
+_PUBLISHABLE_FACTS_KEY = "publishable_facts"
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+           "Oct", "Nov", "Dec")
+
+
+def _day_text(iso_day: str) -> str:
+    """A local date as people write it on the ask path: "Sat Aug 22"."""
+    day = date.fromisoformat(iso_day)
+    return f"{_WEEKDAYS[day.weekday()]} {_MONTHS[day.month - 1]} {day.day}"
+
+
+def _pace_minutes(duration_min, distance_mi, metric_units: bool):
+    """Minutes per mile (or per km) from the stored duration and distance, or
+    ``None`` when either is missing or the distance is zero. Computed from the
+    stored values, never from the rounded ones a row displays."""
+    if duration_min is None or distance_mi is None or not distance_mi > 0:
+        return None
+    distance = (distance_mi * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+                if metric_units else distance_mi)
+    return _r(duration_min / distance, 2)
+
+
+def _workout_window_facts(conn, active: str, start: str, end: str, *,
+                          type_counts, total: int,
+                          metric_units: bool) -> list[dict]:
+    """The aggregates a "how many / longest" question asks for, over the WHOLE
+    range (never the possibly truncated rows), as declared facts (#558, E).
+
+    For the range: how many workouts, and per type how many, the longest by
+    duration and by distance, each with the date it happened. Every value is a
+    SQL result over the same unmarked rows ``list_workouts`` counts. A type
+    with no stored duration or distance publishes no longest for it, and an
+    empty range publishes only its zero count.
+    """
+    window = f"workouts/{start}:{end}"
+    scope = f"from {start} to {end}"
+    facts = [{"id": f"{window}/all/count", "value": total,
+              "label": f"Number of workouts of every type recorded {scope}"}]
+    dist_unit = "km" if metric_units else "mi"
+    # A question about "strength sessions" spans every strength type the vault
+    # names (traditional, functional...), and a model cannot add their counts
+    # itself: publish the family's count when more than one type belongs.
+    strength = [row for row in type_counts if "strength" in row["workout_type"]]
+    if len(strength) > 1:
+        facts.append({
+            "id": f"{window}/strength/count",
+            "value": sum(row["n"] for row in strength),
+            "label": f"Number of strength workouts of any strength type "
+                     f"recorded {scope}"})
+    for row in type_counts:
+        kind = row["workout_type"]
+        base = f"{window}/{kind}"
+        facts.append({"id": f"{base}/count", "value": row["n"],
+                      "label": f"Number of {kind} workouts recorded {scope}"})
+        for name, column, unit in (("duration", "duration_min", "min"),
+                                   ("distance", "distance_mi", dist_unit)):
+            top = conn.execute(
+                f"SELECT w.local_date, w.{column} AS v FROM workouts AS w "
+                f"WHERE w.local_date BETWEEN ? AND ? AND {active} "
+                f"AND w.workout_type = ? AND w.{column} IS NOT NULL "
+                f"AND w.{column} > 0 "
+                f"ORDER BY w.{column} DESC, w.start_utc DESC LIMIT 1",
+                (start, end, kind)).fetchone()
+            if top is None:
+                continue
+            value = top["v"]
+            if name == "distance" and metric_units:
+                value = value * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+            facts.append({
+                "id": f"{base}/longest_{name}", "unit": unit,
+                "value": _r(value, 1 if name == "duration" else 2),
+                "label": f"The longest {kind} workout {scope} by {name}"})
+            facts.append({
+                "id": f"{base}/longest_{name}_date",
+                "value": _day_text(top["local_date"]),
+                "label": f"The date of the longest {kind} workout {scope} "
+                         f"by {name}"})
+    return facts
+
+
 @tool
 def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None = None,
                   limit: int = 50) -> dict:
@@ -735,7 +834,13 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     rows. For a metric-less claim, omit the `metric` key entirely; do not send
     `metric: null`, `metric: ""`, or whitespace as a substitute for
     omission. Dates must be explicit YYYY-MM-DD — an 'error' comes back
-    otherwise."""
+    otherwise.
+
+    Running, walking and hiking rows carry `pace_min_per_mi` (`pace_min_per_km`
+    for a metric vault), minutes per unit distance from the stored duration and
+    distance. `publishable_facts` lists, over the WHOLE range (never just the
+    returned rows): the count of workouts, each type's count, and each type's
+    longest workout by duration and by distance with its date."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
     limit = max(1, min(int(limit), MAX_WORKOUTS))
@@ -777,6 +882,9 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             f"SELECT COUNT(*) FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? "
             f"AND {marked}", (start, end)).fetchone()[0]
         n_segments = _n_segments_by_workout(conn, [r["dedupe_key"] for r in rows])
+        window_facts = _workout_window_facts(
+            conn, active, start, end, type_counts=type_counts, total=total,
+            metric_units=metric_units)
     finally:
         conn.close()
     out = []
@@ -800,6 +908,12 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
         else:
             row["energy_kcal"] = _r(r["energy_kcal"], 1)
             row["distance_mi"] = _r(r["distance_mi"], 2)
+        if r["workout_type"] in _PACE_WORKOUT_TYPES:
+            pace = _pace_minutes(r["duration_min"], r["distance_mi"],
+                                 metric_units)
+            if pace is not None:
+                row["pace_min_per_km" if metric_units
+                    else "pace_min_per_mi"] = pace
         row.update({
             "avg_heart_rate": _r(r["avg_heart_rate"], 0),
             "max_heart_rate": _r(r["max_heart_rate"], 0),
@@ -819,7 +933,8 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
                      "declared": declared_unit_system is not None,
                      "distance": display_units["distance"],
                      "energy": display_units["energy"]},
-           "workouts": out}
+           "workouts": out,
+           _PUBLISHABLE_FACTS_KEY: window_facts}
     if res["truncated"]:
         res["note"] = (
             f"showing the {len(out)} most recent of {total} workouts in this "

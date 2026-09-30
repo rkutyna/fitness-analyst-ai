@@ -19,6 +19,7 @@ from . import claim_contract as _CLAIM_CONTRACT
 from . import deepdive_verify as _verify
 from . import metrics
 from . import normalize
+from . import subjective as _subjective
 
 
 _KEY_SEPARATOR = "|"
@@ -1318,6 +1319,19 @@ _WORKOUT_ROW_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("distance_mi", "distance_mi", "mi"),
     ("distance_km", "distance_km", "km"),
 )
+# A row's pace is computed by ``list_workouts`` from the stored duration and
+# distance (never from the rounded ones the row shows) and published here as
+# ``pace``, unit "min/mi" or "min/km", displayed the way pace is read: "9:03
+# min/mi" (#558, class E).
+_WORKOUT_PACE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("pace_min_per_mi", "min/mi"),
+    ("pace_min_per_km", "min/km"),
+)
+
+
+def _pace_display(value: float, unit: str) -> str:
+    total = int(round(value * 60))
+    return f"{total // 60}:{total % 60:02d} {unit}"
 
 
 def _workout_identity(date, workout_type, start_time=None) -> str | None:
@@ -1408,6 +1422,19 @@ def _workout_row_candidates(row: dict, workout: str | None, *, sequence,
             sequence=sequence, path=f"{path_prefix}.{raw_field}")
         if candidate is not None:
             out.append(candidate)
+    for raw_field, unit in _WORKOUT_PACE_FIELDS:
+        value = row.get(raw_field)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            continue
+        key = workout_fact_key(workout, "pace")
+        out.append((key, {
+            "key": key, "workout": workout, "field": "pace",
+            "value": value, "unit": unit,
+            "display": _pace_display(value, unit),
+            "source": {"sequence": sequence,
+                       "path": f"{path_prefix}.{raw_field}"},
+        }))
     return out
 
 
@@ -1533,7 +1560,37 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
             # rounding, so nothing from it is republished here today.
             continue
 
-    return _publish_unambiguous(candidates)
+    published = _publish_unambiguous(candidates)
+    published.update(_workout_date_facts(published))
+    return published
+
+
+def _workout_date_facts(published: dict[str, dict]) -> dict[str, dict]:
+    """One ``date`` fact per published workout: the day it happened.
+
+    A workout is named by its date and type, and the model has no metric
+    period label for it, so a sentence about a run ("On Aug 25 you ran 6.08
+    miles") had no slot for the date and lost it ("On  6.08 miles", census
+    class E). The date is already in the workout's identity; Python publishes
+    it in the form every other date on the ask path takes ("Tue Aug 25").
+    """
+    out: dict[str, dict] = {}
+    for fact in published.values():
+        workout = fact.get("workout")
+        day = _period_date(str(workout).split("|")[0]) if workout else None
+        if day is None:
+            continue
+        key = workout_fact_key(workout, "date")
+        if key in out:
+            continue
+        label = _short_period_day(day)
+        out[key] = {
+            "key": key, "workout": workout, "field": "date",
+            "value": day.isoformat(), "unit": None, "display": label,
+            "source": {"sequence": (fact.get("source") or {}).get("sequence"),
+                       "workout": workout},
+        }
+    return out
 
 
 # --- get_briefing's own figures (health_advisor#525) ------------------------
@@ -2192,6 +2249,109 @@ def _question_quantities(question: str | None) -> tuple[set[str], set[int]]:
     return words, values
 
 
+# --- the scale of a self-rating (health_advisor#558, class G follow-up) ------
+#
+# A check-in rating (stress, soreness, energy, sleep quality) is a bare score
+# whose meaning is its scale, and the model reaches for it in words: "3.5 out
+# of five". Class G refuses a number the model wrote, and 17 of the 28 answers
+# it refused on the replayed captures were exactly that phrase -- an honest
+# sentence rejected because Python never said the scale. So Python says it. A
+# scale fact is published for every rating metric some published fact names,
+# and its display is the phrase that follows a score ("out of 5"), built from
+# ``subjective.RATING_MIN`` / ``RATING_MAX`` -- the bounds the write path
+# validates against, one definition. Whichever form the model chooses, the
+# number in it is Python's: a placeholder renders it, and a scale phrase whose
+# numbers are the published bounds is not counted as a number the model
+# authored (:func:`_strip_scale_phrases`). Nothing is published for a metric
+# that is not a rating, and nothing when no rating was read this turn.
+_RATING_SCALE_PREFIX = "scale:"
+
+
+def rating_scale_key(metric: str) -> str:
+    """The exact placeholder key for one rating metric's scale."""
+    return _RATING_SCALE_PREFIX + str(metric)
+
+
+def build_rating_scale_facts(facts: dict[str, dict]) -> dict[str, dict]:
+    """One scale fact per subjective rating metric named by ``facts``."""
+    lo, hi = _subjective.RATING_MIN, _subjective.RATING_MAX
+    out: dict[str, dict] = {}
+    for fact in (facts or {}).values():
+        metric = fact.get("metric") if isinstance(fact, dict) else None
+        if metric not in _subjective.RATING_METRICS:
+            continue
+        key = rating_scale_key(metric)
+        out[key] = {
+            "key": key,
+            "label": (f"The scale {metric} is scored on: a whole number "
+                      f"from {lo} to {hi}. Follow a score with this."),
+            "value": f"{lo} to {hi}",
+            "scale_min": lo,
+            "scale_max": hi,
+            "unit": None,
+            "display": f"out of {hi}",
+            "source": {"sequence": (fact.get("source") or {}).get("sequence"),
+                       "scale_of": metric},
+        }
+    return out
+
+
+_RATING_SCALE_GUIDANCE_TEMPLATE = (
+    "RATING SCALE: a check-in rating is a score on a fixed scale. When you "
+    "state one, follow it with {%s} (it renders as the scale) instead of "
+    "writing the scale yourself."
+)
+
+
+def rating_scale_guidance(facts: dict[str, dict]) -> str:
+    """Tell the model a rating's scale is a fact, when one is published."""
+    for key in sorted(facts or {}):
+        if key.startswith(_RATING_SCALE_PREFIX):
+            return _RATING_SCALE_GUIDANCE_TEMPLATE % key
+    return ""
+
+
+def _scale_bounds(facts: dict[str, dict] | None) -> set[tuple[int, int]]:
+    bounds = set()
+    for key, fact in (facts or {}).items():
+        if (isinstance(key, str) and key.startswith(_RATING_SCALE_PREFIX)
+                and isinstance(fact, dict)
+                and isinstance(fact.get("scale_min"), int)
+                and isinstance(fact.get("scale_max"), int)):
+            bounds.add((fact["scale_min"], fact["scale_max"]))
+    return bounds
+
+
+_SCALE_COUNTED_NOUNS = (r"(?:runs?|jogs?|walks?|days?|nights?|workouts?|"
+                        r"sessions?|weeks?|times?|hours?|minutes?)")
+
+
+def _word_or_digit(value: int) -> str:
+    words = [word for word, number in _WORD_VALUES.items() if number == value]
+    return "(?:" + "|".join([str(value), *words]) + ")"
+
+
+def _strip_scale_phrases(text: str, facts: dict[str, dict] | None) -> str:
+    """Blank the scale phrases whose numbers are a published scale's bounds.
+
+    "out of five", "a five-point scale" and "a scale of one to five" state a
+    scale Python published; they are not a measurement, and are no longer the
+    model's own number. Only when the bounds equal a published scale's, and
+    never for "out of five runs".
+    """
+    for lo, hi in _scale_bounds(facts):
+        low, high = _word_or_digit(lo), _word_or_digit(hi)
+        pattern = (
+            rf"\bout\s+of\s+{high}\b(?!\s+{_SCALE_COUNTED_NOUNS}\b)"
+            rf"|\b{high}[\s-]+point\s+scale\b"
+            rf"|\b(?:scale|range)\s+(?:of|from)\s+{low}\s*"
+            rf"(?:-|\u2013|to|through)\s*{high}\b"
+            rf"|\bfrom\s+{low}\s+(?:to|through)\s+{high}\b"
+            rf"|\b{low}\s*(?:-|\u2013|to)\s*{high}\s+scale\b")
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+    return text
+
+
 def unbacked_quantities(text: str, facts: dict[str, dict] | None = None, *,
                         question: str | None = None) -> list[str]:
     """Return the model-authored numbers in ``text`` that the rule refuses.
@@ -2200,6 +2360,7 @@ def unbacked_quantities(text: str, facts: dict[str, dict] | None = None, *,
     removed, or the inside of one advice slot. See the rule above.
     """
     remaining = _PRESCRIPTION_RE.sub(" ", text or "")
+    remaining = _strip_scale_phrases(remaining, facts)
     found = [match.group(0) for match in _DIGIT_QUANTITY_RE.finditer(remaining)]
     words, values = _question_quantities(question)
     for span in number_words(remaining, facts):
@@ -2596,4 +2757,5 @@ STEERING_TEXTS: tuple[str, ...] = (
     _DECLARED_GUIDANCE_TEMPLATE % (_DECLARED_KEY_PREFIX + "..."),
     _COLD_START_GUIDANCE_HEAD,
     _COLD_START_GUIDANCE_LINE % ("...", "..."),
+    _RATING_SCALE_GUIDANCE_TEMPLATE % (_RATING_SCALE_PREFIX + "..."),
 )

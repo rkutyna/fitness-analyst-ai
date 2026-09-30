@@ -20,6 +20,11 @@ from . import db
 from . import normalize as nz
 
 RATING_FIELDS = ("stress", "soreness", "energy", "sleep_quality")
+# The scale every rating field is scored on. One definition: the write path
+# validates against it and the ask path publishes it as a fact (#558), so a
+# narration can say "out of 5" without the model supplying the number.
+RATING_MIN = 1
+RATING_MAX = 5
 COUNT_FIELDS = ("caffeine_drinks", "alcohol_drinks")
 BODY_MEASUREMENT_METRIC = "waist_circumference"
 BODY_MEASUREMENT_FIELD = "waist_circumference"
@@ -36,6 +41,9 @@ METRIC_NAMES = {
     "alcohol_drinks": "alcohol_drinks",
     BODY_MEASUREMENT_FIELD: BODY_MEASUREMENT_METRIC,
 }
+
+# The metric names whose values are ratings on that scale.
+RATING_METRICS = frozenset(METRIC_NAMES[f] for f in RATING_FIELDS)
 
 CHECKIN_ORIGIN = "checkin"  # records.source AND records.origin for mirrored rows
 
@@ -120,8 +128,10 @@ def _validate(day: str, fields: dict, notes) -> None:
         v = fields.get(f)
         if v is None:
             continue
-        if float(v) != int(v) or not 1 <= int(v) <= 5:
-            raise ValueError(f"{f} must be an integer 1-5")
+        if (float(v) != int(v)
+                or not RATING_MIN <= int(v) <= RATING_MAX):
+            raise ValueError(
+                f"{f} must be an integer {RATING_MIN}-{RATING_MAX}")
     for f in COUNT_FIELDS:
         v = fields.get(f)
         if v is not None and float(v) < 0:

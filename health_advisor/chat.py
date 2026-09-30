@@ -749,7 +749,8 @@ def _ask_judge(question: str, prose: str, verification: dict) -> int:
 
 _WORKOUT_FACT_PLACEHOLDER_TEXT = (
     "{fact|workout=...|field=...} for one workout session's own numbers "
-    "(duration, distance, heart rate, its longest running block). Each "
+    "(duration, distance, pace, heart rate, its longest running block) and "
+    "the date it happened (field=date). Each "
     "workout is named by its date and its type (running, walking, and so "
     "on), not by a metric, so a day's run and its walk are always separate "
     "keys; a start time is added only when the same day had two workouts "
@@ -2774,6 +2775,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         **data_facts,
         **fact_template.build_evidence_status_fact(evidence_status),
         **gathered_data_status_fact,
+        # A rating's scale is Python's to state (#558); derived from the
+        # figures published above, so it exists only when a rating was read.
+        **fact_template.build_rating_scale_facts(data_facts),
     }
 
     # The allowlist above is positive evidence that this turn requested no
@@ -2866,6 +2870,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     cold_start_guidance = fact_template.cold_start_guidance(facts)
     gathered_data_guidance = fact_template.gathered_data_status_guidance(facts)
     declared_guidance = fact_template.declared_facts_guidance(facts)
+    rating_scale_guidance = fact_template.rating_scale_guidance(facts)
     # Prompt-cache layout (health_advisor#304). This call is deliberately a
     # FRESH, tool-less prompt, not a continuation of the gather transcript,
     # and its question-independent instruction block leads so that block is
@@ -2885,6 +2890,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
         + (gathered_data_guidance + "\n\n" if gathered_data_guidance else "")
         + (declared_guidance + "\n\n" if declared_guidance else "")
+        + (rating_scale_guidance + "\n\n" if rating_scale_guidance else "")
         + "USER QUESTION:\n" + question.strip() + "\n\n"
         "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
         fact_template.render_fact_set(facts))

@@ -28,13 +28,31 @@ class CalendarWindow:
         return self.matched_phrase
 
 
+# Two readings of "last week" / "last month", told apart the way English tells
+# them apart (health_advisor#558, class F):
+#
+# * ``last week`` / ``last month`` on their own name the previous CALENDAR
+#   period ("How did I sleep last month?" -> July, asked in August).
+# * ``the last week`` / ``the last month`` / ``the past week`` / ``the past
+#   month`` / ``past N days`` are ROLLING: the days ending on the as-of date
+#   ("How consistent has my sleep been over the last month?"). Reading these
+#   as the previous calendar month answered a question asked on 2026-08-31 with
+#   July 4-31, a month stale, and every gate agreed because the window it
+#   measured against was the wrong one Python had itself resolved.
+#
+# A rolling week is 7 days and a rolling month is 30, the same length as the
+# engine's ``30d`` period spec and its ``past N days`` phrase.
 _PHRASE_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?P<phrase>"
-    r"past\s+[1-9]\d*\s+days?|this\s+week|last\s+week|"
-    r"this\s+month|last\s+month|yesterday|today"
+    r"past\s+[1-9]\d*\s+days?|"
+    r"(?:the\s+)?(?:last|past)\s+(?:week|month)(?!\s+of\b)|"
+    r"this\s+week|(?<!the\s)last\s+week|"
+    r"this\s+month|(?<!the\s)last\s+month|yesterday|today"
     r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+ROLLING_WEEK_DAYS = 7
+ROLLING_MONTH_DAYS = 30
 
 _MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4,
@@ -164,6 +182,15 @@ def _absolute_windows(text: str, today: date) -> list[tuple[int, int, CalendarWi
 
 def _window_for(phrase: str, today: date) -> CalendarWindow:
     canonical = " ".join(phrase.lower().split())
+    # "the last month" and "past month" are rolling; a bare "last month" is
+    # the previous calendar month (see ``_PHRASE_RE``).
+    rolling = (canonical.startswith("the ") or canonical.startswith("past ")
+               ) and canonical.split()[-1] in ("week", "month")
+    if rolling:
+        days = (ROLLING_WEEK_DAYS if canonical.endswith("week")
+                else ROLLING_MONTH_DAYS)
+        return CalendarWindow((today - timedelta(days=days - 1)).isoformat(),
+                              today.isoformat(), canonical, None)
     if canonical == "today":
         start = end = today
         by_hint = "day"

@@ -342,6 +342,10 @@ def test_the_census_advice_quantities_fail_the_scan(template):
     assert scan["unbacked_numbers"]
 
 
+STRENGTH_QUESTION = "What strength work should I do this week?"
+WEIGHT_QUESTION = "How has my weight changed since I stopped running?"
+
+
 @pytest.mark.parametrize("content", [
     "3 sets of 8 to 12 reps", "3 sets of 10 reps", "3 rounds",
     "60 seconds", "60-90 seconds", "20–30 seconds", "3x10", "3 x 10",
@@ -349,7 +353,9 @@ def test_the_census_advice_quantities_fail_the_scan(template):
     "3 sets of 8 per leg", "3 repetitions",
 ])
 def test_a_strength_prescription_is_the_one_advice_quantity_admitted(content):
-    assert _scan("Try {advice:" + content + "}.")["ok"] is True
+    # ... in a strength or plan context (#558, scoped 2026-09-30).
+    assert _scan("Try {advice:" + content + "}.",
+                 question=STRENGTH_QUESTION)["ok"] is True
 
 
 @pytest.mark.parametrize("content", [
@@ -359,9 +365,101 @@ def test_a_strength_prescription_is_the_one_advice_quantity_admitted(content):
     "20 to 30 minutes of warm-up", "3 sets in 20 minutes",
 ])
 def test_every_other_advice_quantity_is_refused(content):
-    scan = _scan("Try {advice:" + content + "}.")
+    scan = _scan("Try {advice:" + content + "}.", question=STRENGTH_QUESTION)
     assert scan["ok"] is False, content
     assert scan["reason"] == fact_template.ADVICE_QUANTITY_REASON
+
+
+# --- the prescription exemption is scoped to strength or the plan (#558) -----
+
+C2_ANSWER = ("Your weight trend is on file. Coaching guidance: "
+             "{advice:3 sets of 8-12 reps for each movement, on separate days}")
+SPELLED_PRESCRIPTION = ("Do three sets of eight to twelve reps for each "
+                        "movement, with sixty seconds of rest.")
+
+
+def _plan_day_facts():
+    key = fact_template.declared_fact_key("plan/2026-09-30/title")
+    return {key: {"key": key, "label": "The plan day's session title",
+                  "value": "Full-body strength", "unit": None,
+                  "display": "Full-body strength",
+                  "source": {"sequence": 1, "path": "$"}}}
+
+
+def _strength_workout_facts(workout_type="traditional_strength_training"):
+    workout = "2026-09-28|" + workout_type
+    key = fact_template.workout_fact_key(workout, "duration")
+    return {key: {"key": key, "workout": workout, "field": "duration",
+                  "value": 40, "unit": "min", "display": "40 minutes",
+                  "source": {"sequence": 1, "path": "$"}}}
+
+
+def test_a_prescription_on_a_weight_question_is_refused():
+    # Census 2, persona C, question C2: the answer ended in a strength
+    # prescription the question never asked for.
+    scan = _scan(C2_ANSWER, question=WEIGHT_QUESTION)
+    assert scan["ok"] is False
+    assert scan["reason"] == fact_template.ADVICE_QUANTITY_REASON
+    assert "8" in scan["unbacked_numbers"]
+
+
+def test_the_same_prescription_on_a_strength_question_passes():
+    scan = _scan(C2_ANSWER, question=STRENGTH_QUESTION)
+    assert scan["ok"] is True
+    assert scan["unbacked_numbers"] == []
+
+
+def test_a_spelled_prescription_follows_the_same_scope():
+    refused = _scan(SPELLED_PRESCRIPTION, question=WEIGHT_QUESTION)
+    assert refused["ok"] is False
+    assert refused["reason"] == fact_template.NUMBER_WORD_REASON
+    assert _scan(SPELLED_PRESCRIPTION, question=STRENGTH_QUESTION)["ok"] is True
+
+
+def test_plan_day_facts_make_the_context_whatever_the_question_says():
+    facts = _plan_day_facts()
+    assert _scan(C2_ANSWER, facts, question="What is next?")["ok"] is True
+    assert _scan(SPELLED_PRESCRIPTION, facts, question="Hi")["ok"] is True
+
+
+def test_a_strength_session_fact_makes_the_context():
+    facts = _strength_workout_facts()
+    assert _scan(C2_ANSWER, facts, question=WEIGHT_QUESTION)["ok"] is True
+    # A run is not a strength session.
+    running = _strength_workout_facts("running")
+    assert _scan(C2_ANSWER, running, question=WEIGHT_QUESTION)["ok"] is False
+
+
+@pytest.mark.parametrize("question", [
+    "What strength work should I do this week?",
+    "Can you write this up into a circuit?",
+    "How many reps should I do?",
+    "What does my plan say for Thursday?",
+    "What should I add to my routine?",
+    "Is lifting weights worth it?",
+    "Should I go to the gym on rest days?",
+])
+def test_strength_and_plan_vocabulary_is_the_context(question):
+    assert fact_template.strength_or_plan_context(question, {}) is True
+
+
+@pytest.mark.parametrize("question", [
+    "How has my weight changed since I stopped running?",
+    "How consistent has my sleep been?",
+    "How much did I run over the last two weeks?",
+    "What was my resting heart rate this week?",
+    "Did I train enough last month?",
+    "", None,
+])
+def test_other_questions_are_not(question):
+    assert fact_template.strength_or_plan_context(question, {}) is False
+
+
+def test_unknown_context_grants_no_exemption():
+    # A caller that passes neither a question nor facts gets no exemption.
+    scan = fact_template.scan_template(
+        "Try {advice:3 sets of 10 reps}.", {}, unbacked_numbers=True)
+    assert scan["ok"] is False
 
 
 def test_a_spelled_number_in_prose_is_refused_like_a_digit():
@@ -457,3 +555,17 @@ def test_a_strength_circuit_is_still_answered(monkeypatch, vault):
     assert result["mode"] == "narration"
     assert result["verification"]["advice_quantities"] == [
         "3 rounds", "60 seconds"]
+
+
+def test_the_ask_path_refuses_a_prescription_on_a_weight_question(
+        monkeypatch, vault):
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
+    monkeypatch.setattr(llm, "tool_schemas", lambda *a, **k: [])
+    monkeypatch.setattr(llm, "tool_loop", lambda *a, **k: C2_ANSWER)
+
+    result = chat.answer_question(vault, WEIGHT_QUESTION)
+
+    assert result["mode"] == "fallback"
+    assert result["verification"]["reason"] == (
+        fact_template.ADVICE_QUANTITY_REASON)
+    assert "8-12" not in result["text"]

@@ -801,7 +801,8 @@ _FACT_TEMPLATE_INSTRUCTIONS = (
     "invent a plausible key, calculate a figure or trend, choose a unit, "
     "or put digits in surrounding prose. The only number you may write "
     "yourself is a strength-exercise prescription (sets, reps, rounds, or "
-    "the seconds of a hold or a rest); it belongs in a literal advice slot "
+    "the seconds of a hold or a rest), and only when the question is about "
+    "strength work or the plan; it belongs in a literal advice slot "
     "written as {advice:...}, whose contents are model-authored and will be "
     "visibly labeled as coaching guidance, not your data. Use an advice slot "
     "only for a span that contains such numbers — digit-free "
@@ -1572,7 +1573,8 @@ def _fact_template_refusal_detail(template: str, scan: dict,
                 + ", ".join(repr(span) for span in unbacked)
                 + ". Remove it, or state the figure through a fact "
                 "placeholder. Only a strength prescription (sets, reps, "
-                "rounds, seconds) may be a number you wrote yourself.")
+                "rounds, seconds) in an answer about strength work or the "
+                "plan may be a number you wrote yourself.")
 
     unresolved = [str(key) for key in scan.get("unresolved") or []]
     if unresolved:

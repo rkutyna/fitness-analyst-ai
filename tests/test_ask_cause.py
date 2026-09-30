@@ -34,7 +34,8 @@ def _valid_draft() -> llm.ResearchResponse:
     return draft
 
 
-def _post(vault, monkeypatch, loop, *, judge=None):
+def _post(vault, monkeypatch, loop, *, judge=None,
+          question="How did my recent jogging compare?"):
     monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
     monkeypatch.setattr(llm, "tool_loop", loop)
@@ -42,7 +43,7 @@ def _post(vault, monkeypatch, loop, *, judge=None):
         monkeypatch.setattr(chat, "_ask_judge", judge)
     with TestClient(receiver.create_app(vault)) as client:
         response = client.post(
-            "/v1/ask", json={"question": "How did my recent jogging compare?"},
+            "/v1/ask", json={"question": question},
             headers={"x-health-secret": "ask-secret"})
     assert response.status_code == 200, response.text
     return response.json()
@@ -108,7 +109,9 @@ def test_ask_cause_gate_refused_keeps_python_gate_reason(monkeypatch, vault):
 def test_ask_cause_no_gather_needed_keeps_advice_answer(monkeypatch, vault):
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "1")
     responses = iter(["", "Circuit: {advice:3 rounds} of squats."])
-    body = _post(vault, monkeypatch, lambda *a, **k: next(responses))
+    # A prescription is licensed only by a strength or plan question (#558).
+    body = _post(vault, monkeypatch, lambda *a, **k: next(responses),
+                 question="Write this up into a circuit.")
 
     assert body["verification"]["cause"] == "no_gather_needed"
     assert body["verification"]["reason"] == "ask answer has no tool-call ledger"

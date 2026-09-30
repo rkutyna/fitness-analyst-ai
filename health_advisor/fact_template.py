@@ -2200,6 +2200,12 @@ def cold_start_guidance(facts: dict[str, dict]) -> str:
 #     "60-90 seconds", "3x10"). This is the one quantity class the advice-to-
 #     circuit flow types into a plan (its bounds are sets, reps, rest, time,
 #     rounds), it is not a jog-minute dial, and no tool could publish it.
+#     SCOPED (health_advisor#558, decided 2026-09-30): the exemption holds
+#     only when the question or the published facts involve strength work or
+#     the plan -- see ``strength_or_plan_context``. Anywhere else the same
+#     phrase is a number the model invented, and is refused like one: an
+#     answer about body weight that closed with "3 sets of 8-12 reps for each
+#     movement" was unasked-for coaching with figures Python never owned.
 #     Minutes, hours, days, weeks, sessions, runs, miles, pounds, percent and
 #     beats are NOT exempt: those are training load, sleep or body targets.
 #     Dumbbell loads ("10 to 20 pounds") are refused for the same reason
@@ -2352,6 +2358,51 @@ def _strip_scale_phrases(text: str, facts: dict[str, dict] | None) -> str:
     return text
 
 
+# The context that licenses a strength prescription (health_advisor#558). Two
+# independent signals, either one sufficient; with neither, no exemption.
+#
+#   * The question, by a deliberately tight vocabulary: strength work (strength,
+#     lifting, weights, dumbbell, squat, circuit, reps, sets, gym, routine,
+#     exercises, ...) and the plan (plan, planned, prescribed). Words that also
+#     name ordinary metrics are left out on purpose -- "weight" (singular),
+#     "exercise", "workout", "training", "session", "week" -- so a question
+#     about body weight, a run or a sleep night never unlocks the exemption.
+#   * The published facts: any fact a plan tool declared (key ``pub:plan/...``;
+#     the host plan tools' vocabulary) or a workout fact whose type is a
+#     strength session.
+_STRENGTH_PLAN_QUESTION_RE = re.compile(
+    r"\b(?:strength|lift(?:s|ing|ed)?|weights|weightlifting|"
+    r"weight[- ]training|resistance|dumbbells?|barbells?|kettlebells?|"
+    r"squats?|deadlifts?|lunges?|bench[- ]press|push[- ]?ups?|pull[- ]?ups?|"
+    r"circuits?|reps?|repetitions?|sets|gym|routines?|exercises|"
+    r"plans?|planned|prescribed|prescription)\b",
+    re.IGNORECASE)
+_PLAN_FACT_KEY_PREFIX = "pub:plan/"
+_STRENGTH_WORKOUT_TYPES = frozenset({
+    "core_training", "high_intensity_interval_training"})
+
+
+def strength_or_plan_context(question: str | None,
+                            facts: dict[str, dict] | None = None) -> bool:
+    """True when the question or its published facts involve strength or the plan.
+
+    Deterministic; it gates the strength-prescription exemption of the rule
+    above. Unknown context (no question, no such fact) is False: the safe
+    default is to refuse a number the model wrote.
+    """
+    if question and _STRENGTH_PLAN_QUESTION_RE.search(question):
+        return True
+    for key, fact in (facts or {}).items():
+        if str(key).startswith(_PLAN_FACT_KEY_PREFIX):
+            return True
+        workout = fact.get("workout") if isinstance(fact, dict) else None
+        if workout:
+            kind = (_workout_type_from_identity(workout) or "").lower()
+            if "strength" in kind or kind in _STRENGTH_WORKOUT_TYPES:
+                return True
+    return False
+
+
 def unbacked_quantities(text: str, facts: dict[str, dict] | None = None, *,
                         question: str | None = None) -> list[str]:
     """Return the model-authored numbers in ``text`` that the rule refuses.
@@ -2359,7 +2410,9 @@ def unbacked_quantities(text: str, facts: dict[str, dict] | None = None, *,
     ``text`` is model-written prose with every fact placeholder already
     removed, or the inside of one advice slot. See the rule above.
     """
-    remaining = _PRESCRIPTION_RE.sub(" ", text or "")
+    remaining = text or ""
+    if strength_or_plan_context(question, facts):
+        remaining = _PRESCRIPTION_RE.sub(" ", remaining)
     remaining = _strip_scale_phrases(remaining, facts)
     found = [match.group(0) for match in _DIGIT_QUANTITY_RE.finditer(remaining)]
     words, values = _question_quantities(question)
@@ -2384,7 +2437,8 @@ def scan_template(template: str, facts: dict[str, dict], *,
     a canonical vault metric or the user's own data.
 
     With ``unbacked_numbers`` the exemption narrows to strength prescriptions
-    and spelled numbers stop passing as prose; see ``unbacked_quantities``.
+    (only in a strength or plan context, #558) and spelled numbers stop
+    passing as prose; see ``unbacked_quantities``.
     ``question`` names the numbers the user themselves used.
     """
     text = template if isinstance(template, str) else ""

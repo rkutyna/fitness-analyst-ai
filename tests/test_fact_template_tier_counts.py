@@ -36,7 +36,7 @@ def test_fact_template_tiers_distinguish_zero_and_resolved_placeholders(
     monkeypatch.setattr(llm, "tool_loop",
                         lambda *args, **kwargs: next(responses))
 
-    zero = chat.answer_question(vault, "What should I do next?")
+    zero = chat.answer_question(vault, "What strength work should I do next?")
     resolved = chat.answer_question(vault, "What are the synthetic values?")
 
     assert zero["verification"]["tier_counts"] == {

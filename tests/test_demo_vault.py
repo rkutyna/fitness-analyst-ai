@@ -12,6 +12,8 @@ two-device path is reachable.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import date, timedelta
 
@@ -341,26 +343,48 @@ def test_cli_rejects_a_nonsense_window(tmp_path):
 # --------------------------------------------------------------------------- #
 # The generator draws from ONE random stream, so a single extra (or missing)
 # draw anywhere shifts everything after it. These digests are the whole guard on
-# that: they were measured on the generator before it took a profile, and a
-# change that moves them has changed the default vault, not just added a knob.
-PINNED_DIGESTS = {
-    (730, 42): "452d7a69d17d53d3c44dfb259812d897b933612581ceab08c07de4d7b54809b8",
-    (180, 7): "f6515971dd437e3e4b977a5167cdfcd7437d89969f01ab68aee2d31f9ec1e45c",
+# that: they were measured on the generator before it took a profile (engine
+# 364196d), and a change that moves them has changed the default vault, not
+# just added a knob.
+#
+# They hash the generator's OWN output (records, workouts, check-ins) before any
+# of it reaches the database, not the finished vault: the vault's derived tables
+# are computed with third-party libraries whose versions are not pinned in CI,
+# and their float bits differ between installs (measured 2026-09-30: the same
+# engine gives vault digest 452d7a69... on the requirements.txt pins and
+# 905defa5... under CI's `pip install -e .[dev]`). The raw stream is pure
+# Python and was measured identical on macOS and on python:3.11-bookworm, for
+# both 364196d and the profile-taking generator.
+PINNED_RAW_DIGESTS = {
+    (730, 42): "e2fb67858e76403fcc1c876e4d0c952b855b66609d6369498db981911218a1a6",
+    (180, 7): "23d917f0d41f56860e9ee3737dfeb3f22f6eb30d77a44b8ef66e861f4d61fc45",
 }
 
 
-@pytest.mark.parametrize("days,seed", sorted(PINNED_DIGESTS))
-def test_default_vault_digest_is_pinned(tmp_path, days, seed):
-    path = tmp_path / "pinned.db"
-    demo.build_demo_vault(path, days=days, seed=seed)
-    assert demo.digest_file(path) == PINNED_DIGESTS[(days, seed)]
+def _raw_digest(days, seed, profile=None):
+    end = demo.DEFAULT_END_DATE
+    arbitration_from = (date.fromisoformat(end) - timedelta(days=10)).isoformat()
+    gen = demo._Generator(days, seed, end, arbitration_from, profile)
+    gen.build()
+    blob = json.dumps([gen.records, gen.workouts, gen.subjective],
+                      default=str, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("days,seed", sorted(PINNED_RAW_DIGESTS))
+def test_default_generator_output_is_pinned(days, seed):
+    assert _raw_digest(days, seed) == PINNED_RAW_DIGESTS[(days, seed)]
 
 
 def test_explicit_default_profile_is_the_historical_vault(tmp_path):
+    assert (_raw_digest(180, 7, demo.DemoProfile())
+            == PINNED_RAW_DIGESTS[(180, 7)])
     path = tmp_path / "explicit.db"
     report = demo.build_demo_vault(path, days=180, seed=7,
                                    profile=demo.DemoProfile())
-    assert demo.digest_file(path) == PINNED_DIGESTS[(180, 7)]
+    plain = tmp_path / "plain.db"
+    demo.build_demo_vault(plain, days=180, seed=7)
+    assert demo.digest_file(path) == demo.digest_file(plain)
     assert "profile" not in report
     c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:

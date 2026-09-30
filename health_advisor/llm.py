@@ -1721,6 +1721,138 @@ COACH_TOOLS = (
     "cite",
 )
 
+# Names in COACH_TOOLS that the engine does not implement. A host application
+# (the coaching layer, which owns the fitness plan) supplies them with
+# :func:`register_tools`. They are declared here so the coach surface stays one
+# list, and so a host that forgets to supply them can be told apart from a typo:
+# a name that is neither an engine tool, a synthetic tool, a registered host
+# tool nor declared here is a defect and raises (see ``_check_include``).
+HOST_SUPPLIED_TOOLS = ("get_planned_session", "get_week_plan", "get_plan_overview")
+
+
+class UnregisteredToolError(ValueError):
+    """An ``include`` list names a tool nothing registers (issue #555).
+
+    Before this existed the name simply vanished from the schema list, so the
+    model was offered a smaller surface than the code claimed and nothing said
+    so.
+    """
+
+
+# Host-supplied tools: name -> unbound ``fn(ctx, ...)``, in the same shape as the
+# engine's own tools. Process-wide by design, and safe to be: what is stored is
+# the UNBOUND function, never a vault. ``_registry`` binds it to one session's
+# provider-facing context on every call, exactly as it does the engine tools, so
+# the T-003 property (no ambient vault) is untouched.
+_HOST_TOOLS: dict = {}
+_HOST_TOOLS_LOCK = threading.Lock()
+_HOST_MISSING_ANNOUNCED: set = set()
+
+
+def register_tools(*fns) -> tuple:
+    """Register host tools for the coach/ask paths. Idempotent; returns names.
+
+    Each ``fn`` takes the vault context first, like every engine tool, and is
+    bound to the session's ``provider_facing()`` context when a registry is
+    built, so a host tool gets no capability an engine tool does not. A
+    registered tool passes through ``_ledgered`` with the engine tools: its
+    result is a ledger record, and its leaves are candidates for the fact set
+    and the verifier like any other tool's.
+
+    Registering an engine tool's name, or a different function under a name
+    already registered, raises: a silent override would change what an
+    engine-tested tool does.
+    """
+    from . import mcp_server as S
+    engine_names = {fn.__name__ for fn in S._TOOLS}
+    names = []
+    with _HOST_TOOLS_LOCK:
+        for fn in fns:
+            name = fn.__name__
+            if name in engine_names:
+                raise ValueError(
+                    f"host tool {name!r} collides with an engine tool")
+            if name in (ANALYST_QUERY_NAME, EVIDENCE_CITE_NAME):
+                raise ValueError(f"host tool {name!r} collides with a "
+                                 "synthetic tool")
+            existing = _HOST_TOOLS.get(name)
+            if existing is not None and existing is not fn:
+                raise ValueError(
+                    f"host tool {name!r} is already registered by another "
+                    "function")
+            _HOST_TOOLS[name] = fn
+            names.append(name)
+    return tuple(names)
+
+
+def unregister_tools(*names) -> None:
+    """Remove host tools by name (test isolation). Unknown names are ignored."""
+    with _HOST_TOOLS_LOCK:
+        for name in names:
+            _HOST_TOOLS.pop(name, None)
+        _HOST_MISSING_ANNOUNCED.clear()
+
+
+def registered_host_tools() -> tuple:
+    """The names of the currently registered host tools, sorted."""
+    with _HOST_TOOLS_LOCK:
+        return tuple(sorted(_HOST_TOOLS))
+
+
+def missing_host_tools(names=HOST_SUPPLIED_TOOLS) -> tuple:
+    """Those of ``names`` no host has registered."""
+    with _HOST_TOOLS_LOCK:
+        return tuple(n for n in names if n not in _HOST_TOOLS)
+
+
+def require_host_tools(names=HOST_SUPPLIED_TOOLS) -> None:
+    """Raise :class:`UnregisteredToolError` unless a host registered ``names``.
+
+    For a host application's startup, not for the request path. The engine on
+    its own legitimately has none of these tools, so it cannot itself treat
+    their absence as an error; a host that promises the coach surface can.
+    Refusing to start is a deploy failure someone sees, where the alternative
+    is a running service whose answers quietly know nothing of the plan.
+    """
+    missing = missing_host_tools(names)
+    if missing:
+        raise UnregisteredToolError(
+            "host tools not registered: " + ", ".join(missing)
+            + " (call llm.register_tools before serving the coach surface)")
+
+
+def _check_include(include, *, engine_names) -> None:
+    """Raise for an ``include`` name that nothing could ever register.
+
+    Deliberately narrow. ``analyst_query`` and ``cite`` are synthetic and
+    conditional (``cite`` exists only when a citation seam is passed). Names in
+    ``HOST_SUPPLIED_TOOLS`` are legitimately absent from an engine with no host.
+    Everything else must be an engine tool or a registered host tool.
+    """
+    if include is None:
+        return
+    known = (set(engine_names) | set(_HOST_TOOLS) | set(HOST_SUPPLIED_TOOLS)
+             | {ANALYST_QUERY_NAME, EVIDENCE_CITE_NAME})
+    unknown = sorted(set(include) - known)
+    if unknown:
+        raise UnregisteredToolError(
+            "include names tools that are not registered: "
+            + ", ".join(unknown))
+    absent = tuple(n for n in include
+                   if n in HOST_SUPPLIED_TOOLS and n not in _HOST_TOOLS)
+    if absent and absent not in _HOST_MISSING_ANNOUNCED:
+        # Once per distinct set per process, to stderr only: on a bare engine
+        # this is the normal state, and touching last_loop_status here would
+        # be overwritten by the very next model call anyway.
+        _HOST_MISSING_ANNOUNCED.add(absent)
+        try:
+            print("[llm.host_tools_unregistered] the tool surface omits "
+                  + ", ".join(absent) + ": no host registered them",
+                  file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+
 ANALYST_QUERY_NAME = "analyst_query"
 EVIDENCE_CITE_NAME = "cite"
 _CITE_QUERY_ALLOWED_RE = re.compile(r"[^\w\s_\-'’.,%/]+", re.UNICODE)
@@ -1802,12 +1934,15 @@ def _registry(ctx, include=None, *, analyst_query_fn=None,
     # answers go to a model provider, so it gets a session without RAW_SAMPLES
     # and without WRITE. A tool cannot forget a capability it was never handed.
     selected = frozenset(RESEARCHER_TOOLS if include is None else include)
+    _check_include(include, engine_names={fn.__name__ for fn in S._TOOLS})
+    host_selected = frozenset(n for n in selected if n in _HOST_TOOLS)
     # analyst_query is deliberately not an MCP tool. Analyst mode is exempt
     # from the provider-boundary raw-sample guarantee until its service is
     # separately mediated; keeping it out of build_server preserves that
     # boundary's existing scope and keeps the codex subprocess unable to see it.
-    mcp_selected = selected - {ANALYST_QUERY_NAME}
-    server = S.build_server(ctx.provider_facing(), name="health-deepdive",
+    mcp_selected = selected - {ANALYST_QUERY_NAME} - host_selected
+    provider_ctx = ctx.provider_facing()
+    server = S.build_server(provider_ctx, name="health-deepdive",
                             include=mcp_selected)
     registry = {t.name: (t.fn, {
         "type": "function",
@@ -1817,6 +1952,24 @@ def _registry(ctx, include=None, *, analyst_query_fn=None,
             "parameters": t.parameters,
         },
     }) for t in server._tool_manager.list_tools()}
+    if host_selected:
+        # Same construction as the engine tools above (a real FastMCP object,
+        # so the schema comes from the signature and docstring), bound to the
+        # same provider-facing context.
+        from mcp.server.fastmcp import FastMCP
+        host_server = FastMCP("health-host-tools")
+        with _HOST_TOOLS_LOCK:
+            host_fns = [_HOST_TOOLS[n] for n in sorted(host_selected)]
+        for fn in host_fns:
+            host_server.tool()(S._bind(fn, provider_ctx))
+        registry.update({t.name: (t.fn, {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description or "",
+                "parameters": t.parameters,
+            },
+        }) for t in host_server._tool_manager.list_tools()})
     if ANALYST_QUERY_NAME in selected:
         registry[ANALYST_QUERY_NAME] = (
             lambda question: _analyst_tool(

@@ -443,12 +443,36 @@ def test_strength_and_plan_vocabulary_is_the_context(question):
     assert fact_template.strength_or_plan_context(question, {}) is True
 
 
+# Pain, injury and rehab questions count as strength context (decided
+# 2026-09-30): the prescription they draw is rehab strength work -- "3 sets of
+# 10 single-leg calf raises" for a foot that hurts on runs.
+@pytest.mark.parametrize("question", [
+    "My feet hurt the most when I run, what can I do?",
+    "My knee is hurting after long runs",
+    "I have some shin pain, how do I rehab it?",
+    "Is my calf injury healed enough to run?",
+    "My Achilles aches in the morning",
+    "What exercises would a physio give for plantar fasciitis?",
+    "I injured my ankle last week",
+])
+def test_pain_injury_and_rehab_questions_are_the_context(question):
+    assert fact_template.strength_or_plan_context(question, {}) is True
+
+
+def test_a_rehab_prescription_passes_on_a_pain_question():
+    question = "My feet hurt the most when I run, what can I do?"
+    scan = _scan("Try {advice:3 sets of 10 single-leg calf raises each day}.",
+                 question=question)
+    assert scan["ok"] is True
+
+
 @pytest.mark.parametrize("question", [
     "How has my weight changed since I stopped running?",
     "How consistent has my sleep been?",
     "How much did I run over the last two weeks?",
     "What was my resting heart rate this week?",
     "Did I train enough last month?",
+    "How has my soreness rating trended?",
     "", None,
 ])
 def test_other_questions_are_not(question):

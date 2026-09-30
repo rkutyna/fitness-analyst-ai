@@ -2363,7 +2363,11 @@ def _strip_scale_phrases(text: str, facts: dict[str, dict] | None) -> str:
 #
 #   * The question, by a deliberately tight vocabulary: strength work (strength,
 #     lifting, weights, dumbbell, squat, circuit, reps, sets, gym, routine,
-#     exercises, ...) and the plan (plan, planned, prescribed). Words that also
+#     exercises, ...), the plan (plan, planned, prescribed), and pain, injury
+#     and rehab (pain, hurt, ache, injury, rehab, physio; decided 2026-09-30 --
+#     the prescription such a question draws is rehab strength work, "3 sets
+#     of 10 single-leg calf raises"). "Soreness" stays out: it names a
+#     check-in rating, so a question about its trend is not rehab. Words that also
 #     name ordinary metrics are left out on purpose -- "weight" (singular),
 #     "exercise", "workout", "training", "session", "week" -- so a question
 #     about body weight, a run or a sleep night never unlocks the exemption.
@@ -2375,7 +2379,9 @@ _STRENGTH_PLAN_QUESTION_RE = re.compile(
     r"weight[- ]training|resistance|dumbbells?|barbells?|kettlebells?|"
     r"squats?|deadlifts?|lunges?|bench[- ]press|push[- ]?ups?|pull[- ]?ups?|"
     r"circuits?|reps?|repetitions?|sets|gym|routines?|exercises|"
-    r"plans?|planned|prescribed|prescription)\b",
+    r"plans?|planned|prescribed|prescription|"
+    r"pain(?:s|ful)?|hurts?|hurting|aches?|aching|injur(?:y|ies|ed)|"
+    r"rehab(?:ilitation)?|physio(?:therapy)?|physical[- ]therapy)\b",
     re.IGNORECASE)
 _PLAN_FACT_KEY_PREFIX = "pub:plan/"
 _STRENGTH_WORKOUT_TYPES = frozenset({

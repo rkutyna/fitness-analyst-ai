@@ -407,7 +407,7 @@ def test_revocation_refuses_one_device_and_leaves_the_other(
         assert _signed_get(client, lost).status_code == 200
         # The operator revokes while the receiver runs; no restart.
         assert device_auth.main(["--registry", str(registry_path),
-                                 "revoke", lost.kid]) == 0
+                                 "revoke", "--", lost.kid]) == 0
         assert "other devices unaffected" in capsys.readouterr().out
         refused = _signed_get(client, lost)
         still = _signed_get(client, kept)
@@ -418,10 +418,15 @@ def test_revocation_refuses_one_device_and_leaves_the_other(
     assert re_enrol_body["detail"]["error"] == "device_revoked"
 
     assert device_auth.main(["--registry", str(registry_path),
-                             "revoke", lost.kid]) == 0
+                             "revoke", "--", lost.kid]) == 0
     assert "already revoked" in capsys.readouterr().out
     assert device_auth.main(["--registry", str(registry_path),
                              "revoke", "A" * 22]) == 1
+    # A kid is base64url, so about 1 in 64 starts with '-'; without the `--`
+    # argparse reads it as an option and exits 2 (that flaked CI on
+    # 2026-09-30). With it, a dash-leading kid is an ordinary unknown kid.
+    assert device_auth.main(["--registry", str(registry_path),
+                             "revoke", "--", "-" + "A" * 21]) == 1
     assert device_auth.main(["--registry", str(registry_path), "list"]) == 0
     listing = capsys.readouterr().out
     assert f"{lost.kid}  revoked" in listing

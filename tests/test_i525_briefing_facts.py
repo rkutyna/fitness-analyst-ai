@@ -225,20 +225,23 @@ def test_gathered_data_status_fact_when_nothing_publishable():
     key = "status:gathered_data_uncited"
     assert key in fact
     text = fact[key]["display"]
-    assert "get_briefing" in text
-    assert "summarize_metric" in text
-    # The text INSTRUCTS the model not to claim absence; it must not itself
-    # assert absence as a bare claim outside that instruction.
-    assert "do not say the vault has no data" in text.lower()
-    assert text.lower().count("no data") == 1
+    # The display is interpolated verbatim into the answer, so it is a
+    # sentence for the user: no tool name, no instruction to a model, and no
+    # bare absence claim (health_advisor#557).
+    from health_advisor import steering
+    assert steering.leak(text) is None
+    assert "get_briefing" not in text
+    assert "do not say" not in text.lower()
+    assert "no data" not in text.lower()
+    assert "on file" in text
 
 
-def test_gathered_data_status_fact_names_every_tool_that_ran():
+def test_gathered_data_status_fact_names_no_tool_even_when_several_ran():
     fact = fact_template.build_gathered_data_status_fact(
         ledger_has_data=True, figures_published=False,
         tool_names=["get_briefing", "list_workouts"])
     text = fact["status:gathered_data_uncited"]["display"]
-    assert "get_briefing" in text and "list_workouts" in text
+    assert "get_briefing" not in text and "list_workouts" not in text
 
 
 def test_gathered_data_status_guidance_tells_model_to_quote_it():

@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping
 
 from . import db
 from . import facts as fact_store
+from . import steering
 from . import vault
 from .context import VaultContext
 # health_advisor#495: each PUBLISHED model reply is normalised before its gate.
@@ -393,6 +394,9 @@ def _fallback_answer(verification: dict | None = None) -> str:
                 "placeholder"),
             "ask answer has no tool-call ledger": (
                 "the answer had no tool-call ledger"),
+            steering.REASON: (
+                "the draft repeated internal instructions instead of "
+                "answering"),
         }
         # Some reasons (this one, `restated_unit`, `contradicted_day_count`)
         # embed draft-derived specifics -- a phrase, a count -- so they can
@@ -594,6 +598,51 @@ def _mark_answer_truncated(verification: dict, status: dict) -> bool:
     return True
 
 
+def _mark_steering_leak(verification: dict, *, text: str) -> bool:
+    """Make repeated model-facing instructions a Python-owned refusal.
+
+    ``text`` is what would reach the user. The check is deterministic and
+    independent of what the prompt said (health_advisor#557): see
+    ``steering.leak``. Returns whether it fired; the verification's reason is
+    a fixed label that carries none of the matched text.
+    """
+    # Only an answer that would otherwise publish needs this: a draft the scan
+    # already refused (its unresolved placeholder is exactly the vocabulary the
+    # guard looks for) keeps its own, more specific refusal reason, which the
+    # repair turn is told.
+    if not verification.get("ok") or steering.leak(text) is None:
+        return False
+    verification.update({
+        "ok": False,
+        "grounded": False,
+        "reason": steering.REASON,
+    })
+    return True
+
+
+def _refuse_steering_leak(result: dict) -> dict:
+    """The last line of defence: no narration leaves ``answer_question`` if it
+    repeats model-facing instructions (health_advisor#557).
+
+    The fact-template arm already refuses a leaking draft attempt by attempt;
+    this covers every other arm and any path added later, since it looks only
+    at the text about to be returned. A leaking narration becomes the
+    deterministic fallback, and its ``figures`` are dropped with it.
+    """
+    if (not isinstance(result, dict) or result.get("mode") != "narration"
+            or steering.leak(result.get("text")) is None):
+        return result
+    verification = {
+        **(result.get("verification") or {}),
+        "ok": False, "grounded": False, "reason": steering.REASON,
+        "cause": "gate_refused",
+    }
+    replaced = {key: value for key, value in result.items()
+                if key != "figures"}
+    return {**replaced, "text": _fallback_answer(verification),
+            "mode": "fallback", "verification": verification}
+
+
 def _ask_cause(verification: dict, *, ledger: list[dict],
                loop_outcomes: list[dict], judge_score: int | None = None,
                conversational: bool = False,
@@ -711,6 +760,81 @@ _RETRY_REPAIR_INSTRUCTIONS = (
     "field is that series' value — or REMOVE the number from your text. A "
     "figure that has no published value behind it and fits no listed operation "
     "must be removed, not restated."
+)
+
+_COACH_PREAMBLE = (
+    "You are the user's personal health coach. Answer the user's question "
+    "directly and honestly using the supplied read-only health tools. Call "
+    "the most relevant tool(s), check their scope and caveats, and do not "
+    "invent a number, metric, activity, or period. If the data cannot answer "
+    "the question, say so without guessing."
+)
+
+_GATHER_TURN_SUFFIX = (
+    "\n\nUse the read-only tools needed to answer the question. "
+    "After gathering the data, return a brief acknowledgement without "
+    "measurements; Python will discard it and supply the facts to the "
+    "narration turn. If the user's message is only a greeting, thanks, "
+    "or acknowledgement, answer that conversationally instead of using "
+    "a tool; Python will validate and may publish that reply directly."
+)
+
+_FACT_TEMPLATE_INSTRUCTIONS = (
+    "You are writing the final answer to the user's question. Return a "
+    "prose TEMPLATE only, with no JSON, commentary, or claim metadata. "
+    "Use a placeholder for every figure or computed trend fact, written "
+    "as the complete key wrapped in curly braces and nothing else: "
+    "{fact|metric=...|period=...|field=...} for ledger facts, "
+    "{fact|table=...|column=...|row=...} for analyst table cells, "
+    "{fact|table=...|column=...|trend=...} for computed trends, "
+    + _WORKOUT_FACT_PLACEHOLDER_TEXT + " "
+    "Copy each "
+    "key character-for-character from the CLOSED FACT SET below — a key "
+    "outside braces, bolded, or quoted is not a placeholder and will be "
+    "refused. When a date or period name belongs in prose, use "
+    "{fact|metric=...|period=...|field=period_label}, for example, "
+    "Activity for {fact|metric=jog_minutes|period=s:2026-08-10:2026-08-16|field=period_label}. "
+    "Never construct a key from parts, "
+    "invent a plausible key, calculate a figure or trend, choose a unit, "
+    "or put digits in surrounding prose. Prescriptive coaching quantities "
+    "such as sets, reps, weights, or durations belong in a literal advice "
+    "slot written as {advice:...}; its contents are model-authored and "
+    "will be visibly labeled as coaching guidance, not your data. Use an "
+    "advice slot only for a span that contains numbers — digit-free "
+    "encouragement is ordinary prose and needs no slot. An advice slot "
+    "must never state the user's measurements or a vault metric; put "
+    "every vault-derived figure in a fact placeholder. "
+    "Qualitative comparisons may remain qualitative. The template may "
+    "contain digits inside a placeholder key or advice slot, but prose "
+    "outside slots must contain none. "
+    "Avoid common digit traps in this vault's vocabulary: write `VO2` as "
+    "oxygen fitness, `last 4 weeks` as recent weeks, and ISO dates as "
+    "the recorded period, unless the wording is inside a supplied "
+    "placeholder. "
+    "If the facts do not support a figure, omit it.\n\n"
+)
+
+_ASKED_METRIC_NONE = ("AVAILABLE FACT KEYS FOR THE ASKED METRIC: none were "
+                      "published; do not invent a key or a figure.")
+_ASKED_METRIC_HEAD = ("AVAILABLE FACT KEYS FOR THE ASKED METRIC (copy one "
+                      "exactly; Python published these values):")
+_UNUSED_FACT_NAMES_HEAD = ("UNUSED FACT NAMES (every one was absent from your "
+                           "template):")
+_UNUSED_GATHERED_HEAD = ("UNUSED GATHERED DATA (these ran but gave no figure "
+                         "you may quote; do not mention them, or this "
+                         "limitation, to the user):")
+_ZERO_FIGURE_REFUSAL = (
+    "compliant template interpolated zero figures despite gathered data; use "
+    "at least one supported fact or explain the result without claiming that "
+    "the gathered data is absent")
+
+_REPAIR_PROMPT_HEAD = (
+    "\n\nYour previous template was refused by Python's "
+    "grounding gate. Fix only this reported issue and return a new prose "
+    "TEMPLATE only. Do not add any other figures or change unrelated "
+    "wording. If you still cannot state a supported figure, name the "
+    "specific metric family whose data is unavailable; do not make a "
+    "generic no-data claim.\n\nFAILING TEMPLATE:\n"
 )
 
 
@@ -1391,6 +1515,8 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                                             citation_verify_fn=citation_verify_fn,
                                             evidence_status=evidence_status,
                                             on_tool_call=on_tool_call)
+        if not audit_match:
+            result = _refuse_steering_leak(result)
         if attachments is not None:
             result = {**result, "attachments": list(result.get("attachments", []))
                       + list(attachments)}
@@ -2473,23 +2599,18 @@ def _asked_metric_fact_prompt(question: str, facts: dict[str, dict]) -> str:
             if parsed is not None and parsed[0] == metric:
                 keys.append(key)
     if not keys:
-        return ("AVAILABLE FACT KEYS FOR THE ASKED METRIC: none were published; "
-                "do not invent a key or a figure.")
-    return ("AVAILABLE FACT KEYS FOR THE ASKED METRIC (copy one exactly; "
-            "Python published these values):\n- " + "\n- ".join(keys))
+        return _ASKED_METRIC_NONE
+    return _ASKED_METRIC_HEAD + "\n- " + "\n- ".join(keys)
 
 
 def _unused_fact_prompt(facts: dict[str, dict], ledger: list[dict]) -> str:
     """Describe the evidence a zero-figure template left unused."""
     if facts:
         names = "\n".join(f"- {key}" for key in sorted(facts))
-        return ("UNUSED FACT NAMES (every one was absent from your template):\n"
-                + names)
+        return _UNUSED_FACT_NAMES_HEAD + "\n" + names
     names = _successful_tool_names(ledger)
     if names:
-        return ("UNUSED GATHERED DATA (these ran but gave no figure you may "
-                "quote; do not mention them, or this limitation, to the "
-                "user):\n- " + "\n- ".join(names))
+        return _UNUSED_GATHERED_HEAD + "\n- " + "\n- ".join(names)
     return "UNUSED FACTS: none"
 
 
@@ -2565,12 +2686,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # or facts after Python closes this ledger snapshot.
     gather_status_before = llm.last_loop_status()
     gather_raw = llm.tool_loop(
-        prompt + "\n\nUse the read-only tools needed to answer the question. "
-        "After gathering the data, return a brief acknowledgement without "
-        "measurements; Python will discard it and supply the facts to the "
-        "narration turn. If the user's message is only a greeting, thanks, "
-        "or acknowledgement, answer that conversationally instead of using "
-        "a tool; Python will validate and may publish that reply directly.",
+        prompt + _GATHER_TURN_SUFFIX,
         ctx=ctx, tools=tool_schemas, think=True, ledger_path=ledger_path,
         tool_names=llm.COACH_TOOLS, claim_instructions=None,
         submit_tool=False, ledger_index=False, submit_repair=False,
@@ -2586,6 +2702,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     attachment_facts = fact_template.build_attachment_facts(ledger)
     workout_facts = fact_template.build_workout_facts(ledger)
     briefing_facts = fact_template.build_briefing_facts(ledger)
+    declared_facts = fact_template.build_declared_facts(ledger)
     citation_facts = fact_template.build_citation_facts(ledger)
     # `data_facts` excludes the evidence-status fact on purpose: that fact
     # states an ABSENCE (why `cite` was withheld this turn), not gathered
@@ -2598,6 +2715,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         **attachment_facts,
         **workout_facts,
         **briefing_facts,
+        **declared_facts,
         **citation_facts,
     }
     # health_advisor#525: computed once, up front, so a broad question whose
@@ -2613,7 +2731,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     gathered_data_status_fact = fact_template.build_gathered_data_status_fact(
         ledger_has_data=ledger_has_data,
         figures_published=bool(metric_facts or attachment_facts
-                               or workout_facts or briefing_facts),
+                               or workout_facts or briefing_facts
+                               or declared_facts),
         tool_names=_successful_tool_names(ledger))
     facts = {
         **data_facts,
@@ -2629,6 +2748,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             str(gather_raw or "")).strip()
         conversational_reason = fact_template.conversational_violation(
             conversational_text, facts)
+        if not conversational_reason and steering.leak(conversational_text):
+            conversational_reason = steering.REASON
         conversational_ok = (not conversational_reason
                              and _status_outcome_family(gather_status) == "other")
         conversational_verification = {
@@ -2708,6 +2829,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
 
     cold_start_guidance = fact_template.cold_start_guidance(facts)
     gathered_data_guidance = fact_template.gathered_data_status_guidance(facts)
+    declared_guidance = fact_template.declared_facts_guidance(facts)
     # Prompt-cache layout (health_advisor#304). This call is deliberately a
     # FRESH, tool-less prompt, not a continuation of the gather transcript,
     # and its question-independent instruction block leads so that block is
@@ -2721,42 +2843,12 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # callable tools it must not use. Keep the question and the fact set in
     # the tail; tests/test_i304_answer_prefix.py pins this.
     final_prompt = (
-        "You are writing the final answer to the user's question. Return a "
-        "prose TEMPLATE only, with no JSON, commentary, or claim metadata. "
-        "Use a placeholder for every figure or computed trend fact, written "
-        "as the complete key wrapped in curly braces and nothing else: "
-        "{fact|metric=...|period=...|field=...} for ledger facts, "
-        "{fact|table=...|column=...|row=...} for analyst table cells, "
-        "{fact|table=...|column=...|trend=...} for computed trends, "
-        + _WORKOUT_FACT_PLACEHOLDER_TEXT + " "
-        "Copy each "
-        "key character-for-character from the CLOSED FACT SET below — a key "
-        "outside braces, bolded, or quoted is not a placeholder and will be "
-        "refused. When a date or period name belongs in prose, use "
-        "{fact|metric=...|period=...|field=period_label}, for example, "
-        "Activity for {fact|metric=jog_minutes|period=s:2026-08-10:2026-08-16|field=period_label}. "
-        "Never construct a key from parts, "
-        "invent a plausible key, calculate a figure or trend, choose a unit, "
-        "or put digits in surrounding prose. Prescriptive coaching quantities "
-        "such as sets, reps, weights, or durations belong in a literal advice "
-        "slot written as {advice:...}; its contents are model-authored and "
-        "will be visibly labeled as coaching guidance, not your data. Use an "
-        "advice slot only for a span that contains numbers — digit-free "
-        "encouragement is ordinary prose and needs no slot. An advice slot "
-        "must never state the user's measurements or a vault metric; put "
-        "every vault-derived figure in a fact placeholder. "
-        "Qualitative comparisons may remain qualitative. The template may "
-        "contain digits inside a placeholder key or advice slot, but prose "
-        "outside slots must contain none. "
-        "Avoid common digit traps in this vault's vocabulary: write `VO2` as "
-        "oxygen fitness, `last 4 weeks` as recent weeks, and ISO dates as "
-        "the recorded period, unless the wording is inside a supplied "
-        "placeholder. "
-        "If the facts do not support a figure, omit it.\n\n"
+        _FACT_TEMPLATE_INSTRUCTIONS
         + (EVIDENCE_CITATION_INSTRUCTIONS + "\n\n"
            if citation_fn is not None else "")
         + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
         + (gathered_data_guidance + "\n\n" if gathered_data_guidance else "")
+        + (declared_guidance + "\n\n" if declared_guidance else "")
         + "USER QUESTION:\n" + question.strip() + "\n\n"
         "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
         fact_template.render_fact_set(facts))
@@ -2848,6 +2940,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     answer_truncated = _mark_answer_truncated(verification, final_status)
     withheld_eligible_figure = _mark_withheld_eligible_figure(
         verification, withheld_fact_keys)
+    _mark_steering_leak(verification, text=rendered_text)
     verification["cause"] = _ask_cause(
         verification, ledger=ledger, loop_outcomes=[gather_status, final_status],
         no_gather_needed=(not scan["placeholders"]
@@ -2902,20 +2995,12 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     # gets its failed template plus only the Python-computed refusal detail.
     refusal_detail = _fact_template_refusal_detail(template, scan, verification)
     if empty_with_gathered_data:
-        refusal_detail = (
-            "compliant template interpolated zero figures despite gathered "
-            "data; use at least one supported fact or explain the result "
-            "without claiming that the gathered data is absent\n" +
-            _unused_fact_prompt(facts, ledger))
+        refusal_detail = _ZERO_FIGURE_REFUSAL + "\n" + _unused_fact_prompt(
+            facts, ledger)
     if denied_available_figure:
         refusal_detail += "\n\n" + _asked_metric_fact_prompt(question, facts)
     repair_prompt = (
-        final_prompt + "\n\nYour previous template was refused by Python's "
-        "grounding gate. Fix only this reported issue and return a new prose "
-        "TEMPLATE only. Do not add any other figures or change unrelated "
-        "wording. If you still cannot state a supported figure, name the "
-        "specific metric family whose data is unavailable; do not make a "
-        "generic no-data claim.\n\nFAILING TEMPLATE:\n" + template +
+        final_prompt + _REPAIR_PROMPT_HEAD + template +
         "\n\nEXACT GATE REFUSAL:\n" + refusal_detail)
     retry_status_before = llm.last_loop_status()
     raw = llm.tool_loop(
@@ -3002,6 +3087,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         retry_verification, retry_status)
     retry_withheld_eligible_figure = _mark_withheld_eligible_figure(
         retry_verification, withheld_fact_keys)
+    _mark_steering_leak(retry_verification, text=retry_rendered_text)
     retry_verification["cause"] = _ask_cause(
         retry_verification, ledger=ledger,
         loop_outcomes=[gather_status, retry_status],
@@ -3081,13 +3167,7 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
     window_sidecar_path = _window_override_path(ledger_path)
     _write_window_override(window_sidecar_path, window_config)
 
-    coach_preamble = (
-        "You are the user's personal health coach. Answer the user's question "
-        "directly and honestly using the supplied read-only health tools. Call "
-        "the most relevant tool(s), check their scope and caveats, and do not "
-        "invent a number, metric, activity, or period. If the data cannot answer "
-        "the question, say so without guessing."
-    )
+    coach_preamble = _COACH_PREAMBLE
     rendered_history = _render_history(history)
     rendered_facts = fact_store.render_context(ctx)
     prompt = coach_preamble + "\n\n"
@@ -3980,3 +4060,19 @@ __all__ = [
     "mark_turn_delivered",
     "run_audit",
 ]
+
+
+# Every fixed piece of instruction text the ask path sends a model. This list
+# and ``steering.leak`` are one mechanism (health_advisor#557): a prompt added
+# without being listed here is not protected against being repeated to a user.
+from .fact_template import STEERING_TEXTS as _FACT_TEMPLATE_STEERING_TEXTS  # noqa: E402
+
+steering.register(
+    ASK_CLAIM_INSTRUCTIONS, EVIDENCE_CITATION_INSTRUCTIONS,
+    EVIDENCE_STATUS_INSTRUCTIONS, _RETRY_REPAIR_INSTRUCTIONS,
+    _COACH_PREAMBLE, _GATHER_TURN_SUFFIX, _FACT_TEMPLATE_INSTRUCTIONS,
+    _REPAIR_PROMPT_HEAD, _ASKED_METRIC_NONE, _ASKED_METRIC_HEAD,
+    _UNUSED_FACT_NAMES_HEAD, _UNUSED_GATHERED_HEAD, _ZERO_FIGURE_REFUSAL,
+    _WORKOUT_FACT_PLACEHOLDER_TEXT,
+    *_FACT_TEMPLATE_STEERING_TEXTS,
+)

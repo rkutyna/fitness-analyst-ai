@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from datetime import date, timedelta
 from urllib.parse import quote, unquote
@@ -1685,6 +1686,122 @@ def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
     return _publish_unambiguous(candidates)
 
 
+# --- declared facts: a tool result names its own publishable leaves --------
+#
+# (health_advisor#557.) ``build_fact_set`` publishes only metric-owned leaves,
+# ``build_briefing_facts`` and ``build_workout_facts`` each name one tool's
+# fields, and both skip a leaf with no metric identity. A tool the engine has
+# never heard of -- a host tool registered through ``llm.register_tools`` --
+# therefore publishes nothing, however citable its result is, and its answer
+# degrades to "nothing I can quote" (a fitness plan's session titles and
+# minute targets were exactly this).
+#
+# The convention is deliberately dumb: a tool result may carry a top-level
+# ``publishable_facts`` list, and every well-formed entry becomes one fact.
+# The engine knows nothing about what the entry means. The TOOL, which is
+# Python and owns the truth, decides what is worth publishing and states what
+# each entry is in its ``label``; the engine only enforces shape:
+#
+#   {"id": <stable string, unique within the tool's own vocabulary>,
+#    "label": <one plain sentence saying what the value is>,
+#    "value": <a non-empty string, or a finite number>,
+#    "unit": <optional unit for a number>}
+#
+# The fact key is ``pub:<id>``. Duplicate ids publish only when their values
+# agree, like every other builder here (:func:`_publish_unambiguous`). A
+# malformed entry is skipped, never repaired, and an oversized string is
+# skipped rather than truncated: a clipped title would be a wrong fact.
+DECLARED_FACTS_RESULT_KEY = "publishable_facts"
+_DECLARED_KEY_PREFIX = "pub:"
+_DECLARED_MAX_PER_RESULT = 400
+_DECLARED_MAX_ID = 200
+_DECLARED_MAX_TEXT = 200
+
+
+def declared_fact_key(fact_id: str) -> str:
+    """The exact placeholder key for one declared fact id."""
+    return _DECLARED_KEY_PREFIX + quote(str(fact_id), safe="-_.~:/")
+
+
+def _declared_candidate(item, *, index: int, sequence) -> tuple[str, dict] | None:
+    if not isinstance(item, dict):
+        return None
+    fact_id, label = item.get("id"), item.get("label")
+    value, unit = item.get("value"), item.get("unit")
+    for text, limit in ((fact_id, _DECLARED_MAX_ID),
+                        (label, _DECLARED_MAX_TEXT)):
+        if (not isinstance(text, str) or not text.strip()
+                or len(text) > limit
+                or any(ord(char) < 32 for char in text)):
+            return None
+    if unit is not None and (not isinstance(unit, str) or not unit.strip()):
+        return None
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        if (not value.strip() or len(value) > _DECLARED_MAX_TEXT
+                or any(ord(char) < 32 for char in value)):
+            return None
+        display = value
+    elif isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return None
+        display = _display_value(value, unit=unit)
+    else:
+        return None
+    key = declared_fact_key(fact_id)
+    return key, {
+        "key": key, "label": label, "value": value, "unit": unit,
+        "display": display,
+        "source": {"sequence": sequence,
+                   "path": f"$.result.{DECLARED_FACTS_RESULT_KEY}"
+                           f"[{index}].value"},
+    }
+
+
+def build_declared_facts(ledger: list[dict]) -> dict[str, dict]:
+    """Publish every well-formed ``publishable_facts`` entry in the ledger.
+
+    Only a successful, non-elided record's own ``result`` is read -- never
+    ``arguments`` -- and only the result's top-level list. See the module
+    comment above for the entry shape and why the engine attaches no meaning
+    to it.
+    """
+    if not isinstance(ledger, list):
+        return {}
+    candidates: list[tuple[str, dict]] = []
+    for record in ledger:
+        if not isinstance(record, dict) or record.get("result_elided"):
+            continue
+        result = record.get("result")
+        if not isinstance(result, dict):
+            continue
+        entries = result.get(DECLARED_FACTS_RESULT_KEY)
+        if not isinstance(entries, list):
+            continue
+        for index, item in enumerate(entries[:_DECLARED_MAX_PER_RESULT]):
+            candidate = _declared_candidate(
+                item, index=index, sequence=record.get("sequence"))
+            if candidate is not None:
+                candidates.append(candidate)
+    return _publish_unambiguous(candidates)
+
+
+_DECLARED_GUIDANCE_TEMPLATE = (
+    "LABELLED FACTS: keys beginning `pub:` are copied exactly like any other "
+    "key, for example {%s}. Each carries a `label` saying what its value is; "
+    "use a value only for what its label says."
+)
+
+
+def declared_facts_guidance(facts: dict[str, dict]) -> str:
+    """Tell the model how to use declared facts, when there are any."""
+    for key in sorted(facts or {}):
+        if key.startswith(_DECLARED_KEY_PREFIX):
+            return _DECLARED_GUIDANCE_TEMPLATE % key
+    return ""
+
+
 # --- a Python-owned status when data exists but nothing published it -------
 #
 # (health_advisor#525, item 2.) A closed fact set can go quiet for a
@@ -1697,42 +1814,56 @@ def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
 # ``status``/``status_text`` leaves: a Python-owned sentence the model is
 # told to use verbatim, never a claim it is left to invent in its own words.
 _GATHERED_DATA_STATUS_KEY = "status:gathered_data_uncited"
-_GATHERED_DATA_STATUS_FOLLOWUPS = (
-    "summarize_metric", "get_weekly_series", "list_workouts",
+
+# The sentence a user reads. It is the fact's ``display``, and interpolation
+# copies a display verbatim into the answer, so this text IS user-facing: it
+# must read as an answer, never as an instruction to the model, and must name
+# no internal tool (health_advisor#557, where the earlier wording -- "Do not
+# say the vault has no data ... follow-up tool such as summarize_metric" --
+# was repeated to a user and passed every gate). The steering that tells the
+# model to use it lives in :func:`gathered_data_status_guidance`, never here.
+_GATHERED_DATA_STATUS_SENTENCE = (
+    "Your data is on file, but nothing this lookup returned could be quoted "
+    "as a specific figure. Ask about one measure, such as your resting "
+    "heart rate, and name the period you care about, and I can give you a "
+    "number."
 )
 
 
 def build_gathered_data_status_fact(*, ledger_has_data: bool,
                                     figures_published: bool,
-                                    tool_names) -> dict[str, dict]:
+                                    tool_names=()) -> dict[str, dict]:
     """Publish a status fact iff this turn gathered data but published none.
 
     ``ledger_has_data`` and ``figures_published`` are supplied by the caller
     (``chat._ledger_has_successful_data`` and whether the metric/attachment/
-    workout/briefing fact builders returned anything), not recomputed here --
-    this module has no ledger-walking helper of its own for "did a tool
-    return real data" and must not grow a second one that can drift from the
-    caller's (``_has_nonempty_result_data``'s "a {count:0} response is not
-    evidence" rule is exactly the kind of judgment call that belongs in one
-    place). ``figures_published`` deliberately excludes citation and status
-    facts: a turn that published only an evidence citation, or only this
-    status fact itself, has still published no figure.
+    workout/briefing/declared fact builders returned anything), not
+    recomputed here -- this module has no ledger-walking helper of its own
+    for "did a tool return real data" and must not grow a second one that can
+    drift from the caller's (``_has_nonempty_result_data``'s "a {count:0}
+    response is not evidence" rule is exactly the kind of judgment call that
+    belongs in one place). ``figures_published`` deliberately excludes
+    citation and status facts: a turn that published only an evidence
+    citation, or only this status fact itself, has still published no figure.
+
+    ``tool_names`` is accepted for call-site compatibility and deliberately
+    unused: the sentence names no tool (#557).
     """
+    del tool_names
     if not ledger_has_data or figures_published:
         return {}
-    names = sorted({str(name) for name in (tool_names or [])})
-    followups = ", ".join(_GATHERED_DATA_STATUS_FOLLOWUPS)
-    ran = (" (" + ", ".join(names) + ")") if names else ""
-    text = (
-        f"This turn's tools{ran} returned real vault data, but none of it "
-        "cleared the bar to publish as a citable figure. Do not say the "
-        "vault has no data or no history -- it has data. Say that a "
-        f"specific number needs a follow-up tool such as {followups}."
-    )
     return {_GATHERED_DATA_STATUS_KEY: {
-        "key": _GATHERED_DATA_STATUS_KEY, "display": text,
+        "key": _GATHERED_DATA_STATUS_KEY,
+        "display": _GATHERED_DATA_STATUS_SENTENCE,
         "value": "data_gathered_not_cited",
     }}
+
+
+_GATHERED_DATA_GUIDANCE_TEMPLATE = (
+    "DATA STATUS: this turn's tools returned data, but nothing met the "
+    "bar to cite as a figure. Use {%s} as the sentence saying so; "
+    "never state or imply that the vault has no data."
+)
 
 
 def gathered_data_status_guidance(facts: dict[str, dict]) -> str:
@@ -1740,16 +1871,13 @@ def gathered_data_status_guidance(facts: dict[str, dict]) -> str:
 
     Mirrors :func:`cold_start_guidance`'s pattern: a status leaf is
     meaningless unless the model is told it exists and that it must be
-    quoted, not paraphrased.
+    quoted, not paraphrased. This text is model-facing steering and is
+    registered in :data:`STEERING_TEXTS` so ``steering.leak`` rejects any
+    narration that repeats it.
     """
     if not isinstance(facts, dict) or _GATHERED_DATA_STATUS_KEY not in facts:
         return ""
-    return (
-        "DATA STATUS: this turn's tools returned data, but nothing met the "
-        "bar to cite as a figure. Use "
-        "{" + _GATHERED_DATA_STATUS_KEY + "} as the sentence saying so; "
-        "never state or imply that the vault has no data."
-    )
+    return _GATHERED_DATA_GUIDANCE_TEMPLATE % _GATHERED_DATA_STATUS_KEY
 
 
 def citation_fact_key(sequence, doc_id: str, chunk_ix) -> str:
@@ -1892,6 +2020,16 @@ def build_citation_facts(ledger: list[dict]) -> dict[str, dict]:
 
 
 _EVIDENCE_STATUS_KEY = "evidence:status"
+_EVIDENCE_STATUS_DEFAULT_SENTENCE = (
+    "No evidence search ran for this question, so I have no source to cite.")
+_EVIDENCE_STATUS_SENTENCES = {
+    "out_of_corpus_domain": (
+        "This question is outside the topics my evidence library covers, so "
+        "I have no source to cite for it."),
+    "corpus_domain_unverified": (
+        "I could not check whether my evidence library covers this "
+        "question, so I have no source to cite for it."),
+}
 
 
 def build_evidence_status_fact(status: str | None) -> dict[str, dict]:
@@ -1920,7 +2058,11 @@ def build_evidence_status_fact(status: str | None) -> dict[str, dict]:
     return {
         _EVIDENCE_STATUS_KEY: {
             "key": _EVIDENCE_STATUS_KEY,
-            "display": f"evidence: {status}",
+            # A display is interpolated verbatim into the answer, so it is
+            # a sentence a user can read, never the internal status token
+            # (health_advisor#557); the token stays in ``value``.
+            "display": _EVIDENCE_STATUS_SENTENCES.get(
+                status, _EVIDENCE_STATUS_DEFAULT_SENTENCE),
             "value": status,
         },
     }
@@ -1930,6 +2072,18 @@ def render_fact_set(facts: dict[str, dict]) -> str:
     """Render facts for the final model turn in deterministic JSON."""
     return json.dumps(facts or {}, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), default=str)
+
+
+_COLD_START_GUIDANCE_HEAD = (
+    "COLD-START REFUSAL GUIDANCE: when a surface is refusing, use its "
+    "Python-owned status_text placeholder as the sentence to state the "
+    "measured start and current day."
+)
+_COLD_START_GUIDANCE_LINE = (
+    "- %s: use {%s} as the sentence stating "
+    "why this surface is refusing; do not replace it with a "
+    "generic 'unavailable' paraphrase."
+)
 
 
 def cold_start_guidance(facts: dict[str, dict]) -> str:
@@ -1952,18 +2106,10 @@ def cold_start_guidance(facts: dict[str, dict]) -> str:
             continue
         status_text = leaves.get("status_text")
         if status_text:
-            lines.append(
-                f"- {surface}: use {{{status_text}}} as the sentence stating "
-                "why this surface is refusing; do not replace it with a "
-                "generic 'unavailable' paraphrase."
-            )
+            lines.append(_COLD_START_GUIDANCE_LINE % (surface, status_text))
     if not lines:
         return ""
-    return (
-        "COLD-START REFUSAL GUIDANCE: when a surface is refusing, use its "
-        "Python-owned status_text placeholder as the sentence to state the "
-        "measured start and current day.\n" + "\n".join(lines)
-    )
+    return _COLD_START_GUIDANCE_HEAD + "\n" + "\n".join(lines)
 
 
 def scan_template(template: str, facts: dict[str, dict]) -> dict:
@@ -2134,3 +2280,15 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
 # Verbose aliases make the two safety boundaries easy to discover at call sites.
 resolve_template = interpolate_template
 refuse_template = template_refused
+
+
+# Every fixed piece of model-facing steering text this module can put into a
+# prompt (health_advisor#557). ``steering.leak`` rejects any narration that
+# repeats a run of words from these, so adding a new instruction to a prompt
+# without listing it here leaves it unguarded: keep the two together.
+STEERING_TEXTS: tuple[str, ...] = (
+    _GATHERED_DATA_GUIDANCE_TEMPLATE % _GATHERED_DATA_STATUS_KEY,
+    _DECLARED_GUIDANCE_TEMPLATE % (_DECLARED_KEY_PREFIX + "..."),
+    _COLD_START_GUIDANCE_HEAD,
+    _COLD_START_GUIDANCE_LINE % ("...", "..."),
+)

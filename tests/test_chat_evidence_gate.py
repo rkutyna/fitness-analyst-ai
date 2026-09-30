@@ -218,7 +218,10 @@ def test_build_evidence_status_fact_publishes_the_status_string():
         ac.EVIDENCE_STATUS_OUT_OF_DOMAIN)
     assert list(facts) == ["evidence:status"]
     entry = facts["evidence:status"]
-    assert entry["display"] == "evidence: out_of_corpus_domain"
+    # The display reaches the user verbatim, so it is a sentence, never the
+    # internal token (health_advisor#557); the token stays in ``value``.
+    assert "out_of_corpus_domain" not in entry["display"]
+    assert "no source to cite" in entry["display"]
     assert entry["value"] == ac.EVIDENCE_STATUS_OUT_OF_DOMAIN
 
 
@@ -245,7 +248,9 @@ def test_evidence_status_fact_resolves_in_a_template(vault, tmp_path, monkeypatc
         vault, GAAS_QUESTION, "gather evidence", [], str(tmp_path / "ledger.jsonl"),
         evidence_status=ac.EVIDENCE_STATUS_OUT_OF_DOMAIN)
 
-    assert "evidence: out_of_corpus_domain" in result["text"]
+    assert "no source to cite" in result["text"]
+    assert "out_of_corpus_domain" not in result["text"]
+    assert result["mode"] == "narration"
 
 
 def test_evidence_status_does_not_force_a_retry_on_a_data_question(

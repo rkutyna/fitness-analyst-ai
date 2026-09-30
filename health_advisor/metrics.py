@@ -178,6 +178,10 @@ def format_unit_value(value, unit: str, *, signed: bool = False) -> str | None:
     which is what `test_attachment_facts_publish_verbatim_cells_and_python_trends`
     means by "verbatim".
 
+    The word is the sentence's to write, but a model that leaves it out still
+    gets one: ``fact_template.interpolate_template`` appends ``unit_suffix``
+    when the template does not already say the unit (#558, class D).
+
     Durations and clocks keep their own suffixes ("35 min", "7 h 20 m") in
     :func:`format_presentation` because a duration is not a plain number; the
     unit there is part of the notation, not a label after it.
@@ -190,6 +194,90 @@ def format_unit_value(value, unit: str, *, signed: bool = False) -> str | None:
         decimals = _UNIT_PRESENTATION_DECIMALS.get(
             unit, PRESENTATION_MAX_DECIMALS)
     return format_numeric(value, decimals=decimals, signed=signed)
+
+
+# A bare figure ("5.24") carries no unit, on purpose: the PRECISION comes from
+# the unit and the word comes from the sentence (see ``format_unit_value``).
+# That leaves the word to the model, and a model that omits it publishes "your
+# weight was 196.1" and "oxygen fitness is 41.02" (health_advisor#558, class
+# D). ``unit_suffix`` is the Python-owned answer for the seam that interpolates
+# a display into prose: the short unit to append when, and only when, the
+# surrounding template does not already say it. The second element is the
+# closed set of lower-case words that DO already say it, so a template that
+# writes "{fact} miles" is never rendered "5.24 mi miles".
+#
+# Deliberately absent: units whose word is not the unit (``count`` is a step, a
+# flight, or a BMI depending on the metric; ``score`` is a rating with no unit;
+# ``au`` is an index). Those publish bare, and that is a statement of what
+# Python knows, not an omission. ``in`` renders "inches" because the bare
+# preposition "in" is also the most common word to follow a figure.
+_PERCENT_WORDS = frozenset({"%", "percent", "pct", "percentage"})
+_UNIT_SUFFIXES: dict[str, tuple[str, frozenset[str]]] = {
+    "mi": ("mi", frozenset({"mi", "mile", "miles"})),
+    "km": ("km", frozenset({"km", "kilometer", "kilometers", "kilometre",
+                            "kilometres"})),
+    "lb": ("lb", frozenset({"lb", "lbs", "pound", "pounds"})),
+    "kcal": ("kcal", frozenset({"kcal", "kcals", "calorie", "calories",
+                                "cal", "cals"})),
+    "count/min": ("bpm", frozenset({"bpm", "beat", "beats", "breath",
+                                    "breaths", "brpm"})),
+    "bpm": ("bpm", frozenset({"bpm", "beat", "beats"})),
+    "%": ("%", _PERCENT_WORDS),
+    "min": ("min", frozenset({"min", "mins", "minute", "minutes", "m"})),
+    "h": ("h", frozenset({"h", "hr", "hrs", "hour", "hours"})),
+    "ms": ("ms", frozenset({"ms", "millisecond", "milliseconds"})),
+    "W": ("W", frozenset({"w", "watt", "watts"})),
+    "g": ("g", frozenset({"g", "gram", "grams"})),
+    "mg": ("mg", frozenset({"mg", "milligram", "milligrams"})),
+    "mL": ("mL", frozenset({"ml", "milliliter", "milliliters", "millilitre",
+                            "millilitres"})),
+    "cm": ("cm", frozenset({"cm", "centimeter", "centimeters", "centimetre",
+                            "centimetres"})),
+    "m": ("m", frozenset({"m", "meter", "meters", "metre", "metres"})),
+    "in": ("inches", frozenset({"inch", "inches"})),
+    "ft": ("ft", frozenset({"ft", "foot", "feet"})),
+    "ft/s": ("ft/s", frozenset({"ft/s", "fps"})),
+    "mi/hr": ("mph", frozenset({"mph", "mi/hr", "mi", "mile", "miles"})),
+    "dBASPL": ("dB", frozenset({"db", "dba", "decibel", "decibels"})),
+    "degF": ("\u00b0F", frozenset({"\u00b0f", "f", "degree", "degrees",
+                                   "deg"})),
+    "mL/min\u00b7kg": ("mL/min/kg", frozenset({"ml/min/kg", "ml/kg/min",
+                                             "ml"})),
+    "drinks": ("drinks", frozenset({"drink", "drinks"})),
+}
+# ``count`` is a noun that depends on the metric.
+_COUNT_NOUNS = {
+    "step_count": ("steps", frozenset({"step", "steps"})),
+    "flights_climbed": ("flights", frozenset({"flight", "flights"})),
+    "sleep_awakenings": ("awakenings", frozenset({"awakening", "awakenings"})),
+    "number_of_times_fallen": ("falls", frozenset({"fall", "falls", "time",
+                                                    "times"})),
+}
+# ``count/min`` is a heart rate unless the metric says otherwise.
+_RATE_NOUNS = {
+    "respiratory_rate": ("breaths/min", frozenset({"breath", "breaths",
+                                                    "brpm"})),
+    "cycling_cadence": ("rpm", frozenset({"rpm"})),
+}
+
+
+def unit_suffix(unit: str | None, *, metric: str | None = None,
+                field: str | None = None) -> tuple[str, frozenset[str]] | None:
+    """Return ``(suffix, words_that_already_say_it)`` for a bare figure.
+
+    ``None`` means Python knows no unit word for this figure and it stays
+    bare. A percent-change field is a percentage whatever its metric's unit
+    is: ``delta_pct`` of body weight is "%", not "lb".
+    """
+    if isinstance(field, str) and field.endswith("_pct"):
+        return _UNIT_SUFFIXES["%"]
+    if not isinstance(unit, str) or not unit:
+        return None
+    if unit == "count":
+        return _COUNT_NOUNS.get(metric or "")
+    if unit == "count/min" and metric in _RATE_NOUNS:
+        return _RATE_NOUNS[metric]
+    return _UNIT_SUFFIXES.get(unit)
 
 
 def format_presentation(metric: str, value, *, clock_24: bool = False,

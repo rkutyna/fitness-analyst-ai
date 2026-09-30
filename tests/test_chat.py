@@ -760,7 +760,8 @@ def test_fact_template_repair_prompt_carries_exact_digit_refusal(
         vault, "What is my resting heart rate today?", capture=capture)
 
     assert result["mode"] == "narration"
-    assert result["text"] == "Your rate is 60."
+    # The template writes no unit, so Python supplies the rate's (#558).
+    assert result["text"] == "Your rate is 60 bpm."
     assert [entry["attempt"] for entry in capture] == [1, 2]
     assert capture[0]["verification"]["reason"] == (
         "digit outside placeholder")

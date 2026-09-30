@@ -61,7 +61,7 @@ def test_rendered_duration_unit_restatement_retries_measured_shape(
         f"week, including {{{keys[1]}}} minutes in {{{labels[1]}}} and "
         f"{{{keys[2]}}} minutes in {{{labels[2]}}}."
     )
-    good = (f"The three reported durations were {{{keys[0]}}}, {{{keys[1]}}}, "
+    good = (f"The reported durations were {{{keys[0]}}}, {{{keys[1]}}}, "
             f"and {{{keys[2]}}}.")
 
     result, capture = _template_arm(monkeypatch, vault, ledger, [bad, good])

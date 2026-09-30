@@ -166,7 +166,7 @@ def _prose_arm(monkeypatch, vault, answers):
 def _marked_template() -> str:
     # The observed shape exactly: doubled space, then the artifact, then the
     # figure -- here a Python-interpolated one.
-    return ("You logged  \u200b{" + _key() + "} on  \u0308two rides:  "
+    return ("You logged  \u200b{" + _key() + "} on  \u0308both rides:  "
             "\u2060Tuesday and Friday.")
 
 
@@ -188,7 +188,7 @@ def test_template_first_attempt_publishes_clean(monkeypatch, vault, _seeded):
     result, capture = _template_arm(monkeypatch, vault, [_marked_template()])
     assert result["mode"] == "narration"
     assert result["text"].startswith("You logged 77.5")
-    assert "on two rides: Tuesday and Friday." in result["text"]
+    assert "on both rides: Tuesday and Friday." in result["text"]
     _assert_clean(result["text"])
     _assert_clean(capture[0]["prose"])
 

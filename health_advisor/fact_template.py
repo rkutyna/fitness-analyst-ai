@@ -390,6 +390,11 @@ def _date_range_period_label(start: date, end: date) -> str | None:
     """Name a validated inclusive range without inferring its metric."""
     if end < start:
         return None
+    if end == start:
+        # One day is a day, not "from Mon Aug 31 to Mon Aug 31": the range
+        # form read as "on from Mon Aug 31 to Mon Aug 31" in live answers
+        # (health_advisor#558, class C).
+        return _short_period_day(start)
     if end - start == timedelta(days=6):
         return f"the week of {_full_period_day(start)}"
     start_text, end_text = _range_endpoint_texts(start, end)
@@ -1118,7 +1123,10 @@ def build_fact_set(ledger: list[dict]) -> dict[str, dict]:
                 "period": copy.deepcopy(entry["period"]),
                 "field": entry["field"],
                 "value": entry["value"],
-                "unit": _unit_for(entry, units),
+                # A percent-change field is a percentage, not the unit of the
+                # series it describes: ``delta_pct`` of body weight is "%".
+                "unit": ("%" if _is_percent_change_field(entry["field"])
+                         else _unit_for(entry, units)),
                 "display": display,
                 "source": source,
             }))
@@ -2112,13 +2120,111 @@ def cold_start_guidance(facts: dict[str, dict]) -> str:
     return _COLD_START_GUIDANCE_HEAD + "\n" + "\n".join(lines)
 
 
-def scan_template(template: str, facts: dict[str, dict]) -> dict:
+# --- Model-authored numbers (health_advisor#558, class G) -----------------------
+#
+# "Python owns the truth" means no number reaches a user unless Python put it
+# there. Two doors stayed open on the ask path after the digit scan:
+#
+#   1. ``{advice:...}`` admits any digits, so "Start with 2-3 short runs per
+#      week, increasing each run by 5-10 minutes weekly" and "Aim for a bedtime
+#      window of about 30 minutes" passed verification. Neither figure is
+#      published by any tool; both prescribe training or sleep the plan owns.
+#   2. A number SPELLED as a word ("a total of eight sessions") is not a digit,
+#      so the digit scan never saw it.
+#
+# ``scan_template(..., unbacked_numbers=True)`` closes both. The ask path turns
+# it on; the weekly review, which has its own vocabulary gate, does not.
+#
+# THE RULE. In model-written text -- prose outside a slot, and the inside of an
+# advice slot alike -- a number, digit or spelled, is refused unless it is one
+# of these:
+#   * a strength-exercise prescription: a quantity attached to sets, reps,
+#     repetitions, rounds, circuits or seconds ("3 sets of 8 to 12 reps",
+#     "60-90 seconds", "3x10"). This is the one quantity class the advice-to-
+#     circuit flow types into a plan (its bounds are sets, reps, rest, time,
+#     rounds), it is not a jog-minute dial, and no tool could publish it.
+#     Minutes, hours, days, weeks, sessions, runs, miles, pounds, percent and
+#     beats are NOT exempt: those are training load, sleep or body targets.
+#     Dumbbell loads ("10 to 20 pounds") are refused for the same reason
+#     "lose 10 pounds" must be.
+#   * an ordinal word (third, fourth, ...): it numbers a list position, not a
+#     quantity of the user's data; "first" and "second" were never counted.
+#   * a spelled number the user's own question used ("the last two weeks"):
+#     the model is naming the window Python resolved for the question, as
+#     ``_mark_unsupported_period_phrase`` already allows. A digit in prose
+#     stays refused whatever the question said, exactly as before.
+# A digit outside every slot ("1." list numbering, "15-minute walk" quoted
+# from a plan) stays refused as before: the plan's own figures reach the answer
+# as declared facts in a placeholder, never as typed text.
+_WORD_VALUES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_QUANTITY_ATOM = (r"(?:\d+(?:\.\d+)?|"
+                  + "|".join(sorted(_WORD_VALUES, key=len, reverse=True)) + r")")
+_QUANTITY_SPAN = (_QUANTITY_ATOM + r"(?:\s*(?:-|\u2013|\u2014|to|or)\s*"
+                  + _QUANTITY_ATOM + r")?")
+_PRESCRIPTION_RE = re.compile(
+    r"(?<![\w.])" + _QUANTITY_SPAN
+    + r"\s*(?:sets?|reps?|repetitions?|rounds?|circuits?|seconds?|secs?)\b"
+    r"(?:\s+of\s+" + _QUANTITY_SPAN + r"(?:\s*(?:reps?|repetitions?))?)?"
+    r"|(?<![\w.])" + _QUANTITY_SPAN + r"\s*(?:x|\u00d7)\s*" + _QUANTITY_SPAN
+    + r"(?![\w])",
+    re.IGNORECASE)
+_DIGIT_QUANTITY_RE = re.compile(r"(?<![A-Za-z])\d[\d,]*(?:\.\d+)?")
+_ORDINALS = frozenset(_ORDINAL_WORDS)
+ADVICE_QUANTITY_REASON = "advice slot states a quantity Python does not own"
+NUMBER_WORD_REASON = "number word outside placeholder"
+
+
+def _question_quantities(question: str | None) -> tuple[set[str], set[int]]:
+    """The spelled numbers and the values the user's own question used."""
+    text = (question or "").lower()
+    words = {match.group(0) for match in re.finditer(r"[a-z]+", text)}
+    values = {int(match.group(0).replace(",", ""))
+              for match in re.finditer(r"\d[\d,]*", text)
+              if match.group(0).replace(",", "").isdigit()}
+    values |= {_WORD_VALUES[word] for word in words if word in _WORD_VALUES}
+    return words, values
+
+
+def unbacked_quantities(text: str, facts: dict[str, dict] | None = None, *,
+                        question: str | None = None) -> list[str]:
+    """Return the model-authored numbers in ``text`` that the rule refuses.
+
+    ``text`` is model-written prose with every fact placeholder already
+    removed, or the inside of one advice slot. See the rule above.
+    """
+    remaining = _PRESCRIPTION_RE.sub(" ", text or "")
+    found = [match.group(0) for match in _DIGIT_QUANTITY_RE.finditer(remaining)]
+    words, values = _question_quantities(question)
+    for span in number_words(remaining, facts):
+        first = span.split()[0].lower()
+        if first in _ORDINALS:
+            continue
+        if first in words or _WORD_VALUES.get(first) in values:
+            continue
+        found.append(span)
+    return found
+
+
+def scan_template(template: str, facts: dict[str, dict], *,
+                  question: str | None = None,
+                  unbacked_numbers: bool = False) -> dict:
     """Check fact/advice slots and digits outside their spans.
 
     ``{advice:...}`` is the only literal-content exemption. Its contents are
     model-authored coaching guidance, not Python-owned facts, and therefore
     are returned separately for the response/UI label. A slot may not mention
     a canonical vault metric or the user's own data.
+
+    With ``unbacked_numbers`` the exemption narrows to strength prescriptions
+    and spelled numbers stop passing as prose; see ``unbacked_quantities``.
+    ``question`` names the numbers the user themselves used.
     """
     text = template if isinstance(template, str) else ""
     matches = list(_PLACEHOLDER_RE.finditer(text))
@@ -2127,6 +2233,8 @@ def scan_template(template: str, facts: dict[str, dict]) -> dict:
     citation_keys = []
     keys = []
     advice_errors = []
+    unbacked_advice: list[str] = []
+    prose = _PLACEHOLDER_RE.sub(" ", text)
     for match in matches:
         token = match.group(1)
         if token.startswith(_CITE_PREFIX):
@@ -2145,24 +2253,36 @@ def scan_template(template: str, facts: dict[str, dict]) -> dict:
                 # the flagship advice question when the model wrapped
                 # encouragement at both attempts; unwrapping is behaviorally
                 # identical to the model never typing the slot.
-                pass
+                if unbacked_numbers:
+                    unbacked_advice.extend(unbacked_quantities(
+                        content, facts, question=question))
             else:
                 advice_quantities.append(content)
                 violation = _advice_violation(content, facts)
                 if violation:
                     advice_errors.append(violation)
+                elif unbacked_numbers:
+                    unbacked_advice.extend(unbacked_quantities(
+                        content, facts, question=question))
         else:
             keys.append(token)
     unresolved = [key for key in keys if key not in (facts or {})]
     malformed = "{" in stripped or "}" in stripped
     digits = bool(re.search(r"\d", stripped))
+    unbacked_prose = (unbacked_quantities(prose, facts, question=question)
+                      if unbacked_numbers else [])
+    unbacked = unbacked_advice + unbacked_prose
     reason = ("malformed placeholder" if malformed else
               advice_errors[0] if advice_errors else
               "unresolvable placeholder" if unresolved else
-              "digit outside placeholder" if digits else "")
+              "digit outside placeholder" if digits else
+              ADVICE_QUANTITY_REASON if unbacked_advice else
+              NUMBER_WORD_REASON if unbacked_prose else "")
     return {
-        "ok": (not (malformed or unresolved or digits or advice_errors)
+        "ok": (not (malformed or unresolved or digits or advice_errors
+                    or unbacked)
                and bool(text.strip())),
+        "unbacked_numbers": unbacked,
         "placeholders": keys,
         "citations": citation_keys,
         "advice_quantities": advice_quantities,
@@ -2213,6 +2333,172 @@ def _touches_letter(char: str) -> bool:
     return bool(char) and char.isascii() and char.isalpha()
 
 
+# --- The date-slot seam (health_advisor#558, class C) --------------------------
+#
+# A ``period_label`` display is a whole phrase: "from Mon Jun 9 to Mon Aug 31",
+# "the 4 weeks from Mon Jul 27 to Sun Aug 23", "the week of August 24", or a
+# bare day, "Mon Aug 31". The model writes ordinary prose around the slot and
+# has no way to know which phrase Python will put there, so it supplies its
+# own preposition and its own noun: "from {label}", "In {label}", "in the week
+# {label}", "the week from {label}". Read the census (56 live answers) for the
+# results: "from from Tue Jun 9 to ...", "In from Mon Jun 1 to Tue Jun 30",
+# and a four-week window named "the week".
+#
+# The display cannot change (it is the published fact), so the seam trims the
+# model's words instead. ``fit_period_label`` removes only a word that
+# contradicts or duplicates what the label already says, and nothing else:
+#   * a doubled "from", "the" or "the week of";
+#   * a preposition immediately before a label that opens with "from"
+#     ("in/on/for/during/over ... from X to Y" reads "from X to Y");
+#   * a singular window noun ("the week", "the day", "the month") before a
+#     range label. A range label is never one calendar week (that renders
+#     "the week of ..."), so the noun is always wrong and becomes "the
+#     period".
+_LABEL_PREPOSITIONS = frozenset({
+    "in", "on", "for", "during", "over", "across", "within", "throughout",
+    "through", "between",
+})
+_LABEL_ARTICLES = frozenset({"the", "this", "that"})
+_SINGULAR_WINDOW_RE = re.compile(
+    r"\b(?P<article>the|this|that|a)\s+"
+    r"(?:week|day|month|year|weekend|quarter)"
+    r"(?:\s+(?:of|from))?\s*$", re.IGNORECASE)
+_BARE_WEEK_OF_RE = re.compile(r"\b(?:the\s+)?week\s+of\s*$|\bthe\s+week\s*$",
+                              re.IGNORECASE)
+_COUNTED_LABEL_RE = re.compile(r"the \d+ (?:weeks|days) from ")
+_SENTENCE_START_RE = re.compile(r"(?:^|[.!?\n:])[\s*#>\"'\u201c\u2022-]*$")
+
+
+def _last_word(text: str) -> re.Match | None:
+    return re.search(r"([A-Za-z]+)\s*$", text)
+
+
+def _cut_last_word(before: str, label: str) -> tuple[str, str]:
+    """Drop the word that ends ``before``, re-capitalising ``label`` if that
+    word opened the sentence."""
+    match = _last_word(before)
+    trimmed = before[:match.start(1)]
+    if match.group(1)[:1].isupper() and _SENTENCE_START_RE.search(trimmed):
+        label = label[:1].upper() + label[1:]
+    return trimmed, label
+
+
+def fit_period_label(before: str, label: str) -> tuple[str, str]:
+    """Return ``(before, label)`` with the model's own preposition or window
+    noun removed where the label already says it. Pure; touches nothing that
+    is not a duplicate or a contradiction."""
+    is_span = label.startswith("from ")
+    is_counted = bool(_COUNTED_LABEL_RE.match(label))
+    is_week = label.startswith("the week of ")
+    if not (is_span or is_counted or is_week):
+        return before, label
+
+    noun = _SINGULAR_WINDOW_RE.search(before) if (is_span or is_counted) \
+        else _BARE_WEEK_OF_RE.search(before)
+    if noun is not None:
+        if is_span:
+            # "the week from" + "from X to Y": one window, named honestly.
+            article = "The" if noun.group(0)[:1].isupper() else "the"
+            before = before[:noun.start()] + article + " period "
+        else:
+            trimmed = before[:noun.start()]
+            capital = (noun.group(0)[:1].isupper()
+                       and _SENTENCE_START_RE.search(trimmed))
+            before = trimmed
+            if capital:
+                label = label[:1].upper() + label[1:]
+
+    for _ in range(3):
+        match = _last_word(before)
+        if match is None:
+            break
+        word = match.group(1).lower()
+        if is_span and word == "from":
+            label = label[len("from "):]
+            break
+        removable = (word in _LABEL_ARTICLES
+                     or (is_span and word in _LABEL_PREPOSITIONS)
+                     or (is_counted and word == "from"))
+        if not removable:
+            break
+        before, label = _cut_last_word(before, label)
+    return before, label
+
+
+# --- The unit seam (health_advisor#558, class D) --------------------------------
+#
+# A display such as "5.24" is bare by design (``metrics.format_unit_value``).
+# When the template does not follow the slot with a word that already names the
+# unit, Python appends the unit's short form, so "your weight was {mean}" reads
+# "your weight was 196.1 lb". When it does ("{mean} pounds"), nothing is added.
+_BARE_DISPLAY_RE = re.compile(r"[+\-\u2212\u00b1]?\s?\d[\d,]*(?:\.\d+)?\Z")
+_FOLLOWING_TOKEN_RE = re.compile(r"\s*([A-Za-z\u00b0%][A-Za-z\u00b0%/]*)")
+_ORDINAL_FOLLOW_RE = re.compile(r"(?:st|nd|rd|th)\b", re.IGNORECASE)
+# Words that name SOME unit. A template that already wrote one, even a
+# different one, is not given a second: adding "lb" after "kilograms" would
+# publish two units for one figure. Ambiguous English words are left out.
+_ALL_UNIT_WORDS = frozenset(
+    word for _suffix, words in metrics._UNIT_SUFFIXES.values()
+    for word in words) - {"f", "w", "m", "h", "g", "time", "times", "in"} | {
+    # Units the vault has no metric in, which a model still reaches for.
+    "kg", "kgs", "kilogram", "kilograms", "oz", "ounce", "ounces", "kph",
+    "second", "seconds", "sec", "secs", "stone", "yard", "yards"}
+
+
+def unit_suffix_for(fact: dict, following: str) -> str:
+    """Return the text to append to ``fact``'s display, or ``""``.
+
+    ``following`` is the template text right after the slot. Appends only to a
+    bare number, only when Python knows the unit's word, and never when the
+    template already wrote a unit word (or an ordinal suffix) there.
+    """
+    display = str(fact.get("display", ""))
+    if not _BARE_DISPLAY_RE.match(display):
+        return ""
+    spec = metrics.unit_suffix(fact.get("unit"), metric=fact.get("metric"),
+                               field=fact.get("field"))
+    if spec is None:
+        return ""
+    suffix, words = spec
+    if following[:1] == "-" or _ORDINAL_FOLLOW_RE.match(following):
+        return ""
+    token = _FOLLOWING_TOKEN_RE.match(following)
+    if token is not None:
+        word = token.group(1).lower()
+        if word in words or word in _ALL_UNIT_WORDS:
+            return ""
+    return suffix if suffix == "%" else " " + suffix
+
+
+# --- The sentence-edge seam (health_advisor#558, class C, plan days) -----------
+#
+# A text fact is a phrase or a sentence Python wrote ("Rest day.", "Easy jog at
+# a comfortable, conversational pace.", "Full-body strength (strength)"). The
+# model cannot see whether the display ends a sentence, so it guesses at both
+# edges: "{title}." after a display that already ends in a period gives
+# "pace..", and "{title} On Sunday" after one that has none runs two sentences
+# together. ``fit_sentence_edge`` fixes exactly those two:
+#   * a terminal ".", "!" or "?" the template writes directly after a display
+#     that already ends one is dropped;
+#   * a declared (``pub:``) text display with no terminal mark, followed by a
+#     space and a capitalised word, gets a period. That capitalised word is the
+#     next sentence far more often than a proper noun continuing the phrase,
+#     and only declared plan text is treated this way.
+_CLOSERS = ")\"'\u201d\u2019]"
+
+
+def fit_sentence_edge(display: str, following: str, *,
+                      declared: bool) -> tuple[str, int]:
+    """Return ``(display, chars_of_following_to_drop)`` for a text fact."""
+    core = display.rstrip().rstrip(_CLOSERS)
+    if core[-1:] in (".", "!", "?"):
+        doubled = re.match(r"[.!?]+", following)
+        return display, doubled.end() if doubled else 0
+    if declared and re.match(r"[ \t]+[A-Z][a-z]", following):
+        return display + ".", 0
+    return display, 0
+
+
 def interpolate_template(template: str, facts: dict[str, dict], *,
                           advice_quantities: list[str] | None = None) -> str | None:
     """Interpolate a valid template and optionally collect advice spans.
@@ -2221,22 +2507,29 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
     allowing the ask arm to publish the exact advice contents alongside its
     verification result.
 
-    A rendered value is never left touching an adjacent letter in the
-    surrounding template: the model writes placeholders with no space before
-    or after ("...field=mean}in {fact|...", "}to", "}and"), which glues the
-    Python-owned text to the next or previous word ("about8 hours",
-    "146.6ande"). When the template character immediately before or after the
-    placeholder is an ASCII letter, one space is inserted on that side. Three
-    exceptions stay glued, all on the trailing side, and only apply to the
-    template's own character right after the placeholder -- the rendered
-    value's own text is never touched:
-      - an ordinal suffix ("st"/"nd"/"rd"/"th") written directly in the
-        template right after a rendered value that itself ends in a digit
-        (e.g. a day-of-month fact followed by literal "th" in the template);
-      - a possessive "'s": the apostrophe is not an ASCII letter, so this is
-        already unaffected and needs no special case;
-      - anything already separated by whitespace or punctuation, which simply
-        never matches the glue condition above.
+    Three things happen at the seam, and all three are Python's:
+
+    * A rendered value is never left touching an adjacent letter in the
+      surrounding template: the model writes placeholders with no space before
+      or after ("...field=mean}in {fact|...", "}to", "}and"), which glues the
+      Python-owned text to the next or previous word ("about8 hours",
+      "146.6ande"). When the template character immediately before or after
+      the placeholder is an ASCII letter, one space is inserted on that side.
+      Three exceptions stay glued, all on the trailing side, and only apply to
+      the template's own character right after the placeholder -- the rendered
+      value's own text is never touched:
+        - an ordinal suffix ("st"/"nd"/"rd"/"th") written directly in the
+          template right after a rendered value that itself ends in a digit
+          (e.g. a day-of-month fact followed by literal "th" in the template);
+        - a possessive "'s": the apostrophe is not an ASCII letter, so this is
+          already unaffected and needs no special case;
+        - anything already separated by whitespace or punctuation, which
+          simply never matches the glue condition above.
+    * A bare number gets its unit unless the template already wrote it
+      (``unit_suffix_for``).
+    * A date label is fitted to the words the model wrote before it
+      (``fit_period_label``).
+
     Advice spans are model-authored prose already surrounded by ordinary
     template text on both sides, so they are left exactly as written.
     """
@@ -2246,35 +2539,47 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
     if advice_quantities is not None:
         advice_quantities.extend(scan["advice_quantities"])
 
-    def _replace(match: re.Match) -> str:
+    out: list[str] = []
+    position = 0
+    for match in _PLACEHOLDER_RE.finditer(template):
+        segment = template[position:match.start()]
+        position = match.end()
         token = match.group(1)
         if token.startswith(_ADVICE_PREFIX):
-            return token[len(_ADVICE_PREFIX):].strip()
+            out.append(segment)
+            out.append(token[len(_ADVICE_PREFIX):].strip())
+            continue
 
-        rendered = str(facts[token]["display"])
-        before = template[match.start() - 1] if match.start() > 0 else ""
-        after = template[match.end()] if match.end() < len(template) else ""
+        fact = facts[token]
+        rendered = str(fact["display"])
+        end = match.end()
+        if fact.get("field") == "period_label":
+            segment, rendered = fit_period_label(segment, rendered)
+        elif isinstance(fact.get("value"), str):
+            rendered, skip = fit_sentence_edge(
+                rendered, template[end:],
+                declared=token.startswith(_DECLARED_KEY_PREFIX))
+            end += skip
+            position = end
+        rendered += unit_suffix_for(fact, template[end:])
+        before = (segment[-1:] if segment else
+                  template[match.start() - 1] if match.start() > 0 else "")
+        after = template[end] if end < len(template) else ""
 
         prefix = " " if _touches_letter(before) else ""
         suffix = ""
         if _touches_letter(after):
-            next_two = template[match.end():match.end() + 2].lower()
-            after_suffix = template[match.end() + 2:match.end() + 3]
+            next_two = template[end:end + 2].lower()
+            after_suffix = template[end + 2:end + 3]
             is_ordinal = (rendered[-1:].isdigit()
                           and next_two in _ORDINAL_SUFFIXES
                           and not _touches_letter(after_suffix))
             if not is_ordinal:
                 suffix = " "
-        return prefix + rendered + suffix
-
-    return _PLACEHOLDER_RE.sub(_replace, template)
-
-
-    return _PLACEHOLDER_RE.sub(
-        lambda match: (
-            match.group(1)[len(_ADVICE_PREFIX):].strip()
-            if match.group(1).startswith(_ADVICE_PREFIX)
-            else str(facts[match.group(1)]["display"])), template)
+        out.append(segment)
+        out.append(prefix + rendered + suffix)
+    out.append(template[position:])
+    return "".join(out)
 
 
 # Verbose aliases make the two safety boundaries easy to discover at call sites.

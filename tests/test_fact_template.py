@@ -427,7 +427,9 @@ def test_advice_slot_mixed_with_fact_keeps_both_channels_separate():
 ])
 def test_interpolation_never_glues_a_rendered_value_to_a_letter(
         template, display, expected):
-    facts = fact_template.build_fact_set(_ledger(display=display))
+    # ``unit="score"`` is a unit Python has no word for, so this pins the
+    # glue rule alone; the unit seam has its own tests (#558).
+    facts = fact_template.build_fact_set(_ledger(display=display, unit="score"))
     key = fact_template.fact_key("jog_minutes", "2026-08-17", "mean")
 
     assert fact_template.interpolate_template(

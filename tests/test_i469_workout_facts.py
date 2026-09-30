@@ -468,7 +468,7 @@ def test_scan_template_accepts_real_workout_placeholder():
     assert scan["ok"]
     interpolated = fact_template.interpolate_template(
         "Duration: {" + key + "}", facts)
-    assert interpolated == "Duration: 48.3"
+    assert interpolated == "Duration: 48.3 min"
 
 
 def test_scan_template_lets_the_model_pick_the_run_on_a_run_and_walk_day():
@@ -480,7 +480,7 @@ def test_scan_template_lets_the_model_pick_the_run_on_a_run_and_walk_day():
     scan = fact_template.scan_template(template, facts)
     assert scan["ok"]
     assert fact_template.interpolate_template(template, facts) == \
-        "Run: 52.3. Walk: 15.1."
+        "Run: 52.3 min. Walk: 15.1 min."
 
 
 def test_workout_fact_placeholder_prompt_text_is_jargon_free():

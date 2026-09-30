@@ -380,7 +380,7 @@ def _write_window_override(path: str, config: dict) -> None:
 
 def _fallback_answer(verification: dict | None = None) -> str:
     """Render a safe fallback that names known verification failures."""
-    from . import agents
+    from . import agents, fact_template
 
     seed = "I couldn't verify a grounded answer to that question"
     if isinstance(verification, dict):
@@ -392,6 +392,8 @@ def _fallback_answer(verification: dict | None = None) -> str:
             "number word outside placeholder": (
                 "the draft spelled a number outside a Python-owned fact "
                 "placeholder"),
+            fact_template.ADVICE_QUANTITY_REASON: (
+                "the draft prescribed a quantity that no tool published"),
             "ask answer has no tool-call ledger": (
                 "the answer had no tool-call ledger"),
             steering.REASON: (
@@ -796,16 +798,21 @@ _FACT_TEMPLATE_INSTRUCTIONS = (
     "Activity for {fact|metric=jog_minutes|period=s:2026-08-10:2026-08-16|field=period_label}. "
     "Never construct a key from parts, "
     "invent a plausible key, calculate a figure or trend, choose a unit, "
-    "or put digits in surrounding prose. Prescriptive coaching quantities "
-    "such as sets, reps, weights, or durations belong in a literal advice "
-    "slot written as {advice:...}; its contents are model-authored and "
-    "will be visibly labeled as coaching guidance, not your data. Use an "
-    "advice slot only for a span that contains numbers — digit-free "
-    "encouragement is ordinary prose and needs no slot. An advice slot "
-    "must never state the user's measurements or a vault metric; put "
-    "every vault-derived figure in a fact placeholder. "
+    "or put digits in surrounding prose. The only number you may write "
+    "yourself is a strength-exercise prescription (sets, reps, rounds, or "
+    "the seconds of a hold or a rest); it belongs in a literal advice slot "
+    "written as {advice:...}, whose contents are model-authored and will be "
+    "visibly labeled as coaching guidance, not your data. Use an advice slot "
+    "only for a span that contains such numbers — digit-free "
+    "encouragement is ordinary prose and needs no slot. Never write any "
+    "other quantity of your own, in prose or inside an advice slot: no "
+    "minutes, hours, distances, weights, frequencies, targets or windows "
+    "('2-3 runs a week', 'a 30 minute window'), and never spell a number as "
+    "a word ('two', 'five') — say it without a number, or leave it out. An "
+    "advice slot must never state the user's measurements or a vault "
+    "metric; put every vault-derived figure in a fact placeholder. "
     "Qualitative comparisons may remain qualitative. The template may "
-    "contain digits inside a placeholder key or advice slot, but prose "
+    "contain digits inside a placeholder key or an advice slot, but prose "
     "outside slots must contain none. "
     "Avoid common digit traps in this vault's vocabulary: write `VO2` as "
     "oxygen fitness, `last 4 weeks` as recent weeks, and ISO dates as "
@@ -1544,6 +1551,8 @@ def _fact_template_refusal_detail(template: str, scan: dict,
     placeholders, then find digit spans in what remains.  This detail is
     prompt-only; it never participates in interpolation or verification.
     """
+    from . import fact_template
+
     reason = str(verification.get("reason") or scan.get("reason") or "").strip()
     if reason == "digit outside placeholder":
         outside = _FACT_TEMPLATE_PLACEHOLDER_RE.sub("", template)
@@ -1554,6 +1563,16 @@ def _fact_template_refusal_detail(template: str, scan: dict,
             return (f"{reason}; {label}: "
                     + ", ".join(repr(span) for span in spans))
 
+    unbacked = [str(span) for span in scan.get("unbacked_numbers") or []]
+    if unbacked and reason in (fact_template.ADVICE_QUANTITY_REASON,
+                               fact_template.NUMBER_WORD_REASON):
+        label = "offending span" if len(unbacked) == 1 else "offending spans"
+        return (f"{reason}; {label}: "
+                + ", ".join(repr(span) for span in unbacked)
+                + ". Remove it, or state the figure through a fact "
+                "placeholder. Only a strength prescription (sets, reps, "
+                "rounds, seconds) may be a number you wrote yourself.")
+
     unresolved = [str(key) for key in scan.get("unresolved") or []]
     if unresolved:
         label = ("unresolved placeholder key" if len(unresolved) == 1
@@ -1561,6 +1580,23 @@ def _fact_template_refusal_detail(template: str, scan: dict,
         return f"{reason}; {label}: " + ", ".join(
             repr(key) for key in unresolved)
     return reason or "empty template"
+
+
+def _answer_reason(ledger: list, scan: dict) -> str:
+    """The reason a template attempt reports.
+
+    An empty ledger is reported as such, except when the draft was refused for
+    a number Python does not own: an advice-only answer has no ledger by
+    design (#264), so "no tool-call ledger" would name the wrong defect and the
+    repair turn would never be told which quantity to remove (#558).
+    """
+    from . import fact_template
+
+    reason = scan["reason"]
+    if reason in (fact_template.ADVICE_QUANTITY_REASON,
+                  fact_template.NUMBER_WORD_REASON):
+        return reason
+    return "ask answer has no tool-call ledger" if not ledger else reason
 
 
 def _fact_template_figure_count(scan: dict, facts: dict[str, dict]) -> int:
@@ -2863,7 +2899,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     final_status = _ask_loop_outcome(final_status_before,
                                      llm.last_loop_status())
     template = normalise_model_prose(str(raw or "")).strip()
-    scan = fact_template.scan_template(template, facts)
+    scan = fact_template.scan_template(
+        template, facts, question=question, unbacked_numbers=True)
     advice_quantities: list[str] = []
     # A pure advice answer (zero fact placeholders, >=1 labeled advice span)
     # verifies nothing, so an empty gather grounds nothing it needs — without
@@ -2880,8 +2917,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "ok": bool(scan["ok"] and ledger_ok),
         "grounded": bool(scan["ok"] and ledger_ok),
         "unsupported": list(scan["unresolved"]),
-        "reason": ("ask answer has no tool-call ledger" if not ledger else
-                   scan["reason"]),
+        "reason": _answer_reason(ledger, scan),
         "figures_verified": (_fact_template_figure_count(scan, facts)
                               if scan["ok"] else 0),
         "figures_total": _fact_template_figure_count(scan, facts),
@@ -3012,7 +3048,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
     retry_status = _ask_loop_outcome(retry_status_before,
                                      llm.last_loop_status())
     retry_template = normalise_model_prose(str(raw or "")).strip()
-    retry_scan = fact_template.scan_template(retry_template, facts)
+    retry_scan = fact_template.scan_template(
+        retry_template, facts, question=question, unbacked_numbers=True)
     retry_advice_quantities: list[str] = []
     retry_tier_counts = _fact_template_tier_counts(retry_scan, facts)
     retry_verification = {
@@ -3023,8 +3060,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             ledger or (not retry_scan["placeholders"]
                        and retry_scan["advice_quantities"]))),
         "unsupported": list(retry_scan["unresolved"]),
-        "reason": ("ask answer has no tool-call ledger" if not ledger else
-                   retry_scan["reason"]),
+        "reason": _answer_reason(ledger, retry_scan),
         "figures_verified": (_fact_template_figure_count(retry_scan, facts)
                               if retry_scan["ok"] else 0),
         "figures_total": _fact_template_figure_count(retry_scan, facts),

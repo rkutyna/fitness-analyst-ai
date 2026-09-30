@@ -287,45 +287,66 @@ def test_prose_retry_feedback_names_the_count_and_the_itemisation(
 # Fact-template arm — both attempts.
 # --------------------------------------------------------------------------
 
+# Since #558 the template arm refuses ANY spelled number the model wrote, so a
+# stated day count ("two days", "three days") never reaches the day-count gate:
+# the number gate refuses it first, contradicting or not. The day-count gate
+# stays in force on the prose arm above and on ``_mark_contradicted_day_count``
+# itself (unit tests at the top of this file); what these tests pin is that the
+# template arm still withholds the contradiction, under the earlier gate, and
+# still ships a figure-free itemisation.
+ITEMISED = "You cycled on Tuesday and Friday last week."
+
+
 def test_template_first_attempt_contradiction_is_withheld(monkeypatch, vault,
                                                            conn):
     result, capture = _template_arm(
         monkeypatch, vault,
         [_template(CONTRADICTING), _template(CONTRADICTING)])
 
-    assert capture[0]["verification"]["cause"] == "contradicted_day_count"
-    assert "stated 3" in capture[0]["verification"]["reason"]
+    assert capture[0]["verification"]["cause"] == "gate_refused"
+    assert capture[0]["verification"]["reason"] == (
+        "number word outside placeholder")
     assert result["mode"] == "fallback"
     assert "Tuesday and Friday" not in result["text"]
-    assert result["verification"]["cause"] == "contradicted_day_count"
 
 
-def test_template_publishes_the_control_that_differs_only_in_the_count(
+def test_template_refuses_the_spelled_count_even_when_it_is_right(
         monkeypatch, vault, conn):
-    result, _ = _template_arm(monkeypatch, vault, [_template(CONSISTENT)])
+    """The control: a CORRECT spelled count is refused too. No model wrote a
+    figure Python owns, and no itemisation can make it Python's."""
+    result, capture = _template_arm(
+        monkeypatch, vault, [_template(CONSISTENT), _template(CONSISTENT)])
+
+    assert result["mode"] == "fallback"
+    assert capture[0]["verification"]["reason"] == (
+        "number word outside placeholder")
+
+
+def test_template_publishes_an_itemisation_with_no_spelled_count(
+        monkeypatch, vault, conn):
+    result, _ = _template_arm(monkeypatch, vault, [_template(ITEMISED)])
 
     assert result["mode"] == "narration"
     assert result["verification"]["cause"] == "ok"
-    assert CONSISTENT in result["text"]
+    assert ITEMISED in result["text"]
     # The interpolated figure is Python's, and it is still there — the gate
     # refuses answers, it never edits one.
     assert "77.5" in result["text"]
 
 
 def test_template_retry_contradiction_is_withheld(monkeypatch, vault, conn):
-    """Attempt 1 fails on a bare digit; attempt 2 fails on the day count.
+    """Attempt 1 fails on a bare digit; attempt 2 fails on the spelled count.
 
-    Same construction as the prose retry test, and for the same reason: the
-    two attempts must fail for provably different causes, or this test could
+    The two attempts fail for provably different reasons, or this test could
     pass on a first-attempt-only wiring.
     """
     result, capture = _template_arm(
         monkeypatch, vault,
         ["You cycled 3 times last week.", _template(CONTRADICTING)])
 
-    assert capture[0]["verification"]["cause"] == "gate_refused"
-    assert capture[1]["verification"]["cause"] == "contradicted_day_count"
-    assert "stated 3" in capture[1]["verification"]["reason"]
+    assert capture[0]["verification"]["reason"] == "digit outside placeholder"
+    assert capture[1]["verification"]["reason"] == (
+        "number word outside placeholder")
     assert result["mode"] == "fallback"
     assert "Tuesday and Friday" not in result["text"]
 
@@ -334,11 +355,11 @@ def test_template_retry_still_publishes_a_consistent_repair(monkeypatch, vault,
                                                             conn):
     result, capture = _template_arm(
         monkeypatch, vault,
-        ["You cycled 3 times last week.", _template(CONSISTENT)])
+        ["You cycled 3 times last week.", _template(ITEMISED)])
 
     assert capture[0]["verification"]["cause"] == "gate_refused"
     assert result["mode"] == "narration"
-    assert CONSISTENT in result["text"]
+    assert ITEMISED in result["text"]
     assert result["verification"]["cause"] == "ok"
 
 

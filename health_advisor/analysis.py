@@ -461,12 +461,20 @@ def block_comparison(conn, metric: str, block_weeks: int, as_of: str) -> dict:
         blocks[name] = block
 
     if any("mean" not in block for block in blocks.values()):
+        # The window bounds are `date` objects while the blocks are built; a
+        # tool result goes through json.dumps, which refuses them (#563), so
+        # they are published as ISO strings.
+        refused = {
+            name: {key: value.isoformat() if isinstance(value, date) else value
+                   for key, value in block.items()}
+            for name, block in blocks.items()
+        }
         return {
             "metric": metric,
             "block_weeks": block_weeks,
             "as_of": as_of,
             "status": "insufficient_coverage",
-            "blocks": blocks,
+            "blocks": refused,
             "diff": None,
             "mdc95": None,
             "exceeds_mdc95": None,

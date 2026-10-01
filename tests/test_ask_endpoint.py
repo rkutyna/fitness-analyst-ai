@@ -143,7 +143,10 @@ def test_empty_model_response_is_a_visible_fallback_not_a_500(monkeypatch, vault
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["mode"] == "fallback"
-    assert result["text"].startswith("Fallback:")
+    assert result["text"] == chat._fallback_answer(result["verification"])
+    assert result["text"].startswith(
+        "I couldn't give you an answer I could check against your data.")
+    assert not result["text"].startswith("Fallback")
     assert "How am I doing?" not in result["text"]
 
 

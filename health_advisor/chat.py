@@ -378,101 +378,122 @@ def _write_window_override(path: str, config: dict) -> None:
         os.fsync(fh.fileno())
 
 
-def _fallback_answer(verification: dict | None = None) -> str:
-    """Render a safe fallback that names known verification failures."""
-    from . import agents, fact_template
+_FALLBACK_OPENING = ("I couldn't give you an answer I could check against "
+                     "your data.")
+_FALLBACK_CLOSING = ("Try asking about one thing at a time, or a shorter "
+                     "period.")
 
-    seed = "I couldn't verify a grounded answer to that question"
+# The plain-language "why" for each internal refusal reason. The internal
+# reason stays in the response's verification metadata for developers; the
+# client-facing text never repeats it. These sentences carry no digit and no
+# text from the refused answer.
+_FALLBACK_NUMBER = ("My wording included a number I couldn't trace to your "
+                    "records, so I'm not showing it.")
+_FALLBACK_MALFORMED = ("My answer wasn't put together correctly, so I'm not "
+                       "showing it.")
+_FALLBACK_CLAIM = ("My reply made a claim about your data that I couldn't "
+                   "check, so I'm not showing it.")
+_FALLBACK_CITATION = ("I couldn't confirm a source my answer cited, so I'm not "
+                      "showing it.")
+_FALLBACK_MISSING_DATA = ("My answer said some of your data was missing, but I "
+                          "couldn't confirm that from your records.")
+def _fallback_reason_sentences() -> dict[str, str]:
+    """Plain sentence for each exact internal reason, keyed by the constant.
+
+    Built at call time because the reason constants are defined further down
+    this module and in ``fact_template``, so a rename follows the constant.
+    """
+    from . import fact_template
+
+    return {
+        "answer truncated": "My answer was cut off before it was complete.",
+        "digit outside placeholder": _FALLBACK_NUMBER,
+        fact_template.NUMBER_WORD_REASON: _FALLBACK_NUMBER,
+        fact_template.ADVICE_QUANTITY_REASON: (
+            "My suggestion named an amount that none of your records "
+            "support, so I'm not showing it."),
+        "ask answer has no tool-call ledger": (
+            "I didn't look anything up in your records before answering, so "
+            "I'm not showing what I wrote."),
+        steering.REASON: (
+            "My reply wandered away from your question instead of answering "
+            "it."),
+        "malformed placeholder": _FALLBACK_MALFORMED,
+        "unresolvable placeholder": _FALLBACK_MALFORMED,
+        "empty advice slot": _FALLBACK_MALFORMED,
+        "empty conversational answer": _FALLBACK_MALFORMED,
+        "conversational answer contains a placeholder": _FALLBACK_MALFORMED,
+        "citation verification refused": _FALLBACK_CITATION,
+        "citation verifier is unavailable on the chat path":
+            _FALLBACK_CITATION,
+        _DENIED_AVAILABLE_FIGURE_REASON: (
+            "My wording said I had no figure for this, but your records do "
+            "have one, so I'm not showing it."),
+        _WITHHELD_ELIGIBLE_FIGURE_REASON: (
+            "A figure from your records was left out of my answer, so I'm "
+            "not showing it."),
+        "empty narration does not name a missing metric family":
+            _FALLBACK_MISSING_DATA,
+        "empty narration names a metric whose coverage is not missing":
+            _FALLBACK_MISSING_DATA,
+        _WINDOW_DATA_UNAVAILABLE_REASON: (
+            "Your records don't cover the period you asked about."),
+    }
+
+
+# Reasons that embed answer-derived specifics (a phrase, a count, a date) can
+# never be an exact key above. The closed `cause` is stable, so it gives the
+# user a safe generic sentence instead.
+_FALLBACK_CAUSE_SENTENCES = {
+    "unsupported_period_phrase": (
+        "My wording named a time period longer than your data actually "
+        "covers."),
+    "stale_window": (
+        "My wording described a period that ended well before your most "
+        "recent data."),
+    "contradicted_day_count": (
+        "My wording gave a day count that didn't match the days it listed."),
+    "restated_unit": (
+        "My wording repeated a unit that was already shown with the figure."),
+    "conversational_refused": _FALLBACK_CLAIM,
+}
+
+
+def _fallback_answer(verification: dict | None = None) -> str:
+    """Render the plain-language text shown when an answer is refused.
+
+    Two sentences in the usual case: that no answer is shown and why, then
+    what to try. The internal reason is mapped to a plain sentence; one this
+    function does not know gets no middle sentence and is never echoed. The
+    reason stays on the result's ``verification`` for developers.
+
+    The text states a count of unsupported figures, never the figures
+    themselves: repeating one would put a number Python could not bind in
+    front of the user (#370 Done-when 4; the one rule).
+    """
+    middle = ""
     if isinstance(verification, dict):
         reason = str(verification.get("reason") or "").strip()
-        reason_labels = {
-            "answer truncated": "the answer was truncated before it was complete",
-            "digit outside placeholder": (
-                "the draft put a digit outside a Python-owned fact placeholder"),
-            "number word outside placeholder": (
-                "the draft spelled a number outside a Python-owned fact "
-                "placeholder"),
-            fact_template.ADVICE_QUANTITY_REASON: (
-                "the draft prescribed a quantity that no tool published"),
-            "ask answer has no tool-call ledger": (
-                "the answer had no tool-call ledger"),
-            steering.REASON: (
-                "the draft repeated internal instructions instead of "
-                "answering"),
-        }
-        # Some reasons (this one, `restated_unit`, `contradicted_day_count`)
-        # embed draft-derived specifics -- a phrase, a count -- so they can
-        # never sit in `reason_labels` as an exact key. The closed `cause`
-        # is stable, so a label keyed on it can still give the user a safe,
-        # generic sentence instead of falling through to the scrubbed-reason
-        # branch below.
-        cause_labels = {
-            "unsupported_period_phrase": (
-                "the draft named a time period longer than the data "
-                "actually covers"),
-            "stale_window": (
-                "the draft described a period that ended well before your "
-                "most recent data"),
-        }
-        if reason:
-            if reason in reason_labels:
-                reason_text = reason_labels[reason]
-            elif verification.get("cause") in cause_labels:
-                reason_text = cause_labels[verification.get("cause")]
-            else:
-                # Unknown reasons are useful diagnostics, but a reason may
-                # carry a draft-derived number. Never copy numeric literals or
-                # quoted draft text into the client-facing fallback.
-                safe_reason = re.sub(r"(?:[-+]?\d+(?:\.\d+)?)", "a value",
-                                     reason)
-                safe_reason = re.sub(r"[`\"']([^`\"']*)[`\"']", "a value",
-                                     safe_reason)
-                reason_text = f"the draft failed verification ({safe_reason})"
-        else:
-            reason_text = "the numeric verification verdict was unavailable"
-        tokens = []
-        for token in verification.get("unsupported") or []:
-            token = str(token)
-            if token not in tokens:
-                tokens.append(token)
-        numeric_verdict = verification.get("verdict") or {}
-        if (isinstance(numeric_verdict, dict)
-                and "n_failed" in numeric_verdict):
-            try:
-                failed = int(numeric_verdict.get("n_failed", 0))
-                checkable = int(numeric_verdict.get("n_checkable", 0))
-                numeric_status = ("passed" if checkable > 0 and failed == 0
-                                  else "did not pass" if failed else
-                                  "was unavailable")
-            except (TypeError, ValueError):
-                numeric_status = "was unavailable"
-        else:
-            numeric_status = "was unavailable"
-        if tokens:
-            # Count, never the literal: an unsupported token is a figure the
-            # model derived and Python could not bind, and repeating it inside
-            # the refusal would still put an unverified number in front of the
-            # user (#370 Done-when 4; the one rule).
-            count = len(tokens)
-            noun = "one figure" if count == 1 else f"{count} figures"
-            pronoun = "it" if count == 1 else "them"
-            verdict_detail = (f"the numeric verification verdict {numeric_status}; "
-                              if not (reason and numeric_status == "was unavailable")
-                              else "")
-            seed = (f"I couldn't tie {noun} in my draft to your data, so I'm "
-                    f"not showing {pronoun}; {verdict_detail}{reason_text}")
-        else:
-            seed = (f"I couldn't verify the draft; the numeric verification "
-                    f"verdict {numeric_status}; {reason_text}")
-        if reason and numeric_status == "was unavailable" and not tokens:
-            seed = (f"I couldn't verify the draft; {reason_text}")
-    rendered = agents.render_fallback({
-        "talking_points": [{
-            "seed": seed
-        }],
-        "suggestions": [],
-    })
-    return "Fallback: " + rendered
+        middle = _fallback_reason_sentences().get(reason, "")
+        if not middle and reason.startswith("conversational answer "):
+            middle = _FALLBACK_CLAIM
+        if not middle:
+            middle = _FALLBACK_CAUSE_SENTENCES.get(
+                verification.get("cause"), "")
+        if not middle:
+            tokens = []
+            for token in verification.get("unsupported") or []:
+                token = str(token)
+                if token not in tokens:
+                    tokens.append(token)
+            if tokens:
+                count = len(tokens)
+                noun = "one figure" if count == 1 else f"{count} figures"
+                pronoun = "it" if count == 1 else "them"
+                middle = (f"My answer included {noun} I couldn't match to "
+                          f"your data, so I'm not showing {pronoun}.")
+    return " ".join(part for part in (_FALLBACK_OPENING, middle,
+                                      _FALLBACK_CLOSING) if part)
 
 
 def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],

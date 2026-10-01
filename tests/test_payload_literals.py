@@ -142,23 +142,24 @@ def test_fallback_counts_unsupported_figures_and_never_repeats_them():
     two = chat._fallback_answer({"unsupported": ["14", "97"],
                                  "verdict": {"n_checkable": 1, "n_failed": 0}})
     assert "97" not in two and "14" not in two and "2 figures" in two
-    assert "couldn't verify a grounded answer" not in rendered
-    assert "numeric verification verdict passed" in rendered
+    assert "my answer included one figure" in rendered.lower()
+    assert "verdict" not in rendered and "verif" not in rendered.lower()
 
 
 @pytest.mark.parametrize("reason, phrase", [
-    ("answer truncated", "truncated"),
-    ("digit outside placeholder", "digit outside"),
-    ("ask answer has no tool-call ledger", "no tool-call ledger"),
-    ("synthetic verification problem", "synthetic verification problem"),
+    ("answer truncated", "cut off"),
+    ("digit outside placeholder", "number I couldn't trace"),
+    ("ask answer has no tool-call ledger", "didn't look anything up"),
 ])
 def test_fallback_names_nonempty_verification_reasons(reason, phrase):
     rendered = chat._fallback_answer({"reason": reason})
     assert phrase in rendered
-    assert "numeric verification verdict was unavailable" not in rendered
+    assert reason not in rendered
 
 
 def test_fallback_does_not_copy_numeric_detail_from_unknown_reason():
-    rendered = chat._fallback_answer({"reason": "draft value 987.5 was rejected"})
+    reason = "draft value 987.5 was rejected"
+    rendered = chat._fallback_answer({"reason": reason})
     assert "987.5" not in rendered
-    assert "a value" in rendered
+    assert "rejected" not in rendered
+    assert not any(ch.isdigit() for ch in rendered)

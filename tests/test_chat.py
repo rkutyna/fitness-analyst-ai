@@ -21,6 +21,9 @@ from health_advisor.context import VaultContext, VaultOwnershipError
 from tests.conftest import seed_metric
 
 
+_PLAIN_FALLBACK = chat._fallback_answer(None)
+
+
 @pytest.fixture(autouse=True)
 def _seed_model_path_vault(conn):
     """Keep legacy model-orchestration tests off the new day-zero path."""
@@ -661,7 +664,8 @@ def test_truncated_empty_repair_has_reason_and_closed_cause(
     assert result["mode"] == "fallback"
     assert result["verification"]["reason"] == "answer truncated"
     assert result["verification"]["cause"] == "answer_truncated"
-    assert "truncated" in result["text"]
+    assert "cut off" in result["text"]
+    assert "truncated" not in result["text"]
     assert "unavailable" not in result["text"]
     assert [entry["verification"]["reason"] for entry in capture] == [
         "answer truncated", "answer truncated"]
@@ -833,6 +837,14 @@ def test_fact_template_double_rejection_is_one_retry_then_same_fallback(
     assert "63" not in result["text"]
     assert "61" not in result["text"]
     assert result["verification"]["reason"] == "digit outside placeholder"
+    # The user reads plain language; the developer keeps the raw reason, in
+    # the result's metadata above and in the capture below.
+    assert result["text"].startswith(
+        "I couldn't give you an answer I could check against your data.")
+    assert not result["text"].startswith("Fallback")
+    assert "digit outside placeholder" not in result["text"]
+    assert "placeholder" not in result["text"].lower()
+    assert capture[-1]["verification"]["reason"] == "digit outside placeholder"
     assert [entry["attempt"] for entry in capture] == [1, 2]
     assert capture[1]["verification"]["ok"] is False
     assert len(calls) == 3
@@ -1029,7 +1041,7 @@ def test_render_history_pairs_answers_excludes_superseded_and_undelivered_turns(
     )
     a8 = chat.append_turn(
         vault, conversation["id"], "assistant",
-        "Fallback: I couldn't verify a grounded answer.",
+        _PLAIN_FALLBACK,
         answers_turn_id=q7["id"],
         client_disconnected_at="2026-08-25T00:13:26+00:00",
     )
@@ -1050,7 +1062,7 @@ def test_render_history_pairs_answers_excludes_superseded_and_undelivered_turns(
         "ASSISTANT: Compared with the night before, it was 555.68 versus 343.32.",
         "USER: How has my running volume been over the last two weeks?",
     ]
-    assert "Fallback: I couldn't verify a grounded answer." not in rendered
+    assert _PLAIN_FALLBACK not in rendered
 
 
 def test_superseded_turn_stays_in_store_but_not_rendered(vault):

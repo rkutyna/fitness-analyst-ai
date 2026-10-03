@@ -230,6 +230,36 @@ def _close(a: float, b: float, rel_tol: float = 0.005,
     return abs(a - b) <= max(abs_floor, abs(b) * rel_tol)
 
 
+def _payload_decimals(value) -> int | None:
+    """Decimal places a published payload number carries, or None if unknown."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int) or float(value).is_integer():
+        return 0
+    text = repr(float(value))
+    if "e" in text or "E" in text or "." not in text:
+        return None
+    return len(text.split(".", 1)[1])
+
+
+def _same_scope_value(payload_actual: float, sql_actual: float) -> bool:
+    """Whether a payload figure and the SQL recomputation are one quantity.
+
+    Within `_close`, or the payload is the SQL value rounded to the payload's
+    own precision. A brief that publishes a day's 76.9 kcal as 76.9 rounded to
+    a whole number publishes 77, and that is the same quantity presented, not a
+    different scope -- yet 77 against 76.9 is 0.13%, while 23 against 22.6 is
+    1.8% and failed `_close` on every low-energy day (#568). Truncation is not
+    rounding: 76 against 76.9 is still refused.
+    """
+    if _close(payload_actual, sql_actual):
+        return True
+    places = _payload_decimals(payload_actual)
+    if places is None:
+        return False
+    return round(float(sql_actual), places) == round(float(payload_actual), places)
+
+
 def _rule_r_matches(token: str, claim_value) -> bool:
     """Return whether one prose token is exact or legally rounded to a claim."""
     normalized = str(token).strip().rstrip(".,")
@@ -1486,7 +1516,7 @@ def _resolve_operand(conn, operand: dict, as_of: str | None, payload) -> dict:
     payload_actual = payload_hit.get("value") if payload_hit else None
     sql_actual = sql_hit.get("actual")
     if payload_actual is not None and sql_actual is not None:
-        if not _close(payload_actual, sql_actual):
+        if not _same_scope_value(payload_actual, sql_actual):
             return {"ok": False, "reason": "payload/SQL scope disagreement",
                     "payload_actual": payload_actual, "sql_actual": sql_actual,
                     "gap": abs(payload_actual - sql_actual)}
@@ -1626,7 +1656,7 @@ def verify_number(conn, num: dict, as_of: str | None = None,
         sql_hit = (_sql_scoped_value(conn, num, as_of)
                    if conn is not None else {})
         sql_actual = sql_hit.get("actual")
-        if sql_actual is not None and not _close(payload_actual, sql_actual):
+        if sql_actual is not None and not _same_scope_value(payload_actual, sql_actual):
             return {**base, "payload_actual": payload_actual,
                     "sql_actual": sql_actual, "ok": False,
                     "reason": "payload/SQL scope disagreement"}

@@ -1780,7 +1780,7 @@ DECLARED_FACTS_RESULT_KEY = "publishable_facts"
 _DECLARED_KEY_PREFIX = "pub:"
 _DECLARED_MAX_PER_RESULT = 400
 _DECLARED_MAX_ID = 200
-_DECLARED_MAX_TEXT = 200
+_DECLARED_MAX_TEXT = 320
 
 
 def declared_fact_key(fact_id: str) -> str:

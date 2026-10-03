@@ -93,7 +93,7 @@ def test_declared_facts_engine_knows_no_tool_names():
     {"id": "a", "label": "x", "value": float("nan")},
     {"id": "a", "label": "x", "value": float("inf")},
     {"id": "a", "label": "x", "value": "  "},
-    {"id": "a", "label": "x", "value": "v" * 201},
+    {"id": "a", "label": "x", "value": "v" * 321},
     {"id": "a", "label": "x", "value": [1]},
     {"id": "a", "label": "x", "value": 1, "unit": 5},
     {"id": "a\nb", "label": "x", "value": 1},
@@ -335,3 +335,15 @@ def test_no_instruction_the_ask_path_sends_names_a_tool_a_user_could_read():
     assert steering.leak(fact["display"]) is None
     for name in llm.COACH_TOOLS:
         assert name not in fact["display"]
+
+
+def test_declared_text_bound_carries_a_plan_arc_line_whole():
+    # #558: a consumer composes one plan-arc line as a head (up to ~125
+    # characters) plus the plan's intent (at most 160 characters, plus a
+    # stop). At 200 the engine skipped such a line, and the consumer had to
+    # drop the intent from 2 of 207 demo lines to keep the line at all.
+    line = "w" * 290
+    ledger = [_record(1, "t", {DECLARED: [
+        {"id": "arc", "label": "x", "value": line}]})]
+    facts = fact_template.build_declared_facts(ledger)
+    assert facts[fact_template.declared_fact_key("arc")]["value"] == line

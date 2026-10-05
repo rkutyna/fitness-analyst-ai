@@ -183,7 +183,7 @@ def format_unit_value(value, unit: str, *, signed: bool = False) -> str | None:
     gets one: ``fact_template.interpolate_template`` appends ``unit_suffix``
     when the template does not already say the unit (#558, class D).
 
-    Durations and clocks keep their own suffixes ("35 min", "7 h 20 m") in
+    Durations and clocks keep their own suffixes ("35 min", "7 h 20 min") in
     :func:`format_presentation` because a duration is not a plain number; the
     unit there is part of the notation, not a label after it.
     """
@@ -339,16 +339,16 @@ def format_presentation(metric: str, value, *, clock_24: bool = False,
             total = max(0, int(round(total_minutes)))
         prefix = sign + prefix
         hours, minutes = divmod(total, 60)
+        # Minutes are always "min", never a bare "m": "35 m" reads as metres
+        # (consumer #574). Whole hours drop the minutes; with hours the
+        # minutes are zero-padded ("1 h 06 min").
         if hours:
             if compact:
                 return (f"{prefix}{hours}h" if not minutes else
-                        f"{prefix}{hours}h {minutes}m")
+                        f"{prefix}{hours}h {minutes}min")
             return (f"{prefix}{hours} h" if not minutes else
-                    f"{prefix}{hours} h {minutes:02d} m")
-        if metric == "duration_min":
-            return f"{prefix}{minutes} min"
-        return (f"{prefix}{minutes}m" if compact else
-                f"{prefix}{minutes} m")
+                    f"{prefix}{hours} h {minutes:02d} min")
+        return f"{prefix}{minutes} min"
 
     if metric in _DURATION_MINUTE_METRICS:
         return duration(value)

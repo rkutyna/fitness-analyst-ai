@@ -1627,7 +1627,7 @@ def verify_number(conn, num: dict, as_of: str | None = None,
             or num.get("operands") is not None:
         return _verify_derivation(conn, num, as_of, payload)
 
-    # Presentation leaves are exact strings (for example ``7h 20m`` or
+    # Presentation leaves are exact strings (for example ``7 h 20 min`` or
     # ``11:41 PM``).  They are facts published by Python, not values for this
     # verifier to convert back into raw units.
     if (str(num.get("field") or "").strip() == "presentation"

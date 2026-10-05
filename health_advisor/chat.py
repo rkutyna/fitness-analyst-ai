@@ -1739,10 +1739,13 @@ _WITHHELD_ELIGIBLE_FIGURE_REASON = "fact set withheld an eligible figure"
 _CONTRADICTED_DAY_COUNT_REASON = "narration contradicts its own day itemisation"
 _RESTATED_UNIT_REASON = "narration restates a rendered unit"
 
+# The formatter writes durations as "min" and "h" (consumer #574); the legacy
+# bare "m" tail is still recognised on a stored display, and a bare "m" or "h"
+# the model writes after a duration slot is an echo of it like any other.
 _RENDERED_UNIT_WORDS = {
-    "m": frozenset({"minute", "minutes", "min", "mins"}),
-    "min": frozenset({"minute", "minutes", "min", "mins"}),
-    "h": frozenset({"hour", "hours", "hr", "hrs"}),
+    "m": frozenset({"minute", "minutes", "min", "mins", "m"}),
+    "min": frozenset({"minute", "minutes", "min", "mins", "m"}),
+    "h": frozenset({"hour", "hours", "hr", "hrs", "h"}),
 }
 _RENDERED_UNIT_TAIL_RE = re.compile(r"(?:\d+(?:\.\d+)?\s*)(min|m|h)\s*$",
                                     re.IGNORECASE)
@@ -1751,7 +1754,8 @@ _RENDERED_UNIT_TAIL_RE = re.compile(r"(?:\d+(?:\.\d+)?\s*)(min|m|h)\s*$",
 def _rendered_unit(display: object) -> str | None:
     """Return the unit carried by a Python-rendered duration display.
 
-    The formatter emits duration tails as ``m``, ``min``, or ``h``.  Matching
+    The formatter emits duration tails as ``min`` or ``h`` (``m`` on a stored
+    display from before consumer #574).  Matching
     the complete display tail, rather than any unit-looking word, deliberately
     leaves pace strings such as ``14 min/mi`` and clock strings alone.
     """

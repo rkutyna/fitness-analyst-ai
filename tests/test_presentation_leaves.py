@@ -18,12 +18,12 @@ from tests.conftest import seed_metric
 
 
 def test_formatter_handles_both_duration_families_and_all_hour_origins():
-    assert mx.format_presentation("sleep_asleep", 439.69) == "7 h 20 m"
-    assert mx.format_presentation("sleep_time_in_bed", 462.96) == "7 h 43 m"
+    assert mx.format_presentation("sleep_asleep", 439.69) == "7 h 20 min"
+    assert mx.format_presentation("sleep_time_in_bed", 462.96) == "7 h 43 min"
     assert mx.format_presentation("sleep_bedtime", 11.694) == "11:41 PM"
     assert mx.format_presentation("sleep_midpoint", 15.434) == "3:26 AM"
     assert mx.format_presentation("sleep_wake_time", 7.173) == "7:10 AM"
-    assert mx.format_presentation("sleep_midpoint_sd_28d", 1.019) == "± 1 h 01 m"
+    assert mx.format_presentation("sleep_midpoint_sd_28d", 1.019) == "± 1 h 01 min"
     assert mx.format_presentation("wear_hours", 20.0) == "20 h"
     assert mx.format_presentation("sleep_timing_interval_regularity", 89.0) == "89"
 
@@ -111,7 +111,7 @@ def test_mcp_presentation_leaf_reaches_the_ledger_and_is_claimable(conn, tools):
     leaf = result["points"][0]["presentation"]
     assert leaf == {
         "metric": "sleep_asleep", "period": "2026-08-20",
-        "field": "presentation", "value": "7 h 20 m",
+        "field": "presentation", "value": "7 h 20 min",
     }
 
     ledger = [{"sequence": 1, "tool_name": "get_daily_series",
@@ -121,9 +121,9 @@ def test_mcp_presentation_leaf_reaches_the_ledger_and_is_claimable(conn, tools):
                                  "path": "$.result.points[0].presentation.value"}}
     verdict = DV.verify_number(None, claim, payload=ledger)
     assert verdict["ok"] is True
-    assert verdict["actual"] == "7 h 20 m"
+    assert verdict["actual"] == "7 h 20 min"
 
-    prose = "You got 7 h 20 m asleep."
+    prose = "You got 7 h 20 min asleep."
     grounded = DV.verify_coach_claims(None, prose, [claim], payload=ledger)
     assert grounded["ok"] is True
 
@@ -151,7 +151,7 @@ def test_non_unit_fields_never_publish_metric_unit_leaves():
 
     mcp_server._add_stat_presentations(node, "sleep_asleep", "90d")
 
-    assert node["presentations"]["value"]["value"] == "7 h 20 m"
+    assert node["presentations"]["value"]["value"] == "7 h 20 min"
     assert "delta_pct" not in node["presentations"]
     assert "total_delta_pct" not in node["presentations"]
     assert "trend_per_week" not in node["presentations"]
@@ -161,9 +161,9 @@ def test_non_unit_fields_never_publish_metric_unit_leaves():
 
 def test_signed_duration_fields_preserve_sign_and_magnitude():
     assert mx.format_presentation(
-        "sleep_asleep", -45.0, field="delta_vs_baseline") == "-45 m"
+        "sleep_asleep", -45.0, field="delta_vs_baseline") == "-45 min"
     assert mx.format_presentation(
-        "sleep_asleep", 45.0, field="delta_vs_baseline") == "+45 m"
+        "sleep_asleep", 45.0, field="delta_vs_baseline") == "+45 min"
 
 
 @pytest.mark.live
@@ -196,9 +196,9 @@ def test_real_ledger_fact_set_has_only_field_correct_presentations(tmp_path):
             assert leaf["value"] == mx.format_presentation(
                 result["metric"], result[field], field=field)
     assert awake["delta_vs_baseline"] < 0
-    assert awake["presentations"]["delta_vs_baseline"]["value"] != "0 m"
+    assert awake["presentations"]["delta_vs_baseline"]["value"] != "0 min"
     assert stand["delta_vs_baseline"] < 0
-    assert stand["presentations"]["delta_vs_baseline"]["value"] != "0 m"
+    assert stand["presentations"]["delta_vs_baseline"]["value"] != "0 min"
 
     for point in series["points"]:
         assert point["presentation"]["value"] == mx.format_presentation(

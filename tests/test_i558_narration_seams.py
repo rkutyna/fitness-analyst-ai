@@ -198,7 +198,7 @@ def test_a_text_display_and_the_template_share_one_sentence_edge(
      "You covered about {K} of walking and running.",
      "You covered about 5.24 mi of walking and running."),
     ("vo2_max", "mean", 41.02,
-     "Your oxygen fitness is {K}.", "Your oxygen fitness is 41.02 mL/min/kg."),
+     "Your oxygen fitness is {K}.", "Your oxygen fitness is 41.02 mL/min\u00b7kg."),
     ("active_energy", "mean", 94,
      "Your active energy averaged {K}.", "Your active energy averaged 94 kcal."),
     ("resting_heart_rate", "mean", 50,

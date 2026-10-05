@@ -170,8 +170,9 @@ def format_unit_value(value, unit: str, *, signed: bool = False) -> str | None:
     * Appending the catalog unit produces storage vocabulary in prose. With
       the suffix in place, `test_fact_template_repair_prompt_carries_exact_digit_refusal`
       narrated *"Your rate is 60 count/min."* — a person says "60 bpm".
-      `count`, `count/min` and `mL/min·kg` are how the vault stores a unit,
-      not how anyone reads one.
+      `count` and `count/min` are how the vault stores a unit, not how anyone
+      reads one. (`mL/min·kg` is the one storage spelling a reader does get:
+      it is the fact's own ``unit``, so the suffix and the unit agree, #574.)
 
     Attachment tables are the same story from the other side: the unit is
     already in the column header, so repeating it in every cell is noise —
@@ -241,8 +242,11 @@ _UNIT_SUFFIXES: dict[str, tuple[str, frozenset[str]]] = {
     "dBASPL": ("dB", frozenset({"db", "dba", "decibel", "decibels"})),
     "degF": ("\u00b0F", frozenset({"\u00b0f", "f", "degree", "degrees",
                                    "deg"})),
-    "mL/min\u00b7kg": ("mL/min/kg", frozenset({"ml/min/kg", "ml/kg/min",
-                                             "ml"})),
+    # One spelling: the suffix is the fact's own ``unit`` (consumer #574
+    # rendered "N mL/min/kg mL/min\u00b7kg"). The others are echoes of it.
+    "mL/min\u00b7kg": ("mL/min\u00b7kg", frozenset({
+        "ml/min\u00b7kg", "ml/min/kg", "ml/kg/min", "ml/kg\u00b7min",
+        "ml/(kg\u00b7min)", "ml/(kg*min)", "ml"})),
     "drinks": ("drinks", frozenset({"drink", "drinks"})),
 }
 # ``count`` is a noun that depends on the metric.
@@ -278,6 +282,28 @@ def unit_suffix(unit: str | None, *, metric: str | None = None,
     if unit == "count/min" and metric in _RATE_NOUNS:
         return _RATE_NOUNS[metric]
     return _UNIT_SUFFIXES.get(unit)
+
+
+def unit_echo_forms(unit: str | None, *, metric: str | None = None,
+                    field: str | None = None) -> frozenset[str]:
+    """Every lower-case spelling that already says this fact's unit.
+
+    The table's words, plus the suffix Python would append and the fact's own
+    ``unit``, so a model that copies the unit it was shown is recognised in
+    whatever spelling the engine itself uses for it. One derivation for every
+    unit; empty when Python knows no unit word for the figure. The generic
+    ``count`` is a storage noun, not a spelling of any unit, and a percent
+    field's unit is its suffix, not the series' unit.
+    """
+    spec = unit_suffix(unit, metric=metric, field=field)
+    if spec is None:
+        return frozenset()
+    suffix, words = spec
+    own = {suffix.lower()}
+    percent = isinstance(field, str) and field.endswith("_pct")
+    if isinstance(unit, str) and unit and unit != "count" and not percent:
+        own.add(unit.lower())
+    return words | own
 
 
 def format_presentation(metric: str, value, *, clock_24: bool = False,

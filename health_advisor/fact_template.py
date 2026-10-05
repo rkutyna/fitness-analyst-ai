@@ -20,6 +20,7 @@ from . import deepdive_verify as _verify
 from . import metrics
 from . import normalize
 from . import subjective as _subjective
+from .numeric_tokens import normalise_model_prose
 
 
 _KEY_SEPARATOR = "|"
@@ -2654,6 +2655,10 @@ def fit_period_label(before: str, label: str) -> tuple[str, str]:
 # "your weight was 196.1 lb". When it does ("{mean} pounds"), nothing is added.
 _BARE_DISPLAY_RE = re.compile(r"[+\-\u2212\u00b1]?\s?\d[\d,]*(?:\.\d+)?\Z")
 _FOLLOWING_TOKEN_RE = re.compile(r"\s*([A-Za-z\u00b0%][A-Za-z\u00b0%/]*)")
+# A compound unit ("mL/min\u00b7kg", "ml/(kg\u00b7min)") is one token for the echo
+# check; the plain token above stops at the first "\u00b7" or "(".
+_FOLLOWING_COMPOUND_RE = re.compile(
+    r"\s*([A-Za-z\u00b0%][A-Za-z\u00b0%/\u00b7*()]*)")
 _ORDINAL_FOLLOW_RE = re.compile(r"(?:st|nd|rd|th)\b", re.IGNORECASE)
 # Words that name SOME unit. A template that already wrote one, even a
 # different one, is not given a second: adding "lb" after "kilograms" would
@@ -2680,13 +2685,25 @@ def unit_suffix_for(fact: dict, following: str) -> str:
                                field=fact.get("field"))
     if spec is None:
         return ""
-    suffix, words = spec
+    suffix, _words = spec
     if following[:1] == "-" or _ORDINAL_FOLLOW_RE.match(following):
         return ""
+    # Every spelling the engine uses for this fact's unit is an echo of it,
+    # so the model's own copy renders once (consumer #574).
+    echoes = metrics.unit_echo_forms(fact.get("unit"),
+                                     metric=fact.get("metric"),
+                                     field=fact.get("field"))
+    compound = _FOLLOWING_COMPOUND_RE.match(following)
+    if compound is not None:
+        form = compound.group(1)
+        while form.endswith(")") and form.count(")") > form.count("("):
+            form = form[:-1]
+        if form.lower() in echoes:
+            return ""
     token = _FOLLOWING_TOKEN_RE.match(following)
     if token is not None:
         word = token.group(1).lower()
-        if word in words or word in _ALL_UNIT_WORDS:
+        if word in echoes or word in _ALL_UNIT_WORDS:
             return ""
     return suffix if suffix == "%" else " " + suffix
 
@@ -2720,6 +2737,54 @@ def fit_sentence_edge(display: str, following: str, *,
     return display, 0
 
 
+# --- The status-sentence seam (consumer #574, obs 2) ----------------------------
+#
+# A status fact's display is a whole sentence Python wrote, and the guidance
+# tells the model to use it "verbatim". A model that copies the sentence into
+# its own prose AND adds the slot makes the user read it twice. The scan cannot
+# refuse that (the prose is plain words), and repairing it costs a turn for a
+# defect with one right answer, so the renderer drops the slot and the prose
+# copy stays. The scan is untouched: the slot is still in ``placeholders``, so
+# whatever verifies the status (``gathered_data_uncited``) still sees it used.
+_STATUS_FACT_KEYS = frozenset({_GATHERED_DATA_STATUS_KEY, _EVIDENCE_STATUS_KEY})
+_ABSENT = "\x00"
+
+
+def is_status_fact(key: str, fact: dict | None) -> bool:
+    """Whether a fact is a Python-written status SENTENCE.
+
+    The gathered-data and evidence statuses, and a cold-start surface's
+    ``status_text`` leaf. Its ``status`` leaf is a token, not a sentence.
+    """
+    if key in _STATUS_FACT_KEYS:
+        return True
+    path = fact.get("path", key) if isinstance(fact, dict) else key
+    match = _COLD_START_PATH_RE.fullmatch(str(path))
+    return bool(match and match.group(2) == "status_text")
+
+
+def _prose_text(text: str) -> str:
+    """Whitespace-collapsed, artifact-free form used to compare prose."""
+    return re.sub(r"\s+", " ", normalise_model_prose(text)).strip()
+
+
+def _literal_prose(template: str) -> str:
+    """The template's own words, in order, with every fact slot marked absent.
+
+    Advice contents are rendered as written, so they are prose here. A slot
+    becomes a marker no display contains, so a match never spans one.
+    """
+    parts, position = [], 0
+    for match in _PLACEHOLDER_RE.finditer(template):
+        parts.append(template[position:match.start()])
+        token = match.group(1)
+        parts.append(token[len(_ADVICE_PREFIX):] if
+                     token.startswith(_ADVICE_PREFIX) else _ABSENT)
+        position = match.end()
+    parts.append(template[position:])
+    return _prose_text("".join(parts))
+
+
 def interpolate_template(template: str, facts: dict[str, dict], *,
                           advice_quantities: list[str] | None = None) -> str | None:
     """Interpolate a valid template and optionally collect advice spans.
@@ -2750,6 +2815,8 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
       (``unit_suffix_for``).
     * A date label is fitted to the words the model wrote before it
       (``fit_period_label``).
+    * A status slot whose sentence the template's own prose already contains,
+      verbatim, is dropped, so the reader meets it once (consumer #574).
 
     Advice spans are model-authored prose already surrounded by ordinary
     template text on both sides, so they are left exactly as written.
@@ -2762,6 +2829,7 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
 
     out: list[str] = []
     position = 0
+    prose = None
     for match in _PLACEHOLDER_RE.finditer(template):
         segment = template[position:match.start()]
         position = match.end()
@@ -2772,6 +2840,20 @@ def interpolate_template(template: str, facts: dict[str, dict], *,
             continue
 
         fact = facts[token]
+        if is_status_fact(token, fact):
+            sentence = _prose_text(str(fact["display"]))
+            if prose is None:
+                prose = _literal_prose(template)
+            if sentence and sentence in prose:
+                following = template[position:]
+                gap = len(following) - len(following.lstrip(" \t"))
+                if following[gap:].strip():
+                    position += gap
+                    out.append(segment)
+                else:
+                    out.append(segment.rstrip(" \t"))
+                    position = len(template)
+                continue
         rendered = str(fact["display"])
         end = match.end()
         if fact.get("field") == "period_label":

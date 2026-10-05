@@ -7,6 +7,11 @@ from statistics import median
 from . import vault as V
 
 
+# Stages 1-4 are the base protocol; a protocol may extend it with further
+# optional stages. The bound is this one constant, and the `benchmark` table's
+# CHECK (health_advisor/db.py) must name the same number -- a test holds them
+# together.
+MAX_STAGE = 8
 STAGE_MINUTES = 4
 WARMUP_MINUTES = 8
 RECOVERY_MINUTES = 2
@@ -92,8 +97,8 @@ def record(conn, *, date: str, stage: int, pace: str | float | int,
     Whenever records exist, Python recomputes the final-two-minute median and
     ignores the caller's number (the project's "Python owns the truth" rule).
     """
-    if not 1 <= int(stage) <= 4:
-        raise ValueError("benchmark stage must be between 1 and 4")
+    if not 1 <= int(stage) <= MAX_STAGE:
+        raise ValueError(f"benchmark stage must be between 1 and {MAX_STAGE}")
     computed, records_exist = _median_from_records(
         conn, date, int(stage), stage_start_utc, stage_end_utc,
     )

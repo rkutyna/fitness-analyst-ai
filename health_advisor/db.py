@@ -391,6 +391,85 @@ def _migrate_review_questions_kind_constraint(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+_BENCHMARK_DDL = """
+        CREATE TABLE IF NOT EXISTS {name} (
+            date TEXT NOT NULL,
+            stage INTEGER NOT NULL CHECK (stage BETWEEN 1 AND 8),
+            pace_min_per_mi REAL NOT NULL,
+            median_hr_last_two_min REAL,
+            talk_test TEXT,
+            temp_c REAL,
+            dew_point_c REAL,
+            notes TEXT,
+            -- How median_hr_last_two_min was arrived at. A protocol-derived
+            -- window is a GUESS about session structure (8 min warmup, then
+            -- 4-on/2-off), so a stage timed differently produces a plausible
+            -- wrong number. Recording the provenance is what lets a reader
+            -- tell those apart instead of trusting all stages equally.
+            median_source TEXT,
+            PRIMARY KEY (date, stage)
+        )
+        """
+
+_BENCHMARK_COLUMNS = (
+    "date", "stage", "pace_min_per_mi", "median_hr_last_two_min", "talk_test",
+    "temp_c", "dew_point_c", "notes", "median_source",
+)
+
+
+def _benchmark_stage_bound(conn: sqlite3.Connection) -> int | None:
+    """The upper stage bound the stored `benchmark` DDL declares, if any."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'benchmark'"
+    ).fetchone()
+    if row is None:
+        return None
+    found = re.search(r"stage\s+BETWEEN\s+1\s+AND\s+(\d+)", row[0] or "", re.I)
+    return int(found.group(1)) if found else None
+
+
+def _benchmark_needs_migration(conn: sqlite3.Connection) -> bool:
+    """Whether an existing `benchmark` table carries a stale stage CHECK.
+
+    The table was created with `stage BETWEEN 1 AND 4`; the protocol later
+    gained optional stages (consumer #571). SQLite has no ALTER CHECK, so such
+    a vault needs a table rebuild. A fresh vault, or one already rebuilt,
+    declares the current bound and is left alone.
+    """
+    from . import benchmark
+    bound = _benchmark_stage_bound(conn)
+    return bound is not None and bound != benchmark.MAX_STAGE
+
+
+def _migrate_benchmark_stage_constraint(conn: sqlite3.Connection) -> None:
+    """Rebuild `benchmark` under the current stage CHECK, row for row."""
+    if not _benchmark_needs_migration(conn):
+        return
+    have = {row[1] for row in conn.execute("PRAGMA table_info(benchmark)")}
+    expressions = [c if c in have else "NULL" for c in _BENCHMARK_COLUMNS]
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DROP INDEX IF EXISTS idx_benchmark_date")
+        conn.execute("DROP TABLE IF EXISTS benchmark__new")
+        conn.execute(_BENCHMARK_DDL.format(name="benchmark__new"))
+        # rowid is copied too, so the rebuild is byte-for-byte.
+        conn.execute(
+            f"INSERT INTO benchmark__new (rowid, {', '.join(_BENCHMARK_COLUMNS)}) "
+            f"SELECT rowid, {', '.join(expressions)} FROM benchmark"
+        )
+        conn.execute("DROP TABLE benchmark")
+        conn.execute("ALTER TABLE benchmark__new RENAME TO benchmark")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def _apply_table_migrations(conn: sqlite3.Connection) -> None:
     """Create additive projection tables before the canonical schema indexes."""
     for ddl in _ADDED_TABLES.values():
@@ -418,6 +497,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     # assistant-only trigger on an existing vault.
     _migrate_conversation_turns_answers_constraint(conn)
     _migrate_review_questions_kind_constraint(conn)
+    _migrate_benchmark_stage_constraint(conn)
     # Recreate the append-only trigger below so existing vaults gain the sole
     # permitted mutation: a one-way delivered_at stamp.
     conn.execute("DROP TRIGGER IF EXISTS conversation_turns_no_update")
@@ -438,29 +518,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _apply_table_migrations(conn)
     conn.executescript(SCHEMA_PATH.read_text())
     # W7-7: the treadmill benchmark is deliberately outside the raw workout
-    # schema. Its four stage rows are a hand-recorded instrument, not Apple
+    # schema. Its stage rows are a hand-recorded instrument, not Apple
     # Health workout data, and must survive re-ingestion of that data.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS benchmark (
-            date TEXT NOT NULL,
-            stage INTEGER NOT NULL CHECK (stage BETWEEN 1 AND 4),
-            pace_min_per_mi REAL NOT NULL,
-            median_hr_last_two_min REAL,
-            talk_test TEXT,
-            temp_c REAL,
-            dew_point_c REAL,
-            notes TEXT,
-            -- How median_hr_last_two_min was arrived at. A protocol-derived
-            -- window is a GUESS about session structure (8 min warmup, then
-            -- 4-on/2-off), so a stage timed differently produces a plausible
-            -- wrong number. Recording the provenance is what lets a reader
-            -- tell those apart instead of trusting all four equally.
-            median_source TEXT,
-            PRIMARY KEY (date, stage)
-        )
-        """
-    )
+    conn.execute(_BENCHMARK_DDL.format(name="benchmark"))
     conn.execute("CREATE INDEX IF NOT EXISTS idx_benchmark_date ON benchmark (date)")
     # Keep this second pass for a partially-created database where the table
     # did not exist during the pre-schema pass.

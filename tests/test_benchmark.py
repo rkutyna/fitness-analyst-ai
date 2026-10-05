@@ -156,3 +156,131 @@ def test_get_benchmark_series_status_is_not_the_bare_count(tools, conn):
         "get_benchmark_series returned a bare count with no status string -- "
         "this is issue #81's defect: an empty table now reads as 'never run'"
     )
+
+
+# Consumer #571: the protocol gained optional stages beyond the fourth, so the
+# stage bound is one named constant, enforced identically by record() and by
+# the table's CHECK, and an existing vault's old CHECK is migrated.
+
+
+OLD_BENCHMARK_DDL = """
+CREATE TABLE benchmark (
+    date TEXT NOT NULL,
+    stage INTEGER NOT NULL CHECK (stage BETWEEN 1 AND 4),
+    pace_min_per_mi REAL NOT NULL,
+    median_hr_last_two_min REAL,
+    talk_test TEXT,
+    temp_c REAL,
+    dew_point_c REAL,
+    notes TEXT,
+    median_source TEXT,
+    PRIMARY KEY (date, stage)
+)
+"""
+
+
+def _table_sql(conn) -> str:
+    return conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'benchmark'"
+    ).fetchone()[0]
+
+
+def test_record_accepts_every_stage_up_to_the_named_maximum(conn):
+    assert benchmark.MAX_STAGE == 8
+    for stage in range(1, benchmark.MAX_STAGE + 1):
+        benchmark.record(conn, date="2030-01-05", stage=stage, pace="10:00",
+                         median_hr_last_two_min=120 + stage)
+    assert [r["stage"] for r in benchmark.series(conn)] == list(range(1, 9))
+
+
+@pytest.mark.parametrize("stage", [0, 9, -1])
+def test_record_refuses_a_stage_outside_the_bound(conn, stage):
+    with pytest.raises(ValueError, match="between 1 and 8"):
+        benchmark.record(conn, date="2030-01-05", stage=stage, pace="10:00",
+                         median_hr_last_two_min=120)
+    assert benchmark.series(conn) == []
+
+
+def test_the_table_check_and_the_constant_cannot_drift(conn):
+    # A fresh vault's CHECK must name the same bound record() enforces.
+    assert f"BETWEEN 1 AND {benchmark.MAX_STAGE}" in _table_sql(conn).upper()
+    with pytest.raises(Exception, match="CHECK"):
+        conn.execute("INSERT INTO benchmark (date, stage, pace_min_per_mi) "
+                     "VALUES ('2030-01-05', ?, 10.0)", (benchmark.MAX_STAGE + 1,))
+    conn.execute("INSERT INTO benchmark (date, stage, pace_min_per_mi) "
+                 "VALUES ('2030-01-05', ?, 10.0)", (benchmark.MAX_STAGE,))
+
+
+def test_the_tool_docstring_states_the_same_bound():
+    from health_advisor import mcp_server
+    assert f"1 to {benchmark.MAX_STAGE}" in mcp_server.record_benchmark.__doc__
+
+
+def test_an_explicit_window_stage_five_is_stored_as_explicit_records(conn):
+    local_date = "2030-01-05"
+    start = datetime(2030, 1, 5, 12, 0, tzinfo=timezone.utc)
+    _record_hr(conn, start, [150.0] * 6 + [160.0, 162.0, 164.0, 166.0, 168.0, 170.0],
+               local_date)
+    benchmark.record(conn, date=local_date, stage=5, pace="11:07",
+                     median_hr_last_two_min=999,
+                     stage_start_utc="2030-01-05T12:00:00Z",
+                     stage_end_utc="2030-01-05T12:04:00Z")
+    row = benchmark.series(conn)[0]
+    assert row["stage"] == 5
+    assert row["median_source"] == "records:explicit"
+    assert row["median_hr_last_two_min"] != 999
+
+
+def test_a_vault_with_the_old_check_is_rebuilt_without_losing_a_row(tmp_path):
+    path = tmp_path / "old.db"
+    c = db.connect(path)
+    db.init_db(c)
+    c.execute("DROP TABLE benchmark")
+    c.execute(OLD_BENCHMARK_DDL)
+    c.execute("CREATE INDEX idx_benchmark_date ON benchmark (date)")
+    for date in ("2030-01-05", "2030-02-02"):
+        for stage in range(1, 5):
+            c.execute(
+                "INSERT INTO benchmark VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (date, stage, 15.0 - stage, 130.0 + stage, f"talk {stage}",
+                 21.5, 12.25, f"note {date} {stage}",
+                 ("typed", "records:explicit", "records:protocol", None)[stage - 1]),
+            )
+    c.commit()
+    assert "BETWEEN 1 AND 4" in _table_sql(c)
+    with pytest.raises(Exception, match="CHECK"):
+        c.execute("INSERT INTO benchmark (date, stage, pace_min_per_mi) "
+                  "VALUES ('2030-01-05', 5, 10.0)")
+    c.rollback()
+    before = c.execute("SELECT rowid, * FROM benchmark ORDER BY rowid").fetchall()
+    before = [tuple(r) for r in before]
+    c.close()
+
+    c = db.connect(path)
+    db.init_db(c)
+    after = [tuple(r) for r in
+             c.execute("SELECT rowid, * FROM benchmark ORDER BY rowid").fetchall()]
+    assert after == before and len(after) == 8
+    assert f"BETWEEN 1 AND {benchmark.MAX_STAGE}" in _table_sql(c).upper()
+    # the date index and the (date, stage) key survive the rebuild
+    assert "idx_benchmark_date" in {
+        r[1] for r in c.execute("PRAGMA index_list(benchmark)")}
+    with pytest.raises(Exception, match="UNIQUE|PRIMARY"):
+        c.execute("INSERT INTO benchmark (date, stage, pace_min_per_mi) "
+                  "VALUES ('2030-01-05', 1, 10.0)")
+    c.rollback()
+    benchmark.record(c, date="2030-02-02", stage=5, pace="11:07",
+                     median_hr_last_two_min=150)
+    assert (len(benchmark.series(c)), after == before) == (9, True)
+    sql_before = _table_sql(c)
+    c.close()
+
+    # A second open is a no-op: same DDL, same rows.
+    c = db.connect(path)
+    db.init_db(c)
+    assert _table_sql(c) == sql_before
+    assert len(benchmark.series(c)) == 9
+    assert [tuple(r) for r in c.execute(
+        "SELECT rowid, * FROM benchmark WHERE stage <= 4 ORDER BY rowid")
+    ] == before
+    c.close()

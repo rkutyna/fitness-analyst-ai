@@ -2769,7 +2769,8 @@ def record_benchmark(ctx: VaultContext, date: str, stage: int, pace: str,
 
     Protocol: 4 x 4 min at 15:00 / 14:00 / 13:00 / 12:00 min/mi, the median HR
     of each stage's LAST TWO MINUTES, a spoken sentence per stage, stop at HR
-    170 or loss of speech.
+    170 or loss of speech. A protocol may extend this with further optional
+    stages; any stage from 1 to 8 is accepted.
     Call once per completed stage. A run stopped early stores the stages that
     were completed and nothing for the rest — never a zero.
 
@@ -2817,8 +2818,8 @@ def get_benchmark_series(ctx: VaultContext, *, runs_recorded: int | None = None)
     The returned `heat_effect_bpm_per_c` record carries that citation beside
     the literature figure.
 
-    Compare stages ACROSS dates, never stages within one date — the four paces
-    are four different efforts. Read `median_source` before comparing: a
+    Compare stages ACROSS dates, never stages within one date — each stage's
+    pace is a different effort. Read `median_source` before comparing: a
     "records:protocol" median came from an inferred window.
 
     The engine keeps no register of benchmark runs — only this vault's stage

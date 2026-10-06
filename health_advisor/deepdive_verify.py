@@ -174,9 +174,11 @@ def metric_ownership_sentence() -> str:
 def subjective_claim_metadata_sentence() -> str:
     return ("`get_subjective` keeps flat day fields and adds `period` equal to "
             "the day plus `field_metrics` for the non-null rating fields "
-            "(`stress`, `soreness`, `energy`, `sleep_quality`); cite the "
-            "direct field with its mapped `subjective_*` metric, and omit "
-            "`metric` for fields absent from `field_metrics`.")
+            "(`stress`, `soreness`, `energy`, `sleep_quality`) and drink "
+            "counts (`caffeine_drinks`, `alcohol_drinks`); cite the direct "
+            "field with its mapped metric (`subjective_*` for a rating, the "
+            "drink metric of the same name for a count), and omit `metric` "
+            "for fields absent from `field_metrics`.")
 
 
 def workout_count_claim_metadata_sentence() -> str:

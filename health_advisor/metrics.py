@@ -121,7 +121,9 @@ PRESENTATION_MAX_DECIMALS = 2
 _UNIT_PRESENTATION_DECIMALS = {
     "count": 0,
     "count/min": 0,
-    "drinks": 0,
+    # No entry for "drinks": a day's count is whatever was logged (a half drink
+    # is 0.5), so it keeps the default precision instead of being rounded to a
+    # whole drink ("2.5" must not read "2", consumer #578).
     "%": 1,
     "kcal": 0,
     "lb": 1,

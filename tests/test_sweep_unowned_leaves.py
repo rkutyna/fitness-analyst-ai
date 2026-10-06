@@ -270,9 +270,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "get_subjective": {
-        "UM": """
-            .days[].alcohol_drinks .days[].caffeine_drinks
-        """,
         "AMB": """
             .count
         """,
@@ -357,7 +354,6 @@ KNOWN: dict[str, dict[str, str]] = {
 # one is a fix that should shrink this table.
 GATE_SEES_WITHOUT_SLOT: dict[str, set[str]] = {
     "get_intraday": {"heart_rate", "step_count"},
-    "get_subjective": {"alcohol_drinks", "caffeine_drinks"},
 }
 
 GAP_LABELS = ("UM", "AMB", "DW")

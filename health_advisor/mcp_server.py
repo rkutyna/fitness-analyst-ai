@@ -2257,9 +2257,10 @@ def get_subjective(ctx: VaultContext, start_date: str, end_date: str) -> dict:
 
     `get_subjective` keeps flat day fields and adds `period` equal to the day
     plus `field_metrics` for the non-null rating fields (`stress`, `soreness`,
-    `energy`, `sleep_quality`); cite the direct field with its mapped
-    `subjective_*` metric, and omit `metric` for fields absent from
-    `field_metrics`."""
+    `energy`, `sleep_quality`) and drink counts (`caffeine_drinks`,
+    `alcohol_drinks`); cite the direct field with its mapped metric
+    (`subjective_*` for a rating, the drink metric of the same name for a
+    count), and omit `metric` for fields absent from `field_metrics`."""
     if err := _bad_dates(start=start_date, end=end_date):
         return {"ok": False, "error": err}
     # Read-only, like every other read tool. This one opened the 3.6 GB DB
@@ -2278,6 +2279,17 @@ def get_subjective(ctx: VaultContext, start_date: str, end_date: str) -> dict:
                 "note": "no check-ins have ever been recorded"}
     finally:
         conn.close()
+    for row in days:
+        # The drink counts are published like any daily metric value: Python
+        # renders them with the one formatter, beside the raw figure, so the
+        # same day reads identically here and in get_daily_series.
+        for field in subj.COUNT_FIELDS:
+            if row.get(field) is None:
+                continue
+            leaf = mx.presentation_leaf(subj.METRIC_NAMES[field], row["period"],
+                                        row[field])
+            if leaf is not None:
+                row.setdefault("presentations", {})[field] = leaf
     return {"days": days, "count": len(days)}
 
 

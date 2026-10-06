@@ -163,9 +163,13 @@ def get_range(conn: sqlite3.Connection, start: str, end: str,
             (start, end)):
         row = dict(raw)
         row["period"] = row["date"]
+        # The drink counts are the same kind of figure as the ratings: a daily
+        # value of a catalogue metric of the same name, so they are owned too
+        # (consumer #578: unowned, the figure had no fact-set slot while the
+        # available-figure gate could see it).
         row["field_metrics"] = {
             field: METRIC_NAMES[field]
-            for field in RATING_FIELDS
+            for field in RATING_FIELDS + COUNT_FIELDS
             if row.get(field) is not None
         }
         if row.get(BODY_MEASUREMENT_FIELD) is not None:

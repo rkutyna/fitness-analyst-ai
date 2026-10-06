@@ -117,7 +117,12 @@ def main(argv: list[str] | None = None) -> int:
     # and are useful (and tested) on any payload.
     ctx = VaultContext.local(args.db, user_id="demo")
     tools = mcp_server.build_tools(ctx)
-    control_payload = tools["get_briefing"](scope="deep", day=args.as_of)
+    # The control must carry NO presentation leaf; get_briefing stopped being
+    # one when its readiness factors gained theirs (consumer #578).
+    control_payload = tools["get_training_load_detail"](end=args.as_of)
+    if presentation_leaf_count(control_payload) != 0:
+        raise RuntimeError("get_training_load_detail grew presentation leaves; "
+                           "pick another control payload")
     presentation_payload = tools["get_sleep_regularity"](end=args.as_of)
     if presentation_leaf_count(presentation_payload) == 0:
         raise RuntimeError("get_sleep_regularity returned no presentation leaves")
@@ -125,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     print("N numbers = numeric leaves only; digits inside presentation strings "
           "are not counted.")
     for name, payload in (
-        ("control payload (get_briefing)", control_payload),
+        ("control payload (get_training_load_detail)", control_payload),
         ("presentation payload (get_sleep_regularity)", presentation_payload),
     ):
         result = measure_payload(payload)

@@ -843,10 +843,27 @@ def _recent_and_baseline(conn, metric, as_of, window=READINESS_BASELINE_WINDOW):
     single reading: HRV's measured daily CV is 17.1%, so one night decided the
     band. The baseline excludes exactly the days that made `current`.
     """
+    detail = _recent_and_baseline_detail(conn, metric, as_of, window)
+    return (detail["current"], detail["baseline"], detail["n_baseline"],
+            detail["latest_date"])
+
+
+def _recent_and_baseline_detail(conn, metric, as_of,
+                                window=READINESS_BASELINE_WINDOW) -> dict:
+    """:func:`_recent_and_baseline`, plus the days each figure was drawn from.
+
+    ``current`` is a MEAN over the calendar days ending at ``latest_date``;
+    ``baseline`` is a MEDIAN over the rows before those, so it is not a mean and
+    it does not end on ``latest_date``. ``current_window`` and
+    ``baseline_window`` are the inclusive ``(first, last)`` days of each, which
+    is what a consumer needs to say what the figure covers.
+    """
     start = (date.fromisoformat(as_of) - timedelta(days=window)).isoformat()
     dates, vals, _ = mx.series(conn, metric, start, as_of)
     if not vals:
-        return None, None, 0, None
+        return {"current": None, "baseline": None, "n_baseline": 0,
+                "latest_date": None, "current_window": None,
+                "baseline_window": None}
     # Smooth over calendar days, not over rows: with a gap, the last three rows
     # can span a week and "recent" would quietly mean something else.
     cutoff = (date.fromisoformat(dates[-1])
@@ -854,7 +871,12 @@ def _recent_and_baseline(conn, metric, as_of, window=READINESS_BASELINE_WINDOW):
     recent = [v for d, v in zip(dates, vals) if d >= cutoff][-READINESS_SMOOTH_DAYS:]
     current = sum(recent) / len(recent)
     base = mx.baseline(vals, exclude_recent=len(recent), window=window)
-    return current, base, len(vals) - len(recent), dates[-1]
+    hist_dates = dates[:len(dates) - len(recent)][-window:]
+    return {"current": current, "baseline": base,
+            "n_baseline": len(vals) - len(recent), "latest_date": dates[-1],
+            "current_window": (cutoff, dates[-1]),
+            "baseline_window": ((hist_dates[0], hist_dates[-1])
+                                if hist_dates else None)}
 
 
 def _clamp(x, lo=0.0, hi=100.0):
@@ -897,14 +919,38 @@ def _readiness_subscores(conn, as_of: str):
     ages: dict[str, int] = {}          # component -> age of its source day
     baselined: set[str] = set()        # components with enough history to score
 
-    def _record(component, cur, day, subscore, extra):
+    def _record(component, detail, subscore, extra):
+        cur, day = detail["current"], detail["latest_date"]
         age = _age_days(as_of, day)
         f = {"component": component, "current": mx.r(cur), "date": day,
              "age_days": age, **extra}
         metric = _READINESS_COMPONENT_METRICS[component]
         f["field_metrics"] = {"current": metric}
+        # Say what each figure covers, and render it with the one presentation
+        # formatter. ``current`` is the MEAN of the days in ``current_window``
+        # (never a single day); ``baseline`` is the MEDIAN of the days before
+        # them, which may start weeks earlier and does not end on ``date``.
+        # Publishing either under ``date`` alone would turn an average into
+        # "on <date>" (consumer #578).
+        current_period = "%s:%s" % detail["current_window"]
+        f["field_periods"] = {"current": current_period}
+        f["presentations"] = {}
+        leaf = mx.presentation_leaf(metric, current_period, mx.r(cur),
+                                    field="mean")
+        if leaf is not None:
+            f["presentations"]["current"] = leaf
         if "baseline" in extra:
             f["field_metrics"]["baseline"] = metric
+            if detail["baseline_window"] is not None:
+                baseline_period = "%s:%s" % detail["baseline_window"]
+                f["field_periods"]["baseline"] = baseline_period
+                leaf = mx.presentation_leaf(metric, baseline_period,
+                                            mx.r(detail["baseline"]),
+                                            field="median")
+                if leaf is not None:
+                    f["presentations"]["baseline"] = leaf
+        if not f["presentations"]:
+            del f["presentations"]
         stale = age is None or age > READINESS_MAX_AGE_DAYS
         f["stale"] = stale
         factors.append(f)
@@ -913,23 +959,26 @@ def _readiness_subscores(conn, as_of: str):
         if not stale:
             subs[component] = subscore
 
-    cur, base, n, day = _recent_and_baseline(conn, "heart_rate_variability", as_of)
-    if base is not None and n >= READINESS_MIN_BASELINE_DAYS:
+    detail = _recent_and_baseline_detail(conn, "heart_rate_variability", as_of)
+    cur, base = detail["current"], detail["baseline"]
+    if base is not None and detail["n_baseline"] >= READINESS_MIN_BASELINE_DAYS:
         baselined.add("hrv")
         dev = mx.pct_change(cur, base) or 0.0
-        _record("hrv", cur, day, _clamp(50 + SUBSCORE_K * dev),
+        _record("hrv", detail, _clamp(50 + SUBSCORE_K * dev),
                 {"baseline": mx.r(base), "pct": dev})
 
-    cur, base, n, day = _recent_and_baseline(conn, "resting_heart_rate", as_of)
-    if base is not None and n >= READINESS_MIN_BASELINE_DAYS:
+    detail = _recent_and_baseline_detail(conn, "resting_heart_rate", as_of)
+    cur, base = detail["current"], detail["baseline"]
+    if base is not None and detail["n_baseline"] >= READINESS_MIN_BASELINE_DAYS:
         baselined.add("rhr")
         dev = mx.pct_change(cur, base) or 0.0
-        _record("rhr", cur, day, _clamp(50 - SUBSCORE_K * dev),
+        _record("rhr", detail, _clamp(50 - SUBSCORE_K * dev),
                 {"baseline": mx.r(base), "pct": dev})
 
-    cur, _, _, day = _recent_and_baseline(conn, "sleep_asleep", as_of)
+    detail = _recent_and_baseline_detail(conn, "sleep_asleep", as_of)
+    cur = detail["current"]
     if cur is not None:
-        _record("sleep", cur, day, _clamp(100 * cur / SLEEP_TARGET_MIN),
+        _record("sleep", detail, _clamp(100 * cur / SLEEP_TARGET_MIN),
                 {"target": SLEEP_TARGET_MIN,
                  "pct": mx.pct_change(cur, SLEEP_TARGET_MIN)})
 

@@ -226,7 +226,6 @@ KNOWN: dict[str, dict[str, str]] = {
     },
     "get_briefing": {
         "UM": """
-            .readiness.factors[].baseline .readiness.factors[].current
             .talking_points[].numbers[] .training_load.acute_7d .training_load.acwr
             .training_load.chronic_weekly_avg .trends.hrv_per_week .trends.rhr_per_week
             .workout_focus.energy_kcal
@@ -358,8 +357,6 @@ KNOWN: dict[str, dict[str, str]] = {
 # one is a fix that should shrink this table.
 GATE_SEES_WITHOUT_SLOT: dict[str, set[str]] = {
     "get_intraday": {"heart_rate", "step_count"},
-    "get_briefing": {"heart_rate_variability", "resting_heart_rate",
-                     "sleep_asleep"},
     "get_subjective": {"alcohol_drinks", "caffeine_drinks"},
 }
 

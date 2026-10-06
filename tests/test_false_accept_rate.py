@@ -47,7 +47,7 @@ def test_main_measures_real_demo_mcp_payloads(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "N numbers = numeric leaves only" in output
     assert "digits inside presentation strings are not counted" in output
-    assert "control payload (get_briefing)" in output
+    assert "control payload (get_training_load_detail)" in output
     assert "presentation payload (get_sleep_regularity)" in output
     assert "  presentation leaves: 0" in output
     presentation_output = output.split(

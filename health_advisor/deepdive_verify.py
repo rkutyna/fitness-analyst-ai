@@ -772,11 +772,20 @@ def _ledger_scopes(record: dict) -> list[dict]:
             workout_key = node.get(
                 "workout_key", node.get("dedupe_key", inherited_workout_key))
             field = node.get("field", declared_field)
+            # ``field_periods`` is ``field_metrics``' sibling: one object may
+            # hold figures that cover DIFFERENT windows (a 3-day mean beside a
+            # 28-day median), and the tool, which computed them, says which
+            # window each one is. A child leaf takes its own entry; any other
+            # child inherits the node's period as before.
+            field_periods = node.get("field_periods")
+            if not isinstance(field_periods, dict):
+                field_periods = {}
             for key, child in node.items():
-                if key == "field_metrics":
+                if key in ("field_metrics", "field_periods"):
                     continue
                 child_metric = field_metrics.get(key, metric)
                 child_metric_owned = key in field_metrics
+                child_period = field_periods.get(key, period)
                 # `points[N].value` is owned by the enclosing result metric;
                 # keep this exception scoped to that exact result shape.
                 child_points_metric = (
@@ -784,7 +793,7 @@ def _ledger_scopes(record: dict) -> list[dict]:
                     and key == "points"
                     and not _is_metricless_metric(node.get("metric"))
                     else None)
-                walk(child, path + (key,), child_metric, period,
+                walk(child, path + (key,), child_metric, child_period,
                      workout_key, field, child_metric_owned, root,
                      child_points_metric or points_metric)
             return

@@ -39,6 +39,22 @@ def _wait_for(predicate, timeout=2.0):
     assert predicate()
 
 
+def _join_push_threads(timeout=10.0):
+    """Wait for every in-flight push delivery thread to finish.
+
+    The thread ending is the completion signal: the token removal is committed
+    and its connection closed. Polling the vault from the test thread instead
+    opens a fresh connection every few milliseconds against the file the
+    delivery thread is writing, which on a loaded machine can fail that write
+    with a transient disk I/O error and leave the token in place.
+    """
+    deadline = time.monotonic() + timeout
+    for thread in threading.enumerate():
+        if thread.name == "health-advisor-push":
+            thread.join(max(0.0, deadline - time.monotonic()))
+            assert not thread.is_alive()
+
+
 def test_registration_delete_malformed_and_schema_have_no_health_columns(
         vault, monkeypatch):
     monkeypatch.setattr(receiver, "SHARED_SECRET", "push-secret")
@@ -158,7 +174,9 @@ def test_410_removes_token_and_sender_failure_does_not_fail_request(
         client_disconnected_at="2026-09-11T12:00:00+00:00",
     )
     assert app.state.apns_dispatcher.enqueue(turn) is True
-    _wait_for(lambda: not vault_has_token(vault, "gone-token"))
+    _join_push_threads()
+    assert gone.calls == [("gone-token", turn["id"], "production")]
+    assert not vault_has_token(vault, "gone-token")
 
     failing = _RecordingSender(raises=True)
     app = receiver.create_app(vault, apns_sender=failing)

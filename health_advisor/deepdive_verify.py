@@ -62,7 +62,11 @@ _SERIES_FIELDS = ("mean", "median", "min", "max", "std", "latest", "n_days",
 _INHERITED_SERIES_FIELDS = (
     frozenset(_SERIES_FIELDS) - {"n_days"}
     | frozenset({"total", "mean_delta", "total_delta", "total_delta_pct",
-                 "weeks_per_block"})
+                 "weeks_per_block",
+                 # summarize_metric's recent-vs-baseline change and its linear
+                 # trend; both are in the metric's unit (the second per week)
+                 # and carry their own presentation (consumer #578).
+                 "delta_vs_baseline", "trend_per_week"})
 )
 # Numeric context emitted beside a stats series. These remain unowned; the
 # ledger resolver may only ignore a surplus claim label on this known context

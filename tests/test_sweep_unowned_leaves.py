@@ -56,9 +56,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "summarize_metric": {
-        "UM": """
-            .delta_vs_baseline .trend_per_week
-        """,
         "ST": """
             .n_days .recent_window_days
         """,

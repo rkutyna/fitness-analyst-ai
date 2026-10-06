@@ -104,11 +104,16 @@ _SIGNED_UNIT_PRESERVING_FIELDS = frozenset({
     "delta_vs_baseline", "mean_delta", "total_delta",
 })
 _NON_UNIT_PRESERVING_FIELDS = frozenset({
-    "delta_pct", "total_delta_pct", "trend_per_week",
+    "delta_pct", "total_delta_pct",
 })
+# A per-week RATE is in the metric's unit per week, never a level in the unit:
+# "283" steps would read as a day's count. It renders signed and says "per
+# week" in the figure itself (consumer #578).
+_RATE_PER_WEEK_FIELDS = frozenset({"trend_per_week"})
 _PRESENTATION_FIELDS = (_UNIT_PRESERVING_FIELDS
                         | _SIGNED_UNIT_PRESERVING_FIELDS
-                        | _NON_UNIT_PRESERVING_FIELDS)
+                        | _NON_UNIT_PRESERVING_FIELDS
+                        | _RATE_PER_WEEK_FIELDS)
 
 # Numeric presentation is intentionally a small, explicit policy rather than
 # a call to ``str(float)``. The stored value remains the source of truth; these
@@ -322,7 +327,8 @@ def format_presentation(metric: str, value, *, clock_24: bool = False,
         return None
     if metric != "duration_min" and metric not in nz.CATALOG:
         return None
-    signed_field = field in _SIGNED_UNIT_PRESERVING_FIELDS
+    rate_field = field in _RATE_PER_WEEK_FIELDS
+    signed_field = field in _SIGNED_UNIT_PRESERVING_FIELDS or rate_field
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -352,14 +358,37 @@ def format_presentation(metric: str, value, *, clock_24: bool = False,
                     f"{prefix}{hours} h {minutes:02d} min")
         return f"{prefix}{minutes} min"
 
+    per_week = " per week" if rate_field else ""
     if metric in _DURATION_MINUTE_METRICS:
-        return duration(value)
+        return duration(value) + per_week
     if metric == "duration_min":
-        return duration(value)
+        return duration(value) + per_week
     if metric in _DURATION_HOUR_METRICS:
-        return duration(value * 60)
+        return duration(value * 60) + per_week
     if metric in _SIGNED_DURATION_HOUR_METRICS:
-        return duration(value * 60, prefix="± ")
+        # "±" says a spread; a signed change of a spread already has its sign
+        # ("+18 min", not "+± 18 min").
+        return duration(value * 60,
+                        prefix="" if signed_field else "± ") + per_week
+    if signed_field and (metric in _PREVIOUS_NOON_CLOCK_METRICS
+                         or metric in _MIDNIGHT_CLOCK_METRICS):
+        # A CHANGE of a time of day is a duration, not a time of day: a
+        # bedtime that moved 18 minutes earlier is "-18 min", never the clock
+        # time "11:42 AM".
+        return duration(value * 60) + per_week
+    if rate_field:
+        unit = nz.CATALOG[metric]["unit"]
+        base = (2 if unit in _LENGTH_UNITS else
+                _UNIT_PRESENTATION_DECIMALS.get(unit, PRESENTATION_MAX_DECIMALS))
+        number = format_numeric(
+            value, decimals=min(PRESENTATION_MAX_DECIMALS, base + 1), signed=True)
+        if number.lstrip("+-") == "0":
+            number = "0"            # a rate that rounds to nothing has no sign
+        spec = unit_suffix(unit, metric=metric)
+        if spec is None:
+            return f"{number}{per_week}"
+        word = spec[0]
+        return f"{number}{word if word == '%' else ' ' + word}{per_week}"
     if metric in _PREVIOUS_NOON_CLOCK_METRICS:
         total = int((12.0 + value) * 60) % (24 * 60)
     elif metric in _MIDNIGHT_CLOCK_METRICS:

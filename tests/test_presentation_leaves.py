@@ -154,7 +154,9 @@ def test_non_unit_fields_never_publish_metric_unit_leaves():
     assert node["presentations"]["value"]["value"] == "7 h 20 min"
     assert "delta_pct" not in node["presentations"]
     assert "total_delta_pct" not in node["presentations"]
-    assert "trend_per_week" not in node["presentations"]
+    # A per-week rate is published only WITH its "per week": never a bare
+    # minutes level (consumer #578).
+    assert node["presentations"]["trend_per_week"]["value"] == "-3 min per week"
     assert mx.format_presentation(
         "sleep_asleep", 11.51, field="delta_pct") is None
 
@@ -189,7 +191,8 @@ def test_real_ledger_fact_set_has_only_field_correct_presentations(tmp_path):
     assert asleep["delta_pct"] is not None
     assert "delta_pct" not in asleep["presentations"]
     assert asleep["trend_per_week"] is not None
-    assert "trend_per_week" not in asleep["presentations"]
+    assert asleep["presentations"]["trend_per_week"]["value"].endswith(
+        " per week")
     for result in (asleep, awake, stand):
         for field, leaf in result.get("presentations", {}).items():
             assert field not in mx._NON_UNIT_PRESERVING_FIELDS

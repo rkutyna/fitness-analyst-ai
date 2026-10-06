@@ -806,8 +806,19 @@ def _ledger_scopes(record: dict) -> list[dict]:
             root == "result" and leaf == "value" and points_metric
             and len(path) >= 3 and path[-3] == "points"
             and isinstance(path[-2], int))
+        # ``get_latest`` publishes the day's aggregate as
+        # ``latest_day.value`` beside the result's own ``metric``; the leaf is
+        # that metric's measurement, and its sibling ``presentation`` leaf
+        # carries the date as its period. Without ownership the figure had no
+        # metric, so no fact was published for it (consumer #576). Scoped to
+        # that exact shape: ``latest_sample.value`` is a different reading
+        # that would collide with it on the same key.
+        latest_day_value_owned = bool(
+            root == "result" and leaf == "value" and path == ("latest_day", "value")
+            and not _is_metricless_metric(inherited_metric))
         metric_owned = (
             explicit_measurement or field_metric_owned or points_value_owned
+            or latest_day_value_owned
             or (not declared_field
                 and _metric_owns_field(inherited_metric, field)))
         metric = inherited_metric if metric_owned else None

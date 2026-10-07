@@ -666,6 +666,23 @@ def _refuse_steering_leak(result: dict) -> dict:
             "mode": "fallback", "verification": verification}
 
 
+# The closed set of values a turn's ``cause`` can take: every string
+# ``_ask_cause`` returns, plus the one literal the scripted conversational
+# reply sets directly. The question log copies ``cause`` onto its row only when
+# it is in this set, so an open-ended string can never reach the log through
+# that field. ``tests/test_ask_question_counters.py`` derives the first half
+# of the set from ``_ask_cause``'s own source, so a new cause cannot be added
+# without this set following.
+_ASK_CAUSES = frozenset({
+    "no_data_yet", "backend_unavailable", "transport_failed",
+    "answer_truncated", "conversational", "conversational_refused",
+    "conversational_scripted", "no_gather_needed", "empty_gather",
+    "withheld_available_figure", "denied_available_figure",
+    "contradicted_day_count", "restated_unit", "unsupported_period_phrase",
+    "stale_window", "gate_refused", "judge_refused", "ok",
+})
+
+
 def _ask_cause(verification: dict, *, ledger: list[dict],
                loop_outcomes: list[dict], judge_score: int | None = None,
                conversational: bool = False,
@@ -1351,6 +1368,48 @@ def _try_span_suppression(ctx: VaultContext, question: str, attempt: dict,
     return last_verification, None, attempts, failures
 
 
+_QUESTION_LOG_COUNTS = ("facts_offered", "facts_cited", "facts_withheld")
+_QUESTION_LOG_TRISTATES = ("asked_metric_offered", "asked_metric_cited")
+
+
+def _question_log_counters(verification: dict) -> dict:
+    """The question-log fields that come from Python's per-turn counters.
+
+    Closed by construction: each field is copied only when it has the exact
+    expected type (an int that is not a bool, a bool, or ``None`` where the
+    value can be unknown) and ``cause`` only when it is one of ``_ASK_CAUSES``.
+    No fact key, metric name, value, prose or tool result can pass through
+    here, whatever the verification dict holds -- ``withheld_fact_keys`` in
+    particular stays on the verification and never reaches the row.
+
+    A field the turn could not compute is absent, not zero: the fact-template
+    arm sets the five counters and ``template_compliant``; the other arms set
+    none of them, and an old reader sees the row it always saw.
+    """
+    def exact_int(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    fields: dict = {}
+    if all(exact_int(verification.get(name)) for name in _QUESTION_LOG_COUNTS) \
+            and all(name in verification and (
+                verification[name] is None
+                or isinstance(verification[name], bool))
+                for name in _QUESTION_LOG_TRISTATES):
+        for name in _QUESTION_LOG_COUNTS + _QUESTION_LOG_TRISTATES:
+            fields[name] = verification[name]
+        # The arm that counts figures also owns the retry; elsewhere "retry"
+        # means something else or nothing, so it is not guessed at.
+        fields["retried"] = verification.get("retry") is True
+    if "cause" in verification:
+        cause = verification["cause"]
+        fields["cause"] = cause if cause in _ASK_CAUSES else None
+    if exact_int(verification.get("tool_calls")):
+        fields["tool_calls"] = verification["tool_calls"]
+    if isinstance(verification.get("template_compliant"), bool):
+        fields["template_compliant"] = verification["template_compliant"]
+    return fields
+
+
 def _record_question(question: str, as_of: str | None, result: dict,
                      accounting: dict | None = None,
                      attempt_1_reason: str | None = None) -> None:
@@ -1362,6 +1421,22 @@ def _record_question(question: str, as_of: str | None, result: dict,
     verdict, never the answer prose. Read per call, so a service turns it off
     by unsetting one variable and a test points it at ``tmp_path``. A failed
     write is announced on stderr and never breaks the answer.
+
+    Row fields: ``asked_at``, ``question``, ``as_of``, ``mode``, ``reason``,
+    ``attempt_1_reason``, ``figures_verified``, ``figures_total`` (figures the
+    answer STATED), ``elapsed_seconds``, ``python_seconds``,
+    ``model_call_count``, ``model_calls``, ``accounting_anomaly`` and, on an
+    anomaly, ``timing_anomaly``. A turn that took the fact-template arm adds
+    (``_question_log_counters``): ``facts_offered`` (figure facts Python
+    published), ``facts_cited`` (distinct ones the final prose cites),
+    ``facts_withheld`` (eligible facts the publisher dropped),
+    ``asked_metric_offered`` / ``asked_metric_cited`` (true/false, or null when
+    the question names no metric) and ``retried``. They describe the LAST
+    attempt, so on a fallback they describe the answer the user did not get.
+    ``cause`` (one of ``_ASK_CAUSES``, else null), ``tool_calls`` and
+    ``template_compliant`` are copied when the turn's verification carries
+    them. The new fields are integers, booleans, null and that closed ``cause``
+    string only; absent, not zero, where the turn could not compute them.
     """
     try:
         path = os.environ.get("HA_ASK_QUESTION_LOG", "").strip()
@@ -1410,6 +1485,7 @@ def _record_question(question: str, as_of: str | None, result: dict,
         }
         if timing_anomaly is not None:
             row["timing_anomaly"] = timing_anomaly
+        row.update(_question_log_counters(verification))
         print(f"ask question model-call count: {model_call_count}",
               file=sys.stderr)
         if model_call_count == 0 and mode != "fallback":
@@ -2481,6 +2557,66 @@ def _template_has_asked_metric_figure(question: str, template: str,
     return False
 
 
+def _ask_fact_counters(question: str, facts: dict[str, dict],
+                       figure_facts: dict[str, dict], scan: dict,
+                       withheld_fact_keys) -> dict:
+    """Count what one fact-template attempt was offered, cited and withheld.
+
+    Python-computed, integers and booleans only, for the question log
+    (``_record_question``): ``figure_facts`` is the published fact set minus
+    the facts that are not figures, and ``scan`` is
+    ``fact_template.scan_template``'s result for the attempt's prose.
+
+    * ``facts_offered`` -- distinct figure fact keys published this turn. A
+      figure fact is a metric, attachment, workout, briefing or declared fact
+      that is not a pure label: ``period_label`` and a workout's ``date`` are
+      labels, and citation, status and rating-scale facts are not in
+      ``figure_facts`` at all.
+    * ``facts_cited`` -- distinct keys among those that the prose's
+      placeholders cite. A label, status or unresolved placeholder is not one.
+    * ``facts_withheld`` -- ``len(withheld_fact_keys)``: eligible keys the
+      publisher dropped. The keys themselves never leave this function.
+    * ``asked_metric_offered`` / ``asked_metric_cited`` -- whether the metric
+      the question names (``_question_metric``, the denial gate's own
+      resolution) has at least one offered / cited figure fact. Both ``None``
+      when the question names no metric, which is not the same as ``False``.
+    """
+    from . import fact_template
+
+    def is_figure(fact) -> bool:
+        if not isinstance(fact, dict):
+            return False
+        field = fact.get("field")
+        return not (field == "period_label"
+                    or (field == "date" and fact.get("workout")))
+
+    offered = {key for key, fact in (figure_facts or {}).items()
+               if is_figure(fact)}
+    cited = {key for key in (scan or {}).get("placeholders", [])
+             if key in offered}
+
+    def metric_of(key: str):
+        try:
+            parsed = fact_template.parse_fact_key(key)
+        except (TypeError, ValueError):
+            return None
+        return parsed[0] if parsed is not None else None
+
+    metric = _question_metric(question, facts)
+    if _DV_VOCAB._is_metricless_metric(metric):
+        asked_offered = asked_cited = None
+    else:
+        asked_offered = any(metric_of(key) == metric for key in offered)
+        asked_cited = any(metric_of(key) == metric for key in cited)
+    return {
+        "facts_offered": len(offered),
+        "facts_cited": len(cited),
+        "facts_withheld": len(withheld_fact_keys or ()),
+        "asked_metric_offered": asked_offered,
+        "asked_metric_cited": asked_cited,
+    }
+
+
 def _prose_has_asked_metric_figure(metric: str | None, claims,
                                    verification: dict) -> bool:
     """Whether a verified prose claim carries a figure for ``metric``."""
@@ -2782,6 +2918,16 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         **declared_facts,
         **citation_facts,
     }
+    # The facts that are figures, for the question log's counters: data facts
+    # without the citation sources (those are scanned as `citations`, not
+    # `placeholders`). `_ask_fact_counters` drops the pure labels.
+    figure_facts = {
+        **metric_facts,
+        **attachment_facts,
+        **workout_facts,
+        **briefing_facts,
+        **declared_facts,
+    }
     # health_advisor#525: computed once, up front, so a broad question whose
     # only tool is get_briefing sees this status on the FIRST narration
     # attempt, not only after a repair round -- `_ledger_has_successful_data`
@@ -2835,6 +2981,9 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             "template_compliant": False,
             "narration_counts_comparable": False,
         }
+        conversational_verification.update(_ask_fact_counters(
+            question, facts, figure_facts, {"placeholders": []},
+            withheld_fact_keys))
         # `True` unconditionally: the flag says this turn TOOK the
         # conversational path, not that it succeeded on it. Passing
         # `conversational_ok` here made a refused conversational reply fall
@@ -2966,6 +3115,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         # prose-mode arms.
         "narration_counts_comparable": False,
     }
+    verification.update(_ask_fact_counters(
+        question, facts, figure_facts, scan, withheld_fact_keys))
     interpolated = fact_template.interpolate_template(
         template, facts, advice_quantities=advice_quantities)
     if interpolated is not None:
@@ -3106,6 +3257,8 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         "template_compliant": bool(retry_scan["ok"]),
         "narration_counts_comparable": False,
     }
+    retry_verification.update(_ask_fact_counters(
+        question, facts, figure_facts, retry_scan, withheld_fact_keys))
     retry_interpolated = fact_template.interpolate_template(
         retry_template, facts, advice_quantities=retry_advice_quantities)
     if retry_interpolated is not None:

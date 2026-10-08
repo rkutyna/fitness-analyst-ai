@@ -2569,8 +2569,8 @@ def _ask_fact_counters(question: str, facts: dict[str, dict],
 
     * ``facts_offered`` -- distinct figure fact keys published this turn. A
       figure fact is a metric, attachment, workout, briefing or declared fact
-      that is not a pure label: ``period_label`` and a workout's ``date`` are
-      labels, and citation, status and rating-scale facts are not in
+      that is not a pure label: ``period_label`` and a workout's ``date``,
+      ``setting``, ``fitness_machine`` and ``climb_source`` are labels, and citation, status and rating-scale facts are not in
       ``figure_facts`` at all.
     * ``facts_cited`` -- distinct keys among those that the prose's
       placeholders cite. A label, status or unresolved placeholder is not one.
@@ -2588,7 +2588,8 @@ def _ask_fact_counters(question: str, facts: dict[str, dict],
             return False
         field = fact.get("field")
         return not (field == "period_label"
-                    or (field == "date" and fact.get("workout")))
+                    or (field in fact_template.WORKOUT_LABEL_FIELDS
+                        and fact.get("workout")))
 
     offered = {key for key, fact in (figure_facts or {}).items()
                if is_figure(fact)}

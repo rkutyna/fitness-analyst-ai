@@ -1330,6 +1330,74 @@ _WORKOUT_PACE_FIELDS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Where a session was recorded, published as Python-authored labels (consumer
+# #590). They are words, not figures: only a row that STATES a value gets one,
+# so a session whose device did not say (``is_indoor`` null) publishes no
+# setting at all -- absence is not "outdoors". A machine kind Apple adds later
+# is published as a generic phrase; the stored text never reaches the model
+# through a fact.
+WORKOUT_LABEL_FIELDS = frozenset({
+    "date", "setting", "fitness_machine", "climb_source"})
+_FITNESS_MACHINE_PHRASES = {
+    "treadmill": "a treadmill",
+    "indoor_bike": "an indoor bike",
+    "elliptical": "an elliptical",
+    "stair_stepper": "a stair stepper",
+    "rower": "a rowing machine",
+}
+_UNKNOWN_MACHINE_PHRASE = "a connected fitness machine"
+_CLIMB_SOURCE_PHRASE = "the machine's own climb figure"
+
+
+def _workout_label(workout: str, field: str, value: str, display: str, *,
+                   sequence, path: str) -> tuple[str, dict]:
+    key = workout_fact_key(workout, field)
+    return key, {
+        "key": key, "workout": workout, "field": field, "value": value,
+        "unit": None, "display": display,
+        "source": {"sequence": sequence, "path": path},
+    }
+
+
+def _workout_context_candidates(row: dict, workout: str | None, *, sequence,
+                                path_prefix: str) -> list[tuple[str, dict]]:
+    """Setting, machine, and average-grade facts for one ``list_workouts`` row.
+
+    The average grade is the session's climb over its distance, computed by
+    ``list_workouts`` from the stored values. It is published only for a row
+    that names a fitness machine, and the ``climb_source`` label says the climb
+    behind it is that machine's own figure. A row without a machine never
+    yields a grade here, whatever else it carries.
+    """
+    if not isinstance(row, dict) or workout is None:
+        return []
+    out: list[tuple[str, dict]] = []
+    indoor = row.get("is_indoor")
+    if isinstance(indoor, bool):
+        out.append(_workout_label(
+            workout, "setting", "indoor" if indoor else "outdoor",
+            "indoors" if indoor else "outdoors",
+            sequence=sequence, path=f"{path_prefix}.is_indoor"))
+    machine = row.get("fitness_machine")
+    if isinstance(machine, str) and machine.strip():
+        out.append(_workout_label(
+            workout, "fitness_machine",
+            machine if machine in _FITNESS_MACHINE_PHRASES else "other",
+            _FITNESS_MACHINE_PHRASES.get(machine, _UNKNOWN_MACHINE_PHRASE),
+            sequence=sequence, path=f"{path_prefix}.fitness_machine"))
+        grade = row.get("average_grade_pct")
+        candidate = _workout_candidate(
+            workout, "average_grade_pct", grade, "%", sequence=sequence,
+            path=f"{path_prefix}.average_grade_pct")
+        if candidate is not None and math.isfinite(grade):
+            out.append(candidate)
+            out.append(_workout_label(
+                workout, "climb_source", "fitness_machine",
+                _CLIMB_SOURCE_PHRASE, sequence=sequence,
+                path=f"{path_prefix}.average_grade_pct"))
+    return out
+
+
 def _pace_display(value: float, unit: str) -> str:
     total = int(round(value * 60))
     return f"{total // 60}:{total % 60:02d} {unit}"
@@ -1474,6 +1542,7 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
         return {}
 
     candidates: list[tuple[str, dict]] = []
+    context_candidates: list[tuple[str, dict]] = []
     for record in ledger:
         if (not isinstance(record, dict) or record.get("result_elided")
                 or record.get("tool_name") not in _WORKOUT_TOOLS):
@@ -1507,6 +1576,9 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
                 workout = _workout_identity(
                     row.get("date"), row.get("type"), start_time)
                 candidates.extend(_workout_row_candidates(
+                    row, workout, sequence=sequence,
+                    path_prefix=f"$.result.workouts[{row_index}]"))
+                context_candidates.extend(_workout_context_candidates(
                     row, workout, sequence=sequence,
                     path_prefix=f"$.result.workouts[{row_index}]"))
 
@@ -1562,6 +1634,13 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
             continue
 
     published = _publish_unambiguous(candidates)
+    # Context describes a workout the closed set already speaks about; it never
+    # makes a workout appear on its own.
+    named = {fact.get("workout") for fact in published.values()}
+    published.update({
+        key: fact
+        for key, fact in _publish_unambiguous(context_candidates).items()
+        if fact.get("workout") in named})
     published.update(_workout_date_facts(published))
     return published
 

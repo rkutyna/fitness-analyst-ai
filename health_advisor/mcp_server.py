@@ -748,6 +748,24 @@ def _pace_minutes(duration_min, distance_mi, metric_units: bool):
     return _r(duration_min / distance, 2)
 
 
+def _average_grade_pct(ascended_m, distance_mi, fitness_machine):
+    """The session's average grade, percent: climb over distance, or ``None``.
+
+    Published ONLY for a session recorded with a connected fitness machine
+    that also reported a climb, and only over a positive distance. The climb is
+    the machine's own figure, and an outdoor or machine-less session has no
+    such figure to divide, so none of those gets a grade (and a missing climb
+    is never read as a flat 0). Computed from the stored metres and miles,
+    never from rounded ones, in one unit (metres) on both sides.
+    """
+    if (not fitness_machine or ascended_m is None or distance_mi is None
+            or not distance_mi > 0):
+        return None
+    distance_m = (distance_mi * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+                  * 1000.0)
+    return _r(ascended_m / distance_m * 100.0, 1)
+
+
 def _workout_window_facts(conn, active: str, start: str, end: str, *,
                           type_counts, total: int,
                           metric_units: bool) -> list[dict]:
@@ -842,7 +860,15 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     for a metric vault), minutes per unit distance from the stored duration and
     distance. `publishable_facts` lists, over the WHOLE range (never just the
     returned rows): the count of workouts, each type's count, and each type's
-    longest workout by duration and by distance with its date."""
+    longest workout by duration and by distance with its date.
+
+    `is_indoor` is true or false when the device said where the session was
+    recorded and null when it did not say; null is not outdoors.
+    `fitness_machine` names the connected machine that recorded it
+    (treadmill, indoor_bike, elliptical, stair_stepper, rower, or another kind
+    as sent) and is null when none was stated. A session recorded with a machine
+    that also reported its climb carries `average_grade_pct`: that climb over
+    the session's distance, one decimal, a whole-session average."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
     limit = max(1, min(int(limit), MAX_WORKOUTS))
@@ -864,13 +890,20 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             end = row[0] or today
         if start is None:
             start = (date.fromisoformat(end) - timedelta(days=89)).isoformat()
+        # A read-only connection never migrates, so a vault that predates the
+        # context (or elevation) columns reads them as NULL: not stated.
+        have = {c[1] for c in conn.execute("PRAGMA table_info(workouts)")}
+        context_sql = "".join(
+            f", w.{c} AS {c}" if c in have else f", NULL AS {c}"
+            for c in ("is_indoor", "fitness_machine", "elevation_ascended_m"))
         rows = conn.execute(
             "SELECT w.local_date, w.workout_type, w.duration_min, w.energy_kcal, "
             "w.distance_mi, w.avg_heart_rate, w.max_heart_rate, "
             "w.start_utc, w.end_utc, w.dedupe_key "
             ", EXISTS (SELECT 1 FROM workout_routes AS wr "
             "WHERE wr.workout_id = w.id) AS has_route "
-            f"FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? AND {active} "
+            + context_sql +
+            f" FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? AND {active} "
             "ORDER BY start_utc DESC LIMIT ?", (start, end, limit)).fetchall()
         total = conn.execute(
             f"SELECT COUNT(*) FROM workouts AS w WHERE w.local_date BETWEEN ? AND ? "
@@ -923,7 +956,15 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             "end_time_local": _local_hhmm(r["end_utc"], local_timezone),
             "has_route": bool(r["has_route"]),
             "n_segments": n_segments.get(r["dedupe_key"], 0),
+            # NULL is "not stated" and stays null: never False, never outdoors.
+            "is_indoor": (None if r["is_indoor"] is None
+                          else bool(r["is_indoor"])),
+            "fitness_machine": r["fitness_machine"],
         })
+        grade = _average_grade_pct(r["elevation_ascended_m"],
+                                   r["distance_mi"], r["fitness_machine"])
+        if grade is not None:
+            row["average_grade_pct"] = grade
         out.append(row)
     res = {"start": start, "end": end, "count": len(out),
            "total_in_range": total, "truncated": total > len(out),

@@ -1,7 +1,9 @@
 """Single-use enrolment tokens for QR pairing (T5, consumer #426).
 
 An operator mints a token for one phone to scan: a 256-bit random secret and
-a fresh, token-scoped X25519 keypair, TTL-capped at ``MAX_TTL_SECONDS``. The
+a fresh, token-scoped X25519 keypair, TTL-capped at ``max_ttl_seconds()``
+(``MAX_TTL_SECONDS`` unless ``HA_ENROL_MAX_TTL_SECONDS`` raises it, never past
+``TTL_CEILING_SECONDS``). The
 phone reaches ``/v1/enrol`` (a separate module; this one holds no route) with
 a body sealed under HPKE base mode to the token's public key, carrying the
 token itself, the phone's device public key, and a symmetric ``response_key``
@@ -60,8 +62,13 @@ from . import device_auth
 STORE_VERSION = 1
 TOKEN_BYTES = 32          # 256-bit single-use token
 RESPONSE_KEY_BYTES = 32   # AES-256-GCM key the phone supplies for the reply
-MAX_TTL_SECONDS = 900     # the engine's hard cap; a caller cannot ask for more
+MAX_TTL_SECONDS = 900     # the default cap; a caller cannot ask for more
 ENROL_TOKEN_TTL_SECONDS = 900
+# An invite that travels to a person needs longer than a QR shown in person.
+# HA_ENROL_MAX_TTL_SECONDS raises the cap above MAX_TTL_SECONDS, but no
+# configuration can take it past this ceiling (24 hours).
+MAX_TTL_ENV = "HA_ENROL_MAX_TTL_SECONDS"
+TTL_CEILING_SECONDS = 86400
 NONCE_BYTES = 12
 STATES = ("live", "used", "cancelled", "expired")
 HPKE_INFO_PREFIX = b"ha-enrol-v1\n"
@@ -81,6 +88,27 @@ class EnrolError(Exception):
         self.code = code
         self.status = status
         super().__init__(code)
+
+
+def max_ttl_seconds() -> int:
+    """The longest token lifetime this instance will grant, in seconds.
+
+    Unset means ``MAX_TTL_SECONDS``. A set value must be a whole number of
+    seconds from 1 to ``TTL_CEILING_SECONDS``; anything else (empty,
+    non-numeric, fractional, zero, negative, above the ceiling) refuses at
+    startup, like the engine's other mode variables, and is never defaulted
+    or clamped, because a lifetime silently different from the configured one
+    is a security setting the operator did not choose.
+    """
+    raw = os.environ.get(MAX_TTL_ENV)
+    if raw is None:
+        return MAX_TTL_SECONDS
+    if raw.isascii() and raw.isdigit() and 1 <= int(raw) <= TTL_CEILING_SECONDS:
+        return int(raw)
+    raise RuntimeError(
+        f"QR enrolment refuses to start: {MAX_TTL_ENV} is set to invalid "
+        f"value {raw!r}; set it to a whole number of seconds from 1 to "
+        f"{TTL_CEILING_SECONDS}, or leave it unset for {MAX_TTL_SECONDS}.")
 
 
 def _b64url(data: bytes) -> str:
@@ -266,7 +294,7 @@ class TokenStore:
         """Create a token; return (record, plaintext token). Never re-read
         by the caller: the plaintext exists nowhere in the store."""
         now = time.time() if now is None else now
-        ttl_seconds = min(ttl_seconds, MAX_TTL_SECONDS)
+        ttl_seconds = min(ttl_seconds, max_ttl_seconds())
         token = secrets.token_bytes(TOKEN_BYTES)
         token_text = _b64url(token)
         private_key = X25519PrivateKey.generate()
@@ -429,7 +457,9 @@ def main(argv: list[str] | None = None) -> int:
 
     mint = sub.add_parser("mint", help="create a token and print it once, as JSON")
     mint.add_argument("--ttl", type=int, default=ENROL_TOKEN_TTL_SECONDS,
-                      help=f"seconds until expiry, capped at {MAX_TTL_SECONDS}")
+                      help=f"seconds until expiry, capped at {MAX_TTL_SECONDS} "
+                           f"unless {MAX_TTL_ENV} raises the cap "
+                           f"(at most {TTL_CEILING_SECONDS})")
 
     status = sub.add_parser("status", help="show one token's current state")
     status.add_argument("id")
@@ -448,6 +478,11 @@ def main(argv: list[str] | None = None) -> int:
     store = TokenStore(args.store)
 
     if args.command == "mint":
+        try:
+            max_ttl_seconds()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         record, token_text = store.mint(ttl_seconds=args.ttl)
         print(json.dumps({
             "id": record.id,

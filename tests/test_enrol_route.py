@@ -517,3 +517,20 @@ def test_app_killed_after_enrol_re_pairing_the_same_key_is_idempotent(make_app, 
         second, key2 = _pair(client, phone, store, r2, t2)
     assert second.status_code == 200
     assert _open_reply(second, key2)["created"] is False
+
+
+@pytest.mark.parametrize("bad", ["86401", "0", "-1", "abc", "", "900.5"])
+@pytest.mark.parametrize("enrol_mode", ["on", "off"])
+def test_an_invalid_max_ttl_refuses_at_startup(make_app, monkeypatch, bad, enrol_mode):
+    monkeypatch.setenv("HA_ENROL_MAX_TTL_SECONDS", bad)
+    with pytest.raises(RuntimeError, match="HA_ENROL_MAX_TTL_SECONDS"):
+        make_app(enrol_mode=enrol_mode)
+
+
+@pytest.mark.parametrize("good", [None, "900", "3600", "86400"])
+def test_a_valid_or_unset_max_ttl_starts(make_app, monkeypatch, good):
+    if good is None:
+        monkeypatch.delenv("HA_ENROL_MAX_TTL_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("HA_ENROL_MAX_TTL_SECONDS", good)
+    make_app(enrol_mode="on")

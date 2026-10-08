@@ -2180,6 +2180,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         devices = device_auth.DeviceAuth(device_mode,
                                          device_auth.registry_from_env())
     enrol_active = _enrol_mode() == "on"  # likewise: fails closed at startup
+    enrol.max_ttl_seconds()  # likewise: an invalid cap refuses here, on or off
     enrol_store = None
     if enrol_active:
         if devices is None:

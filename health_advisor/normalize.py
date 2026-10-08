@@ -368,6 +368,52 @@ def workout_label(activity_type: str) -> str:
     return _camel_to_snake(activity_type.replace("HKWorkoutActivityType", ""))
 
 
+# --------------------------------------------------------------------------- #
+# Connected fitness machine -> canonical kind (consumer #590)
+# --------------------------------------------------------------------------- #
+# HealthKit names the machine a session was recorded with by a device model of
+# the form "com.apple.health.fitnessmachinemodel.<kind>". The phone sends the
+# kind (or the whole identifier; both are accepted). Only the five kinds below
+# are renamed, and only by spelling: matching ignores case and the separators
+# "-", "_" and " ". Any other kind is kept exactly as sent, lower-cased, so a
+# machine Apple adds later is stored rather than dropped, and nothing is mapped
+# onto a kind it merely resembles. The manufacturer's name is not part of this
+# vocabulary and is never stored.
+_FITNESS_MACHINE_PREFIX = "fitnessmachinemodel."
+_FITNESS_MACHINE_CANONICAL = {
+    "treadmill": "treadmill",
+    "indoorbike": "indoor_bike",
+    "elliptical": "elliptical",
+    "stairstepper": "stair_stepper",
+    "rower": "rower",
+}
+FITNESS_MACHINE_KINDS = frozenset(_FITNESS_MACHINE_CANONICAL.values())
+FITNESS_MACHINE_MAX_LENGTH = 64
+_FITNESS_MACHINE_SHAPE = re.compile(r"[a-z0-9][a-z0-9 ._-]*\Z")
+
+
+def fitness_machine_kind(value) -> str | None:
+    """The stored kind for a fitness-machine value, or ``None`` if unusable.
+
+    ``None`` means the value is not a string, is empty, is longer than
+    ``FITNESS_MACHINE_MAX_LENGTH`` once reduced to its kind, or holds a
+    character outside letters, digits, space, ".", "_" and "-". The caller
+    refuses such a value; it is never guessed at or truncated. The charset is
+    narrow on purpose: this text reaches a model's context.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    cut = text.rfind(_FITNESS_MACHINE_PREFIX)
+    if cut >= 0:
+        text = text[cut + len(_FITNESS_MACHINE_PREFIX):].strip()
+    if (not text or len(text) > FITNESS_MACHINE_MAX_LENGTH
+            or _FITNESS_MACHINE_SHAPE.match(text) is None):
+        return None
+    squashed = re.sub(r"[-_ ]", "", text)
+    return _FITNESS_MACHINE_CANONICAL.get(squashed, text)
+
+
 # Health Auto Export sends human display names ("Outdoor Run", "Indoor Cycle")
 # rather than HK activity types. Map them onto the SAME canonical vocabulary the
 # backfill produced from HK types (running/walking/cycling/...), so type-based

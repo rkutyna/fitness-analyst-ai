@@ -33,6 +33,7 @@ _TOP_FIELDS = frozenset({
     "workouts", "daily_totals",
     "workout_routes",
     "workout_elevation",
+    "workout_context",
 })
 _DEVICE_FIELDS = frozenset({"id", "name", "model"})
 _SAMPLE_DEVICE_FIELDS = frozenset({"name", "model"})
@@ -50,11 +51,17 @@ _WORKOUT_FIELDS = frozenset({
     "hk_uuid", "workout_activity_type", "start", "end", "duration_min",
     "energy_kcal", "distance_mi", "avg_heart_rate", "max_heart_rate",
     "elevation_ascended_m", "elevation_descended_m",
+    "is_indoor", "fitness_machine",
     "source_revision",
 })
 _WORKOUT_ELEVATION_FIELDS = frozenset({
     "hk_uuid", "start", "end", "source_name",
     "elevation_ascended_m", "elevation_descended_m",
+})
+# The one-time context backfill (consumer #590): a sibling of workout_elevation
+# so each can be re-run on its own generation.
+_WORKOUT_CONTEXT_FIELDS = frozenset({
+    "hk_uuid", "start", "end", "source_name", "is_indoor", "fitness_machine",
 })
 _DAILY_TOTAL_FIELDS = frozenset({
     "type_identifier", "local_date", "value", "unit", "interval",
@@ -410,6 +417,35 @@ def _parse_sample(sample: dict, index: int, device_id: str,
         pairs.add((metric, row["local_date"]))
 
 
+def _context_flags(mapping: dict, where: str) -> tuple[int | None, str | None]:
+    """The (is_indoor, fitness_machine) a workout or backfill entry states.
+
+    ``is_indoor`` is a JSON boolean or null; it is stored as 1, 0 or None, and
+    a number, string or anything else is refused (``1`` is not ``true``).
+    ``fitness_machine`` is a machine kind or null, reduced to the stored
+    vocabulary by :func:`normalize.fitness_machine_kind`. A missing key is the
+    same as null: nothing is stated.
+    """
+    raw_indoor = mapping.get("is_indoor")
+    if raw_indoor is None:
+        is_indoor = None
+    elif isinstance(raw_indoor, bool):
+        is_indoor = int(raw_indoor)
+    else:
+        raise PayloadError(f"{where}.is_indoor must be true, false or null")
+    raw_machine = mapping.get("fitness_machine")
+    if raw_machine is None:
+        machine = None
+    else:
+        machine = nz.fitness_machine_kind(raw_machine)
+        if machine is None:
+            raise PayloadError(
+                f"{where}.fitness_machine must be a machine kind of at most "
+                f"{nz.FITNESS_MACHINE_MAX_LENGTH} letters, digits, spaces, "
+                "'.', '_' or '-', or null")
+    return is_indoor, machine
+
+
 def _parse_workout(workout: dict, index: int, workouts: list[dict],
                    workout_dates: set[str], unhandled: list[str]) -> None:
     required = ("hk_uuid", "workout_activity_type", "start", "end",
@@ -475,6 +511,12 @@ def _parse_workout(workout: dict, index: int, workouts: list[dict],
             )
         elevation_numbers[field] = value
 
+    # Absent and null both mean "not stated" (the phone's Codable omits a nil
+    # key), exactly as for distance_mi above. A key that IS stated but of the
+    # wrong type refuses the payload, as a malformed elevation field does.
+    is_indoor, fitness_machine = _context_flags(
+        workout, f"payload.workouts[{index}]")
+
     start_utc, end_utc = nz.to_utc_iso(start_dt), nz.to_utc_iso(end_dt)
     workout_type = nz.workout_label(workout["workout_activity_type"])
     row = {
@@ -496,6 +538,8 @@ def _parse_workout(workout: dict, index: int, workouts: list[dict],
         "elevation_ascended_m": None,
         "elevation_descended_m": None,
         "elevation_source": None,
+        "is_indoor": is_indoor,
+        "fitness_machine": fitness_machine,
         "dedupe_key": db.workout_key(workout_type, start_utc, end_utc),
         "hk_uuid": workout["hk_uuid"],
     }
@@ -559,6 +603,42 @@ def _parse_workout_elevation(entry: dict, index: int,
         "end_utc": nz.to_utc_iso(end_dt),
         "source_name": entry["source_name"],
         **values,
+    })
+
+
+def _parse_workout_context(entry: dict, index: int,
+                           entries: list[dict]) -> None:
+    """Parse the strict, one-time workout context backfill section.
+
+    Like workout_elevation, all six keys are required and a missing value is
+    an explicit null: this section exists only for phones that know it, so
+    there is no older shape to stay compatible with.
+    """
+    where = f"payload.workout_context[{index}]"
+    _reject_unknown(entry, _WORKOUT_CONTEXT_FIELDS, where)
+    missing = _required(
+        entry, ("hk_uuid", "start", "end", "source_name",
+                "is_indoor", "fitness_machine"),
+        f"workout_context[{index}]",
+    )
+    if missing:
+        raise PayloadError(
+            f"{where} is missing required field(s): {', '.join(missing)}")
+    if entry["hk_uuid"] is not None and not _text(entry["hk_uuid"]):
+        raise PayloadError(f"{where}.hk_uuid must be a string or null")
+    if not _text(entry["source_name"]):
+        raise PayloadError(f"{where}.source_name must be a non-empty string")
+    start_dt, end_dt = _parse_dt(entry["start"]), _parse_dt(entry["end"])
+    if start_dt is None or end_dt is None or end_dt <= start_dt:
+        raise PayloadError(f"{where} has unparseable or inverted start/end")
+    is_indoor, machine = _context_flags(entry, where)
+    entries.append({
+        "hk_uuid": entry["hk_uuid"],
+        "start_utc": nz.to_utc_iso(start_dt),
+        "end_utc": nz.to_utc_iso(end_dt),
+        "source_name": entry["source_name"],
+        "is_indoor": is_indoor,
+        "fitness_machine": machine,
     })
 
 
@@ -864,6 +944,17 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 f"payload.workout_elevation[{i}] must be a JSON object"
             )
         _parse_workout_elevation(entry, i, workout_elevation)
+    workout_context_present = "workout_context" in envelope
+    workout_context_wire = _list(
+        envelope.get("workout_context", []), "payload.workout_context"
+    )
+    workout_context: list[dict] = []
+    for i, entry in enumerate(workout_context_wire):
+        if not isinstance(entry, dict):
+            raise PayloadError(
+                f"payload.workout_context[{i}] must be a JSON object"
+            )
+        _parse_workout_context(entry, i, workout_context)
     daily_totals_wire = _list(envelope.get("daily_totals", []),
                               "payload.daily_totals")
     daily_totals: list[dict] = []
@@ -891,6 +982,8 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "workout_dates": workout_dates,
         "workout_elevation": workout_elevation,
         "workout_elevation_present": workout_elevation_present,
+        "workout_context": workout_context,
+        "workout_context_present": workout_context_present,
         "daily_totals": daily_totals,
         "daily_total_dates": daily_total_dates,
         "workout_routes": parsed_routes,

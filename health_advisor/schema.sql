@@ -243,6 +243,13 @@ CREATE TABLE IF NOT EXISTS workouts (
     elevation_ascended_m  REAL,
     elevation_descended_m REAL,
     elevation_source      TEXT,
+    -- Where the session was recorded (consumer #590). is_indoor is 1, 0 or
+    -- NULL; NULL is "the device did not say", never "outdoors". fitness_machine
+    -- is the short kind of connected machine that recorded it (treadmill,
+    -- indoor_bike, ...) or NULL when none was stated. Neither is part of the
+    -- session's identity: dedupe_key stays type|start|end.
+    is_indoor             INTEGER,
+    fitness_machine       TEXT,
     dedupe_key      TEXT NOT NULL UNIQUE,
     hk_uuid         TEXT
 );

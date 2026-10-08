@@ -113,6 +113,11 @@ _ADDED_COLUMNS = {
         "elevation_ascended_m": "REAL",
         "elevation_descended_m": "REAL",
         "elevation_source": "TEXT",
+        # consumer #590: NULL on every existing row, meaning "not stated".
+        # Adding a nullable column is not a VAULT_SCHEMA_VERSION bump, the
+        # same as the elevation columns above.
+        "is_indoor": "INTEGER",
+        "fitness_machine": "TEXT",
     },
     "workout_routes": {
         "workout_hk_uuid": "TEXT",
@@ -935,7 +940,8 @@ WORKOUT_COLS = (
     "workout_type", "start_utc", "end_utc", "local_date", "duration_min",
     "energy_kcal", "distance_mi", "unit_distance", "source", "route_ref",
     "avg_heart_rate", "max_heart_rate", "elevation_ascended_m",
-    "elevation_descended_m", "elevation_source", "dedupe_key", "hk_uuid",
+    "elevation_descended_m", "elevation_source", "is_indoor", "fitness_machine",
+    "dedupe_key", "hk_uuid",
 )
 # New identity fields are optional until the HealthKit-direct ingest exists.
 _RECORD_OPTIONAL = (
@@ -944,7 +950,8 @@ _RECORD_OPTIONAL = (
 # Optional workout columns default to NULL when a caller (e.g. backfill) omits them.
 _WORKOUT_OPTIONAL = ("route_ref", "avg_heart_rate", "max_heart_rate", "hk_uuid",
                      "elevation_ascended_m", "elevation_descended_m",
-                     "elevation_source", "_elevation_fields_present")
+                     "elevation_source", "_elevation_fields_present",
+                     "is_indoor", "fitness_machine")
 
 
 def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
@@ -1136,11 +1143,13 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
         "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
         "duration_min, energy_kcal, distance_mi, unit_distance, source, route_ref, "
         "avg_heart_rate, max_heart_rate, elevation_ascended_m, "
-        "elevation_descended_m, elevation_source, dedupe_key, hk_uuid) "
+        "elevation_descended_m, elevation_source, is_indoor, fitness_machine, "
+        "dedupe_key, hk_uuid) "
         "VALUES (:workout_type, :start_utc, :end_utc, :local_date, :duration_min, "
         ":energy_kcal, :distance_mi, :unit_distance, :source, :route_ref, "
         ":avg_heart_rate, :max_heart_rate, :elevation_ascended_m, "
-        ":elevation_descended_m, :elevation_source, :dedupe_key, :hk_uuid) "
+        ":elevation_descended_m, :elevation_source, :is_indoor, "
+        ":fitness_machine, :dedupe_key, :hk_uuid) "
         f"ON CONFLICT(dedupe_key) DO UPDATE SET {sets}, "
         "source = COALESCE(NULLIF(source, ''), excluded.source), "
         "elevation_ascended_m = CASE WHEN :_elevation_fields_present "
@@ -1151,7 +1160,13 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
         "CASE WHEN excluded.elevation_ascended_m IS NOT NULL "
         "OR excluded.elevation_descended_m IS NOT NULL "
         "THEN 'device_metadata' ELSE NULL END "
-        "ELSE elevation_source END "
+        "ELSE elevation_source END, "
+        # consumer #590. A STATED value replaces what is stored (as the
+        # elevation columns do on this path); NULL means "not stated" and
+        # leaves the stored value alone, so a later upload that cannot say
+        # never erases one that did.
+        "is_indoor = COALESCE(excluded.is_indoor, is_indoor), "
+        "fitness_machine = COALESCE(excluded.fitness_machine, fitness_machine) "
         "WHERE (duration_min IS NULL AND excluded.duration_min IS NOT NULL) "
         "OR (energy_kcal IS NULL AND excluded.energy_kcal IS NOT NULL) "
         "OR (distance_mi IS NULL AND excluded.distance_mi IS NOT NULL) "
@@ -1164,7 +1179,11 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
         "OR (:_elevation_fields_present AND "
         "(elevation_ascended_m IS NOT excluded.elevation_ascended_m "
         "OR elevation_descended_m IS NOT excluded.elevation_descended_m "
-        "OR elevation_source IS NOT excluded.elevation_source))"
+        "OR elevation_source IS NOT excluded.elevation_source)) "
+        "OR (excluded.is_indoor IS NOT NULL "
+        "AND is_indoor IS NOT excluded.is_indoor) "
+        "OR (excluded.fitness_machine IS NOT NULL "
+        "AND fitness_machine IS NOT excluded.fitness_machine)"
     )
     # Tolerate rows missing optional keys (backfill) and ignore transient extras
     # like route_points that aren't columns.
@@ -1328,6 +1347,58 @@ def attach_workout_elevation(conn: sqlite3.Connection, rows: Iterable[dict]) -> 
              row["elevation_ascended_m"], row["elevation_descended_m"],
              parent_id, row["elevation_ascended_m"],
              row["elevation_descended_m"]),
+        ).rowcount
+        updated += int(changed > 0)
+    return {"seen": seen, "matched": matched, "updated": updated,
+            "unmatched": unmatched}
+
+
+# Bump when a matcher or ingest change can fill context an earlier backfill
+# could not (the elevation backfill's WORKOUT_ELEVATION_BACKFILL_GENERATION
+# works the same way). Advertised by the receiver's /health so a phone knows
+# whether it still owes the server a workout_context pass (consumer #590).
+WORKOUT_CONTEXT_BACKFILL_GENERATION = 1
+
+
+def has_workout_context_columns(conn: sqlite3.Connection) -> bool:
+    """Whether this connection's ``workouts`` table has the context columns.
+
+    A read-only connection never migrates (see :func:`init_db`), so a reader of
+    a vault that has not been opened for writing since the columns were added
+    must be able to ask, and read its rows as "not stated" when they are absent.
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(workouts)")}
+    return {"is_indoor", "fitness_machine"} <= have
+
+
+def attach_workout_context(conn: sqlite3.Connection,
+                           rows: Iterable[dict]) -> dict[str, int]:
+    """Fill missing indoor / fitness-machine context from the backfill.
+
+    Each entry is matched exactly as a workout-elevation entry is: by HealthKit
+    UUID, then by the shared overlap rule against UUID-less rows. The
+    per-column COALESCE is intentional and mirrors
+    :func:`attach_workout_elevation`: the workout pass is authoritative, and a
+    backfill entry fills only a column that is still NULL. It never overwrites a
+    stated value and a NULL in an entry never clears one.
+    """
+    seen = matched = updated = unmatched = 0
+    for row in rows:
+        seen += 1
+        parent_id = _workout_parent_id(conn, row, uuid_key="hk_uuid")
+        if parent_id is None:
+            unmatched += 1
+            continue
+        matched += 1
+        changed = conn.execute(
+            "UPDATE workouts SET "
+            "is_indoor = COALESCE(is_indoor, ?), "
+            "fitness_machine = COALESCE(fitness_machine, ?) "
+            "WHERE id = ? AND "
+            "((is_indoor IS NULL AND ? IS NOT NULL) OR "
+            "(fitness_machine IS NULL AND ? IS NOT NULL))",
+            (row["is_indoor"], row["fitness_machine"], parent_id,
+             row["is_indoor"], row["fitness_machine"]),
         ).rowcount
         updated += int(changed > 0)
     return {"seen": seen, "matched": matched, "updated": updated,

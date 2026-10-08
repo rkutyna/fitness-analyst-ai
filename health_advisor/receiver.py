@@ -673,11 +673,20 @@ def _health(ctx, corpus_path: str | None = None):
             "secret_reloads": _SECRET_FILE_RELOADS,
             "workout_routes_supported": True,
             "workout_elevation_supported": True,
+            # consumer #590: this server's parser accepts is_indoor and
+            # fitness_machine on a workout and a workout_context backfill
+            # section. An older server omits both keys, which a phone must
+            # read as "do not send them": its strict parser refuses unknown
+            # fields.
+            "workout_context_supported": True,
             "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE,
             **_corpus_status(corpus_path)}
     if payload["workout_elevation_supported"]:
         payload["workout_elevation_backfill_generation"] = (
             elevation.WORKOUT_ELEVATION_BACKFILL_GENERATION)
+    if payload["workout_context_supported"]:
+        payload["workout_context_backfill_generation"] = (
+            db.WORKOUT_CONTEXT_BACKFILL_GENERATION)
     return payload
 
 
@@ -861,6 +870,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     workout_elevation_matched = 0
     workout_elevation_updated = 0
     workout_elevation_unmatched = 0
+    workout_context_seen = 0
+    workout_context_matched = 0
+    workout_context_updated = 0
+    workout_context_unmatched = 0
     deleted = 0
     tombstones_added = 0
     moved = 0
@@ -1195,6 +1208,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             workout_elevation_matched = elevation_counts["matched"]
             workout_elevation_updated = elevation_counts["updated"]
             workout_elevation_unmatched = elevation_counts["unmatched"]
+            context_counts = db.attach_workout_context(
+                conn, parsed["workout_context"])
+            workout_context_seen = context_counts["seen"]
+            workout_context_matched = context_counts["matched"]
+            workout_context_updated = context_counts["updated"]
+            workout_context_unmatched = context_counts["unmatched"]
             # A workout may arrive after its route. Resolve old unmatched rows
             # as well as routes in this batch, all inside the batch transaction.
             db.attach_unmatched_workout_routes(conn)
@@ -1301,6 +1320,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                    f"workout_elevation_updated={workout_elevation_updated} "
                    f"workout_elevation_unmatched={workout_elevation_unmatched} "
                    if parsed["workout_elevation_present"] else "")
+                + (f"workout_context_seen={workout_context_seen} "
+                   f"workout_context_updated={workout_context_updated} "
+                   f"workout_context_unmatched={workout_context_unmatched} "
+                   if parsed["workout_context_present"] else "")
                 + route_detail
                 + f"history_imported_through={history or '-'} "
                 + (f"compacted_through={compacted_through} "
@@ -1336,6 +1359,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 "workout_elevation_matched": 0,
                 "workout_elevation_updated": 0,
                 "workout_elevation_unmatched": 0,
+            })
+        if parsed["workout_context_present"]:
+            response.update({
+                "workout_context_seen": len(parsed["workout_context"]),
+                "workout_context_matched": 0,
+                "workout_context_updated": 0,
+                "workout_context_unmatched": 0,
             })
         if parsed["rejected_anchors"]:
             response["anchor_results"] = parsed["anchor_results"]
@@ -1433,6 +1463,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             "workout_elevation_matched": workout_elevation_matched,
             "workout_elevation_updated": workout_elevation_updated,
             "workout_elevation_unmatched": workout_elevation_unmatched,
+        })
+    if parsed["workout_context_present"]:
+        response.update({
+            "workout_context_seen": workout_context_seen,
+            "workout_context_matched": workout_context_matched,
+            "workout_context_updated": workout_context_updated,
+            "workout_context_unmatched": workout_context_unmatched,
         })
     if daily_totals_skipped_settled:
         # A settled day re-pulled in this batch was skipped, not written

@@ -718,8 +718,10 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
     return out
 
 
-# Workout types a pace ("9:03 per mile") is a meaningful reading of.
-_PACE_WORKOUT_TYPES = frozenset({"running", "walking", "hiking"})
+# Workout types a pace ("9:03 per mile") is a meaningful reading of. One
+# definition, owned by ``normalize`` (the workout vocabulary) and shared with
+# ``analysis.workout_focus``; this name is kept for existing importers.
+_PACE_WORKOUT_TYPES = nz.PACE_WORKOUT_TYPES
 # The key a tool result publishes its own citable facts under; pinned equal to
 # ``fact_template.DECLARED_FACTS_RESULT_KEY`` by a test (that module imports
 # this one's siblings, so the literal lives here).

@@ -398,6 +398,16 @@ def workout_name_to_canonical(name: str) -> str:
     return _camel_to_snake(s).replace(" ", "_").strip("_")
 
 
+# Canonical workout types a minutes-per-mile pace is a meaningful reading of:
+# travel on foot. This is an allowlist on purpose. A distance can arrive with
+# any workout type (a swim, a row, a paddle, a skate, a ski, a wheelchair push,
+# or an uncategorised session), and dividing the duration by it for those reads
+# as a pace nobody uses and no one can check against a watch. Every surface
+# that publishes a pace tests membership here, so a new type with a distance
+# gets none until someone decides it should.
+PACE_WORKOUT_TYPES = frozenset({"running", "walking", "hiking"})
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #

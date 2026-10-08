@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from . import db
 from . import metrics as mx
+from . import normalize as nz
 from . import vault as V
 from .metrics import WEAR_MIN_HOURS
 
@@ -1560,8 +1561,10 @@ def training_load(conn, as_of: str | None = None, *,
 def workout_focus(conn, as_of: str | None = None, *,
                   metric_units: bool = False) -> dict | None:
     """Most recent workout within the lookback window.
-    Running-style workouts get pace; cycling gets speed so a bike ride can never
-    be narrated as a running pace.
+    Foot-travel workouts (``normalize.PACE_WORKOUT_TYPES``) get pace; cycling
+    gets speed so a bike ride can never be narrated as a running pace; any other
+    type that carries a distance (a swim, a row, an uncategorised session)
+    reports the distance and duration and neither.
     On a same-day tie the longest workout (by duration) is chosen."""
     as_of = _as_of(conn, as_of)
     start = (date.fromisoformat(as_of)
@@ -1576,6 +1579,10 @@ def workout_focus(conn, as_of: str | None = None, *,
     dist = row["distance_mi"]
     dur = row["duration_min"]
     cycling = _is_cycling_type(row["workout_type"])
+    # Pace is a foot-travel reading (normalize.PACE_WORKOUT_TYPES, the same set
+    # list_workouts uses). A swim, a row or an "other" session can carry a
+    # distance and gets neither a pace nor a speed here; only a ride gets speed.
+    foot = _is_pace_type(row["workout_type"])
     # duration / distance on a run/walk session is a BLENDED pace — it counts
     # the walk breaks — and this dict reaches the agent verbatim through
     # get_briefing. On 2026-08-09 the workout row gave 17.0 min/mi while the
@@ -1585,7 +1592,7 @@ def workout_focus(conn, as_of: str | None = None, *,
     # day_actuals already does exactly this; the briefing path did not.
     day = row["local_date"]
     jog_pace = None
-    if not cycling:
+    if foot:
         try:
             rows = impact_volume(conn, day, day, by="day", metric_units=metric_units)
             jog_pace = (rows[0].get(
@@ -1595,7 +1602,7 @@ def workout_focus(conn, as_of: str | None = None, *,
             jog_pace = None
     pace_key = "pace_min_per_km" if metric_units else "pace_min_per_mi"
     speed_key = "speed_kph" if metric_units else "speed_mph"
-    pace = (None if cycling else dur / dist if dist and dur else None)
+    pace = (dur / dist if foot and dist and dur else None)
     speed = (dist / (dur / 60) if cycling and dist and dur else None)
     display_system = "metric" if metric_units else None
     pace, _ = V.convert_for_unit_system(pace, "min/mi", display_system)
@@ -1616,11 +1623,16 @@ def workout_focus(conn, as_of: str | None = None, *,
         "duration_min": mx.r(dur, 1) if dur is not None else None,
         energy_key: energy,
         pace_key: pace,
-        "pace_label": None if cycling else "blended",
+        "pace_label": "blended" if foot else None,
         jog_pace_key: jog_pace,
         speed_key: speed,
     }
     return out
+
+
+def _is_pace_type(workout_type: str | None) -> bool:
+    """True when a minutes-per-mile pace is a meaningful reading of this type."""
+    return (workout_type or "").lower() in nz.PACE_WORKOUT_TYPES
 
 
 def _is_cycling_type(workout_type: str | None) -> bool:
@@ -1852,7 +1864,22 @@ def talking_points(parts: dict) -> list[dict]:
                     else "distance_km")
     jog_pace_key = ("jog_pace_min_per_mi" if wf and "jog_pace_min_per_mi" in wf
                     else "jog_pace_min_per_km")
-    if wf and wf.get(distance_key) and (wf.get(pace_key) or wf.get(speed_key)):
+    distance_only = bool(
+        wf and wf.get(distance_key)
+        and not (wf.get(pace_key) or wf.get(speed_key))
+        and not _is_pace_type(wf.get("type"))
+        and not _is_cycling_type(wf.get("type")))
+    if distance_only:
+        # A distance with no rate: a swim, a row, an uncategorised session.
+        # Say the distance and stop; a pace is a foot-travel reading.
+        when = "today" if wf.get("date") == parts.get("as_of") \
+            else f"on {wf.get('date')} (not today)"
+        distance_unit = "mi" if distance_key == "distance_mi" else "km"
+        tp.append({"topic": "workout",
+                   "seed": f"{wf['type']} workout {when}: "
+                           f"{wf[distance_key]} {distance_unit}",
+                   "numbers": [wf[distance_key]]})
+    elif wf and wf.get(distance_key) and (wf.get(pace_key) or wf.get(speed_key)):
         # Date-stamp the seed: the focus workout may be up to 2 days old, and an
         # undated seed reads as "today" to the narrator (observed fabrication:
         # a rest-day briefing praising the previous day's ride as today's).

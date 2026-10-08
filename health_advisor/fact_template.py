@@ -1373,7 +1373,11 @@ def _workout_context_candidates(row: dict, workout: str | None, *, sequence,
         return []
     out: list[tuple[str, dict]] = []
     indoor = row.get("is_indoor")
-    if isinstance(indoor, bool):
+    # HealthKit's flag only means something for travel-type workouts; for any
+    # other type it is stored and listed but never narrated as a setting.
+    if (isinstance(indoor, bool)
+            and str(row.get("type") or "").lower()
+            in normalize.SETTING_WORKOUT_TYPES):
         out.append(_workout_label(
             workout, "setting", "indoor" if indoor else "outdoor",
             "indoors" if indoor else "outdoors",

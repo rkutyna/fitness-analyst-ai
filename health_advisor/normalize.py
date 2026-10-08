@@ -454,6 +454,32 @@ def workout_name_to_canonical(name: str) -> str:
 PACE_WORKOUT_TYPES = frozenset({"running", "walking", "hiking"})
 
 
+# Canonical workout types for which "indoors or outdoors" is a meaningful thing
+# to say about a session (consumer #590): the ones where a person travels or
+# moves through a place, so the same activity really can be done in either.
+# HealthKit states its indoor flag on EVERY workout, and for a strength, yoga
+# or other stationary session the stored value says nothing about the place
+# (a strength session done indoors is stated as not-indoor), so a "setting"
+# fact is published only for these types. The raw flag is still stored and
+# still listed. This is an allowlist like PACE_WORKOUT_TYPES: a new type gets
+# no setting until someone decides it should. "other" is deliberately absent:
+# an uncategorised session says nothing about where it was done.
+#
+#   foot and wheel travel   running, walking, hiking, hand_cycling,
+#                           wheelchair_walk_pace, wheelchair_run_pace
+#   cycling                 cycling
+#   water                   swimming, rowing, paddle_sports
+#   skating                 skating_sports
+#   snow                    cross_country_skiing, downhill_skiing,
+#                           snow_sports, snowboarding
+SETTING_WORKOUT_TYPES = frozenset({
+    "running", "walking", "hiking", "cycling", "hand_cycling",
+    "swimming", "rowing", "paddle_sports", "skating_sports",
+    "wheelchair_walk_pace", "wheelchair_run_pace",
+    "cross_country_skiing", "downhill_skiing", "snow_sports", "snowboarding",
+})
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #

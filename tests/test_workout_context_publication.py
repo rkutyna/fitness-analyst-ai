@@ -359,3 +359,67 @@ def test_wire_to_facts_for_a_machine_session(conn, tools):
             row["average_grade_pct"]) == (True, "treadmill", 3.1)
     facts = _facts(copy.deepcopy(listed))
     assert _fields(facts, "average_grade_pct")[f"{DAY}|running"]["value"] == 3.1
+
+
+# --------------------------------------------------------------------------- #
+# The setting label is published only for travel-type workouts (consumer #590)
+# --------------------------------------------------------------------------- #
+def test_the_setting_type_set_is_pinned():
+    from health_advisor import normalize
+    assert normalize.SETTING_WORKOUT_TYPES == frozenset({
+        "running", "walking", "hiking", "cycling", "hand_cycling",
+        "swimming", "rowing", "paddle_sports", "skating_sports",
+        "wheelchair_walk_pace", "wheelchair_run_pace",
+        "cross_country_skiing", "downhill_skiing", "snow_sports",
+        "snowboarding"})
+    assert "other" not in normalize.SETTING_WORKOUT_TYPES
+    assert normalize.PACE_WORKOUT_TYPES <= normalize.SETTING_WORKOUT_TYPES
+
+
+@pytest.mark.parametrize("wtype", [
+    "traditional_strength_training", "yoga", "other", "elliptical",
+    "high_intensity_interval_training"])
+@pytest.mark.parametrize("indoor", [True, False])
+def test_a_non_travel_workout_publishes_no_setting_whatever_it_holds(
+        wtype, indoor):
+    row = _machine_row(type=wtype, is_indoor=indoor, fitness_machine=None,
+                       average_grade_pct=None)
+    facts = _facts(_listing(row))
+    assert _fields(facts, "setting") == {}
+    assert facts  # the session is still spoken about (duration etc.)
+    assert not [f for f in facts.values()
+                if f.get("display") in ("indoors", "outdoors")]
+
+
+@pytest.mark.parametrize("indoor, display", [(False, "outdoors"),
+                                              (True, "indoors")])
+@pytest.mark.parametrize("wtype", ["running", "cycling", "swimming",
+                                   "snowboarding"])
+def test_a_travel_workout_still_publishes_its_setting(wtype, indoor, display):
+    row = _machine_row(type=wtype, is_indoor=indoor, fitness_machine=None,
+                       average_grade_pct=None)
+    fact = _fields(_facts(_listing(row)), "setting")[f"{DAY}|{wtype}"]
+    assert fact["display"] == display
+
+
+def test_a_strength_session_with_a_machine_still_publishes_the_machine():
+    row = _machine_row(type="traditional_strength_training", is_indoor=False,
+                       fitness_machine="rower", average_grade_pct=None)
+    facts = _facts(_listing(row))
+    workout = f"{DAY}|traditional_strength_training"
+    assert _fields(facts, "fitness_machine")[workout]["display"] == (
+        "a rowing machine")
+    assert _fields(facts, "setting") == {}
+
+
+def test_list_workouts_still_returns_the_raw_flag_for_a_non_travel_type(
+        conn, tools):
+    db.insert_workouts(conn, [_workout(
+        "s", wtype="traditional_strength_training", distance_mi=None,
+        is_indoor=0)])
+    conn.commit()
+    row = _by_key(_listed(tools))["s"]
+    assert row["is_indoor"] is False
+    doc = " ".join(mcp_server.list_workouts.__doc__.split())
+    assert "HealthKit's own flag" in doc
+    assert "only meaningful for travel-type workouts" in doc

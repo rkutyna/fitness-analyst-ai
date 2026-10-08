@@ -862,8 +862,11 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     returned rows): the count of workouts, each type's count, and each type's
     longest workout by duration and by distance with its date.
 
-    `is_indoor` is true or false when the device said where the session was
-    recorded and null when it did not say; null is not outdoors.
+    `is_indoor` is HealthKit's own flag, stored as sent: true or false when the
+    device stated one and null when it did not; null is not outdoors. It is only
+    meaningful for travel-type workouts (running, walking, cycling, swimming
+    and the like); a strength or yoga session can carry either value without
+    that saying where it was done.
     `fitness_machine` names the connected machine that recorded it
     (treadmill, indoor_bike, elliptical, stair_stepper, rower, or another kind
     as sent) and is null when none was stated. A session recorded with a machine

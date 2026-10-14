@@ -1344,6 +1344,30 @@ def test_ask_cause_keeps_a_real_zero_distinct_from_no_judge():
                            judge_score=0) == "judge_refused"
 
 
+def test_legacy_arm_judge_pass_mark_is_agents_judge_pass(monkeypatch, vault,
+                                                         conn):
+    # #85: the legacy prose arm passes or refuses on agents.JUDGE_PASS, not a
+    # literal 70. With the mark raised to 90, a judge score of 80 is refused
+    # on both attempts; with the literal 70 restored, it would pass.
+    from health_advisor import agents
+
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setattr(agents, "JUDGE_PASS", 90)
+    ledger, draft = _verified_draft()
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
+    monkeypatch.setattr(chat, "_ask_judge", lambda *args, **kwargs: 80)
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop", lambda *args, **kwargs: draft)
+
+    capture = []
+    result = chat.answer_question(vault, "How is my jogging?", capture=capture)
+
+    assert result["mode"] != "narration"
+    assert [entry["judge_score"] for entry in capture] == [80, 80]
+    assert chat._ask_cause({"ok": True}, ledger=ledger, loop_outcomes=[],
+                           judge_score=80) == "judge_refused"
+
+
 def _failed_verification(*, figures_verified, figures_total, reason,
                          unsupported=None):
     return {

@@ -755,7 +755,9 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
         return "stale_window"
     if not verification.get("ok"):
         return "gate_refused"
-    if judge_score is not None and judge_score < 70:
+    from . import agents
+
+    if judge_score is not None and judge_score < agents.JUDGE_PASS:
         return "judge_refused"
     return "ok"
 
@@ -3511,7 +3513,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             "ledger": ledger,
         }
 
-        if (verification.get("ok") and (score is None or score >= 70)
+        if (verification.get("ok")
+                and (score is None or score >= agents.JUDGE_PASS)
                 and prose.strip()):
             return {
                 "text": prose.strip(), "mode": "narration",
@@ -3586,7 +3589,8 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
             "ledger": ledger,
         }
 
-        if (verification.get("ok") and (score is None or score >= 70)
+        if (verification.get("ok")
+                and (score is None or score >= agents.JUDGE_PASS)
                 and prose.strip()):
             return {
                 "text": prose.strip(), "mode": "narration",

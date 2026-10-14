@@ -1,8 +1,10 @@
 """LLM seam + deterministic helpers. run_model is a thin delegator over
 health_advisor.llm (direct Ollama /api/chat); the model is only ever a text
-transformer here — Python owns the truth. extract_json / grounding_check /
-render_fallback are the gates that make a wrong or empty model output safe.
-The numeric grounding pattern is shared with the other narration gates.
+transformer here — Python owns the truth. extract_json parses model output
+(chat.py and split_claim_channel call it). The numeric grounding pattern is
+shared with the other narration gates. render_fallback is kept, but no
+production path calls it: its only caller is tests/test_agents.py. The live
+fallback for a failed answer is chat._fallback_answer.
 
 ``grounding_check`` is retained as a legacy, unscoped pre-filter for callers
 outside this package. Its result is not a grounding verdict: a nested briefing

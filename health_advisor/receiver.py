@@ -1,11 +1,21 @@
 """FastAPI receiver for HealthKit-direct delta POSTs.
 
-- Optional shared-secret header; rejects without it when set. The secret is
-  read from HA_SECRET_FILE when set, else HA_SHARED_SECRET (#101).
+- Shared-secret check on the X-Health-Secret header. The secret is read from
+  HA_SECRET_FILE when set, else HA_SHARED_SECRET (#101). The header may carry
+  the derived auth token; HA_SECRET_HEADER_MODE=token_only refuses the raw
+  secret as well (the default, raw_or_token, accepts both). Every route except
+  /health and the QR enrolment route checks it. The ask-path and device-token
+  routes refuse when no secret is configured; /v1/ingest skips the check in
+  that case, and HA_REQUIRE_SECRET=1 turns "no secret" into a startup failure.
+- HA_DEVICE_AUTH_MODE=required additionally demands a valid signature from an
+  enrolled, unrevoked device key (device_auth.py), so the secret alone no
+  longer admits a request. In accept, a signed request must verify, and an
+  unsigned one is still admitted on the secret.
 - Idempotent upserts; recomputes daily_metrics for affected (metric, date) pairs.
 - A vault that declares imported history refuses HealthKit samples on or before
   its watermark until an explicit re-derivation migration moves that marker.
-- Binds to localhost by default (front with `tailscale serve`, never 0.0.0.0).
+- Binds to 127.0.0.1 by default (`--host`). To reach it from another machine,
+  front it with a proxy such as `tailscale serve`; do not bind 0.0.0.0.
 
 Run:  the receiver module --vault PATH [--host H --port P]
 Env:  HA_SECRET_FILE (preferred) or HA_SHARED_SECRET; HA_REQUIRE_SECRET=1 makes

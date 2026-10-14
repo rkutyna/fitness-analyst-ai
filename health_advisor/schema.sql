@@ -336,8 +336,10 @@ CREATE TABLE IF NOT EXISTS hk_sync_state (
     PRIMARY KEY (device_id, type_identifier)
 );
 
--- Deletions are retained as tombstones in this slice; applying them is a
--- later ingest concern.
+-- Deletions are retained as tombstones and also applied: _healthkit_ingest
+-- deletes the matching `records` row when a deletion arrives, and again when
+-- a sample re-sent under the same UUID replaces its earlier copy. The
+-- tombstone is what outlives the deleted row.
 CREATE TABLE IF NOT EXISTS hk_deletions (
     device_id       TEXT NOT NULL,
     type_identifier TEXT NOT NULL,

@@ -250,7 +250,14 @@ def test_permit_release_guard_cannot_release_a_newer_run():
 
 def test_timed_out_analyst_releases_permit_for_the_next_ask(
         vault, monkeypatch):
-    """A failed analyst call is a refusal and does not poison the permit."""
+    """A failed analyst call is a refusal and does not poison the permit.
+
+    The property is that the permit is free again once the ask that hit the
+    provider deadline has returned, so the next analyst run is admitted rather
+    than queued behind the dead one. It is asserted on the permit's own state,
+    observed through /v1/analyst's immediate 429 for a held permit, and on the
+    next ask reaching the analyst; no wall-clock ceiling stands in for it.
+    """
     # #86: the switches now default on; this test pins the legacy arm.
     monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
     monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
@@ -259,13 +266,15 @@ def test_timed_out_analyst_releases_permit_for_the_next_ask(
     timeouts = []
     analyst_calls = {"count": 0}
 
-    def complete(prompt, *, timeout):
+    def complete(prompt, *, timeout=None):
+        if timeout is None:
+            # The direct /v1/analyst probe below, not an ask turn.
+            return "```python\nemit('resting_rate', rows)\n```"
         timeouts.append(timeout)
         analyst_calls["count"] += 1
         if analyst_calls["count"] == 1:
             # Model the provider wrapper returning its deadline failure; the
             # real llm.complete call uses the same timeout on its transport.
-            threading.Event().wait(0.02)
             raise TimeoutError("provider timed out")
         return "```python\nemit('resting_rate', rows)\n```"
 
@@ -292,24 +301,24 @@ def test_timed_out_analyst_releases_permit_for_the_next_ask(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport,
                                      base_url="http://test") as client:
-            begin = asyncio.get_running_loop().time()
             first = await client.post(
                 "/v1/ask", json={"question": "first"},
                 headers={"x-health-secret": "secret"})
-            first_elapsed = asyncio.get_running_loop().time() - begin
-
-            begin = asyncio.get_running_loop().time()
+            # A held permit answers 429 at once; a free one admits the run.
+            # Checked before the second ask so a leaked permit fails here
+            # rather than by that ask queueing for its internal wait.
+            probe = await client.post(
+                "/v1/analyst", json={"question": "probe"},
+                headers={"x-health-secret": "secret"})
+            assert probe.status_code == 200, "permit still held after the timeout"
             second = await client.post(
                 "/v1/ask", json={"question": "second"},
                 headers={"x-health-secret": "secret"})
-            elapsed = asyncio.get_running_loop().time() - begin
-        return first, second, first_elapsed, elapsed
+        return first, second
 
-    first, second, first_elapsed, elapsed = asyncio.run(exercise())
+    first, second = asyncio.run(exercise())
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first_elapsed < 1.0
-    assert elapsed < 1.0
     assert timeouts == [llm.TIMEOUT_ASK_TURN, llm.TIMEOUT_ASK_TURN]
 
     first_tool = json.loads(bodies[1]["messages"][-1]["content"])

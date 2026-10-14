@@ -1018,8 +1018,9 @@ def delete_records_for_pairs(
     origin: str = "backfill",
 ) -> int:
     """Delete records for the given (metric, local_date) pairs, optionally only
-    of a given origin. Used by the receiver to evict coarse backfill rows for a
-    day before inserting the fine-grained live samples (kills double-counting)."""
+    of a given origin. Callers: subjective.py and scripts/repair_missing_days.py.
+    The HealthKit receiver does not use it: it refuses a whole batch (409) that
+    holds rows on or before history_imported_through instead of evicting."""
     n = 0
     for metric, date in set(pairs):
         cur = conn.execute(

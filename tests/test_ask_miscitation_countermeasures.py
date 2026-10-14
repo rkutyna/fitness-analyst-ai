@@ -344,6 +344,10 @@ def test_the_ask_path_passes_the_flag_through_to_the_loop(openrouter,
                                                           conn):
     """Both attempts run the same arm; a retry on a different prompt shape
     would not be measuring one thing."""
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     seen = []
     real_tool_loop = llm.tool_loop
 

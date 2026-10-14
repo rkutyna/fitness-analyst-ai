@@ -251,6 +251,10 @@ def test_permit_release_guard_cannot_release_a_newer_run():
 def test_timed_out_analyst_releases_permit_for_the_next_ask(
         vault, monkeypatch):
     """A failed analyst call is a refusal and does not poison the permit."""
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     monkeypatch.setattr(receiver, "SHARED_SECRET", "secret")
     timeouts = []
     analyst_calls = {"count": 0}

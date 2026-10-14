@@ -261,7 +261,8 @@ def test_a_non_template_arm_still_writes_a_valid_row_without_the_counters(
          "figures_verified": 0, "figures_total": 1, "tool_calls": 1},
     ])
     drafts = iter([llm.ResearchResponse("draft"), llm.ResearchResponse("retry")])
-    monkeypatch.delenv("HA_ASK_FACT_TEMPLATE", raising=False)
+    # #86: the template default is on; this non-template arm test pins it off.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
     monkeypatch.setattr(chat, "_verify_ask_answer",
                         lambda *a, **k: next(verifications))
     monkeypatch.setattr(chat, "_read_ledger", lambda path: [{"sequence": 1}])

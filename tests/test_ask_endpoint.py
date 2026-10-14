@@ -244,6 +244,10 @@ def test_shared_secret_rejects_same_length_wrong_values(monkeypatch, presented):
 
 
 def test_endpoint_records_user_and_assistant_turn_and_provenance(monkeypatch, vault):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
     fixture_line = LEDGER_FIXTURE.read_text()
@@ -277,6 +281,10 @@ def test_endpoint_records_user_and_assistant_turn_and_provenance(monkeypatch, va
 
 def test_followup_prompt_contains_prior_turns_once_and_reads_before_append(
         monkeypatch, vault):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
     prompts = []
@@ -364,6 +372,10 @@ def test_history_cannot_launder_a_figure_from_an_earlier_turn(
 
 def test_history_does_not_change_resolvable_scope_pool_width(
         monkeypatch, vault, conn, tmp_path):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
     ledger_record = {
         "sequence": 1,
@@ -410,6 +422,10 @@ def test_retry_is_absent_on_a_first_pass_success_and_true_after_a_retry(
     happened" rather than "unknown". Nothing asserted this, which is how the
     ambiguity survived long enough for two readers to disagree about it.
     """
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger = _ledger()
     period = ledger[0]["result"]["block_comparison"]["blocks"]["recent"]["period"]
     good = _claim("jog_minutes", period, "mean", 50.1,

@@ -50,6 +50,10 @@ def _post(vault, monkeypatch, loop, *, judge=None,
 
 
 def test_ask_cause_ok_and_reason_is_unchanged(monkeypatch, vault):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger_line = LEDGER_FIXTURE.read_text(encoding="utf-8")
     draft = _valid_draft()
 
@@ -93,6 +97,10 @@ def test_ask_cause_empty_gather_keeps_no_ledger_reason(monkeypatch, vault):
 
 
 def test_ask_cause_gate_refused_keeps_python_gate_reason(monkeypatch, vault):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger_line = LEDGER_FIXTURE.read_text(encoding="utf-8")
 
     def loop(*args, **kwargs):
@@ -118,6 +126,10 @@ def test_ask_cause_no_gather_needed_keeps_advice_answer(monkeypatch, vault):
 
 
 def test_ask_cause_judge_refused_keeps_python_gate_reason(monkeypatch, vault):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger_line = LEDGER_FIXTURE.read_text(encoding="utf-8")
     draft = _valid_draft()
 

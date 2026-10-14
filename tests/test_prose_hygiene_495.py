@@ -225,6 +225,9 @@ def test_prose_retry_publishes_clean(monkeypatch, vault, _seeded):
 
 def test_span_suppression_regeneration_publishes_clean(monkeypatch, vault,
                                                        _seeded):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     claim = {"metric": "jog_minutes", "period": "recent", "field": "mean",
              "value": 50.1,
              "source": {"sequence": 1, "path": "$.result.mean"}}

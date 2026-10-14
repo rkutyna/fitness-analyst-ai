@@ -32,6 +32,10 @@ def _seed_model_path_vault(conn):
 
 def test_first_question_prompt_is_unchanged_without_history(monkeypatch, vault,
                                                             conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     # #439: this vault declares its zone, as every deployed vault does since
     # `deploy/bootstrap.py` began refusing to create one without it. An
     # undeclared vault deliberately renders a DIFFERENT line — the current date
@@ -221,6 +225,10 @@ def test_recorded_empty_sleep_answer_skips_a_failing_judge(
 
 def test_empty_sleep_exemption_does_not_keep_a_figure_claim(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger, draft = _recorded_empty_sleep_draft()
     draft = llm.ResearchResponse("I slept for 8 hours.", draft.claims)
     judge_calls = []
@@ -1226,6 +1234,10 @@ def _verified_draft():
 
 def test_capture_records_the_single_attempt_of_a_first_pass_success(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger, draft = _verified_draft()
     monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
     monkeypatch.setattr(chat, "_ask_judge", lambda *args, **kwargs: 100)
@@ -1249,6 +1261,10 @@ def test_capture_records_the_single_attempt_of_a_first_pass_success(
 
 
 def test_capture_records_the_failed_draft_and_the_retry(monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger, draft = _verified_draft()
     drafts = iter([llm.ResearchResponse(""), draft])
     monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
@@ -1275,6 +1291,10 @@ def test_accounting_out_of_band_dict_is_populated_with_stub_call_count(
     caller's dict is filled with the turn's ModelCallAccounting snapshot
     (the same shape ``_record_question`` receives), and the returned
     response — the shape ``/v1/ask`` hands to clients — is unaffected."""
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger, draft = _verified_draft()
     monkeypatch.setattr(chat, "_read_ledger", lambda path: ledger)
     monkeypatch.setattr(chat, "_ask_judge", lambda *args, **kwargs: 100)
@@ -1307,6 +1327,10 @@ def test_accounting_out_of_band_dict_is_populated_with_stub_call_count(
 
 
 def test_unrun_judge_is_none_in_capture_and_response(monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     verifications = iter([
         _failed_verification(figures_verified=0, figures_total=1,
                              reason="first gate failure"),
@@ -1368,6 +1392,33 @@ def test_legacy_arm_judge_pass_mark_is_agents_judge_pass(monkeypatch, vault,
                            judge_score=80) == "judge_refused"
 
 
+def test_with_all_three_switches_unset_ask_takes_the_fact_template_arm(
+        monkeypatch, vault, conn):
+    # #86: the three switches default on. With every one unset, /v1/ask runs
+    # the closed-fact template arm, and the legacy claim-channel instructions
+    # are not in its prompt.
+    for name in ("HA_ASK_FACT_TEMPLATE", "HA_ASK_SUBMIT_REPAIR",
+                 "HA_ASK_SPAN_SUPPRESS"):
+        monkeypatch.delenv(name, raising=False)
+    taken_prompts = []
+    real_fact_arm = chat._answer_fact_template
+
+    def spy(*args, **kwargs):
+        taken_prompts.append(args[2])
+        return real_fact_arm(*args, **kwargs)
+
+    monkeypatch.setattr(chat, "_answer_fact_template", spy)
+    monkeypatch.setattr(chat, "_read_ledger", lambda path: [{"sequence": 1}])
+    monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(llm, "tool_loop",
+                        lambda *args, **kwargs: llm.ResearchResponse(""))
+
+    chat.answer_question(vault, "How is my jogging?")
+
+    assert len(taken_prompts) >= 1
+    assert chat.ASK_CLAIM_INSTRUCTIONS not in taken_prompts[0]
+
+
 def _failed_verification(*, figures_verified, figures_total, reason,
                          unsupported=None):
     return {
@@ -1381,6 +1432,10 @@ def _failed_verification(*, figures_verified, figures_total, reason,
 
 
 def test_retry_returns_the_more_verified_failed_attempt(monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     verifications = iter([
         _failed_verification(figures_verified=1, figures_total=2,
                              reason="attempt one retained a verified figure"),
@@ -1408,6 +1463,10 @@ def test_retry_returns_the_more_verified_failed_attempt(monkeypatch, vault, conn
 
 def test_retry_returns_attempt_two_when_python_verifies_more_figures(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     verifications = iter([
         _failed_verification(figures_verified=0, figures_total=1,
                              reason="attempt one failed"),
@@ -1523,6 +1582,9 @@ def test_weekday_beside_a_bare_figure_is_not_a_date_span():
 
 def test_span_suppression_rewrites_from_only_verified_claims(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     verified_claim = {"metric": "jog_minutes", "period": "recent",
                       "field": "mean", "value": 50.1,
                       "source": {"sequence": 1, "path": "$.result.mean"}}
@@ -1611,6 +1673,9 @@ def test_span_suppression_withholds_a_denial_of_an_available_figure(
 
 def test_span_suppression_failure_twice_refuses_whole_answer(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     claims = [{"value": 50.1}, {"value": 26}]
     failed = _partial_failure()
     verifications = iter([failed, failed, failed, failed])
@@ -1639,6 +1704,9 @@ def test_span_suppression_failure_twice_refuses_whole_answer(
 
 def test_all_claims_failed_never_attempts_span_suppression(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     claims = [{"value": 26}]
     failed = {
         **_failed_verification(figures_verified=0, figures_total=1,
@@ -1668,6 +1736,9 @@ def test_all_claims_failed_never_attempts_span_suppression(
 
 def test_majority_failed_figures_stay_a_whole_answer_refusal(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     claims = [{"value": 50.1}, {"value": 26}, {"value": 27}]
     failed = {
         "ok": False, "grounded": False,
@@ -1703,13 +1774,16 @@ def test_majority_failed_figures_stay_a_whole_answer_refusal(
 
 def test_span_suppression_flag_off_keeps_whole_answer_fallback(
         monkeypatch, vault, conn):
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     claims = [{"value": 50.1}, {"value": 26}]
     failed = _partial_failure()
     verifications = iter([failed, failed])
     drafts = iter([llm.ResearchResponse("draft", claims),
                    llm.ResearchResponse("retry", claims)])
     regeneration_calls = []
-    monkeypatch.delenv("HA_ASK_SPAN_SUPPRESS", raising=False)
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     monkeypatch.setattr(chat, "_verify_ask_answer",
                         lambda *args, **kwargs: next(verifications))
     monkeypatch.setattr(chat, "_read_ledger", lambda path: [{"sequence": 1}])
@@ -1730,6 +1804,10 @@ def test_span_suppression_flag_off_keeps_whole_answer_fallback(
 def test_question_log_records_the_question_and_verdict_only(
         monkeypatch, vault, conn, tmp_path):
     """HA_ASK_QUESTION_LOG appends question + Python's verdict, never prose."""
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     verifications = iter([
         _failed_verification(figures_verified=1, figures_total=2,
                              reason="first failed"),
@@ -1897,6 +1975,10 @@ def test_degenerate_repeated_token_has_a_distinct_verification_reason():
 
 def test_capture_adds_no_key_to_the_returned_response(monkeypatch, vault, conn):
     """The draft channel is out-of-band; the client-facing shape does not move."""
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     # `HA_ASK_VALUE_REBIND` (Method C) declares one additional verification
     # field, `rebind_counts`, and only while it is on. That is asserted in
     # `tests/test_ledger_value_rebind.py`; the default shape is asserted here,
@@ -1999,6 +2081,10 @@ def test_retry_feedback_says_the_value_is_unlabelled_when_no_metric_hint():
 def test_the_retry_prompt_names_the_leftover_token(monkeypatch, vault, conn):
     """The second tool_loop call must receive the pointed feedback, not the
     verification dict as JSON."""
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     ledger, draft = _verified_draft()
     drafts = iter([llm.ResearchResponse("You ran 26 miles."), draft])
     prompts = []

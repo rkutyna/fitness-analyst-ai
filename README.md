@@ -260,6 +260,30 @@ unless you name it. If you want OpenRouter under your own policy, point
 `openai_compatible` at `https://openrouter.ai/api/v1` and list `openrouter.ai`.
 Then OpenRouter chooses the serving provider, because no pin is sent.
 
+### Grounding switches for `/v1/ask`
+
+Three environment switches choose how `/v1/ask` grounds its answers. All three
+default to **on**, which is the production shape: the model writes prose with a
+placeholder for each figure, and Python fills the figures in from a closed fact
+set, so the model never writes a published digit.
+
+| Variable | Default | `1` (default) | `0` |
+|---|---|---|---|
+| `HA_ASK_FACT_TEMPLATE` | `1` | Closed-fact template arm: placeholders, filled by Python | Legacy prose arm: claim channel checked by Python, plus a judge pass |
+| `HA_ASK_SUBMIT_REPAIR` | `1` | A malformed `submit_answer` call gets one repair turn | The malformed call is not repaired |
+| `HA_ASK_SPAN_SUPPRESS` | `1` | When only a minority of figures fail, the failed ones are removed and the answer is regenerated from the verified claims, then gated again | Any failed figure falls back the whole answer |
+
+To run the legacy behaviour, set the switch to `0` explicitly:
+
+```bash
+export HA_ASK_FACT_TEMPLATE=0
+export HA_ASK_SUBMIT_REPAIR=0
+export HA_ASK_SPAN_SUPPRESS=0
+```
+
+Before updating a deployment, check its environment. One that never set these
+switches changes `/v1/ask` behaviour on its next engine update.
+
 ## Status and limitations
 
 Things this README will not pretend about:

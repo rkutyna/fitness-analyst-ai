@@ -301,6 +301,10 @@ def test_the_ask_prompt_carries_one_claim_schema_not_two(openrouter, monkeypatch
     source path may be rooted at `$.arguments...`, which `_verify_ask_answer`
     rejects. Whatever else the ask prompt says, it must not say that.
     """
+    # #86: the switches now default on; this test pins the legacy arm.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
+    monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
+    monkeypatch.setenv("HA_ASK_SPAN_SUPPRESS", "0")
     monkeypatch.setattr(llm, "_registry", _REAL_REGISTRY)
     bodies = []
 

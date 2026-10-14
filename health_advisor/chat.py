@@ -5,12 +5,12 @@ caller-supplied history and vault-scoped durable user facts as prompt context.
 Every operation receives its :class:`VaultContext` explicitly so a conversation
 can never fall back to an ambient database path.
 
-Partial verification is all-or-nothing by default: an answer with any failed
-figure falls back as a whole. With ``HA_ASK_SPAN_SUPPRESS=1``, only a minority
-failure may enter the salvage arm; Python removes failed figures, regenerates
-from the remaining verified claims, and publishes only after the rewrite passes
-the same gate. A failed rewrite still falls back, so no unverified sentence is
-published with a caveat.
+Partial verification: with ``HA_ASK_SPAN_SUPPRESS=0`` an answer with any failed
+figure falls back as a whole. By default (on since #86) only a minority failure
+may enter the salvage arm; Python removes failed figures, regenerates from the
+remaining verified claims, and publishes only after the rewrite passes the same
+gate. A failed rewrite still falls back, so no unverified sentence is published
+with a caveat.
 """
 from __future__ import annotations
 
@@ -1019,9 +1019,10 @@ def _fact_template_enabled() -> bool:
     """Whether ask uses the closed-fact template narration arm.
 
     Read per call so a measurement process can select this arm and the legacy
-    prose arm in succession.  Default OFF preserves the existing ask path.
+    prose arm in succession.  Default ON since #86; ``HA_ASK_FACT_TEMPLATE=0``
+  selects the legacy prose arm.
     """
-    return os.environ.get("HA_ASK_FACT_TEMPLATE", "0").strip() == "1"
+    return os.environ.get("HA_ASK_FACT_TEMPLATE", "1").strip() == "1"
 
 
 _CONVERSATIONAL_MESSAGE_RE = re.compile(
@@ -1092,9 +1093,10 @@ def _submit_repair_enabled() -> bool:
 
     Read per call, not at import, for the same reason as
     :func:`_ledger_index_enabled`: a measurement run sets both arms in one
-    process. Default OFF, so every existing caller is byte-identical.
+    process. Default ON since #86; ``HA_ASK_SUBMIT_REPAIR=0`` restores the
+    pre-repair path, byte-identical to before.
     """
-    return os.environ.get("HA_ASK_SUBMIT_REPAIR", "0").strip() == "1"
+    return os.environ.get("HA_ASK_SUBMIT_REPAIR", "1").strip() == "1"
 
 
 _SPAN_SUPPRESS_MIN_FRACTION = 0.5
@@ -1157,11 +1159,11 @@ def _span_suppress_enabled() -> bool:
     """Whether failed ask answers may take the opt-in salvage path.
 
     Read per call, not at import, so measurement can set both arms in one
-    process. Default OFF preserves the existing whole-answer fallback. Note
+    process. Default ON since #86; ``0`` preserves the whole-answer fallback. Note
     that narration counts before and after this change are not comparable:
     this path converts some fallbacks into narrations by definition.
     """
-    return os.environ.get("HA_ASK_SPAN_SUPPRESS", "0").strip() == "1"
+    return os.environ.get("HA_ASK_SPAN_SUPPRESS", "1").strip() == "1"
 
 
 def _figure_key(value) -> tuple[str, str]:

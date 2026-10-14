@@ -477,23 +477,27 @@ def test_an_empty_text_answer_is_not_a_shape_failure_and_is_not_repaired(
 
 
 # --------------------------------------------------------------------------
-# the env flag, and the default that keeps every existing caller identical
+# the env flag, and its default (on since #86) with the "0" opt-out
 # --------------------------------------------------------------------------
 
-def test_the_env_flag_defaults_off_and_reads_1(monkeypatch):
+def test_the_env_flag_defaults_on_and_reads_0_as_off(monkeypatch):
     monkeypatch.delenv("HA_ASK_SUBMIT_REPAIR", raising=False)
-    assert chat._submit_repair_enabled() is False
+    assert chat._submit_repair_enabled() is True
     monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", "0")
     assert chat._submit_repair_enabled() is False
     monkeypatch.setenv("HA_ASK_SUBMIT_REPAIR", " 1 ")
     assert chat._submit_repair_enabled() is True
 
 
-@pytest.mark.parametrize("value, expected", [(None, False), ("1", True)])
+@pytest.mark.parametrize("value, expected",
+                         [(None, True), ("0", False), ("1", True)])
 def test_answer_question_passes_one_arm_to_both_attempts(monkeypatch, vault,
                                                          conn, value, expected):
     """A retry that saw a different arm than the draft it is fixing would not
     be measuring one thing — so both attempts carry the same flag."""
+    # #86: this asserts the legacy prose loop's kwarg, so pin the template arm
+    # off; the flag under test is then the only thing that varies.
+    monkeypatch.setenv("HA_ASK_FACT_TEMPLATE", "0")
     if value is None:
         monkeypatch.delenv("HA_ASK_SUBMIT_REPAIR", raising=False)
     else:

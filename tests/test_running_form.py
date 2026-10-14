@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import math
 import itertools
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from health_advisor import db
+from health_advisor import metrics as mx
 from health_advisor import running_form as rf
 
 
@@ -261,6 +264,13 @@ def _insert_nested_running_workouts(conn):
             ts = (t0 + timedelta(seconds=20 * i)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             _insert_running_sample(conn, "distance_walking_running", ts, local_date, 1.0 / 42.0, f"{week}-{i}")
             _insert_running_sample(conn, "heart_rate", (t0 + timedelta(seconds=20 * i + 5)).strftime("%Y-%m-%dT%H:%M:%SZ"), local_date, 140.0, f"{week}-{i}")
+            # Cadence inside the workout window is what makes a bucket jog
+            # (metrics.impact_bucket_rows): 47 steps per 20 s is 141 spm.
+            conn.execute(
+                "INSERT INTO records (metric, start_utc, end_utc, local_date, value, unit, "
+                "source, dedupe_key) VALUES ('step_count', ?, ?, ?, 47.0, 'count', 'test', ?)",
+                (ts, ts, local_date, f"step_count|{ts}|{week}-{i}"),
+            )
     conn.commit()
 
 
@@ -372,3 +382,102 @@ def test_monthly_running_power_excludes_treadmill_runs(conn):
     _insert_power_run(conn, "2026-07-14", 8, 200.0, route_ref="run-a.gpx")
     _insert_power_run(conn, "2026-07-21", 8, 400.0, route_ref=None)
     assert rf.monthly_running_power(conn, "2026-07") is None
+
+
+def _conn_for(tmp_path):
+    c = db.connect(str(tmp_path / "running_form.db"))
+    db.init_db(c)
+    return c
+
+
+def _insert_run_buckets(conn, segments):
+    """One running workout with one 20-second bucket per entry, written the way
+    the vault holds raw samples: a distance sample, a step sample when the
+    cadence is non-zero, and a heart-rate sample when HR is given.
+
+    Each entry is (pace_min_per_mi, cadence_spm, hr_bpm or None).
+    """
+    t0 = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+    seconds = 20 * len(segments)
+    start = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = (t0 + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "duration_min, source, dedupe_key) VALUES ('running', ?, ?, '2026-07-01', "
+        "?, 'test', ?)",
+        (start, end, seconds / 60.0, f"run|{start}|{end}"),
+    )
+
+    def record(metric, ts, value, unit):
+        conn.execute(
+            "INSERT INTO records (metric, value, unit, start_utc, end_utc, "
+            "local_date, source, origin, dedupe_key) VALUES (?, ?, ?, ?, ?, "
+            "'2026-07-01', 'test', 'test', ?)",
+            (metric, value, unit, ts, ts, f"{metric}|{ts}"),
+        )
+
+    for i, (pace, cadence, hr) in enumerate(segments):
+        ts = (t0 + timedelta(seconds=20 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record("distance_walking_running", ts, (20 / 60.0) / pace, "mi")
+        if cadence:
+            record("step_count", ts, cadence / 3.0, "count")
+        if hr is not None:
+            record("heart_rate", ts, hr, "count/min")
+    conn.commit()
+    return start, end
+
+
+def _epoch_bucket(value: str) -> int:
+    """UTC 20-second bucket index of an ISO timestamp, the volume rule's key."""
+    seconds = int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return seconds // mx.IMPACT_BUCKET_SECONDS
+
+
+def test_pace_and_heart_rate_alone_do_not_make_a_running_form_jog(tmp_path):
+    """Pace 14 min/mi and HR 140 sit inside the retired pace/HR lane, but the
+    bucket is walking by cadence (110 spm inside a workout). Running form must
+    count it as walking, as the volume dial does."""
+    conn = _conn_for(tmp_path)
+    start, end = _insert_run_buckets(conn, [(14.0, 110.0, 140.0)] * 20)
+    rows = mx.bucket_series(conn, start, end)
+    assert len(rows) == 20
+    assert not any(row["is_jog"] for row in rows)
+
+    collapsed = rf._collapse_bucket_rows(rows)
+    assert all(b["is_walk"] and not b["is_jog"] for b in collapsed)
+    assert rf.efficiency_change_from_buckets(rows)["jog_minutes"] == 0.0
+    conn.close()
+
+
+def test_running_form_jog_set_is_the_volume_dial_jog_set(tmp_path):
+    """Mixed fixture where pace/HR and cadence disagree in both directions:
+    the incline walk must leave the jog set, the slow jog must join it, and
+    the two jog sets must match impact_bucket_rows bucket for bucket."""
+    conn = _conn_for(tmp_path)
+    start, end = _insert_run_buckets(conn, (
+        [(10.0, 150.0, 150.0)] * 10     # jog on cadence
+        + [(14.0, 110.0, 140.0)] * 5    # incline walk: pace/HR say jog, cadence says walk
+        + [(17.0, 150.0, 120.0)] * 5    # slow jog: pace/HR say walk, cadence says jog
+        + [(22.0, 0.0, 110.0)] * 5      # walk with no step samples
+    ))
+    volume_rows = mx.impact_bucket_rows(
+        conn, "start_utc >= ? AND start_utc < ?", (start, end),
+        arbitration_window=(start, end), arbitration_window_kind="utc")
+    volume_jog = {int(row["bkt"]) for row in volume_rows if row["is_jog"]}
+
+    rows = mx.bucket_series(conn, start, end)
+    running_form_jog = {_epoch_bucket(b["bucket_start_utc"])
+                        for b in rf._collapse_bucket_rows(rows) if b["is_jog"]}
+
+    assert len(volume_jog) == 15
+    assert running_form_jog == volume_jog
+    conn.close()
+
+
+def test_collapse_reads_the_canonical_is_jog_it_is_given():
+    """A bucket the volume rule calls walking stays walking here, even when its
+    pace and heart rate would have passed the retired pace/HR lane."""
+    collapsed = rf._collapse_bucket_rows(
+        [_bucket(False, 60.0 / 14.0, 140.0, is_walk=True)])
+    assert collapsed[0]["is_jog"] is False
+    assert collapsed[0]["is_walk"] is True

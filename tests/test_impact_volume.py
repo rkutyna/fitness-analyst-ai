@@ -64,7 +64,7 @@ def _emit(conn, local_date: str, start_hhmm: str, seconds: int,
             )
 
 
-def test_jog_and_walk_are_split_by_pace():
+def test_jog_and_walk_minutes_split_on_running_cadence():
     conn = _conn()
     _emit(conn, "2026-07-28", "12:00", 300, 14.0)   # 5 min jogging
     _emit(conn, "2026-07-28", "12:05", 300, 22.0, cadence_spm=0.0)   # 5 min walking
@@ -135,10 +135,10 @@ def test_pace_no_longer_controls_jog_classification():
     assert rows["2026-07-29"]["jog_minutes"] > 1.5
 
 
-def test_slow_jog_confirmed_by_heart_rate_counts_as_impact():
-    """The Week 5 bug: jogging slowly enough to hold the HR cap fell off the far
-    side of the 16 min/mi cutoff and scored as walking. A 10-minute jog at 18
-    min/mi with the heart rate of a run is a jog."""
+def test_slow_jog_at_running_cadence_counts_as_impact():
+    """Slow jogging at running cadence inside a workout is impact, whatever the
+    heart rate. A 10-minute jog at 17 min/mi with HR 140 counts as jog minutes;
+    the pace and HR lanes that once decided it no longer do."""
     conn = _conn()
     _emit(conn, "2026-07-29", "12:00", 600, 17.0, hr=140)
     (row,) = A.impact_volume(conn, "2026-07-29", "2026-07-29", by="day")

@@ -184,7 +184,7 @@ LONGTERM_METRICS = ["step_count", "active_energy", "distance_walking_running",
 # Re-exported so existing callers of analysis.IMPACT_* keep working; the
 # definitions live in metrics.py alongside bucket_series.
 from .metrics import (  # noqa: F401  — re-export
-    IMPACT_BUCKET_SECONDS, IMPACT_JOG_HR_MIN, IMPACT_JOG_HR_PACE_MAX,
+    IMPACT_BUCKET_SECONDS, IMPACT_JOG_HR_MIN,
     IMPACT_IMPLAUSIBLE_PACE_MIN, IMPACT_JOG_CADENCE_MIN,
     IMPACT_JOG_PACE_MAX, IMPACT_WALK_PACE_MAX,
     IMPACT_CADENCE_PLAUSIBLE_MAX, BLOCK_EFFORT_CADENCE_MIN,

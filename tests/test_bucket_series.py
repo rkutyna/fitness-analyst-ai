@@ -98,8 +98,8 @@ def _add_hr(c, start_utc, local_date, bpm):
         (start_utc, start_utc, local_date, bpm, f"h|{start_utc}|{bpm}"))
 
 
-def test_fast_bucket_is_jog_on_pace_alone(conn):
-    # 20 s at 10 min/mi = 0.0333 mi. Well inside the 16 min/mi pace lane.
+def test_fast_bucket_at_running_cadence_is_jog(conn):
+    # 20 s at 10 min/mi = 0.0333 mi, at the default 141 spm inside a workout.
     _add_distance(conn, "2026-07-01T12:00:00Z", "2026-07-01", 0.0333)
     conn.commit()
     rows = mx.bucket_series(conn, "2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z")
@@ -111,9 +111,9 @@ def test_fast_bucket_is_jog_on_pace_alone(conn):
     assert rows[0]["speed_mph"] == pytest.approx(6.0, abs=0.1)
 
 
-def test_slow_bucket_with_high_hr_is_jog_on_the_hr_lane(conn):
-    # 20 s at 17.5 min/mi = 0.01905 mi — too slow for the pace lane, inside the
-    # 18 min/mi HR lane. With HR 135 (>=130) it is a jog.
+def test_slow_bucket_at_running_cadence_is_jog(conn):
+    # 20 s at 17.5 min/mi = 0.01905 mi, at the default 141 spm inside a workout.
+    # HR 135 is recorded; cadence is what makes it a jog.
     _add_distance(conn, "2026-07-01T12:00:00Z", "2026-07-01", 0.01905)
     _add_hr(conn, "2026-07-01T12:00:05Z", "2026-07-01", 135.0)
     conn.commit()

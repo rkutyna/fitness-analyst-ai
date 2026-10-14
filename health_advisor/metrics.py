@@ -507,12 +507,11 @@ IMPACT_JOG_CADENCE_MIN = 140.0  # steps/min; walk/run gait transition; six oracl
 # consumer — the volume SQL below and the block predicate — reads this one
 # name rather than a second literal.
 IMPACT_CADENCE_PLAUSIBLE_MAX = 250.0  # steps/min; glitch ceiling, not a gait threshold
-# Not impact-volume lanes. IMPACT_JOG_HR_PACE_MAX is running_form's slow-bucket
-# ceiling. IMPACT_JOG_HR_MIN is the heart-rate line read by the block dial's
-# pace-veto and effort-confirm lanes (analysis._is_jog_bucket) and by
-# running_form's bucket collapse. The block bridge reads BLOCK_BRIDGE_HR_MIN
-# below, an equal value kept as a separate name on purpose.
-IMPACT_JOG_HR_PACE_MAX = 18.0  # min/mi; running_form's slow-bucket ceiling
+# Not impact-volume lanes. IMPACT_JOG_HR_MIN is the heart-rate line read by the
+# block dial's pace-veto and effort-confirm lanes (analysis._is_jog_bucket).
+# running_form takes its jog flag from the canonical bucket rows and does not
+# read it. The block bridge reads BLOCK_BRIDGE_HR_MIN below, an equal value
+# kept as a separate name on purpose.
 IMPACT_JOG_HR_MIN = 130.0      # bpm; block dial's pace-veto / effort-confirm HR line
 
 # Effort-confirmed near-running gait: the block dial's third lane. A bucket

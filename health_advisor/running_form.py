@@ -55,12 +55,11 @@ def _collapse_bucket_rows(buckets, metric_units: bool = False):
         hrs = [float(row["hr"]) for row in rows if row.get("hr") is not None]
         hr = sum(hrs) / len(hrs) if hrs else None
         pace = bucket_min / miles if miles > 0 else None
-        is_jog = bool(
-            pace is not None
-            and pace >= mx.IMPACT_IMPLAUSIBLE_PACE_MIN
-            and (pace <= mx.IMPACT_JOG_PACE_MAX
-                 or (pace <= mx.IMPACT_JOG_HR_PACE_MAX
-                     and (hr or 0.0) >= mx.IMPACT_JOG_HR_MIN)))
+        # The canonical jog flag from metrics.impact_bucket_rows, read not
+        # re-derived. Cadence and the workout window are per UTC bucket, so
+        # split rows can disagree only through their own miles; one jog row
+        # makes the bucket jog, as it does in the volume rule.
+        is_jog = any(bool(row["is_jog"]) for row in rows)
         is_walk = bool(not is_jog and pace is not None
                        and pace >= mx.IMPACT_IMPLAUSIBLE_PACE_MIN
                        and pace <= mx.IMPACT_WALK_PACE_MAX)

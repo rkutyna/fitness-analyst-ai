@@ -527,10 +527,14 @@ def test_an_invalid_max_ttl_refuses_at_startup(make_app, monkeypatch, bad, enrol
         make_app(enrol_mode=enrol_mode)
 
 
-@pytest.mark.parametrize("good", [None, "900", "3600", "86400"])
-def test_a_valid_or_unset_max_ttl_starts(make_app, monkeypatch, good):
+@pytest.mark.parametrize("good, expected", [
+    (None, enrol.MAX_TTL_SECONDS), ("900", 900), ("3600", 3600), ("86400", 86400)])
+def test_a_valid_or_unset_max_ttl_starts(make_app, monkeypatch, good, expected):
     if good is None:
         monkeypatch.delenv("HA_ENROL_MAX_TTL_SECONDS", raising=False)
     else:
         monkeypatch.setenv("HA_ENROL_MAX_TTL_SECONDS", good)
     make_app(enrol_mode="on")
+    # The app starts, and the cap it will grant is the configured one, not
+    # the default or a clamped value.
+    assert enrol.max_ttl_seconds() == expected

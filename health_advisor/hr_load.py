@@ -114,6 +114,8 @@ def daily_load(conn, start: str, end: str,
 
     by_day: dict[str, dict] = {}
     kept_by_day: dict[str, list[tuple[str, str]]] = {}
+    rest_by_day: dict[str, float | None] = {}
+    peak_by_day: dict[str, float | None] = {}
     for w in workouts:
         day = w["local_date"]
         d = by_day.setdefault(day, {"date": day, "load": 0.0, "sessions": 0,
@@ -127,8 +129,20 @@ def daily_load(conn, start: str, end: str,
         kept.append((w["start_utc"], w["end_utc"]))
         mean_hr, _n = _session_mean_hr(conn, w["start_utc"], w["end_utc"],
                                        w["duration_min"])
-        rest = hr_rest if hr_rest is not None else hr_rest_estimate(conn, day)
-        peak = hr_max if hr_max is not None else hr_max_estimate(conn, day)
+        # Both estimates depend only on the day, so a day's second and later
+        # sessions reuse the first one's values.
+        if hr_rest is not None:
+            rest = hr_rest
+        else:
+            if day not in rest_by_day:
+                rest_by_day[day] = hr_rest_estimate(conn, day)
+            rest = rest_by_day[day]
+        if hr_max is not None:
+            peak = hr_max
+        else:
+            if day not in peak_by_day:
+                peak_by_day[day] = hr_max_estimate(conn, day)
+            peak = peak_by_day[day]
         load = session_load(w["duration_min"], mean_hr, rest, peak)
         if load is None:
             d["sessions_without_hr"] += 1

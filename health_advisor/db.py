@@ -2901,11 +2901,13 @@ def log_ingest_diagnostics(conn: sqlite3.Connection,
 def _main(argv: Sequence[str] | None = None) -> int:
     """`python -m health_advisor.db --reconcile-hr [--db P] [--since D] [--dry-run]`
 
-    reconcile_workout_heart_rate is otherwise only ever called by the receiver,
-    scoped to the days a POST touched, so a workout that predates the receiver
-    — or that arrived by export.zip on a day the phone did not sync — is never
-    revisited. This runs the same pass over history, with the same evidence
-    gates (HR_MIN_SAMPLES / HR_MIN_COVERAGE) deliberately unchanged: the point
+    reconcile_workout_heart_rate is called by this entry point and by
+    `scripts/survey_workout_mutations.py`; the receiver does not call it, so a
+    workout is reconciled only when someone runs this pass. A workout that
+    predates the receiver — or that arrived by export.zip on a day the phone
+    did not sync — is therefore reached only here. This runs the pass over
+    history, with the same evidence gates (HR_MIN_SAMPLES / HR_MIN_COVERAGE)
+    deliberately unchanged: the point
     is to reach the rows, not to lower the bar for overruling a device summary.
     """
     import argparse

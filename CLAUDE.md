@@ -48,8 +48,13 @@ ingest or aggregation. The short version:
 - `daily_metrics.last` means "value at the latest timestamp", not the largest.
 - Journal mode is `DELETE`, not WAL, and that is load-bearing.
 - Sleep is attributed **by session**, to the date the session ends.
-- Jog minutes are classified by **20-second cadence** inside a workout window.
-  Nothing coarser than 20-second samples produces a single jog minute.
+- Jog minutes are classified by **20-second cadence** inside a workout window
+  (cadence 140-250 spm, or 130-250 spm at a heart rate of 130 or over; pace is
+  only an implausibility floor). **One rule serves every use** --
+  `metrics.is_jog_bucket` for jog minutes, `metrics.is_block_bucket` and
+  `metrics.is_bridge_bucket` for the longest-block dial and any consumer that
+  finds a block. Never write a second copy of it. Nothing coarser than
+  20-second samples produces a single jog minute.
 - **`_workout_arbitration` classifies device labels by role at query time**
   (`normalize.workout_source_role`: product type first, then localised role
   words such as watch/phone), then binds the raw labels into one SQL set per

@@ -1701,6 +1701,11 @@ def movers(conn, as_of: str | None = None, scope: str = "daily",
         # Effect size: how far the recent mean sits from the baseline in units of
         # the baseline's own day-to-day spread. A perfectly flat baseline makes
         # any move unambiguous, so it takes the cap rather than dividing by zero.
+        # The one POPULATION (ddof 0) spread in the engine, kept by decision
+        # (#94): every other published std/sd is the sample sd, but this is the
+        # effect-size denominator the mover thresholds were tuned against, and
+        # the published baseline_sd is the same number so that effect_sd stays
+        # diff / baseline_sd.
         sd = statistics.pstdev(base_vals) if len(base_vals) > 1 else 0.0
         diff = recent - base
         if sd > 0:

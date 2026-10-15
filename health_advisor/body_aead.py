@@ -97,6 +97,9 @@ def _hkdf(secret: str, info: bytes, length: int) -> bytes:
 def _derived_material(secret: str) -> _DerivedMaterial:
     """Return cached derivations keyed by the exact trimmed secret bytes."""
     secret_b = _secret_bytes(secret)
+    if not secret_b:
+        # HKDF over empty input yields keys anyone can compute.
+        raise ValueError("an empty secret derives no keys")
     with _DERIVED_CACHE_LOCK:
         material = _DERIVED_CACHE.get(secret_b)
         if material is not None:

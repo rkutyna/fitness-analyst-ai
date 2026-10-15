@@ -9,6 +9,7 @@ token (``raw_or_token``, the default) or refused (``token_only``).
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
 
@@ -101,7 +102,12 @@ def test_a_wrong_token_is_refused(monkeypatch, mode, presented):
 def test_an_empty_ask_secret_refuses_even_the_token_of_an_empty_secret(monkeypatch):
     _mode(monkeypatch, "raw_or_token")
     monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    _refusal(receiver._require_ask_secret, body_aead.auth_token(""))
+    # body_aead no longer derives from an empty secret (#104), so build the
+    # token an attacker could compute from the empty string by hand.
+    attacker_token = base64.urlsafe_b64encode(
+        body_aead._hkdf("", body_aead.INFO_AUTH_TOKEN, body_aead.AUTH_TOKEN_BYTES)
+    ).decode("ascii").rstrip("=")
+    _refusal(receiver._require_ask_secret, attacker_token)
 
 
 @pytest.mark.parametrize("value", ["sometimes", "token", "RAW_OR_TOKEN", " token_only"])

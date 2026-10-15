@@ -16,7 +16,7 @@ MAX_SERIES_POINTS = 400
 # the derive backfill automatically revisits source-backed rows at the new
 # version. A bump triggers re-derivation, while source-less old rows remain
 # visible to the operator as unrecomputable rather than being deleted.
-DERIVED_FORMULA_VERSION = 2
+DERIVED_FORMULA_VERSION = 3
 VERSIONED_DERIVED_METRICS = frozenset({
     "sleep_bedtime", "sleep_wake_time", "sleep_midpoint",
     "sleep_time_in_bed", "sleep_awakenings", "sleep_awake_longest",
@@ -470,7 +470,6 @@ IMPACT_BUCKET_SECONDS = 20
 # for daily-total-style rows: it protects the pre-June-2026 history without
 # pretending that a 599-second live interval is a 20-second observation.
 IMPACT_MAX_SAMPLE_SPAN_SECONDS = 12 * 60 * 60
-IMPACT_JOG_PACE_MAX = 16.0     # min/mi; retained for the separate block dial
 IMPACT_WALK_PACE_MAX = 40.0    # slower than this is standing/GPS noise, not walking
 # No lower pace bound existed here, so a car journey read as jogging: 2026-06-03
 # carries a chain of buckets at 29-59 mph with no heart rate and no workout, and
@@ -480,9 +479,10 @@ IMPACT_WALK_PACE_MAX = 40.0    # slower than this is standing/GPS noise, not wal
 # noise.
 IMPACT_IMPLAUSIBLE_PACE_MIN = 5.0  # min/mi; faster than this is not human travel
 
-# Jogging is now a workout-scoped cadence classification. The pace constants
-# remain part of the bucket payload and the separate block dial; they do not
-# classify impact-volume jogging.
+# Jogging is a workout-scoped cadence classification (is_jog_bucket below),
+# with a pace floor and, for a tired stride, a heart-rate confirmation. Pace
+# otherwise decides nothing: it is a plausibility floor here and a "still
+# moving" test inside a block bridge, never a lane of its own.
 #
 # The threshold is a RATE, so the series it reads has to be one too. A step
 # sample is an interval, not an observation of one bucket: HealthKit hands the
@@ -504,40 +504,101 @@ IMPACT_JOG_CADENCE_MIN = 140.0  # steps/min; walk/run gait transition; six oracl
 # A cadence above this is a sensor/aggregation glitch: the same step-total
 # misread that once produced a four-figure spm (see above) must not count as
 # running in ANY lane. Real human cadence does not reach 250 spm, so every
-# consumer — the volume SQL below and the block predicate — reads this one
-# name rather than a second literal.
+# consumer — the jog predicate below, and through it volume, blocks and
+# decoupling — reads this one name rather than a second literal.
 IMPACT_CADENCE_PLAUSIBLE_MAX = 250.0  # steps/min; glitch ceiling, not a gait threshold
-# Not impact-volume lanes. IMPACT_JOG_HR_MIN is the heart-rate line read by the
-# block dial's pace-veto and effort-confirm lanes (analysis._is_jog_bucket).
-# running_form takes its jog flag from the canonical bucket rows and does not
-# read it. The block bridge reads BLOCK_BRIDGE_HR_MIN below, an equal value
-# kept as a separate name on purpose.
-IMPACT_JOG_HR_MIN = 130.0      # bpm; block dial's pace-veto / effort-confirm HR line
+# The heart-rate line of the effort-confirmed lane below. The block bridge
+# reads BLOCK_BRIDGE_HR_MIN, an equal value kept as a separate name on purpose.
+IMPACT_JOG_HR_MIN = 130.0      # bpm; effort-confirm HR line
 
-# Effort-confirmed near-running gait: the block dial's third lane. A bucket
-# sitting just under the 140 gait line at a running heart rate IS running —
-# a tired stride, not a walk — but only when its cadence is present, plausible,
-# and close enough to the gait line for HR to be confirming rather than
+# Effort-confirmed near-running gait: the second jog lane. A bucket sitting
+# just under the 140 gait line at a running heart rate IS running -- a tired
+# stride, not a walk -- but only when its cadence is present, plausible, and
+# close enough to the gait line for HR to be confirming rather than
 # contradicting.
-BLOCK_EFFORT_CADENCE_MIN = 130.0  # steps/min; floor for the HR-confirmed lane
+IMPACT_JOG_EFFORT_CADENCE_MIN = 130.0  # steps/min; floor for the HR-confirmed lane
 
 # --- the bridge rule: how a bucket is classified, item 3 ----------------------
-# A continuous jog is not a continuous chain of <=16 min/mi buckets. GPS drops a
+# A continuous jog is not a continuous chain of jog buckets. GPS drops a
 # bucket, a road crossing slows one, and a single 20-second sample splits a run
 # in two. On 2026-08-15 exactly that happened: a 9.3-minute continuous jog was
 # reported as 4.0 — the best session on record read as the worst — because
-# two buckets in the middle fell to 16-18 min/mi.
+# two buckets in the middle fell out of the chain.
 #
-# So up to TWO consecutive buckets at 16-18 min/mi MAY bridge two jog segments,
-# but only with HR >= 130 confirming the athlete was still running through
-# them, only when the bucket indices are genuinely contiguous (no missing
-# time), and only when flanked by jog buckets on BOTH sides — a trailing slow
-# tail does not extend a block. Backtested across every running session since
-# 2026-06-22 the bridge changes exactly one number, which is the point: it is
-# a repair for a specific artifact, not a loosening.
+# So up to TWO consecutive non-jog buckets MAY bridge two jog segments, but
+# only when each is still MOVING (pace between the plausibility floor and
+# BLOCK_BRIDGE_PACE_MAX) at a running heart rate (>= BLOCK_BRIDGE_HR_MIN) --
+# a standing stop keeps the heart rate up but fails "still moving" -- only
+# when the bucket indices are genuinely contiguous (no missing time), and only
+# when flanked by jog buckets on BOTH sides: a trailing slow tail does not
+# extend a block. Pace's one job in the whole block rule is this test.
 BLOCK_BRIDGE_MAX_BUCKETS = 2
-BLOCK_BRIDGE_PACE_MAX = 18.0   # min/mi; same ceiling as the HR-confirmed jog lane
-BLOCK_BRIDGE_HR_MIN = 130.0    # bpm; same floor, and for the same reason
+BLOCK_BRIDGE_PACE_MAX = 18.0   # min/mi; slower than this is not "still moving"
+BLOCK_BRIDGE_HR_MIN = 130.0    # bpm; same floor as the effort lane, and for the same reason
+
+
+def is_jog_bucket(*, in_workout: bool, pace_min_per_mi: float | None,
+                  cadence_spm: float | None, hr: float | None,
+                  gait_cadence_min: float = IMPACT_JOG_CADENCE_MIN) -> bool:
+    """THE jog rule: the one definition behind jog minutes, the longest-block
+    dial, running form and cardiac decoupling.
+
+    A bucket is a jog bucket iff it lies inside a workout window AND its pace
+    is not implausibly fast (``IMPACT_IMPLAUSIBLE_PACE_MIN``, checked only when
+    the pace is known) AND its cadence is present, at most
+    ``IMPACT_CADENCE_PLAUSIBLE_MAX``, and either
+
+    * at least ``IMPACT_JOG_CADENCE_MIN`` (the running gait), or
+    * at least ``IMPACT_JOG_EFFORT_CADENCE_MIN`` with a KNOWN heart rate of at
+      least ``IMPACT_JOG_HR_MIN`` (a tired stride just under the gait line at
+      a running heart rate).
+
+    Pace has no lane here. An incline walk reports a jog pace and a running
+    heart rate while its cadence plainly says walking; cadence and heart rate
+    decide, pace only vetoes the impossible. A missing heart rate cannot
+    confirm the effort lane, and a missing cadence cannot make a jog.
+
+    ``gait_cadence_min`` exists only so the cadence-sensitivity diagnostic can
+    move the gait line; every production caller leaves it at the default.
+    """
+    if not in_workout:
+        return False
+    if (pace_min_per_mi is not None
+            and pace_min_per_mi < IMPACT_IMPLAUSIBLE_PACE_MIN):
+        return False
+    if cadence_spm is None or cadence_spm > IMPACT_CADENCE_PLAUSIBLE_MAX:
+        return False
+    if cadence_spm >= gait_cadence_min:
+        return True
+    return (cadence_spm >= IMPACT_JOG_EFFORT_CADENCE_MIN
+            and hr is not None and hr >= IMPACT_JOG_HR_MIN)
+
+
+def is_bridge_bucket(bucket: dict) -> bool:
+    """THE bridge rule: may this non-jog bucket sit inside a block bridge?
+
+    The bucket is still moving (pace known, from ``IMPACT_IMPLAUSIBLE_PACE_MIN``
+    to ``BLOCK_BRIDGE_PACE_MAX``) at a running heart rate (known and at least
+    ``BLOCK_BRIDGE_HR_MIN``). A standing stop keeps the heart rate up and moves
+    nothing, so it is not a bridge. Takes a ``bucket_series`` row. At most
+    ``BLOCK_BRIDGE_MAX_BUCKETS`` of them, contiguous, flanked by jog buckets on
+    both sides, make a bridge; that chaining lives with the callers.
+    """
+    pace, hr = bucket.get("pace_min_per_mi"), bucket.get("hr")
+    return (pace is not None
+            and IMPACT_IMPLAUSIBLE_PACE_MIN <= pace <= BLOCK_BRIDGE_PACE_MAX
+            and hr is not None and hr >= BLOCK_BRIDGE_HR_MIN)
+
+
+def is_block_bucket(bucket: dict) -> bool:
+    """Whether a ``bucket_series`` row is a link in a block chain: a block is a
+    chain of jog buckets, so this is the jog rule's verdict on the row.
+
+    The row already carries ``is_jog``, set by ``is_jog_bucket`` in
+    ``impact_bucket_rows``; this reads it rather than re-deriving it, so the
+    block dial and cardiac decoupling cannot hold a second opinion.
+    """
+    return bool(bucket.get("is_jog"))
 
 # The ceiling a continuous block's MEAN heart rate must clear to count toward the
 # ramp (P2-1, adopted at the Week 7 review 2026-08-16).
@@ -600,8 +661,8 @@ def impact_bucket_rows(conn, window_predicate: str,
     this one b/h/c rule.  Callers supply their question's window predicate:
     bucket_series uses the UTC timestamp window, while impact_volume uses the
     inclusive local-date window.  The bucket width, positive-distance HAVING
-    clause, span guard, pace fields, and cadence/workout-window jog rule are
-    deliberately not caller parameters.
+    clause, span guard, pace fields, and the jog rule (``is_jog_bucket``, applied
+    to each row after the query) are deliberately not caller parameters.
 
     Workout-window device arbitration is applied to the distance CTE before
     bucketing, so the same selected stream feeds ``impact_volume`` and
@@ -803,26 +864,12 @@ def impact_bucket_rows(conn, window_predicate: str,
                                                <= b.bkt * {IMPACT_BUCKET_SECONDS}
                                      AND CAST(strftime('%s', w.end_utc) AS INTEGER)
                                        > b.bkt * {IMPACT_BUCKET_SECONDS}
-                            ) THEN 1 ELSE 0 END AS in_workout,
-                 CASE WHEN b.mi <= ?
-                            AND s.cadence_spm >= ?
-                            AND s.cadence_spm <= {IMPACT_CADENCE_PLAUSIBLE_MAX}
-                            AND EXISTS (
-                                  SELECT 1 FROM {workout_source} w
-                                   WHERE {workout_active_condition}
-                                     AND CAST(strftime('%s', w.start_utc) AS INTEGER)
-                                           <= b.bkt * {IMPACT_BUCKET_SECONDS}
-                                     AND CAST(strftime('%s', w.end_utc) AS INTEGER)
-                                       > b.bkt * {IMPACT_BUCKET_SECONDS}
-                            )
-                      THEN 1 ELSE 0 END AS is_jog
+                            ) THEN 1 ELSE 0 END AS in_workout
             FROM b LEFT JOIN h
               ON h.local_date = b.local_date AND h.bkt = b.bkt
             LEFT JOIN s ON s.bkt = b.bkt
         )
-        SELECT bkt, local_date, mi, hr, cadence_spm, in_workout, is_jog,
-               CASE WHEN is_jog = 0 AND mi >= ? AND mi <= ?
-                    THEN 1 ELSE 0 END AS is_walk
+        SELECT bkt, local_date, mi, hr, cadence_spm, in_workout
           FROM c
       ORDER BY bkt, local_date
         """,
@@ -831,12 +878,27 @@ def impact_bucket_rows(conn, window_predicate: str,
              IMPACT_MAX_SAMPLE_SPAN_SECONDS,
              *repeated_window_args,
              *repeated_window_args,
-             IMPACT_MAX_SAMPLE_SPAN_SECONDS,
-         implausible_mi_ceiling, IMPACT_JOG_CADENCE_MIN,
-         bucket_min / IMPACT_WALK_PACE_MAX,
-         implausible_mi_ceiling),
+             IMPACT_MAX_SAMPLE_SPAN_SECONDS),
     ).fetchall()
-    return [dict(row) for row in rows]
+    # The classification is applied here, in Python, from the same row the
+    # caller receives: there is no second copy of the rule in the SQL to drift
+    # from is_jog_bucket. A walk bucket is a plausible-pace bucket (slower than
+    # the implausible floor, faster than the standing ceiling) that is not a jog.
+    walk_mi_min = bucket_min / IMPACT_WALK_PACE_MAX
+    out: list[dict] = []
+    for row in rows:
+        bucket = dict(row)
+        mi = bucket["mi"]
+        jog = is_jog_bucket(
+            in_workout=bool(bucket["in_workout"]),
+            pace_min_per_mi=bucket_min / mi if mi > 0 else None,
+            cadence_spm=bucket["cadence_spm"], hr=bucket["hr"])
+        bucket["is_jog"] = 1 if jog else 0
+        bucket["is_walk"] = (
+            1 if (not jog and walk_mi_min <= mi <= implausible_mi_ceiling)
+            else 0)
+        out.append(bucket)
+    return out
 
 
 def bucket_series(conn, start_utc: str, end_utc: str, *,

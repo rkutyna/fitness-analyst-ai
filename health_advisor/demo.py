@@ -423,9 +423,10 @@ class _Generator:
 
         Cadence is the discriminator ``impact_bucket_rows`` classifies jogging
         on (>= metrics.IMPACT_JOG_CADENCE_MIN steps/min inside a workout
-        window), so the warm-up and cool-down segments come out as walking and
-        the middle as jogging — inside one session, which is exactly the case
-        ``analysis.longest_block`` was written for.
+        window, or a near-running cadence at a running heart rate -- see
+        ``metrics.is_jog_bucket``), so the warm-up and cool-down segments
+        come out as walking and the middle as jogging — inside one session,
+        which is exactly the case ``analysis.longest_block`` was written for.
         """
         t = start
         hrs: list[float] = []

@@ -312,17 +312,30 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
         before_block = analysis.longest_block(
             conn, workout["start_utc"], workout["end_utc"])
 
+        before_miles = sum(row["miles"] for row in metrics.bucket_series(
+            conn, workout["start_utc"], workout["end_utc"]))
+
     after_volume = analysis.impact_volume(
         conn, "2026-08-25", "2026-08-25", by="day")[0]
     after_block = analysis.longest_block(
         conn, workout["start_utc"], workout["end_utc"])
+    after_miles = sum(row["miles"] for row in metrics.bucket_series(
+        conn, workout["start_utc"], workout["end_utc"]))
 
     # This fixture predates the cadence stream, so neither volume result can
-    # classify a bucket as jogging. The pace-only block dial still sees the
-    # distributed duplicate stream; keeping these assertions separate is the
-    # #193 scope guard.
+    # classify a bucket as jogging -- and since the one jog rule (#604) the block
+    # dial cannot either: pace no longer makes a jog bucket, so a session with no
+    # step data has no block. The block figures below were 57.3 (the duplicate
+    # streams, pace-only) and 5.0 (the selected stream, five pace-lane reps)
+    # while the dial still had a pace lane; they are 0.0 and no reps now, with
+    # or without arbitration. That would leave this test unable to see the
+    # arbitration at all, so the bucket rows -- the one series volume and blocks
+    # both read -- are asserted directly: the duplicate streams sum to 7.28 mi
+    # in this workout's window and the selected stream to its recorded 3.45 mi.
+    assert before_miles == pytest.approx(7.2799, abs=0.001)
+    assert after_miles == pytest.approx(3.4495, abs=0.001)
     assert before_volume["jog_minutes"] == pytest.approx(0.0, abs=0.1)
-    assert before_block["bridged_min"] == pytest.approx(57.3, abs=0.1)
+    assert before_block["bridged_min"] == pytest.approx(0.0, abs=0.1)
     # 22.3, and IT IS SIX MINUTES TOO HIGH. The athlete supplied the segment times for
     # this session on 2026-08-28: it was the 4x4 test, four reps of 4:02/4:02/
     # 4:03/4:04 = 16.2 min of jogging. The "16.2-minute ground truth" an earlier
@@ -348,25 +361,32 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
     # by #193, not a tuning oracle. Do not "fix" it by reverting #189.
     # The '62-minute' figure remains the inflated duplicate-stream result.
     assert after_volume["jog_minutes"] == pytest.approx(0.0, abs=0.1)
-    assert len(after_block["reps"]) == 5
-    assert after_block["bridged_min"] == pytest.approx(5.0, abs=0.2)
+    assert after_block["reps"] == []
+    assert after_block["bridged_min"] == pytest.approx(0.0, abs=0.2)
 
 
 def test_each_inflated_session_has_a_finite_selected_block_structure(conn):
     payload = load_f82_multi_source(conn)
-    expected_blocks = {809: 0.0, 810: 0.0, 812: 0.0, 815: 5.0}
+    # 815 read 5.0 while the block dial had a pace lane; the fixture carries no
+    # step data, so under the one jog rule (#604) every session here has no
+    # block. The selected stream is checked on the bucket rows instead: each
+    # session's bucket miles equal its recorded distance (809's 1.0802 is the
+    # known whole-day Watch-vs-iPhone residue, see the ratios test above).
+    expected_blocks = {809: 0.0, 810: 0.0, 812: 0.0, 815: 0.0}
+    expected_ratio = {809: 1.0802, 810: 1.0, 812: 1.0, 815: 1.0001}
     for workout_id, expected in expected_blocks.items():
         workout = conn.execute(
-            "SELECT start_utc, end_utc FROM workouts WHERE id = ?",
+            "SELECT start_utc, end_utc, distance_mi FROM workouts WHERE id = ?",
             (workout_id,),
         ).fetchone()
         block = analysis.longest_block(
             conn, workout["start_utc"], workout["end_utc"])
-        if expected:
-            assert block["reps"]
-        else:
-            assert block["reps"] == []
+        assert block["reps"] == []
         assert block["bridged_min"] == pytest.approx(expected, abs=0.2)
+        miles = sum(row["miles"] for row in metrics.bucket_series(
+            conn, workout["start_utc"], workout["end_utc"]))
+        assert miles / workout["distance_mi"] == pytest.approx(
+            expected_ratio[workout_id], abs=0.0005)
     assert set(payload["multi_source_workout_ids"]) == {
         746, 748, 762, 809, 810, 812, 815
     }

@@ -178,7 +178,8 @@ LONGTERM_METRICS = ["step_count", "active_energy", "distance_walking_running",
 # Workout duration overstates running impact ~2x because it counts walk breaks.
 # The dial that matters for injury risk is time actually spent jogging, so we
 # bucket the distance samples and classify each bucket by cadence inside a
-# workout window. Pace remains a field used by the separate block dial.
+# workout window (metrics.is_jog_bucket, the one jog rule). Pace is a field of
+# each bucket but decides nothing beyond a plausibility floor.
 # 20s is short enough to resolve a 90-second interval and long enough that GPS
 # jitter on a single sample can't flip a bucket.
 # Re-exported so existing callers of analysis.IMPACT_* keep working; the
@@ -186,8 +187,8 @@ LONGTERM_METRICS = ["step_count", "active_energy", "distance_walking_running",
 from .metrics import (  # noqa: F401  — re-export
     IMPACT_BUCKET_SECONDS, IMPACT_JOG_HR_MIN,
     IMPACT_IMPLAUSIBLE_PACE_MIN, IMPACT_JOG_CADENCE_MIN,
-    IMPACT_JOG_PACE_MAX, IMPACT_WALK_PACE_MAX,
-    IMPACT_CADENCE_PLAUSIBLE_MAX, BLOCK_EFFORT_CADENCE_MIN,
+    IMPACT_WALK_PACE_MAX,
+    IMPACT_CADENCE_PLAUSIBLE_MAX, IMPACT_JOG_EFFORT_CADENCE_MIN,
 )
 
 
@@ -214,53 +215,6 @@ def _bucket_index(bucket_start_utc: str) -> int:
     return int(ts.replace(tzinfo=timezone.utc).timestamp()) // mx.IMPACT_BUCKET_SECONDS
 
 
-def _is_jog_bucket(b: dict) -> bool:
-    """Three signals, any one of which makes a bucket count as jogging:
-
-    1. Running gait: canonical `is_jog` (cadence >= IMPACT_JOG_CADENCE_MIN inside
-       a workout window) AND cadence plausible (present and
-       <= IMPACT_CADENCE_PLAUSIBLE_MAX). Without the ceiling a glitch cadence
-       from a mis-scaled step sample would count as running despite being
-       physically impossible.
-    2. Jog pace, not vetoed: pace within the jog lane
-       (IMPACT_IMPLAUSIBLE_PACE_MIN..IMPACT_JOG_PACE_MAX) UNLESS the heart rate
-       is KNOWN and below IMPACT_JOG_HR_MIN. A missing HR must NOT veto:
-       absence of a reading is not evidence of walking, and many older
-       sessions have no HR at all.
-    3. Effort-confirmed near-running gait: cadence is plausible AND
-       >= BLOCK_EFFORT_CADENCE_MIN AND heart rate is known AND >= IMPACT_JOG_HR_MIN.
-       This is the stride signal plus effort: a tired bucket sitting just under
-       the 140 gait line at an obvious running heart rate IS running.
-
-    Each signal fails somewhere the others do not. Cadence is the gait signal:
-    an incline treadmill walk shows a slow-jog pace AND running-effort HR while
-    its cadence (~95-110) plainly says walking. HR confirms a slow or fatigued
-    stride just under the gait line. HR also vetoes a false pace: a treadmill
-    can report a fast pace while the person walks at a walking heart rate.
-    """
-    cadence = b.get("cadence_spm")
-    pace = b.get("pace_min_per_mi")
-    hr = b.get("hr")
-    cadence_plausible = (cadence is not None
-                         and cadence <= mx.IMPACT_CADENCE_PLAUSIBLE_MAX)
-
-    if b.get("is_jog") and cadence_plausible:
-        return True
-    if (pace is not None
-            and mx.IMPACT_IMPLAUSIBLE_PACE_MIN <= pace <= mx.IMPACT_JOG_PACE_MAX
-            and not (hr is not None and hr < mx.IMPACT_JOG_HR_MIN)):
-        return True
-    return (cadence_plausible
-            and cadence >= mx.BLOCK_EFFORT_CADENCE_MIN
-            and hr is not None and hr >= mx.IMPACT_JOG_HR_MIN)
-
-
-def _is_bridge_bucket(b: dict) -> bool:
-    p, hr = b.get("pace_min_per_mi"), b.get("hr")
-    return (p is not None and mx.IMPACT_JOG_PACE_MAX < p <= mx.BLOCK_BRIDGE_PACE_MAX
-            and (hr or 0.0) >= mx.BLOCK_BRIDGE_HR_MIN)
-
-
 def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
                                hr_ceiling: float | None = None) -> dict:
     """The block structure of one session, given its bucket series.
@@ -284,10 +238,10 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
     segs: list[list[int]] = []          # [start, end] positions into bk
     i, n = 0, len(bk)
     while i < n:
-        if _is_jog_bucket(bk[i]):
+        if mx.is_block_bucket(bk[i]):
             j = i
             while (j + 1 < n and bk[j + 1]["_i"] == bk[j]["_i"] + 1
-                   and _is_jog_bucket(bk[j + 1])):
+                   and mx.is_block_bucket(bk[j + 1])):
                 j += 1
             segs.append([i, j])
             i = j + 1
@@ -304,7 +258,7 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
             contiguous = all(bk[k]["_i"] == bk[k - 1]["_i"] + 1
                              for k in range(prev[1] + 1, s[0] + 1))
             if (contiguous and 1 <= len(gap) <= mx.BLOCK_BRIDGE_MAX_BUCKETS
-                    and all(_is_bridge_bucket(bk[k]) for k in gap)):
+                    and all(mx.is_bridge_bucket(bk[k]) for k in gap)):
                 out[-1] = [prev[0], s[1]]
             else:
                 out.append(s)

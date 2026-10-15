@@ -4,7 +4,36 @@ from __future__ import annotations
 import pytest
 
 from health_advisor import analysis
+from health_advisor import metrics as mx
 from tests.fixture_loader import load_f84_wholeday
+
+
+def _seed_cadence_where_the_retired_pace_lane_fired(conn, workouts):
+    """Give the cadence-blind fixture the step stream the block dial now needs.
+
+    This fixture has no step_count, and since the one jog rule (#604) pace no
+    longer makes a jog bucket, so without it every block here would read 0.0.
+    The block assertions below guard the distance attribution (#189): they must
+    keep seeing the same buckets as jog. So each workout window gets a 150 spm
+    step sample in exactly the buckets the retired pace lane counted (pace
+    5-16 min/mi, heart rate not known to be under 130), and the block
+    expectations stay the ones that were recorded against that lane.
+    """
+    for workout in workouts.values():
+        for bucket in mx.bucket_series(
+                conn, workout["start_utc"], workout["end_utc"]):
+            pace, hr = bucket["pace_min_per_mi"], bucket["hr"]
+            if not (pace is not None and 5.0 <= pace <= 16.0
+                    and not (hr is not None and hr < 130.0)):
+                continue
+            start = bucket["bucket_start_utc"]
+            conn.execute(
+                "INSERT INTO records (metric, value, unit, start_utc, end_utc, "
+                "local_date, source, origin, dedupe_key) VALUES "
+                "('step_count', ?, 'count', ?, ?, ?, 'cadence-seed', 'test', ?)",
+                (150.0 / 3.0, start, start, bucket["local_date"],
+                 f"i604-cadence|{start}"))
+    conn.commit()
 
 
 def test_post_boundary_intervals_distribute_inside_workouts(conn):
@@ -30,6 +59,7 @@ def test_post_boundary_intervals_distribute_inside_workouts(conn):
             "WHERE id IN (809, 810, 808, 811)"
         )
     }
+    _seed_cadence_where_the_retired_pace_lane_fired(conn, workouts)
     blocks = {
         workout_id: analysis.longest_block(
             conn, workout["start_utc"], workout["end_utc"]

@@ -1,12 +1,16 @@
-"""The three-signal jog predicate for block structure, and the cadence glitch
-ceiling that also protects the impact-volume dial.
+"""The one jog predicate behind block structure, and the cadence glitch ceiling
+that also protects the impact-volume dial.
 
-Rule (analysis._is_jog_bucket): a bucket counts as jogging if ANY of:
-  1. canonical is_jog AND cadence plausible (present, <= 250.0);
-  2. jog pace (IMPACT_IMPLAUSIBLE_PACE_MIN..IMPACT_JOG_PACE_MAX) unless the
-     heart rate is KNOWN and below IMPACT_JOG_HR_MIN — a missing HR never vetoes;
-  3. cadence plausible AND >= BLOCK_EFFORT_CADENCE_MIN AND known HR
-     >= IMPACT_JOG_HR_MIN.
+Rule (metrics.is_jog_bucket, which the block dial reads through
+metrics.is_block_bucket since #604): a bucket inside a workout window counts as
+jogging when its pace is not implausibly fast (IMPACT_IMPLAUSIBLE_PACE_MIN, when
+known) AND its cadence is present, at most IMPACT_CADENCE_PLAUSIBLE_MAX, and
+either
+  1. at least IMPACT_JOG_CADENCE_MIN, or
+  2. at least IMPACT_JOG_EFFORT_CADENCE_MIN with a known HR at or over
+     IMPACT_JOG_HR_MIN.
+Pace is not a lane. The lane-by-lane tests are in test_one_jog_dial.py; the
+tests below are the older block-structure cases, restated onto the one rule.
 """
 from __future__ import annotations
 
@@ -43,53 +47,59 @@ def _buckets(*specs):
     return out
 
 
+def _is_jog(b):
+    """The rule's verdict for a hand-built bucket that is inside a workout."""
+    return metrics.is_jog_bucket(
+        in_workout=True, pace_min_per_mi=b.get("pace_min_per_mi"),
+        cadence_spm=b.get("cadence_spm"), hr=b.get("hr"))
+
+
 def test_cadence_140_counts_as_running_gait():
     # Pace absent so only the running-gait lane can possibly fire.
     b = _bucket(cadence_spm=140.0, is_jog=True, pace_min_per_mi=None)
-    assert analysis._is_jog_bucket(b) is True
+    assert _is_jog(b) is True
 
 
 def test_incline_walk_does_not_count():
-    """A slow jog pace and running-effort HR, but cadence ~105 says walking.
-
-    Pace sits above the jog-pace lane, so only the effort lane could count
-    it — and its cadence floor is why it does not.
-    """
+    """A slow jog pace and running-effort HR, but cadence ~105 says walking."""
     b = _bucket(pace_min_per_mi=17.0, hr=150.0, cadence_spm=105.0)
-    assert analysis._is_jog_bucket(b) is False
+    assert _is_jog(b) is False
 
 
 def test_fatigued_bucket_counts_on_effort():
-    """Just under the gait line at an obvious running HR, pace slower than 16."""
+    """Just under the gait line at an obvious running HR."""
     b = _bucket(pace_min_per_mi=18.0, hr=150.0, cadence_spm=135.0)
-    assert analysis._is_jog_bucket(b) is True
+    assert _is_jog(b) is True
 
 
 def test_fast_pace_with_known_walking_hr_does_not_count():
-    """The HR veto: a treadmill pace at an obvious walking heart rate."""
+    """A treadmill pace at an obvious walking heart rate, no cadence."""
     b = _bucket(pace_min_per_mi=9.0, hr=100.0)
-    assert analysis._is_jog_bucket(b) is False
+    assert _is_jog(b) is False
 
 
-def test_fast_pace_with_missing_hr_counts():
-    """A missing HR never vetoes — absence of a reading is not evidence."""
+def test_fast_pace_with_missing_hr_and_no_cadence_does_not_count():
+    """Was test_fast_pace_with_missing_hr_counts: True while a pace lane
+    existed (a missing HR never vetoed it). Pace has no lane since #604, and
+    with no cadence there is nothing to count it on, so a pace-9 bucket is a
+    walk bucket whatever the HR says."""
     b = _bucket(pace_min_per_mi=9.0, hr=None)
-    assert analysis._is_jog_bucket(b) is True
+    assert _is_jog(b) is False
 
 
 def test_glitch_cadence_does_not_count():
     """2961 spm is a mis-scaled sample; the plausible ceiling refuses it even
-    with canonical is_jog, a running HR, and a pace outside the jog lane."""
+    with a running HR."""
     b = _bucket(cadence_spm=2961.0, hr=135.0, is_jog=True,
                 pace_min_per_mi=18.0)
-    assert analysis._is_jog_bucket(b) is False
+    assert _is_jog(b) is False
 
 
 def test_glitch_cadence_at_exactly_the_ceiling_counts():
     """The boundary: <= IMPACT_CADENCE_PLAUSIBLE_MAX is plausible."""
     b = _bucket(cadence_spm=metrics.IMPACT_CADENCE_PLAUSIBLE_MAX,
                 hr=135.0, is_jog=True, pace_min_per_mi=18.0)
-    assert analysis._is_jog_bucket(b) is True
+    assert _is_jog(b) is True
 
 
 def _workout(conn, start: str, seconds: int):

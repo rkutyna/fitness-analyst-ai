@@ -1312,16 +1312,16 @@ def _impact_change_pct(periods: list[dict], by: str) -> None:
 def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
     """How much of jog_minutes depends on exactly where the cadence cutoff sits.
 
-    Uses the shared bucket set and varies only cadence. Workout scope and the
-    implausible-pace floor remain fixed, so the live threshold row is exactly
-    the same classification as ``impact_volume``. ``jog_minutes`` is the only
+    Uses the shared bucket set and varies only the gait cadence line. Workout
+    scope, the implausible-pace floor and the heart-rate-confirmed lane remain
+    fixed, so the live threshold row is exactly the same classification as
+    ``impact_volume``. ``jog_minutes`` is the only
     series value in each sensitivity row and is recomputed at that cadence
     edge; ``cadence_min_steps_per_min``, ``jog_buckets``, and ``live_cutoff``
     are context about the sensitivity calculation and remain unowned.
     """
     bucket_min = mx.IMPACT_BUCKET_SECONDS / 60.0
     live = mx.IMPACT_JOG_CADENCE_MIN
-    implausible_mi_ceiling = bucket_min / mx.IMPACT_IMPLAUSIBLE_PACE_MIN
     edges = sorted({round(live + off, 1) for off in IMPACT_SENSITIVITY_OFFSETS
                     if live + off > 0})
     near_floor = max(live - IMPACT_NEAR_THRESHOLD_STEPS_PER_MIN, 0.1)
@@ -1330,21 +1330,20 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
     )
 
     def is_jog_at(row: dict, cadence_min: float) -> bool:
-        """Apply one cadence edge to the shared bucket set."""
-        mi = row["mi"]
-        return (mi <= implausible_mi_ceiling
-                and row["in_workout"]
-                and (row["cadence_spm"] or 0.0) >= cadence_min)
+        """Apply one gait-cadence edge to the shared bucket set."""
+        return mx.is_jog_bucket(
+            in_workout=bool(row["in_workout"]),
+            pace_min_per_mi=bucket_min / row["mi"] if row["mi"] > 0 else None,
+            cadence_spm=row["cadence_spm"], hr=row["hr"],
+            gait_cadence_min=cadence_min)
 
     counts = [sum(is_jog_at(row, edge) for row in bucket_rows) for edge in edges]
     # "near the cliff" means an otherwise eligible bucket within the diagnostic
-    # cadence band below the live threshold.
-    near = sum(
-        row["in_workout"]
-        and row["mi"] <= implausible_mi_ceiling
-        and near_floor <= (row["cadence_spm"] or 0.0) < live
-        for row in bucket_rows
-    )
+    # cadence band below the live threshold that does not count today: one that
+    # lowering the gait line would add. A tired-stride bucket already counted by
+    # the heart-rate-confirmed lane is not at risk from the gait line.
+    near = sum((not row["is_jog"]) and is_jog_at(row, near_floor)
+               for row in bucket_rows)
     at_live = counts[edges.index(live)] if live in edges else 0
     if not at_live and not any(counts):
         return None

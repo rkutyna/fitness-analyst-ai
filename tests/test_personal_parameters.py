@@ -71,6 +71,9 @@ def test_block_reader_uses_the_vault_ceiling(conn, vault, monkeypatch):
         "bucket_start_utc": "2020-01-02T00:00:00Z",
         "pace_min_per_mi": 10.0,
         "hr": 150.0,
+        # A block is a chain of jog buckets; pace no longer makes one (#604),
+        # so the hand-built bucket says so itself.
+        "is_jog": True,
     }]
     monkeypatch.setattr(analysis.mx, "bucket_series", lambda *args: buckets)
 

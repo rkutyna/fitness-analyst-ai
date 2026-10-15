@@ -2622,6 +2622,31 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
             finish_reason=finish_reason)
 
 
+def _decode_call_args(call: dict) -> tuple[object, bool]:
+    """The arguments of one proposed tool call, and whether they were readable.
+
+    Returns ``(args, undecodable)``. Arguments arrive as a mapping (Ollama) or
+    as a JSON string (the OpenAI dialect); a missing value is ``{}``. A string
+    that does not decode has no defined meaning, so it comes back as
+    ``({}, True)`` and the caller must report that to the model and NOT run the
+    tool: running it with ``{}`` would let a tool whose parameters all have
+    defaults answer a question the model never asked (#102). A string that
+    decodes to something other than a mapping is returned as decoded, exactly
+    as the callers always received it.
+
+    This is not :func:`_submit_answer_decode`, which refuses a malformed
+    terminal call with a repair message instead.
+    """
+    fn = call.get("function") or {}
+    args = fn.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            return json.loads(args), False
+        except Exception:
+            return {}, True
+    return args, False
+
+
 def _openai_assistant_turn(msg: dict, turn: int) -> tuple[dict, list[dict]]:
     """Sanitize an assistant turn for echo-back and give every call an id.
 
@@ -2874,17 +2899,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     # and must not get a ledger entry behind it.)
                     fn = call.get("function") or {}
                     name = fn.get("name")
-                    args = fn.get("arguments") or {}
-                    args_undecodable = False
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            # Undecodable arguments have no defined meaning:
-                            # report it to the model, never run the tool with
-                            # defaults.
-                            args = {}
-                            args_undecodable = True
+                    args, args_undecodable = _decode_call_args(call)
                     if on_tool_call is not None:
                         try:
                             on_tool_call(name, tool_sequence)
@@ -3175,17 +3190,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                 for call in calls:
                     fn = call.get("function") or {}
                     name = fn.get("name")
-                    args = fn.get("arguments") or {}
-                    args_undecodable = False
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            # Undecodable arguments have no defined meaning:
-                            # report it to the model, never run the tool with
-                            # defaults.
-                            args = {}
-                            args_undecodable = True
+                    args, args_undecodable = _decode_call_args(call)
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}

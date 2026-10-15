@@ -20,6 +20,7 @@ consumer-repo question fixture.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -79,7 +80,7 @@ def test_common_english_words_list_loads_and_has_documented_size():
 
 def test_common_english_words_path_resolves_inside_the_package():
     assert ac.COMMON_ENGLISH_WORDS_PATH.is_file()
-    assert ac.COMMON_ENGLISH_WORDS_PATH.parent == ac.COMMON_ENGLISH_WORDS_PATH.parent
+    assert ac.COMMON_ENGLISH_WORDS_PATH.parent == Path(ac.__file__).resolve().parent
     assert ac.COMMON_ENGLISH_WORDS_PATH.name == "common_english_words.txt"
 
 

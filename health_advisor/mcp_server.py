@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import inspect
 import sqlite3
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
@@ -3061,7 +3062,7 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
 
 def main(argv: "list[str] | None" = None, *, prog: "str | None" = None,
          tools: "dict | None" = None,
-         make_tools: "Callable[[VaultContext], dict] | None" = None) -> int:
+         make_tools: Callable[[VaultContext], dict] | None = None) -> int:
     """Serve one session over stdio. The vault arrives on argv, not from the
     environment: an env var is ambient, and ambient is how a worker ends up
     serving the vault it happened to inherit.

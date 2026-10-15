@@ -7,7 +7,6 @@ ambient default for another vault.
 """
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -21,6 +20,8 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+from .wire import b64url_encode
 
 
 logger = logging.getLogger(__name__)
@@ -88,10 +89,6 @@ def validate_apns_endpoint(endpoint: str) -> str:
     return endpoint.rstrip("/")
 
 
-def _b64url(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
-
-
 def build_apns_jwt(
     private_key: ec.EllipticCurvePrivateKey,
     *,
@@ -113,17 +110,17 @@ def build_apns_jwt(
             datetime.now(timezone.utc).timestamp()
         ),
     }
-    encoded_header = _b64url(json.dumps(
+    encoded_header = b64url_encode(json.dumps(
         header, separators=(",", ":"), sort_keys=True
     ).encode("ascii"))
-    encoded_claims = _b64url(json.dumps(
+    encoded_claims = b64url_encode(json.dumps(
         claims, separators=(",", ":"), sort_keys=True
     ).encode("ascii"))
     signing_input = f"{encoded_header}.{encoded_claims}".encode("ascii")
     der_signature = private_key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
     r, s = decode_dss_signature(der_signature)
     raw_signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-    return f"{encoded_header}.{encoded_claims}.{_b64url(raw_signature)}"
+    return f"{encoded_header}.{encoded_claims}.{b64url_encode(raw_signature)}"
 
 
 def build_answer_ready_payload(turn_id: str) -> dict[str, Any]:

@@ -9,6 +9,7 @@ import math
 import numpy as np
 
 from . import normalize as nz
+from .dates import week_start
 
 MAX_SERIES_POINTS = 400
 
@@ -1154,7 +1155,7 @@ def downsample_weekly(dates, vals, how: str) -> list[dict]:
     buckets: dict[str, list[float]] = {}
     for d, v in zip(dates, vals):
         day = date.fromisoformat(d)
-        wk = (day - timedelta(days=day.weekday())).isoformat()
+        wk = week_start(day).isoformat()
         buckets.setdefault(wk, []).append(v)
     if how == "sum":
         reduce = np.sum

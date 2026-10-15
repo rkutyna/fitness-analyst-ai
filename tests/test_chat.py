@@ -103,7 +103,7 @@ def test_ask_prompt_states_vault_today_and_as_of_once_when_equal_or_different(
 
     vaultmod.set_local_timezone(conn, "UTC")
     seed_metric(conn, "step_count", "2099-04-03", [1])
-    monkeypatch.setattr(analysis, "datetime", FrozenDateTime)
+    monkeypatch.setattr(vaultmod, "datetime", FrozenDateTime)
     prompts = []
     monkeypatch.setattr(llm, "tool_schemas", lambda *args, **kwargs: [])
     monkeypatch.setattr(llm, "tool_loop",
@@ -2420,7 +2420,7 @@ def test_malformed_advice_without_a_ledger_still_gets_one_repair(
 # ---------------------------------------------------------------------------
 # #439: the vault's zone, not the host's, decides the prompt's current date.
 #
-# `analysis._today` reads `vault.local_timezone` and falls back to the HOST
+# `vault.local_today` reads `vault.local_timezone` and falls back to the HOST
 # date.  Every host this project deploys to runs UTC, so for the four hours
 # between 20:00 and midnight in a UTC-4 zone the fallback is already tomorrow
 # — the exact window in which the evening review runs and a user asks
@@ -2454,8 +2454,8 @@ class _FrozenUTCHostDate(date):
 
 
 def _freeze_late_evening(monkeypatch):
-    monkeypatch.setattr(analysis, "datetime", _FrozenDateTime)
-    monkeypatch.setattr(analysis, "date", _FrozenUTCHostDate)
+    monkeypatch.setattr(vaultmod, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(vaultmod, "date", _FrozenUTCHostDate)
 
 
 def _capture_ask_prompt(monkeypatch, vault):

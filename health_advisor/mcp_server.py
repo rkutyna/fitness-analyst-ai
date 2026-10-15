@@ -29,6 +29,7 @@ from mcp.server.fastmcp import FastMCP
 from . import analysis as A
 from . import correlate as C
 from . import benchmark
+from . import dates
 from . import db
 from . import food as fd
 from . import hr_load as HL
@@ -1261,7 +1262,7 @@ def _impact_period_keys(start: str, end: str, by: str) -> list[date]:
     d0, d1 = date.fromisoformat(start), date.fromisoformat(end)
     if by == "day":
         return [d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)]
-    keys, k = [], d0 - timedelta(days=d0.weekday())   # Monday, as analysis groups
+    keys, k = [], dates.week_start(d0)   # Monday, as analysis groups
     while k <= d1:
         keys.append(k)
         k += timedelta(days=7)

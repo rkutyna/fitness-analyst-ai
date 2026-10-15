@@ -17,6 +17,7 @@ import sqlite3
 from datetime import date, timedelta
 
 from . import db
+from . import dates
 from . import normalize as nz
 
 RATING_FIELDS = ("stress", "soreness", "energy", "sleep_quality")
@@ -54,13 +55,6 @@ CHECKIN_ORIGIN = "checkin"  # records.source AND records.origin for mirrored row
 SELF_REPORT_CADENCES = {BODY_MEASUREMENT_METRIC: BODY_MEASUREMENT_CADENCE_DAYS}
 
 
-def _as_date(value: str, name: str) -> date:
-    try:
-        return date.fromisoformat(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be YYYY-MM-DD") from None
-
-
 def cadence_windows(
         start: str, as_of: str, *,
         metric: str = BODY_MEASUREMENT_METRIC) -> list[dict]:
@@ -72,7 +66,7 @@ def cadence_windows(
     """
     if metric not in SELF_REPORT_CADENCES:
         raise ValueError(f"no self-report cadence for {metric!r}")
-    first, cutoff = _as_date(start, "start"), _as_date(as_of, "as_of")
+    first, cutoff = dates.parse_date(start, "start"), dates.parse_date(as_of, "as_of")
     if cutoff < first:
         raise ValueError("as_of must not precede start")
     step = timedelta(days=SELF_REPORT_CADENCES[metric])
@@ -106,7 +100,7 @@ def measurement_status(conn: sqlite3.Connection, start: str, as_of: str,
         (start, as_of),
     ).fetchall()
     observed = {row["date"] for row in rows}
-    cutoff = _as_date(as_of, "as_of")
+    cutoff = dates.parse_date(as_of, "as_of")
     out = []
     for window in windows:
         window_end = date.fromisoformat(window["end"])

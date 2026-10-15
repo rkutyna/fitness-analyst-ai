@@ -36,13 +36,10 @@ uses for ``devices.json``, factored out there rather than reimplemented here
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import contextlib
 import hashlib
 import json
 import os
-import re
 import secrets
 import sys
 import time
@@ -57,6 +54,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import device_auth
+from . import dates
+from .wire import b64url_decode, b64url_encode
 
 
 STORE_VERSION = 1
@@ -111,23 +110,6 @@ def max_ttl_seconds() -> int:
         f"{TTL_CEILING_SECONDS}, or leave it unset for {MAX_TTL_SECONDS}.")
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _b64url_decode(text: str) -> bytes:
-    if not isinstance(text, str) or not re.fullmatch(r"[A-Za-z0-9_-]*", text):
-        raise ValueError("not base64url")
-    try:
-        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("not base64url") from exc
-
-
-def _utc_now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def token_hash(token_text: str) -> str:
     """The hash stored for a token, keyed on its wire form (base64url text) --
     the same bytes the phone actually sends inside the sealed payload, not
@@ -153,7 +135,7 @@ def open_sealed(private_key_b64: str, info: bytes, wire: bytes) -> bytes:
     the same to a caller, and none of them burn the token.
     """
     try:
-        sk = X25519PrivateKey.from_private_bytes(_b64url_decode(private_key_b64))
+        sk = X25519PrivateKey.from_private_bytes(b64url_decode(private_key_b64))
     except (ValueError, TypeError) as exc:
         raise EnrolError("enrol_undecryptable", 400) from exc
     try:
@@ -165,7 +147,7 @@ def open_sealed(private_key_b64: str, info: bytes, wire: bytes) -> bytes:
 def seal_to(public_key_b64: str, info: bytes, plaintext: bytes) -> bytes:
     """The sender side of ``open_sealed`` — used by the operator's ``pair``
     tooling (and by tests standing in for the phone), never by the server."""
-    pk = X25519PublicKey.from_public_bytes(_b64url_decode(public_key_b64))
+    pk = X25519PublicKey.from_public_bytes(b64url_decode(public_key_b64))
     return _HPKE_SUITE.encrypt(plaintext, pk, info=info)
 
 
@@ -296,16 +278,16 @@ class TokenStore:
         now = time.time() if now is None else now
         ttl_seconds = min(ttl_seconds, max_ttl_seconds())
         token = secrets.token_bytes(TOKEN_BYTES)
-        token_text = _b64url(token)
+        token_text = b64url_encode(token)
         private_key = X25519PrivateKey.generate()
         private_bytes = private_key.private_bytes(
             serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
             serialization.NoEncryption())
         record = EnrolToken(
-            id=_b64url(secrets.token_bytes(12)),
+            id=b64url_encode(secrets.token_bytes(12)),
             token_sha256=token_hash(token_text),
-            x25519_private=_b64url(private_bytes),
-            created_at=_utc_now_iso(),
+            x25519_private=b64url_encode(private_bytes),
+            created_at=dates.utc_now(),
             expires_at=now + ttl_seconds,
             state="live",
         )
@@ -318,10 +300,10 @@ class TokenStore:
     def server_public_key(self, record: EnrolToken) -> str:
         """The token's public key, base64url, for the QR payload."""
         private_key = X25519PrivateKey.from_private_bytes(
-            _b64url_decode(record.x25519_private))
+            b64url_decode(record.x25519_private))
         public_bytes = private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        return _b64url(public_bytes)
+        return b64url_encode(public_bytes)
 
     def _effective(self, record: EnrolToken, now: float) -> EnrolToken:
         if record.state == "live" and now >= record.expires_at:
@@ -376,7 +358,7 @@ class TokenStore:
                 self._write(tokens)
                 raise EnrolError("enrol_token_expired", 401)
             burned = replace(record, state="used", x25519_private=None,
-                             kid=kid, used_at=_utc_now_iso())
+                             kid=kid, used_at=dates.utc_now())
             tokens[id] = burned
             self._write(tokens)
             return burned

@@ -14,6 +14,7 @@ from typing import Any
 
 from . import analysis
 from . import db
+from . import dates
 from . import metrics
 
 SCOPES = ("week", "day", "session")
@@ -21,15 +22,8 @@ FIELDS = ("jog_minutes", "jogged", "longest_block_min", "structure")
 EVIDENCE = ("recall", "segments", "device")
 
 
-def _date(value: str, name: str = "local_date") -> date:
-    try:
-        return date.fromisoformat(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be YYYY-MM-DD") from None
-
-
 def _range(start: str, end: str) -> tuple[str, str]:
-    a, b = _date(start, "start"), _date(end, "end")
+    a, b = dates.parse_date(start, "start"), dates.parse_date(end, "end")
     if a > b:
         raise ValueError("start must not be after end")
     return a.isoformat(), b.isoformat()
@@ -50,7 +44,7 @@ def _validate(*, scope: str, local_date: str, workout_key: str, field: str,
               agrees: Any, evidence: str) -> None:
     if scope not in SCOPES:
         raise ValueError(f"scope must be one of: {', '.join(SCOPES)}")
-    day = _date(local_date)
+    day = dates.parse_date(local_date)
     if scope == "week" and day.weekday() != 0:
         raise ValueError("local_date must be the Monday when scope is 'week'")
     if field not in FIELDS:
@@ -196,7 +190,7 @@ def _session_line(conn: sqlite3.Connection, workout: sqlite3.Row) -> dict:
 
 def week_lines(conn: sqlite3.Connection, monday: str) -> list[dict]:
     """Return one computed presentation line per workout in Monday's week."""
-    monday_date = _date(monday, "monday")
+    monday_date = dates.parse_date(monday, "monday")
     if monday_date.weekday() != 0:
         raise ValueError("monday must be a Monday in YYYY-MM-DD")
     end = (monday_date + timedelta(days=6)).isoformat()

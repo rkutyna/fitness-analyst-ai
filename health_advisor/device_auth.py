@@ -71,8 +71,6 @@ channel enrolled a key; and nothing here depends on how D23 derives its keys.
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import contextlib
 import fcntl
 import hashlib
@@ -86,6 +84,8 @@ import time
 from dataclasses import asdict, dataclass
 
 from . import body_aead
+from . import dates
+from .wire import b64url_decode, b64url_encode
 
 
 MODES = ("off", "accept", "required")
@@ -129,22 +129,9 @@ def device_auth_mode() -> str:
     )
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _b64url_decode(text: str) -> bytes:
-    if not isinstance(text, str) or not re.fullmatch(r"[A-Za-z0-9_-]*", text):
-        raise ValueError("not base64url")
-    try:
-        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("not base64url") from exc
-
-
 def kid_for(public_key_x963: bytes) -> str:
     """The key id of an uncompressed P-256 public key."""
-    return _b64url(hashlib.sha256(public_key_x963).digest()[:KID_BYTES])
+    return b64url_encode(hashlib.sha256(public_key_x963).digest()[:KID_BYTES])
 
 
 def body_sha256(body: bytes) -> str:
@@ -224,7 +211,7 @@ def parse_headers(get_header) -> SignedHeaders | None:
     if not _KID_RE.fullmatch(kid) or not _TS_RE.fullmatch(ts):
         raise DeviceAuthError("device_sig_malformed")
     try:
-        signature = _b64url_decode(sig)
+        signature = b64url_decode(sig)
     except ValueError as exc:
         raise DeviceAuthError("device_sig_malformed") from exc
     if len(signature) != SIGNATURE_BYTES:
@@ -271,11 +258,7 @@ class Device:
         return self.revoked_at is None
 
     def public_key_bytes(self) -> bytes:
-        return _b64url_decode(self.public_key)
-
-
-def _utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return b64url_decode(self.public_key)
 
 
 @contextlib.contextmanager
@@ -413,8 +396,8 @@ class DeviceRegistry:
                 return existing, False
             if not allow_new:
                 raise DeviceAuthError("device_enrol_closed", 403)
-            device = Device(kid=kid, public_key=_b64url(public_key_x963),
-                            enrolled_at=_utc_now(), via=via,
+            device = Device(kid=kid, public_key=b64url_encode(public_key_x963),
+                            enrolled_at=dates.utc_now(), via=via,
                             key_storage=key_storage)
             devices[kid] = device
             self._write(devices)
@@ -429,7 +412,7 @@ class DeviceRegistry:
                 raise KeyError(kid)
             if not existing.active:
                 return existing, True
-            revoked = Device(**{**asdict(existing), "revoked_at": _utc_now()})
+            revoked = Device(**{**asdict(existing), "revoked_at": dates.utc_now()})
             devices[kid] = revoked
             self._write(devices)
             return revoked, False

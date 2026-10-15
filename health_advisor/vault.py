@@ -20,7 +20,7 @@ import tempfile
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import available_timezones
+from zoneinfo import ZoneInfo, available_timezones
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -302,6 +302,12 @@ def convert_for_unit_system(value, unit: str | None,
     else:
         value = float(value) * factor
     return value, target
+
+
+def local_today(conn: sqlite3.Connection) -> date:
+    """Today's date in the vault's declared zone, or the host date if undeclared."""
+    tz = local_timezone(conn)
+    return datetime.now(ZoneInfo(tz)).date() if tz else date.today()
 
 
 def local_timezone(conn: sqlite3.Connection) -> str | None:

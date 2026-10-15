@@ -253,8 +253,8 @@ def test_analysis_and_chat_today_use_the_vault_zone(tmp_path, monkeypatch):
             instant = cls(2026, 8, 1, 2, tzinfo=timezone.utc)
             return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
 
-    monkeypatch.setattr(analysismod, "datetime", FrozenDateTime)
-    monkeypatch.setattr(chatmod, "datetime", FrozenDateTime)
+    # The zone-aware today now lives in vault.local_today; analysis and chat call it.
+    monkeypatch.setattr(vaultmod, "datetime", FrozenDateTime)
     expected = {
         "Pacific/Kiritimati": "2026-08-01",
         "Pacific/Pago_Pago": "2026-07-31",
@@ -264,7 +264,7 @@ def test_analysis_and_chat_today_use_the_vault_zone(tmp_path, monkeypatch):
         conn = ctx.read_only()
         try:
             assert analysismod._as_of(conn, None) == expected_today
-            assert chatmod._today(conn).isoformat() == expected_today
+            assert vaultmod.local_today(conn).isoformat() == expected_today
         finally:
             conn.close()
 
@@ -272,7 +272,7 @@ def test_analysis_and_chat_today_use_the_vault_zone(tmp_path, monkeypatch):
     conn = undeclared.read_only()
     try:
         assert analysismod._as_of(conn, None) == date.today().isoformat()
-        assert chatmod._today(conn).isoformat() == date.today().isoformat()
+        assert vaultmod.local_today(conn).isoformat() == date.today().isoformat()
     finally:
         conn.close()
 

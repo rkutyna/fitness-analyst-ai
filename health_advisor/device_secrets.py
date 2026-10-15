@@ -37,6 +37,7 @@ import time
 from dataclasses import asdict, dataclass
 
 from . import device_auth
+from . import dates
 
 
 MODES = ("instance", "per_device")
@@ -63,10 +64,6 @@ class DeviceSecret:
     kid: str
     secret: str
     issued_at: str
-
-
-def _utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 class DeviceSecretStore:
@@ -166,7 +163,7 @@ class DeviceSecretStore:
         either write.
         """
         record = DeviceSecret(kid=kid, secret=secrets.token_urlsafe(SECRET_BYTES),
-                              issued_at=_utc_now())
+                              issued_at=dates.utc_now())
         with self._exclusive():
             current = self._read_file()
             if self._test_race_delay:

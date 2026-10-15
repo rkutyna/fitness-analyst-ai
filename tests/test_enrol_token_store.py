@@ -36,6 +36,7 @@ import time
 import pytest
 
 from health_advisor import enrol
+from health_advisor.wire import b64url_decode
 
 
 @pytest.fixture
@@ -57,9 +58,9 @@ def test_mint_returns_a_live_token_with_a_server_public_key(store):
     assert record.state == "live"
     assert record.kid is None
     assert record.used_at is None
-    assert len(enrol._b64url_decode(token)) == enrol.TOKEN_BYTES
+    assert len(b64url_decode(token)) == enrol.TOKEN_BYTES
     pub = store.server_public_key(record)
-    assert len(enrol._b64url_decode(pub)) == 32
+    assert len(b64url_decode(pub)) == 32
 
 
 def test_mint_never_writes_the_plaintext_token(store, store_path):
@@ -314,14 +315,14 @@ def test_hpke_open_a_cryptokit_sealed_fixture_from_ios():
         .read_text(encoding="utf-8"))
     info = enrol.info_for(fixture["enrol_id"])
     assert info == fixture["info_text"].encode("ascii")
-    wire = enrol._b64url_decode(fixture["request"]["wire_b64url"])
+    wire = b64url_decode(fixture["request"]["wire_b64url"])
     opened = enrol.open_sealed(fixture["recipient_private_x25519_raw_b64url"], info, wire)
     assert opened == fixture["request"]["plaintext_json"].encode("utf-8")
     tampered = wire[:-1] + bytes([wire[-1] ^ 1])
     with pytest.raises(Exception):
         enrol.open_sealed(fixture["recipient_private_x25519_raw_b64url"], info, tampered)
-    response_key = enrol._b64url_decode(fixture["response"]["response_key_b64url"])
-    response_wire = enrol._b64url_decode(fixture["response"]["wire_b64url"])
+    response_key = b64url_decode(fixture["response"]["response_key_b64url"])
+    response_wire = b64url_decode(fixture["response"]["wire_b64url"])
     assert enrol.open_response(response_key, response_wire) == \
         fixture["response"]["plaintext_json"].encode("utf-8")
 

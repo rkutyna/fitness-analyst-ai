@@ -22,7 +22,6 @@ import sys
 import tempfile
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from typing import Any, Callable, Mapping
 
 from . import db
@@ -127,13 +126,6 @@ _TURN_COLUMNS = (
 _AUDIT_COMMAND_RE = re.compile(
     r"^\s*run_audit\(\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\)\s*$"
 )
-
-
-def _today(conn) -> date:
-    """Return today's date in the vault's declared zone, or the host date."""
-    local_timezone = vault.local_timezone(conn)
-    return (datetime.now(ZoneInfo(local_timezone)).date()
-            if local_timezone else date.today())
 
 
 def _decode_turn_attachments(turn: dict[str, Any]) -> dict[str, Any]:
@@ -260,7 +252,7 @@ def _ask_calendar_dates(ctx: VaultContext,
         empty = sqlite3.connect(":memory:")
         try:
             empty.execute("CREATE TABLE daily_metrics (date TEXT)")
-            today = analysis._today(empty)
+            today = vault.local_today(empty)
             horizon = date.fromisoformat(analysis._as_of(empty, None))
             return today, horizon
         finally:
@@ -268,7 +260,7 @@ def _ask_calendar_dates(ctx: VaultContext,
 
     conn = ctx.read_only()
     try:
-        today = analysis._today(conn)
+        today = vault.local_today(conn)
         horizon = date.fromisoformat(analysis._as_of(conn, None))
         return today, horizon
     finally:
@@ -315,7 +307,7 @@ def _ask_calendar_today_is_declared(ctx: VaultContext,
                                    as_of: str | None) -> bool:
     """Say whether the prompt's current date came from a zone we can name.
 
-    #439: ``analysis._today`` falls back to the HOST date when the vault
+    #439: ``vault.local_today`` falls back to the HOST date when the vault
     declares no ``local_timezone``, and every host this project deploys to
     runs UTC — so between 20:00 and 23:59 in a UTC-4 zone that date is already
     tomorrow, for four hours every evening, invisibly.  An explicit ``as_of``
@@ -1500,7 +1492,7 @@ def _no_data_answer(ctx: VaultContext, as_of: str | None) -> dict | None:
 
     conn = ctx.read_only()
     try:
-        effective_as_of = as_of or _today(conn).isoformat()
+        effective_as_of = as_of or vault.local_today(conn).isoformat()
         if cold_start._first_date(conn, effective_as_of) is not None:
             return None
         description = cold_start.describe(
@@ -2816,7 +2808,7 @@ def _ask_history_days(ctx: VaultContext, as_of: str | None) -> int | None:
 
     conn = ctx.read_only()
     try:
-        effective_as_of = as_of or _today(conn).isoformat()
+        effective_as_of = as_of or vault.local_today(conn).isoformat()
         first = cold_start._first_date(conn, effective_as_of)
         if first is None:
             return None

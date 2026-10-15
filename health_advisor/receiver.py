@@ -84,6 +84,7 @@ from . import body_aead
 from . import device_auth
 from . import device_secrets
 from . import enrol
+from .wire import b64url_decode
 
 logger = logging.getLogger(__name__)
 
@@ -1682,12 +1683,12 @@ def _enrol_qr(store: "enrol.TokenStore", devices: "device_auth.DeviceAuth",
         token_text = payload["token"]
         if not isinstance(token_text, str):
             raise ValueError("token")
-        device_pub = device_auth._b64url_decode(payload["device_pub"])
+        device_pub = b64url_decode(payload["device_pub"])
         device_auth.load_public_key(device_pub)
         key_storage = payload.get("key_storage")
         if key_storage not in device_auth.KEY_STORAGE_VALUES:
             raise ValueError("key_storage")
-        response_key = enrol._b64url_decode(payload["response_key"])
+        response_key = b64url_decode(payload["response_key"])
         if len(response_key) != enrol.RESPONSE_KEY_BYTES:
             raise ValueError("response_key")
         # attestation is reserved for T10 (D4: deferred). `null` is accepted
@@ -1784,7 +1785,7 @@ def _enrol_upgrade(devices: "device_auth.DeviceAuth", request: Request,
         payload = json.loads(raw)
         if not isinstance(payload, dict) or payload.get("v") != 1:
             raise ValueError("version")
-        public_key = device_auth._b64url_decode(payload["public_key"])
+        public_key = b64url_decode(payload["public_key"])
         device_auth.load_public_key(public_key)
         key_storage = payload.get("key_storage")
         if key_storage not in device_auth.KEY_STORAGE_VALUES:

@@ -7,9 +7,9 @@ import math
 import sqlite3
 import statistics
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from . import db
+from . import dates
 from . import metrics as mx
 from . import normalize as nz
 from . import vault as V
@@ -198,14 +198,7 @@ def _as_of(conn, as_of: str | None) -> str:
     row = conn.execute(
         "SELECT MAX(date) FROM daily_metrics WHERE "
         + mx.current_daily_metrics_predicate(conn)).fetchone()
-    return row[0] if row and row[0] else _today(conn).isoformat()
-
-
-def _today(conn) -> date:
-    """Return today's date in the vault's declared zone, or the host date."""
-    local_timezone = V.local_timezone(conn)
-    return (datetime.now(ZoneInfo(local_timezone)).date()
-            if local_timezone else date.today())
+    return row[0] if row and row[0] else V.local_today(conn).isoformat()
 
 
 def _bucket_index(bucket_start_utc: str) -> int:
@@ -515,7 +508,7 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
     for row in rows:
         d, v = row["date"], row["v"]
         day = date.fromisoformat(d)
-        monday = (day - timedelta(days=day.weekday())).isoformat()
+        monday = dates.week_start(day).isoformat()
         weeks.setdefault(monday, []).append(
             (v, mx.verification_status(metric, row["derived_version"])))
     out = []
@@ -703,8 +696,7 @@ def _week_start(day: str) -> str:
     used to be a Python copy of `date(local_date, 'weekday 0', '-6 days')` kept
     in step by hand, and became the only implementation when the bucket rule
     moved to metrics.impact_bucket_rows."""
-    d = date.fromisoformat(day)
-    return (d - timedelta(days=d.weekday())).isoformat()
+    return dates.week_start(date.fromisoformat(day)).isoformat()
 
 
 def coverage(conn, as_of: str | None = None) -> list[dict]:

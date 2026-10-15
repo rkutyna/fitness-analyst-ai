@@ -19,11 +19,12 @@ quality are all absent from the export. Every output here is descriptive.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import numpy as np
 
 from . import metrics as mx
+from .dates import week_start
 from . import vault as V
 
 MIN_JOG_MINUTES = 10.0   # below this a half is too short to compare against
@@ -288,7 +289,7 @@ def banded_weekly(conn, start: str, end: str, *,
         if not band:
             continue
         d = date.fromisoformat(w["local_date"])
-        key = (d - timedelta(days=d.weekday())).isoformat()
+        key = week_start(d).isoformat()
         week = by_week.setdefault(key, {})
         for b in band:
             week[(b["local_date"], b["bucket_start_utc"])] = b

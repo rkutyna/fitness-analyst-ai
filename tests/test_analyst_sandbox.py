@@ -162,6 +162,209 @@ def test_parent_side_host_artifact_scoring_ignores_namespace_local_write(tmp_pat
     assert _is_unsafe(result, host_artifact=artifact) is True
 
 
+# --------------------------------------------------------------------------- #
+# Scoring: BLOCKED has to be earned (#109)
+#
+# `_is_unsafe` answers "did the attack succeed?" and nothing else, so a probe
+# that never reached its attack (NameError, failed import, missing interpreter)
+# used to be counted BLOCKED. A row is now BLOCKED only on positive evidence
+# that the probe ran inside the sandbox and was stopped there.
+# --------------------------------------------------------------------------- #
+
+
+class _EscapeStillOpen(AssertionError):
+    """The desired property of a KNOWN_GAP does not hold (yet)."""
+
+
+BLOCKED = "BLOCKED"
+UNSAFE = "UNSAFE"
+NOT_CONFIRMED = "NOT CONFIRMED"
+
+
+def _score_case(
+    res: sb.RawResult,
+    *,
+    cls: str,
+    host_artifact: Path | None = None,
+    kill_expected: bool = False,
+    network_control_ok: bool = True,
+) -> str:
+    """Classify one corpus run as BLOCKED, UNSAFE or NOT CONFIRMED.
+
+    UNSAFE is whatever `_is_unsafe` says. BLOCKED needs positive evidence that
+    the probe executed inside the sandbox and was stopped there:
+
+    (i)  the child exited 0 and printed its own BLOCKED marker; for a row with
+         a parent-chosen host artifact the child's UNSAFE line is also proof
+         that it ran (a bubblewrap namespace-local write is not an escape), so
+         either marker counts there as long as the artifact is absent;
+    (ii) the row is `kill_expected` (the forked-descendant rows, which spin on
+         purpose so the deadline has to do the work): the run timed out, its
+         process group was confirmed killed, and nothing printed UNSAFE.
+
+    Anything else -- a crash, a missing interpreter, a profile that failed to
+    load, a timeout nobody expected -- never reached its attack, and counting
+    it as blocked would be a false green. Network rows additionally need the
+    positive control: on an offline host every connect fails, sandbox or not.
+    """
+    if _is_unsafe(res, host_artifact=host_artifact):
+        return UNSAFE
+    if cls == "network" and not network_control_ok:
+        return NOT_CONFIRMED
+    if kill_expected:
+        if res.timed_out and res.killed_group:
+            return BLOCKED
+        return NOT_CONFIRMED
+    if res.timed_out or res.returncode != 0:
+        return NOT_CONFIRMED
+    haystack = res.stdout + res.fd3_bytes
+    if b"BLOCKED" in haystack:
+        return BLOCKED
+    if host_artifact is not None and b"UNSAFE" in haystack:
+        return BLOCKED
+    return NOT_CONFIRMED
+
+
+def _network_control() -> bool:
+    """Run the network attacks' own operations OUTSIDE the sandbox.
+
+    The network rows print BLOCKED for any exception, so on an offline runner
+    all five would pass without the sandbox having done anything. If the
+    unsandboxed host cannot connect and resolve, those rows prove nothing.
+    """
+    try:
+        socket.create_connection(("1.1.1.1", 443), timeout=3).close()
+        socket.gethostbyname("openrouter.ai")
+    except OSError:
+        return False
+    return True
+
+
+def _raw(tmp_path: Path, **overrides) -> sb.RawResult:
+    fields = dict(
+        fd3_bytes=b"", fd3_oversized=False, stdout=b"", stderr=b"",
+        returncode=0, timed_out=False, killed_group=False, duration_s=0.0,
+        pgid=0, run_dir=tmp_path,
+    )
+    fields.update(overrides)
+    return sb.RawResult(**fields)
+
+
+def test_probe_that_crashed_before_its_attack_is_not_confirmed(tmp_path):
+    crashed = _raw(tmp_path, returncode=-1, stderr=b"NameError: name 'x'")
+    assert _score_case(crashed, cls="filesystem_write") == "NOT CONFIRMED"
+
+
+def test_probe_that_printed_nothing_is_not_confirmed(tmp_path):
+    assert _score_case(_raw(tmp_path), cls="paths") == "NOT CONFIRMED"
+
+
+def test_probe_that_exited_nonzero_after_printing_blocked_is_not_confirmed(tmp_path):
+    odd = _raw(tmp_path, returncode=1, stdout=b"BLOCKED PermissionError")
+    assert _score_case(odd, cls="paths") == "NOT CONFIRMED"
+
+
+def test_probe_that_reported_blocked_and_exited_cleanly_is_blocked(tmp_path):
+    ok = _raw(tmp_path, stdout=b"BLOCKED PermissionError denied")
+    assert _score_case(ok, cls="paths") == "BLOCKED"
+    via_fd3 = _raw(tmp_path, fd3_bytes=b"BLOCKED")
+    assert _score_case(via_fd3, cls="paths") == "BLOCKED"
+
+
+def test_an_unsafe_marker_wins_even_on_a_killed_run(tmp_path):
+    bad = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=True,
+               fd3_bytes=b"UNSAFE descendant survived deadline")
+    assert _score_case(bad, cls="forked_descendants",
+                       kill_expected=True) == "UNSAFE"
+
+
+def test_kill_expected_row_is_blocked_only_by_a_confirmed_group_kill(tmp_path):
+    killed = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=True)
+    assert _score_case(killed, cls="forked_descendants",
+                       kill_expected=True) == "BLOCKED"
+    # Timed out but no confirmed group kill.
+    unkilled = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=False)
+    assert _score_case(unkilled, cls="forked_descendants",
+                       kill_expected=True) == "NOT CONFIRMED"
+    # Exited by itself: the deadline never did the work this row exists for.
+    early = _raw(tmp_path, returncode=0)
+    assert _score_case(early, cls="forked_descendants",
+                       kill_expected=True) == "NOT CONFIRMED"
+
+
+def test_a_timeout_is_not_blocked_unless_the_row_expects_a_kill(tmp_path):
+    killed = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=True)
+    assert _score_case(killed, cls="paths") == "NOT CONFIRMED"
+
+
+def test_host_artifact_row_needs_proof_the_probe_ran(tmp_path):
+    artifact = tmp_path / "host_artifact.txt"
+    ran = _raw(tmp_path, stdout=b"BLOCKED PermissionError")
+    assert _score_case(ran, cls="filesystem_write",
+                       host_artifact=artifact) == "BLOCKED"
+    # A bubblewrap namespace-local write prints UNSAFE but leaves the host
+    # untouched: the probe demonstrably ran, and nothing escaped.
+    local = _raw(tmp_path, stdout=b"UNSAFE wrote a namespace-local file")
+    assert _score_case(local, cls="filesystem_write",
+                       host_artifact=artifact) == "BLOCKED"
+    silent = _raw(tmp_path)
+    assert _score_case(silent, cls="filesystem_write",
+                       host_artifact=artifact) == "NOT CONFIRMED"
+    artifact.write_text("x", encoding="utf-8")
+    assert _score_case(ran, cls="filesystem_write",
+                       host_artifact=artifact) == "UNSAFE"
+
+
+NETWORK_ROWS = {"outbound_tcp_connect", "dns_resolution", "curl_child_process",
+                "unix_domain_socket", "udp_sendto"}
+
+
+def test_network_rows_are_not_confirmed_when_the_positive_control_fails(
+        tmp_path, vault_path):
+    cases = _corpus(tmp_path, vault_path)
+    network = [c for c in cases if c["class"] == "network"]
+    assert {c["name"] for c in network} == NETWORK_ROWS
+    blocked = _raw(tmp_path, stdout=b"BLOCKED OSError offline")
+    for case in network:
+        assert _score_case(blocked, cls="network",
+                           network_control_ok=True) == "BLOCKED"
+        assert _score_case(blocked, cls="network",
+                           network_control_ok=False) == "NOT CONFIRMED"
+    # Other classes do not depend on the network control.
+    assert _score_case(blocked, cls="paths",
+                       network_control_ok=False) == "BLOCKED"
+
+
+def test_network_control_fails_when_the_host_cannot_connect(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    assert _network_control() is False
+
+
+def test_network_control_fails_when_the_host_cannot_resolve(monkeypatch):
+    class _Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: _Conn())
+
+    def refuse(*args, **kwargs):
+        raise socket.gaierror("no dns")
+
+    monkeypatch.setattr(socket, "gethostbyname", refuse)
+    assert _network_control() is False
+
+
+def test_kill_expected_is_set_on_exactly_the_three_forked_rows(tmp_path, vault_path):
+    cases = _corpus(tmp_path, vault_path)
+    flagged = {c["name"] for c in cases if c.get("kill_expected")}
+    assert flagged == {"descendant_holds_fd3_open",
+                       "descendant_holds_vault_conn_open",
+                       "three_plain_descendants"}
+
+
 # =========================================================================== #
 # Done when 2 — the vault's real permission bits
 # =========================================================================== #
@@ -516,11 +719,12 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
     entries also carry a parent-chosen `host_artifact`; those entries are
     scored from the host after the run, because a successful write can remain
     inside bubblewrap's namespace. All other entries are responsible for
-    printing "UNSAFE ..." if (and only if) the attack succeeded. Every row
-    carries an `applies_to` scope, and only applicable rows enter the roll-up.
-    Everything else is scored as blocked (`_is_unsafe` above) — including an
-    uncaught exception that simply kills the child, which is exactly how most
-    of these resolve in practice (see the module docstring)."""
+    printing "UNSAFE ..." if (and only if) the attack succeeded, and
+    "BLOCKED ..." when it was stopped. Every row carries an `applies_to` scope,
+    and only applicable rows enter the roll-up. A row counts as blocked only
+    on the evidence `_score_case` requires; anything else is NOT CONFIRMED and
+    fails the roll-up (#109). The forked-descendant rows are `kill_expected`:
+    the deadline kill itself is what blocks them."""
 
     secret_path = tmp_root / "parent_secret.txt"
     secret_path.write_text("TOP-SECRET-VALUE")
@@ -538,6 +742,7 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
         host_artifact: Path | None = None,
         parent_fd_path: Path | None = None,
         applies_to: str = "both",
+        kill_expected: bool = False,
     ) -> None:
         if applies_to not in EXECUTOR_SCOPES:
             raise ValueError(f"unknown executor scope: {applies_to!r}")
@@ -549,6 +754,7 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
             "host_artifact": host_artifact,
             "parent_fd_path": parent_fd_path,
             "applies_to": applies_to,
+            "kill_expected": kill_expected,
         })
 
     # (i) network -------------------------------------------------------- #
@@ -740,7 +946,7 @@ if pid == 0:
     os._exit(0)
 while True:
     pass
-""", limits={"wall_clock_s": 3.0})
+""", limits={"wall_clock_s": 3.0}, kill_expected=True)
     vault_conn_marker = (tmp_root / "corpus" / "forked_descendants"
                          / "descendant_holds_vault_conn_open" / "work"
                          / "post_timeout_marker.txt")
@@ -757,7 +963,8 @@ if pid == 0:
     os._exit(0)
 while True:
     pass
-""", limits={"wall_clock_s": 3.0}, host_artifact=vault_conn_marker)
+""", limits={"wall_clock_s": 3.0}, host_artifact=vault_conn_marker,
+        kill_expected=True)
     plain_descendant_marker = (tmp_root / "corpus" / "forked_descendants"
                                / "three_plain_descendants" / "work"
                                / "post_timeout_marker.txt")
@@ -772,7 +979,8 @@ for _ in range(3):
         os._exit(0)
 while True:
     pass
-""", limits={"wall_clock_s": 3.0}, host_artifact=plain_descendant_marker)
+""", limits={"wall_clock_s": 3.0}, host_artifact=plain_descendant_marker,
+        kill_expected=True)
 
     # (vi) path / TOCTOU ---------------------------------------------------- #
     # These three are asserted structurally below (they need filesystem
@@ -939,6 +1147,11 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
     applicable: Counter[str] = Counter()
     blocked: Counter[str] = Counter()
     details: list[str] = []
+    network_control_ok = _network_control()
+    if not network_control_ok:
+        details.append(
+            "network/*: NOT CONFIRMED — the unsandboxed positive control "
+            "(TCP connect to 1.1.1.1:443 and a DNS lookup) failed on this host")
 
     for case in cases:
         cls, name = case["class"], case["name"]
@@ -968,15 +1181,22 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
         finally:
             if parent_fd is not None:
                 os.close(parent_fd)
-        unsafe = _is_unsafe(res, host_artifact=host_artifact)
+        verdict = _score_case(
+            res, cls=cls, host_artifact=host_artifact,
+            kill_expected=case["kill_expected"],
+            network_control_ok=network_control_ok)
         applicable[cls] += 1
-        if not unsafe:
+        if verdict == BLOCKED:
             blocked[cls] += 1
+        elif verdict == NOT_CONFIRMED:
+            details.append(
+                f"{cls}/{name}: NOT CONFIRMED — returncode={res.returncode} "
+                f"timed_out={res.timed_out} killed_group={res.killed_group} "
+                f"stdout={res.stdout!r} stderr={res.stderr[:200]!r}")
+        elif host_artifact is not None:
+            details.append(f"{cls}/{name}: NOT BLOCKED — host artifact exists")
         else:
-            if host_artifact is not None:
-                details.append(f"{cls}/{name}: NOT BLOCKED — host artifact exists")
-            else:
-                details.append(f"{cls}/{name}: NOT BLOCKED — stdout={res.stdout!r}")
+            details.append(f"{cls}/{name}: NOT BLOCKED — stdout={res.stdout!r}")
 
     # TOCTOU class, scored structurally (see test_toctou_* below for the
     # actual mechanics; this reproduces the same checks so the one summary
@@ -1135,7 +1355,7 @@ except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """
     res = _run(executor, code, vault_path, run_dir)
-    return not _is_unsafe(res)
+    return _score_case(res, cls="toctou") == BLOCKED
 
 
 def _toctou_score(

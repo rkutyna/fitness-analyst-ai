@@ -574,7 +574,8 @@ def session_hr_scopes(conn, start_utc: str, end_utc: str,
 
 
 def impact_volume(conn, start: str, end: str, by: str = "week", *,
-                  metric_units: bool = False) -> list[dict]:
+                  metric_units: bool = False,
+                  bucket_rows: list[dict] | None = None) -> list[dict]:
     """Minutes actually spent jogging vs walking between two local dates.
 
     Groups raw distance_walking_running samples into fixed time buckets and
@@ -582,13 +583,18 @@ def impact_volume(conn, start: str, end: str, by: str = "week", *,
     remains diagnostic and belongs to the separate block dial. Returns one row
     per week (Monday anchored) or per day. Distances are miles, durations
     minutes.
+
+    ``bucket_rows`` lets a caller that already classified this exact
+    ``start``..``end`` window pass the result in; it is read, never changed.
+    Left out, the buckets are classified here.
     """
     if by not in ("week", "day"):
         raise ValueError("by must be 'week' or 'day'")
     bucket_min = IMPACT_BUCKET_SECONDS / 60.0
-    bucket_rows = mx.impact_bucket_rows(
-        conn, "local_date BETWEEN ? AND ?", (start, end)
-    )
+    if bucket_rows is None:
+        bucket_rows = mx.impact_bucket_rows(
+            conn, "local_date BETWEEN ? AND ?", (start, end)
+        )
     grouped: dict[str, dict[str, float | int]] = {}
     for bucket in bucket_rows:
         period = (_week_start(bucket["local_date"]) if by == "week"

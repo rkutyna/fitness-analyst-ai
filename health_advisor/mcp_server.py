@@ -1325,13 +1325,17 @@ def _impact_change_pct(periods: list[dict], by: str) -> None:
         prev = p
 
 
-def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
+def _jog_threshold_sensitivity(conn, start: str, end: str, *,
+                               bucket_rows: list[dict] | None = None
+                               ) -> dict | None:
     """How much of jog_minutes depends on exactly where the cadence cutoff sits.
 
     Uses the shared bucket set and varies only the gait cadence line. Workout
     scope, the implausible-pace floor and the heart-rate-confirmed lane remain
     fixed, so the live threshold row is exactly the same classification as
-    ``impact_volume``. ``jog_minutes`` is the only
+    ``impact_volume``. ``bucket_rows`` is that shared set for ``start``..``end``
+    when the caller already classified it; it is read, never changed.
+    ``jog_minutes`` is the only
     series value in each sensitivity row and is recomputed at that cadence
     edge; ``cadence_min_steps_per_min``, ``jog_buckets``, and ``live_cutoff``
     are context about the sensitivity calculation and remain unowned.
@@ -1341,9 +1345,10 @@ def _jog_threshold_sensitivity(conn, start: str, end: str) -> dict | None:
     edges = sorted({round(live + off, 1) for off in IMPACT_SENSITIVITY_OFFSETS
                     if live + off > 0})
     near_floor = max(live - IMPACT_NEAR_THRESHOLD_STEPS_PER_MIN, 0.1)
-    bucket_rows = mx.impact_bucket_rows(
-        conn, "local_date BETWEEN ? AND ?", (start, end)
-    )
+    if bucket_rows is None:
+        bucket_rows = mx.impact_bucket_rows(
+            conn, "local_date BETWEEN ? AND ?", (start, end)
+        )
 
     def is_jog_at(row: dict, cadence_min: float) -> bool:
         """Apply one gait-cadence edge to the shared bucket set."""
@@ -1686,9 +1691,16 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                     "reason": "window_after_as_of"}
 
         effective_end = min(date.fromisoformat(end), as_of_date).isoformat()
+        # One classification of the window feeds both the period rows and the
+        # cadence-sensitivity table, so they cannot disagree and the vault's
+        # raw samples are bucketed once.
+        bucket_rows = mx.impact_bucket_rows(
+            conn, "local_date BETWEEN ? AND ?", (start, effective_end))
         rows = A.impact_volume(conn, start, effective_end, by=by,
-                               metric_units=metric_units)
-        sens = _jog_threshold_sensitivity(conn, start, effective_end)
+                               metric_units=metric_units,
+                               bucket_rows=bucket_rows)
+        sens = _jog_threshold_sensitivity(conn, start, effective_end,
+                                          bucket_rows=bucket_rows)
         # Fill periods analysis had no rows for, then recompute the change
         # column over the complete sequence. The same labelled rows feed block
         # comparison. Do this while the read-only connection is open only

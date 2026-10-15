@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from . import db
+from . import hr_zones
 from . import normalize as nz
 
 # The origin tag this parser stamps on records.origin. Named for its writer
@@ -34,7 +35,10 @@ _TOP_FIELDS = frozenset({
     "workout_routes",
     "workout_elevation",
     "workout_context",
+    "characteristics",
 })
+# The optional envelope section a client states about the person (#113).
+_CHARACTERISTICS_FIELDS = frozenset({"date_of_birth"})
 _DEVICE_FIELDS = frozenset({"id", "name", "model"})
 _SAMPLE_DEVICE_FIELDS = frozenset({"name", "model"})
 # Every field the source_revision object MAY carry (unknown ones are rejected)…
@@ -92,6 +96,35 @@ DAILY_TOTAL_METRICS = D19_TOTAL_METRICS
 
 class PayloadError(ValueError):
     """The envelope shape is not a HealthKit-direct payload."""
+
+
+class CharacteristicsError(PayloadError):
+    """The optional `characteristics` section is refused; the batch is not applied.
+
+    The receiver answers 422 for this, where any other envelope shape error is
+    400, so a client that sends a bad birth date can tell it apart from one that
+    sent a malformed batch. The message never echoes the stated value.
+    """
+
+
+def _parse_characteristics(wire: Any) -> dict:
+    """The stated characteristics, keyed by name; ``{}`` when none are stated."""
+    if not isinstance(wire, dict):
+        raise CharacteristicsError("characteristics must be a JSON object")
+    unknown = sorted(set(wire) - _CHARACTERISTICS_FIELDS)
+    if unknown:
+        raise CharacteristicsError(
+            f"characteristics has unknown field(s): {', '.join(unknown)}")
+    parsed: dict[str, Any] = {}
+    if "date_of_birth" in wire:
+        try:
+            parsed["date_of_birth"] = hr_zones.parse_date_of_birth(
+                wire["date_of_birth"])
+        except ValueError:
+            raise CharacteristicsError(
+                "characteristics.date_of_birth must be a calendar date in "
+                "YYYY-MM-DD form") from None
+    return parsed
 
 
 def _mapping(value: Any, what: str) -> dict:
@@ -955,6 +988,8 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 f"payload.workout_context[{i}] must be a JSON object"
             )
         _parse_workout_context(entry, i, workout_context)
+    characteristics = _parse_characteristics(
+        envelope.get("characteristics", {}))
     daily_totals_wire = _list(envelope.get("daily_totals", []),
                               "payload.daily_totals")
     daily_totals: list[dict] = []
@@ -984,6 +1019,7 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "workout_elevation_present": workout_elevation_present,
         "workout_context": workout_context,
         "workout_context_present": workout_context_present,
+        "characteristics": characteristics,
         "daily_totals": daily_totals,
         "daily_total_dates": daily_total_dates,
         "workout_routes": parsed_routes,

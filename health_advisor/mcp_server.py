@@ -79,12 +79,17 @@ def build_tools(ctx: VaultContext) -> dict:
 
 
 def build_server(ctx: VaultContext, *, name: str = "health-advisor",
-                 include: "frozenset[str] | tuple[str, ...] | None" = None) -> FastMCP:
+                 include: "frozenset[str] | tuple[str, ...] | None" = None,
+                 tools: "dict | None" = None) -> FastMCP:
     """A FastMCP bound to one session. `include` narrows the surface — the
     researcher gets a strict subset (llm.RESEARCHER_TOOLS), and D5 wants that
-    asymmetry expressed here rather than enforced by convention elsewhere."""
+    asymmetry expressed here rather than enforced by convention elsewhere.
+
+    `tools` is an explicit `{name: callable}` mapping to register instead of the
+    engine's `build_tools(ctx)`; `include` still filters it. Each callable must
+    already be bound to `ctx` (see `build_tools`)."""
     server = FastMCP(name)
-    for tool_name, bound in build_tools(ctx).items():
+    for tool_name, bound in (build_tools(ctx) if tools is None else tools).items():
         if include is not None and tool_name not in include:
             continue
         server.tool()(bound)
@@ -117,6 +122,16 @@ _series = mx.series
 _stats = mx.stats
 _metric_exists = mx.metric_exists
 MAX_SERIES_POINTS = mx.MAX_SERIES_POINTS
+
+
+def _unknown_metric(metric) -> dict:
+    """The refusal every tool returns for a metric the vault does not hold."""
+    return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
+
+
+def _unit_system(settings) -> str:
+    """The vault's declared unit system, from a ``ctx.settings()`` mapping."""
+    return settings["unit_system"]
 
 
 # One source of truth, deliberately not a copy (#215). `metrics` owns which
@@ -277,7 +292,7 @@ def list_available_metrics(ctx: VaultContext) -> dict:
     what can be queried."""
     conn = ctx.read_only()
     settings = ctx.settings()
-    unit_system = settings["unit_system"]
+    unit_system = _unit_system(settings)
     try:
         rows = conn.execute(
             "SELECT metric, MIN(date) f, MAX(date) l, COUNT(*) n, MAX(unit) u "
@@ -313,11 +328,11 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
     Dates must be explicit YYYY-MM-DD — an 'error' comes back otherwise."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
-    unit_system = ctx.settings()["unit_system"]
+    unit_system = _unit_system(ctx.settings())
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
-            return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
+            return _unknown_metric(metric)
         anchor = end or _anchor_end(conn, metric)
         if start is None:
             start = (date.fromisoformat(anchor) - timedelta(days=89)).isoformat()
@@ -371,11 +386,11 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     mean/median/min/max, recent-vs-baseline change, and a linear trend per week.
     Anchored to the metric's most recent data. A period the server can't parse
     comes back as an 'error' — it is never silently replaced with a default."""
-    unit_system = ctx.settings()["unit_system"]
+    unit_system = _unit_system(ctx.settings())
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
-            return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
+            return _unknown_metric(metric)
         anchor = _anchor_end(conn, metric)
         try:
             # parse_range, NOT parse_period: parse_period rejects explicit
@@ -435,11 +450,11 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     An unparseable window is an 'error', never a default. If either window has
     no data the deltas come back null with a 'note' — an empty window is not a
     change of the other window's whole size."""
-    unit_system = ctx.settings()["unit_system"]
+    unit_system = _unit_system(ctx.settings())
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
-            return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
+            return _unknown_metric(metric)
         anchor = _anchor_end(conn, metric)
         try:
             a0, a1 = _parse_range(period_a, anchor)
@@ -484,7 +499,7 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
     an HR cap use get_hr_zones, which scopes to the workout itself."""
     if err := _bad_dates(day=day):
         return {"error": err}
-    unit_system = ctx.settings()["unit_system"]
+    unit_system = _unit_system(ctx.settings())
     try:
         bucket_hours = int(bucket_hours)
     except (TypeError, ValueError):
@@ -501,7 +516,7 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
-            return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
+            return _unknown_metric(metric)
         sqlagg = "SUM(value)" if _agg(metric) == "sum" else "AVG(value)"
         # Arbitrate exactly as the daily read path does. `daily_metrics` is
         # built through db._arbitration(), which drops a mirror source once the
@@ -879,7 +894,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     settings = ctx.settings()
     local_timezone = _as_timezone(settings["local_timezone"])
     today = _today(local_timezone).isoformat()
-    declared_unit_system = settings["unit_system"]
+    declared_unit_system = _unit_system(settings)
     metric_units = declared_unit_system == "metric"
     display_system = declared_unit_system or "imperial"
     display_units = settings["units"] or V.UNIT_SYSTEMS["imperial"]
@@ -1913,7 +1928,7 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
     if err := _bad_dates(workout_date=workout_date, start=start, end=end):
         return {"error": err}
     settings = ctx.settings()
-    declared_unit_system = settings["unit_system"]
+    declared_unit_system = _unit_system(settings)
     metric_units = declared_unit_system == "metric"
     conn = ctx.read_only()
     try:
@@ -1975,7 +1990,7 @@ def get_briefing(ctx: VaultContext, scope: str = "daily", day: str | None = None
         return {"error": f"scope={scope!r} is not a briefing scope; use "
                          f"{' or '.join(repr(s) for s in BRIEFING_SCOPES)}"}
     settings = ctx.settings()
-    declared_unit_system = settings["unit_system"]
+    declared_unit_system = _unit_system(settings)
     metric_units = declared_unit_system == "metric"
     conn = ctx.read_only()
     try:
@@ -2001,11 +2016,11 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
     than assuming today's build width applies to a vault that may predate
     it.
     """
-    unit_system = ctx.settings()["unit_system"]
+    unit_system = _unit_system(ctx.settings())
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
-            return {"error": f"unknown metric {metric!r}. Call list_available_metrics."}
+            return _unknown_metric(metric)
         col = _value_col(metric)
         dm = conn.execute(
             f"SELECT date, {col} v, unit FROM daily_metrics WHERE metric = ? AND "
@@ -2112,7 +2127,7 @@ def correlate_metrics(ctx: VaultContext, metric_x: str, metric_y: str, lag_days:
     try:
         for m in (metric_x, metric_y):
             if not _metric_exists(conn, m):
-                return {"error": f"unknown metric {m!r}. Call list_available_metrics."}
+                return _unknown_metric(m)
         lag_days = max(0, min(int(lag_days), 7))
         try:
             start_iso, end_iso = _corr_window(conn, metric_y, period)
@@ -2181,7 +2196,7 @@ def scan_correlations(ctx: VaultContext, target: str, period: str = "90d", lags:
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, target):
-            return {"error": f"unknown metric {target!r}. Call list_available_metrics."}
+            return _unknown_metric(target)
         try:
             lag_list = tuple(sorted({max(0, min(int(p), 7))
                                      for p in lags.split(",") if p.strip()})) or (0,)
@@ -2288,7 +2303,7 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
     conn = ctx.connect()
     try:
         db.init_db(conn)
-        unit_system = settings["unit_system"]
+        unit_system = _unit_system(settings)
         row = subj.log(conn, day, stress=stress, soreness=soreness,
                        energy=energy, sleep_quality=sleep_quality,
                        caffeine_drinks=caffeine_drinks,
@@ -2859,7 +2874,7 @@ def record_benchmark(ctx: VaultContext, date: str, stage: int, pace: str,
     """
     if err := _bad_dates(date=date):
         return {"ok": False, "error": err}
-    metric_units = ctx.settings()["unit_system"] == "metric"
+    metric_units = _unit_system(ctx.settings()) == "metric"
     conn = ctx.connect()
     try:
         db.init_db(conn)
@@ -2903,7 +2918,7 @@ def get_benchmark_series(ctx: VaultContext, *, runs_recorded: int | None = None)
     supplied, `status` says the run count is UNKNOWN rather than implying
     zero: silence about the register is not evidence the register is empty.
     """
-    metric_units = ctx.settings()["unit_system"] == "metric"
+    metric_units = _unit_system(ctx.settings()) == "metric"
     conn = ctx.read_only()
     try:
         rows = benchmark.series(conn, metric_units=metric_units)
@@ -2980,7 +2995,7 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
         return {"ok": False, "error": err}
     settings = ctx.settings()
     local_timezone = _as_timezone(settings["local_timezone"])
-    declared_unit_system = settings["unit_system"]
+    declared_unit_system = _unit_system(settings)
     metric_units = declared_unit_system == "metric"
     if day > _today(local_timezone).isoformat():
         return {"ok": False, "error": f"day={day!r} is in the future"}
@@ -2998,19 +3013,23 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
     return {"ok": True, "day": day, "day_totals": rows}
 
 
-def main(argv: "list[str] | None" = None) -> int:
+def main(argv: "list[str] | None" = None, *, prog: "str | None" = None,
+         tools: "dict | None" = None) -> int:
     """Serve one session over stdio. The vault arrives on argv, not from the
     environment: an env var is ambient, and ambient is how a worker ends up
-    serving the vault it happened to inherit."""
+    serving the vault it happened to inherit.
+
+    `prog` names the program in usage text and `tools` is passed through to
+    `build_server`; both default to the engine's own values."""
     import argparse
 
-    ap = argparse.ArgumentParser(prog="python -m health_advisor.mcp_server")
+    ap = argparse.ArgumentParser(prog=prog or "python -m health_advisor.mcp_server")
     ap.add_argument("--vault", "--db", dest="vault", required=True,
                     help="path to the vault this session serves")
     ap.add_argument("--user", default="local", help="user id this vault belongs to")
     args = ap.parse_args(argv)
     ctx = VaultContext.local(args.vault, user_id=args.user, writable=True)
-    build_server(ctx).run(transport="stdio")
+    build_server(ctx, tools=tools).run(transport="stdio")
     return 0
 
 

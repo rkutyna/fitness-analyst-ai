@@ -907,57 +907,78 @@ _TRANSPORT: httpx.BaseTransport | None = None
 # string came from a completed model response or from a backend that could not
 # produce one.  ``call_id`` lets callers distinguish a fresh status from a
 # status left by an earlier call without clearing the loop status semantics.
+#
+# The status is PER THREAD, like the loop status below: a caller attributes an
+# outcome to its own call by reading it right after ``complete()`` returns, and
+# with one process-global dict a call finishing on another thread in between
+# replaced it (a timeout read back as a neighbour's success). ``complete()`` is
+# synchronous and never hops threads, so the thread that calls it is the thread
+# that sets and reads its status. ``call_id`` still comes from one process-wide
+# counter under a lock, so it is unique and monotonic across threads.
 _COMPLETE_CALL_ID = 0
-_LAST_COMPLETE_STATUS = {
-    "call_id": 0,
-    "outcome": "not_called",
-    "backend": None,
-    "response_received": None,
-    "request_made": False,
-    "detail": "",
-    "text_length": 0,
-}
+_COMPLETE_CALL_LOCK = threading.Lock()
+_THREAD_COMPLETE_STATUS = threading.local()
+
+
+def _not_called_complete_status() -> dict:
+    return {
+        "call_id": 0,
+        "outcome": "not_called",
+        "backend": None,
+        "response_received": None,
+        "request_made": False,
+        "detail": "",
+        "text_length": 0,
+    }
 
 
 def last_complete_status() -> dict:
-    """Return the most recent single-shot completion status.
+    """Return the calling thread's most recent single-shot completion status.
 
     The return value of :func:`complete` deliberately stays a string.  A
     non-empty answer has ``outcome == "success"`` and
     ``response_received == True``; an empty answer has a different outcome and
     ``response_received == False``.  This is an inspectable transport fact,
     independent of the coaching length gate or the model's interpretation.
+    A thread that has not called :func:`complete` reads ``not_called``.
     """
-    return dict(_LAST_COMPLETE_STATUS)
+    status = getattr(_THREAD_COMPLETE_STATUS, "status", None)
+    return dict(status) if status is not None else _not_called_complete_status()
 
 
 def _begin_complete() -> int:
     global _COMPLETE_CALL_ID
-    _COMPLETE_CALL_ID += 1
-    _LAST_COMPLETE_STATUS.clear()
-    _LAST_COMPLETE_STATUS.update({
-        "call_id": _COMPLETE_CALL_ID,
+    with _COMPLETE_CALL_LOCK:
+        _COMPLETE_CALL_ID += 1
+        call_id = _COMPLETE_CALL_ID
+    # Built whole and assigned once: no reader can see a half-filled status.
+    _THREAD_COMPLETE_STATUS.status = {
+        "call_id": call_id,
         "outcome": "in_progress",
         "backend": BACKEND,
         "response_received": None,
         "request_made": False,
         "detail": "",
         "text_length": 0,
-    })
-    return _COMPLETE_CALL_ID
+    }
+    return call_id
 
 
 def _set_complete_status(*, outcome: str, response_received: bool,
                          request_made: bool, detail: str = "",
                          text_length: int = 0) -> None:
-    _LAST_COMPLETE_STATUS.update({
+    status = getattr(_THREAD_COMPLETE_STATUS, "status", None)
+    if status is None:
+        status = _not_called_complete_status()
+    _THREAD_COMPLETE_STATUS.status = {
+        **status,
         "outcome": outcome,
         "backend": BACKEND,
         "response_received": response_received,
         "request_made": request_made,
         "detail": str(detail)[:CODEX_STDERR_MAX],
         "text_length": text_length,
-    })
+    }
 
 
 # The researcher response remains string-compatible with the pipeline while
@@ -2837,11 +2858,16 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     fn = call.get("function") or {}
                     name = fn.get("name")
                     args = fn.get("arguments") or {}
+                    args_undecodable = False
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except Exception:
+                            # Undecodable arguments have no defined meaning:
+                            # report it to the model, never run the tool with
+                            # defaults.
                             args = {}
+                            args_undecodable = True
                     if on_tool_call is not None:
                         try:
                             on_tool_call(name, tool_sequence)
@@ -2856,6 +2882,8 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}
+                    elif args_undecodable:
+                        result = {"error": "arguments were not valid JSON"}
                     else:
                         try:
                             result = entry[0](**args)
@@ -3134,14 +3162,21 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                     fn = call.get("function") or {}
                     name = fn.get("name")
                     args = fn.get("arguments") or {}
+                    args_undecodable = False
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except Exception:
+                            # Undecodable arguments have no defined meaning:
+                            # report it to the model, never run the tool with
+                            # defaults.
                             args = {}
+                            args_undecodable = True
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}
+                    elif args_undecodable:
+                        result = {"error": "arguments were not valid JSON"}
                     else:
                         try:
                             result = entry[0](**args)

@@ -26,8 +26,11 @@ sends the answer to the deterministic fallback.
 """
 from __future__ import annotations
 
+import logging
 import re
 import threading
+
+logger = logging.getLogger(__name__)
 
 SHINGLE_WORDS = 6
 
@@ -59,6 +62,51 @@ _MARKER_RE = re.compile(
 _LOCK = threading.Lock()
 _TEXTS: dict[str, frozenset] = {}
 _EXTRA_TOOL_NAMES: set[str] = set()
+
+# The tool names known when the live enumeration in :func:`tool_names` cannot
+# run (its imports failed). A test pins this equal to the live set, so it cannot
+# drift from the registries it stands in for.
+_FALLBACK_TOOL_NAMES = (
+    "analyst_query",
+    "compare_periods",
+    "correlate_metrics",
+    "food_catalog_add",
+    "food_lookup",
+    "food_meal_total",
+    "get_benchmark_series",
+    "get_block_comparison",
+    "get_block_structure",
+    "get_briefing",
+    "get_daily_series",
+    "get_hr_zones",
+    "get_impact_volume",
+    "get_ingest_diagnostics",
+    "get_intraday",
+    "get_latest",
+    "get_monthly_running_power",
+    "get_plan_overview",
+    "get_planned_session",
+    "get_run_form",
+    "get_sleep_regularity",
+    "get_subjective",
+    "get_training_load_detail",
+    "get_week_plan",
+    "get_weekly_readiness",
+    "get_weekly_series",
+    "get_workout_coverage",
+    "get_workout_segments",
+    "list_available_metrics",
+    "list_workouts",
+    "log_manual_jog_minutes",
+    "log_subjective",
+    "mark_workout_not_a_session",
+    "record_benchmark",
+    "scan_correlations",
+    "submit_answer",
+    "summarize_metric",
+    "write_insight",
+)
+_FALLBACK_WARNED = False
 
 
 def _words(text: str) -> list[str]:
@@ -109,11 +157,21 @@ def tool_names() -> frozenset:
         from . import llm, mcp_server
         names.update(llm.COACH_TOOLS)
         names.update(llm.RESEARCHER_TOOLS)
+        names.add(llm.SUBMIT_ANSWER_NAME)
         names.update(fn.__name__ for fn in mcp_server._TOOLS)
         names.update(llm.registered_host_tools())
     except Exception:                                # noqa: BLE001
-        # A guard that cannot enumerate must still guard with what it has.
-        pass
+        # A guard that cannot enumerate must still guard with what it knows:
+        # fall back to the static names rather than dropping all of them.
+        global _FALLBACK_WARNED
+        names.update(_FALLBACK_TOOL_NAMES)
+        with _LOCK:
+            warn = not _FALLBACK_WARNED
+            _FALLBACK_WARNED = True
+        if warn:
+            logger.warning(
+                "steering.tool_names: live tool enumeration failed; "
+                "using the static fallback names")
     return frozenset(name for name in names if "_" in name)
 
 

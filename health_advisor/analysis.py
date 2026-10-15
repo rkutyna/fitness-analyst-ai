@@ -814,8 +814,15 @@ def _recent_and_baseline_detail(conn, metric, as_of,
     it does not end on ``latest_date``. ``current_window`` and
     ``baseline_window`` are the inclusive ``(first, last)`` days of each, which
     is what a consumer needs to say what the figure covers.
+
+    The fetch reaches back ``window + READINESS_SMOOTH_DAYS - 1`` days, so on a
+    complete series it returns ``window + READINESS_SMOOTH_DAYS`` rows and the
+    baseline still holds ``window`` days once the recent ones are excluded. A
+    fetch of ``window`` days left the baseline ``READINESS_SMOOTH_DAYS - 1``
+    days short, and the window passed to ``mx.baseline`` never bound.
     """
-    start = (date.fromisoformat(as_of) - timedelta(days=window)).isoformat()
+    start = (date.fromisoformat(as_of)
+             - timedelta(days=window + READINESS_SMOOTH_DAYS - 1)).isoformat()
     dates, vals, _ = mx.series(conn, metric, start, as_of)
     if not vals:
         return {"current": None, "baseline": None, "n_baseline": 0,

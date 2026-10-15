@@ -230,7 +230,7 @@ emit('queries', ['value'], ['count'], [[50]])
     print(f"\n[runner] sequential_queries=50 elapsed_s={elapsed:.4f}")
 
 
-def test_median_round_trip_latency_of_20_queries(vault_path, tmp_path, executor,
+def test_twenty_queries_each_get_one_timed_reply(vault_path, tmp_path, executor,
                                                   monkeypatch):
     timings = []
     original = runner._service_query

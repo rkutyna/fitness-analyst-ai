@@ -183,7 +183,7 @@ def test_orphan_goes_green_when_the_join_is_mutated_and_is_restored(tmp_path,
     print("mutation: orphan GREEN without docs JOIN; SQL restored byte-identically")
 
 
-def test_citation_verifier_median_latency_for_fifty_claims(tmp_path):
+def test_citation_verifier_returns_ok_for_fifty_claims(tmp_path):
     corpus = _build_test_corpus(tmp_path / "corpus.db")
     claim = _claim(_source())
     samples = []

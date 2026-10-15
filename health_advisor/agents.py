@@ -832,12 +832,13 @@ def extract_json(text: str):
             return None
         candidate = text[start:]
     candidate = _strip_json_invisibles(candidate)
-    for end in range(len(candidate), 0, -1):
-        try:
-            return json.loads(candidate[:end])
-        except json.JSONDecodeError:
-            continue
-    return None
+    # The first complete JSON value is the only one a longer prefix can extend, so
+    # one raw_decode from the first brace gives the value the old prefix loop found.
+    try:
+        value, _end = json.JSONDecoder().raw_decode(candidate.lstrip())
+    except json.JSONDecodeError:
+        return None
+    return value
 
 
 def split_claim_channel(text: str) -> tuple[str, list[dict] | None]:

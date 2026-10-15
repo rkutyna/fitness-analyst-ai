@@ -627,3 +627,53 @@ def test_coach_grounding_does_not_flag_a_date_carrying_an_invisible():
         "Your longest run was on July ️26, at 3.04 miles.",
         claims, payload=ledger)
     assert "26," not in bad and "26" not in bad, bad
+
+
+# Parity table for extract_json (#107). The expected values were recorded from the
+# longest-prefix loop that extract_json used before a single raw_decode.
+EXTRACT_JSON_PARITY = [
+    ("Here you go:\n```json\n{\"text\": \"hi\", \"claims\": []}\n```\nthanks",
+     {"text": "hi", "claims": []}),
+    ('{"a": 1, "b": [2, 3]}', {"a": 1, "b": [2, 3]}),
+    ('{"a": [1,2]} trailing', {"a": [1, 2]}),
+    ('[[1, 2], [3, [4]]]', [[1, 2], [3, [4]]]),
+    ('{"x": "}"} junk', {"x": "}"}),
+    ('noise {"s": "a{b}[c]"} tail', {"s": "a{b}[c]"}),
+    ('{​"a"‍: ⁠ 1}', {"a": 1}),
+    ('{"a": "x​y"}', {"a": "x​y"}),
+    ('{"a": {"b": 1', None),
+    ('[1, 2] [3]', [1, 2]),
+    ('{"a":1}   ', {"a": 1}),
+    ('x {"first": 1} y {"second": 2}', {"first": 1}),
+    ('', None),
+    ('no braces here', None),
+    ('{"x": 5} tail', {"x": 5}),
+    ('[{"k": [1]}] ]', [{"k": [1]}]),
+    ('```\n[1, 2]\n```', [1, 2]),
+    ('{"text": "a \\"quoted\\" } brace", "claims": [{"n": 1}]} and more',
+     {"text": 'a "quoted" } brace', "claims": [{"n": 1}]}),
+    ('{"text": "unterminated', None),
+    ('  \n {"lead": true}', {"lead": True}),
+    ('[1, 2', None),
+]
+
+
+@pytest.mark.parametrize("text,expected", EXTRACT_JSON_PARITY)
+def test_extract_json_parity_with_recorded_prefix_loop(text, expected):
+    assert G.extract_json(text) == expected
+
+
+def test_extract_json_truncated_16kb_input_makes_bounded_json_loads_calls(monkeypatch):
+    # One json.loads per prefix made the cost quadratic (#107); a single raw_decode
+    # makes none, so the count bound is what the test pins, not wall-clock time.
+    calls = []
+    real_loads = G.json.loads
+
+    def counting_loads(s, *args, **kwargs):
+        calls.append(len(s))
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(G.json, "loads", counting_loads)
+    text = '{"text": "' + ("lorem ipsum dolor sit amet " * 700)[:16000]
+    assert G.extract_json(text) is None
+    assert len(calls) <= 2

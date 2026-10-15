@@ -769,6 +769,10 @@ def _health(ctx, corpus_path: str | None = None):
             # read as "do not send them": its strict parser refuses unknown
             # fields.
             "workout_context_supported": True,
+            # #113: this server reads an optional `characteristics` section
+            # (date_of_birth). A phone that does not see the key must not send
+            # it, because an older server would refuse the unknown field.
+            "characteristics_supported": True,
             "openrouter_api_key_source": llm.OPENROUTER_API_KEY_SOURCE,
             **_corpus_status(corpus_path)}
     if payload["workout_elevation_supported"]:
@@ -957,6 +961,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     try:
         payload = json.loads(raw)
         parsed = hk_parse.parse_payload(payload)
+    except hk_parse.CharacteristicsError as exc:
+        # #113: a refused characteristics section is a 422, and as with any
+        # refused envelope nothing has been written.
+        raise HTTPException(status_code=422, detail=str(exc))
     except (json.JSONDecodeError, hk_parse.PayloadError) as exc:
         # A malformed HealthKit envelope must leave no
         # database evidence at all. In particular, do not write an ingest_log
@@ -1164,6 +1172,22 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     daily_totals_skipped_settled += 1
                     continue
                 writable_totals.append(row)
+
+            # #113: a stated birth date is the vault's, written before any
+            # mutation of this batch. A value the vault refuses (future, or an
+            # age outside 10 to 100) refuses the whole batch with 422: the
+            # client sent something false about the person, and a partial
+            # apply would hide it. The message names the rule, not the value.
+            if "date_of_birth" in parsed["characteristics"]:
+                try:
+                    vault.set_date_of_birth(
+                        conn, parsed["characteristics"]["date_of_birth"])
+                except ValueError as exc:
+                    conn.rollback()
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"characteristics.date_of_birth refused: {exc}",
+                    ) from None
 
             # D2 (consumer #37, engine #28): behind the compaction watermark a
             # non-allowlisted day is FROZEN -- its raw rows are gone, its

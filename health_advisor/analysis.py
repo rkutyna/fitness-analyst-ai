@@ -794,25 +794,17 @@ def _coverage_typical_gap(conn, metric: str, col: str,
     return statistics.median(gaps) if gaps else None
 
 
-def _recent_and_baseline(conn, metric, as_of, window=READINESS_BASELINE_WINDOW):
-    """Return (current_value, baseline_value, n_baseline_days, latest_date).
-
-    `latest_date` is the day `current` actually came from — it is NOT `as_of`.
-    Callers must compare the two: a metric that stopped arriving keeps returning
-    its final value forever, and a readiness score built on it reads as today's.
-
-    `current` is the mean of the last READINESS_SMOOTH_DAYS days rather than a
-    single reading: HRV's measured daily CV is 17.1%, so one night decided the
-    band. The baseline excludes exactly the days that made `current`.
-    """
-    detail = _recent_and_baseline_detail(conn, metric, as_of, window)
-    return (detail["current"], detail["baseline"], detail["n_baseline"],
-            detail["latest_date"])
-
-
 def _recent_and_baseline_detail(conn, metric, as_of,
                                 window=READINESS_BASELINE_WINDOW) -> dict:
-    """:func:`_recent_and_baseline`, plus the days each figure was drawn from.
+    """Return the recent and baseline figures, plus the days each was drawn from.
+
+    ``latest_date`` is the day ``current`` actually came from, which is NOT
+    ``as_of``: a metric that stopped arriving keeps returning its final value
+    forever, so a caller must compare the two before reading it as today's.
+
+    ``current`` is the mean of the last READINESS_SMOOTH_DAYS days rather than a
+    single reading: HRV's measured daily CV is 17.1%, so one night decided the
+    band. The baseline excludes exactly the days that made ``current``.
 
     ``current`` is a MEAN over the calendar days ending at ``latest_date``;
     ``baseline`` is a MEDIAN over the rows before those, so it is not a mean and

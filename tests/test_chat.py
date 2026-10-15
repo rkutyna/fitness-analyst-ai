@@ -2313,9 +2313,9 @@ def test_refused_conversational_reply_reports_its_own_cause_not_empty_gather(
 
     assert result["verification"]["cause"] == "conversational_scripted"
     assert result["verification"]["cause"] != "empty_gather"
-    assert "conversational_scripted" in chat.ASK_CAUSES
+    assert "conversational_scripted" in chat._ASK_CAUSES
     # Kept for rows written before #410's scripted reply existed.
-    assert "conversational_refused" in chat.ASK_CAUSES
+    assert "conversational_refused" in chat._ASK_CAUSES
 
 
 @pytest.mark.parametrize("message, opening", (

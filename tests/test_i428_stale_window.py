@@ -259,7 +259,7 @@ def test_mutation_stubbed_marker_breaks_the_refusal(monkeypatch):
 
 
 def test_cause_is_closed_and_ranked_after_the_period_phrase():
-    assert "stale_window" in chat.ASK_CAUSES
+    assert "stale_window" in chat._ASK_CAUSES
     ledger = [{"sequence": 1}]
     assert chat._ask_cause({"ok": False}, ledger=ledger, loop_outcomes=[],
                            stale_window=True) == "stale_window"

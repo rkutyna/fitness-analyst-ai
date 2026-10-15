@@ -111,7 +111,7 @@ def _template(sentence: str) -> str:
 
 def test_the_cause_is_in_the_closed_ask_vocabulary():
     """A cause the taxonomy does not contain is a cause nothing can chart."""
-    assert "contradicted_day_count" in chat.ASK_CAUSES
+    assert "contradicted_day_count" in chat._ASK_CAUSES
 
 
 def test_the_cause_outranks_the_generic_gate_verdict_but_not_a_denial():

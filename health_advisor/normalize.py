@@ -414,36 +414,6 @@ def fitness_machine_kind(value) -> str | None:
     return _FITNESS_MACHINE_CANONICAL.get(squashed, text)
 
 
-# Health Auto Export sends human display names ("Outdoor Run", "Indoor Cycle")
-# rather than HK activity types. Map them onto the SAME canonical vocabulary the
-# backfill produced from HK types (running/walking/cycling/...), so type-based
-# queries and workout_mix don't fragment across the two ingestion paths.
-_WORKOUT_QUALIFIERS = ("outdoor", "indoor", "pool", "open water")
-_WORKOUT_KEYWORDS = (
-    ("run", "running"), ("walk", "walking"), ("hik", "hiking"),
-    ("cycl", "cycling"), ("bik", "cycling"), ("swim", "swimming"),
-    ("row", "rowing"), ("elliptical", "elliptical"),
-)
-
-
-def workout_name_to_canonical(name: str) -> str:
-    """Canonical workout type from an HAE display name or HK type."""
-    raw = (name or "").strip()
-    if not raw:
-        return "other"
-    if raw.startswith("HKWorkoutActivityType"):
-        return workout_label(raw)
-    s = raw.lower()
-    for q in _WORKOUT_QUALIFIERS:
-        if s.startswith(q + " "):
-            s = s[len(q) + 1:]
-            break
-    for kw, canon in _WORKOUT_KEYWORDS:
-        if kw in s:
-            return canon
-    return _camel_to_snake(s).replace(" ", "_").strip("_")
-
-
 # Canonical workout types a minutes-per-mile pace is a meaningful reading of:
 # travel on foot. This is an allowlist on purpose. A distance can arrive with
 # any workout type (a swim, a row, a paddle, a skate, a ski, a wheelchair push,
@@ -614,7 +584,7 @@ def apply_unit(raw_value: float, raw_unit: Optional[str]) -> tuple[float, Option
     """Relabel/convert known units (e.g. Cal -> kcal). Returns (value, unit).
 
     Legacy, still used by the backfill path where the export's units already ARE
-    the canonical ones. New code should use unit_converter()/to_canonical(),
+    the canonical ones. New code should use unit_converter(),
     which knows the target metric and therefore can actually convert.
     """
     if raw_unit in UNIT_RELABEL:
@@ -817,12 +787,6 @@ def unit_converter(metric: str, raw_unit: Optional[str]):
         return (lambda v: v), (target or "")
     convert_unit(1.0, src, target)          # probe: raises UnitError if impossible
     return (lambda v: convert_unit(v, src, target)), target
-
-
-def to_canonical(metric: str, value: float, raw_unit: Optional[str]) -> tuple[float, str]:
-    """Convenience: convert one value into `metric`'s canonical unit."""
-    convert, unit = unit_converter(metric, raw_unit)
-    return convert(value), unit
 
 
 # Metrics whose canonical unit is '%' (0–100) but which HealthKit reports as a 0–1

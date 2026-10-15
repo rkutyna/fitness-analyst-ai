@@ -2322,20 +2322,6 @@ def _submit_answer_decode(call: dict):
     return (ResearchResponse(text, claims), None, "", None)
 
 
-def _submit_answer_response(call: dict) -> ResearchResponse:
-    """Decode one ``submit_answer`` call into the claim channel.
-
-    Only the channel's shape is checked, and a malformed call is announced
-    (#128) and degraded to the loops' empty return rather than raised or
-    papered over. The repair turn in :func:`tool_loop` is what may recover
-    from that; this remains the terminal reading.
-    """
-    response, event, detail, _repair = _submit_answer_decode(call)
-    if event:
-        _announce(event, detail)
-    return response if response is not None else ResearchResponse()
-
-
 # ---------------------------------------------------------------------------
 # OpenAI dialect (#128) — the shape the openrouter backend's tool path speaks.
 #

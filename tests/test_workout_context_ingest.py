@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from health_advisor import db, hk_parse, receiver, vault as vault_mod
 from health_advisor import normalize as nz
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 DEVICE = {"id": "synthetic-device", "name": "synthetic-phone",
@@ -65,8 +66,8 @@ def _entry(*, uuid="synthetic-workout", start=START, end=END, source=SOURCE,
 
 
 def _client(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    return TestClient(receiver.create_app(vault))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    return TestClient(receiver.create_app(vault), headers=INGEST_HEADERS)
 
 
 def _rows(vault):

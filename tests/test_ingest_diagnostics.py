@@ -6,6 +6,7 @@ import copy
 from fastapi.testclient import TestClient
 
 from health_advisor import db, hk_parse, mcp_server, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 DAY = "2026-08-01"
@@ -43,8 +44,8 @@ def _payload():
 def test_unknown_unit_is_structured_and_explained_by_the_tool(
     vault, vault_path, monkeypatch
 ):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    with TestClient(receiver.create_app(vault)) as client:
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    with TestClient(receiver.create_app(vault), headers=INGEST_HEADERS) as client:
         response = client.post("/v1/ingest", json=_payload())
     assert response.status_code == 200, response.text
 
@@ -105,7 +106,7 @@ def test_empty_diagnostics_are_explicit(conn, tools):
 
 
 def test_only_rejections_write_diagnostics(vault, vault_path, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
     payload = _payload()
     accepted = []
     for i in range(100):
@@ -132,7 +133,7 @@ def test_only_rejections_write_diagnostics(vault, vault_path, monkeypatch):
         rejected.append(sample)
     payload.update({"batch_id": "accepted-and-rejected", "samples": accepted + rejected})
 
-    with TestClient(receiver.create_app(vault)) as client:
+    with TestClient(receiver.create_app(vault), headers=INGEST_HEADERS) as client:
         response = client.post("/v1/ingest", json=payload)
     assert response.status_code == 200, response.text
 
@@ -161,7 +162,7 @@ def test_rejected_sample_date_is_derived_from_timestamp():
 def test_duplicate_daily_totals_do_not_create_point_diagnostics(
     vault, vault_path, monkeypatch
 ):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
     payload = _payload()
     payload.update({
         "batch_id": "duplicate-daily-totals",
@@ -177,7 +178,7 @@ def test_duplicate_daily_totals_do_not_create_point_diagnostics(
     parsed = hk_parse.parse_payload(payload)
     assert [row["_point_index"] for row in parsed["daily_totals"]] == [0, 1]
 
-    with TestClient(receiver.create_app(vault)) as client:
+    with TestClient(receiver.create_app(vault), headers=INGEST_HEADERS) as client:
         response = client.post("/v1/ingest", json=payload)
     assert response.status_code == 200, response.text
     assert response.json()["daily_totals_added"] == 2

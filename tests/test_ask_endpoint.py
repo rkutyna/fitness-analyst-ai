@@ -196,12 +196,15 @@ def test_ask_reports_uncovered_as_of_per_metric_without_new_numbers(
                             if key != "freshness"}))
 
 
-def test_ask_requires_a_non_empty_secret_and_ingest_keeps_optional_behavior(
-        monkeypatch, vault):
+def test_ask_and_ingest_both_require_a_non_empty_secret(monkeypatch, vault):
     request = object()
     monkeypatch.setattr(receiver, "SHARED_SECRET", "")
     with pytest.raises(Exception) as exc:
         receiver._require_ask_secret(None)
+    assert getattr(exc.value, "status_code", None) == 401
+    # #105: the ingest helper refuses an empty configured secret the same way.
+    with pytest.raises(Exception) as exc:
+        receiver._require_ingest_secret(None, request=request)
     assert getattr(exc.value, "status_code", None) == 401
 
     monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
@@ -209,9 +212,6 @@ def test_ask_requires_a_non_empty_secret_and_ingest_keeps_optional_behavior(
         receiver._require_ask_secret("wrong")
     assert getattr(exc.value, "status_code", None) == 401
 
-    # The ingest helper intentionally retains its historical optional-secret
-    # behavior; an empty configured secret does not reject a valid empty batch.
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
     payload = {
         "protocol_version": 1,
         "device": {"id": "d", "name": "n", "model": "m"},
@@ -221,7 +221,7 @@ def test_ask_requires_a_non_empty_secret_and_ingest_keeps_optional_behavior(
     }
     import json as json_module
     response = receiver._healthkit_ingest(
-        vault, request, json_module.dumps(payload).encode(), None)
+        vault, request, json_module.dumps(payload).encode(), "ask-secret")
     assert response.status_code == 200
 
 

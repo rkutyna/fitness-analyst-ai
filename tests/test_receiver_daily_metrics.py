@@ -6,6 +6,7 @@ import json
 from starlette.requests import Request
 
 from health_advisor import db, receiver
+from tests.conftest import INGEST_TEST_SECRET
 
 
 def _request():
@@ -29,7 +30,7 @@ def test_receiver_incremental_ingest_populates_last(vault, vault_path, monkeypat
     this test from `body_mass` to `step_count` was what kept the suite green.
     """
     path = vault_path
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
     payload = {
         "protocol_version": 1,
         "device": {"id": "scale", "name": "Scale", "model": "test"},
@@ -54,7 +55,8 @@ def test_receiver_incremental_ingest_populates_last(vault, vault_path, monkeypat
     }
 
     response = receiver._healthkit_ingest(vault, _request(),
-                                          json.dumps(payload).encode(), None)
+                                          json.dumps(payload).encode(),
+                                          INGEST_TEST_SECRET)
     assert response.status_code == 200
 
     conn = db.connect(path, read_only=True)

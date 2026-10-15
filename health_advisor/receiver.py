@@ -5,8 +5,8 @@
   the derived auth token; HA_SECRET_HEADER_MODE=token_only refuses the raw
   secret as well (the default, raw_or_token, accepts both). Every route except
   /health and the QR enrolment route checks it. The ask-path and device-token
-  routes refuse when no secret is configured; /v1/ingest skips the check in
-  that case, and HA_REQUIRE_SECRET=1 turns "no secret" into a startup failure.
+  routes, and /v1/ingest, refuse with 401 when no secret is configured (#105);
+  HA_REQUIRE_SECRET=1 additionally turns "no secret" into a startup failure.
 - HA_DEVICE_AUTH_MODE=required additionally demands a valid signature from an
   enrolled, unrevoked device key (device_auth.py), so the secret alone no
   longer admits a request. In accept, a signed request must verify, and an
@@ -19,7 +19,8 @@
 
 Run:  the receiver module --vault PATH [--host H --port P]
 Env:  HA_SECRET_FILE (preferred) or HA_SHARED_SECRET; HA_REQUIRE_SECRET=1 makes
-      "no secret at all" a startup failure instead of an unauthenticated receiver
+      "no secret at all" a startup failure instead of a receiver that answers
+      every secret-checked route with 401
       HEALTH_ADVISOR_ANALYST_EXECUTOR=transient explicitly selects the
       user-systemd analyst executor; absent means the platform default
       HA_DEVICE_AUTH_MODE=off|accept|required (default off) and
@@ -140,8 +141,9 @@ def _check_env_secret(env_secret: str) -> None:
     The file path has always required >= 16 characters (`_load_file_secret`);
     the environment path accepted anything non-empty, so a placeholder or a
     one-character value became the shared secret. An EMPTY value is left
-    alone here: it means "no check" by historical design and is governed by
-    HA_REQUIRE_SECRET above (#104). The value is never echoed.
+    alone here: it loads as empty, every secret-checked route then refuses with
+    401 (#105), and HA_REQUIRE_SECRET above turns it into a startup failure
+    (#104). The value is never echoed.
     """
     if not env_secret:
         return
@@ -171,12 +173,12 @@ def _load_shared_secret() -> tuple[str, str]:
     two, and `secret_source` on /health is how you tell which path a running
     container actually took — do not infer it.
 
-    Fail-closed, and this is the part that matters. `receiver.py` treats an
-    EMPTY secret as "no check" (see the auth callers below), so a file that is
-    missing, unreadable, badly permissioned or too short must raise rather
-    than fall through to the environment. Falling back would turn a
-    misconfigured secret into a silently unauthenticated receiver that looks
-    configured — the one way this change could be actively dangerous.
+    Fail-closed, and this is the part that matters. A file that is missing,
+    unreadable, badly permissioned or too short must raise rather than fall
+    through to the environment, so a misconfigured secret never quietly
+    becomes a different one. (An EMPTY secret is refused with 401 on every
+    secret-checked route, /v1/ingest included, #105; this function's raising
+    keeps the failure at startup rather than at the first request.)
 
     The checks mirror `deploy/entrypoint.sh` and `scripts/run_receiver.sh`
     exactly, including stripping all whitespace the way `tr -d '[:space:]'`
@@ -188,16 +190,17 @@ def _load_shared_secret() -> tuple[str, str]:
         "1", "true", "yes", "on"}
     path = os.environ.get("HA_SECRET_FILE", "").strip()
     if not path:
-        # No file configured: the historical environment path, unchanged,
-        # empty-means-no-check included. Tests rely on that, and so does any
-        # launcher that has not been migrated.
+        # No file configured: the historical environment path. An empty
+        # value is loaded as empty and then refused with 401 at request time
+        # (#105), so a launcher that has not been migrated serves nothing
+        # rather than serving unauthenticated.
         env_secret = os.environ.get("HA_SHARED_SECRET", "")
         if require and not env_secret:
             # Step two of #101 removes `export HA_SHARED_SECRET` from
             # entrypoint.sh. After that, a HA_SECRET_FILE that fails to reach
-            # Python leaves BOTH sources empty — and an empty secret means "no
-            # check", so the receiver would serve unauthenticated on the
-            # tailnet while looking configured. A deployment sets
+            # Python leaves BOTH sources empty. Every secret-checked route
+            # refuses an empty secret with 401 (#105), but the process would
+            # still start and look configured; a deployment sets
             # HA_REQUIRE_SECRET so that state is a startup failure instead.
             raise RuntimeError(
                 "refusing to start: HA_REQUIRE_SECRET is set but neither "
@@ -468,9 +471,8 @@ def _secret_header_refusal(x_health_secret: str | None, secret: str) -> str | No
 def _require_ask_secret(x_health_secret: str | None) -> None:
     """Require a configured, non-empty secret for the interactive endpoint.
 
-    This is intentionally stricter than ``/v1/ingest``'s historical optional
-    check. An accidentally empty ask secret must never turn a health question
-    endpoint into an unauthenticated data reader.
+    ``/v1/ingest`` applies the same rule (#105). An accidentally empty secret
+    must never turn a health endpoint into an unauthenticated reader or writer.
     """
     secret = _shared_secret_for_request()
     if not secret:
@@ -1858,14 +1860,19 @@ def _enrol_upgrade(devices: "device_auth.DeviceAuth", request: Request,
 
 
 def _require_ingest_secret(x_health_secret: str | None, *, request: Request | None = None) -> None:
+    """Require a configured secret and a matching header for ingest (#105).
+
+    An empty secret refuses with 401, the same shape the ask routes use, rather
+    than admitting an unauthenticated write."""
     state = getattr(request, "state", None)
     if state is not None and getattr(state, "ingest_secret_checked", False):
         return
     secret = _shared_secret_for_request()
-    if secret:
-        refusal = _secret_header_refusal(x_health_secret, secret)
-        if refusal is not None:
-            raise HTTPException(status_code=401, detail=refusal)
+    if not secret:
+        raise HTTPException(status_code=401, detail=_BAD_SECRET_DETAIL)
+    refusal = _secret_header_refusal(x_health_secret, secret)
+    if refusal is not None:
+        raise HTTPException(status_code=401, detail=refusal)
     if state is not None:
         state.ingest_secret_checked = True
 

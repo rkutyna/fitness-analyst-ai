@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import db, hk_parse, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 def _base(**overrides):
@@ -44,8 +45,8 @@ MALFORMED = [
 
 @pytest.fixture
 def client(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    with TestClient(receiver.create_app(vault)) as c:
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    with TestClient(receiver.create_app(vault), headers=INGEST_HEADERS) as c:
         yield c
 
 

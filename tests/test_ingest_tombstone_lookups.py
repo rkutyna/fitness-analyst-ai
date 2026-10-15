@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import db, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 HEART = "HKQuantityTypeIdentifierHeartRate"
 SAMPLE_LOOKUP = "FROM hk_deletions WHERE (device_id, type_identifier, hk_uuid) IN"
@@ -53,8 +54,8 @@ def statements(monkeypatch):
 
 
 def _client(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    return TestClient(receiver.create_app(vault))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    return TestClient(receiver.create_app(vault), headers=INGEST_HEADERS)
 
 
 def _post(client, payload):

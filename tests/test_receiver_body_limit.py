@@ -15,13 +15,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import db, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 @pytest.fixture
 def client(vault, tmp_path, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
     monkeypatch.setattr(receiver, "MAX_BODY_BYTES", 500)
-    with TestClient(receiver.create_app(vault)) as c:
+    with TestClient(receiver.create_app(vault), headers=INGEST_HEADERS) as c:
         yield c
 
 

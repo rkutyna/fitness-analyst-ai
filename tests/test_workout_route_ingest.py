@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from health_advisor import db, hk_parse, mcp_server, receiver, vault
 from health_advisor.context import VaultContext
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 DEVICE = {"id": "synthetic-device", "name": "synthetic-phone", "model": "synthetic-model"}
@@ -57,8 +58,8 @@ def _payload(*, routes=None, workouts=None, deletions=None, samples=None,
 
 
 def _client(vault_context, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    return TestClient(receiver.create_app(vault_context))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    return TestClient(receiver.create_app(vault_context), headers=INGEST_HEADERS)
 
 
 def _workout(*, uuid="workout-1", start="2026-01-02T10:00:00Z",

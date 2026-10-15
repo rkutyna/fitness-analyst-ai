@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from health_advisor import receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 def test_ingest_guard_runs_before_the_body_is_parsed(vault, monkeypatch):
@@ -17,8 +18,9 @@ def test_ingest_guard_runs_before_the_body_is_parsed(vault, monkeypatch):
         calls.append("guard")
         return JSONResponse({"detail": "temporarily unavailable"}, status_code=503)
 
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    with TestClient(receiver.create_app(vault, ingest_guard=guard)) as client:
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    with TestClient(receiver.create_app(vault, ingest_guard=guard),
+                    headers=INGEST_HEADERS) as client:
         response = client.post(
             "/v1/ingest",
             content=b"this is deliberately not JSON",
@@ -31,7 +33,7 @@ def test_ingest_guard_runs_before_the_body_is_parsed(vault, monkeypatch):
 
 
 def test_health_extra_is_merged_into_health_payload(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
     with TestClient(receiver.create_app(
             vault, health_extra=lambda: {"deployment": "ready"})) as client:
         response = client.get("/health")

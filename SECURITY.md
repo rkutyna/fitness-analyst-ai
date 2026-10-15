@@ -302,5 +302,7 @@ configured.
 - A decrypted vault on disk is plaintext health data. Treat the working path
   accordingly, and clean it up.
 - The local REST receiver accepts HealthKit deltas. Bind it to an interface you
-  control and configure its shared secret; do not expose it to the internet.
+  control and configure its shared secret; do not expose it to the internet. With
+  no shared secret configured, `/v1/ingest` and the ask routes refuse every
+  request with 401; an empty secret never means "no check".
 - Never attach a real vault, a real export, or real fixtures to an issue or a PR.

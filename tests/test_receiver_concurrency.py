@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import db, hk_parse, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 @pytest.fixture
@@ -22,8 +23,8 @@ def app(vault):
 
 @pytest.fixture
 def client(app, tmp_path, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    with TestClient(app) as c:
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    with TestClient(app, headers=INGEST_HEADERS) as c:
         yield c
 
 
@@ -64,7 +65,7 @@ def test_ingest_endpoint_is_sync_so_starlette_threadpools_it(app):
 def test_ingest_work_runs_off_the_event_loop_thread(app, vault_path, conn, tmp_path, monkeypatch):
     """Hard proof: the parse/DB work happens on a thread that is NOT the thread
     running the event loop, and /health answers while /v1/ingest is mid-flight."""
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
     # httpx.ASGITransport does not run lifespan; the conn fixture initializes the schema.
 
     started = threading.Event()
@@ -83,7 +84,8 @@ def test_ingest_work_runs_off_the_event_loop_thread(app, vault_path, conn, tmp_p
     async def _run():
         loop_thread = threading.current_thread()
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://t",
+                                 headers=INGEST_HEADERS) as ac:
             post = asyncio.create_task(ac.post("/v1/ingest", json=_payload(3)))
             await asyncio.to_thread(started.wait, 5)
             assert started.is_set(), "/v1/ingest never reached the parse"

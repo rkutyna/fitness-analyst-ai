@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import db, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 ROUTE_TYPE = "HKWorkoutRouteTypeIdentifier"
 SOURCE = "synthetic-route-source"
@@ -55,8 +56,8 @@ def statements(monkeypatch):
 
 
 def _client(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    return TestClient(receiver.create_app(vault))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    return TestClient(receiver.create_app(vault), headers=INGEST_HEADERS)
 
 
 def _post(client, payload):

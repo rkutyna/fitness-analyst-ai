@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import db, elevation, hk_parse, receiver
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 DEVICE = {"id": "synthetic-device", "name": "synthetic-phone", "model": "synthetic-model"}
@@ -60,8 +61,8 @@ def _payload(*, batch_id="synthetic-batch", workouts=None, workout_elevation=Non
 
 
 def _client(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    return TestClient(receiver.create_app(vault))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    return TestClient(receiver.create_app(vault), headers=INGEST_HEADERS)
 
 
 def _workout_row(vault):

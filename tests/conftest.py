@@ -14,6 +14,12 @@ from health_advisor import metrics as mx
 from health_advisor import normalize as nz
 from health_advisor.context import VaultContext
 
+# The shared secret the receiver tests configure, and the header a client sends
+# with it. /v1/ingest refuses an empty configured secret (#105), so a test that
+# ingests names a secret and presents it rather than configuring none.
+INGEST_TEST_SECRET = "ingest-test-secret"
+INGEST_HEADERS = {"x-health-secret": INGEST_TEST_SECRET}
+
 # The live 3.4 GB DB. The package has no default path any more (T-003), so this
 # is spelled out here — the guard still has to know what it is defending.
 PROD_DB_PATH = (dbmod.REPO_ROOT / "data" / "health.db").resolve()

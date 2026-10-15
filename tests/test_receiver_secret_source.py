@@ -87,6 +87,27 @@ def test_nothing_configured_is_empty_which_means_no_check(monkeypatch):
     assert _load(monkeypatch) == ("", "env")
 
 
+@pytest.mark.parametrize("value", [
+    "CHANGE_ME",             # the placeholder an example config ships with
+    "change_me",             # and its lowercase spelling
+    "short",                 # under the 16 characters the file path requires
+    "   short-ish   ",       # padding does not count toward the length
+    "x" * 15,                # one under the threshold
+])
+def test_a_weak_environment_secret_refuses_to_start(monkeypatch, value):
+    """The file path has always required >= 16 characters. A non-empty value
+    that is a placeholder or too short must not be accepted as the secret on
+    the environment path either (#104)."""
+    with pytest.raises(RuntimeError, match="refusing to start"):
+        _load(monkeypatch, env=value)
+
+
+@pytest.mark.parametrize("value", ["x" * 16, "a-real-deployed-secret-of-32-chars!!"])
+def test_an_environment_secret_at_or_over_the_threshold_is_unchanged(
+        monkeypatch, value):
+    assert _load(monkeypatch, env=value) == (value, "env")
+
+
 # -------------------------------------------------------------- the file path
 
 def test_a_good_file_is_used_and_reports_its_source(monkeypatch, tmp_path):

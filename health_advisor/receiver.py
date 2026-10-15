@@ -127,6 +127,35 @@ def _load_file_secret(path: str, *, file_stat=None) -> tuple[str, tuple[int, int
     return secret, (file_stat.st_mtime_ns, file_stat.st_size)
 
 
+# Values an example configuration ships with. Matched case-insensitively
+# against the trimmed environment secret.
+_PLACEHOLDER_SECRETS = frozenset({"change_me"})
+_MIN_SECRET_CHARS = 16        # the same floor the file path enforces
+
+
+def _check_env_secret(env_secret: str) -> None:
+    """Refuse a non-empty environment secret that is a placeholder or short.
+
+    The file path has always required >= 16 characters (`_load_file_secret`);
+    the environment path accepted anything non-empty, so a placeholder or a
+    one-character value became the shared secret. An EMPTY value is left
+    alone here: it means "no check" by historical design and is governed by
+    HA_REQUIRE_SECRET above (#104). The value is never echoed.
+    """
+    if not env_secret:
+        return
+    trimmed = env_secret.strip()
+    if trimmed.casefold() in _PLACEHOLDER_SECRETS:
+        raise RuntimeError(
+            "refusing to start: HA_SHARED_SECRET is a placeholder value. Set "
+            "a real secret of >= 16 characters.")
+    if len(trimmed) < _MIN_SECRET_CHARS:
+        raise RuntimeError(
+            f"refusing to start: HA_SHARED_SECRET is {len(trimmed)} chars "
+            f"after trimming; >= {_MIN_SECRET_CHARS} is required, the same "
+            "floor as HA_SECRET_FILE.")
+
+
 def _load_shared_secret() -> tuple[str, str]:
     """The shared secret, preferring a file over the environment (#101, F-43).
 
@@ -175,6 +204,7 @@ def _load_shared_secret() -> tuple[str, str]:
                 "empty secret disables authentication entirely, which is why "
                 "this raises rather than serving unauthenticated."
             )
+        _check_env_secret(env_secret)
         return env_secret, "env"
 
     global _LAST_FILE_SIGNATURE
@@ -669,8 +699,12 @@ def _health(ctx, corpus_path: str | None = None):
     conn = ctx.read_only()
     try:
         n = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
-        last = conn.execute("SELECT created_at, detail FROM ingest_log "
-                            "ORDER BY id DESC LIMIT 1").fetchone()
+        # /health is unauthenticated, so it never returns the log's `detail`
+        # text: that carries workout timestamps, device and batch ids and
+        # guard-refusal evidence (#104). The column is still written.
+        last = conn.execute(
+            "SELECT created_at, source, kind, rows_seen, rows_added "
+            "FROM ingest_log ORDER BY id DESC LIMIT 1").fetchone()
     finally:
         conn.close()
     payload = {"ok": True, "records": n,
@@ -2034,6 +2068,14 @@ class D23BodyAEADApp:
                                 body_aead.auth_token(per.secret).encode("ascii")):
                             secret = per.secret
                             secret_source = "device"
+            if not secret.strip() and (has_d23_content_type
+                                       or self.mode == "required"):
+                # `secret` here is the instance secret or a verified device's
+                # own. Keys derived from an empty one are publicly
+                # computable, so opening or sealing under them is not
+                # encryption (#104).
+                await self._refusal(send, "d23_no_secret", status=401)
+                return
             if has_d23_content_type:
                 if request_body is None:
                     return

@@ -262,6 +262,48 @@ def test_off_accepts_clear_and_encrypted_bodies(monkeypatch, vault):
                            b"/test/echo", sealed_response.content) == b"sealed payload"
 
 
+@pytest.mark.parametrize("secret", ["", "   ", "\n"])
+def test_empty_secret_derives_nothing(secret):
+    """Keys derived from the empty string are publicly computable, so there is
+    nothing to derive (#104)."""
+    for call in (body_aead.derive_keys, body_aead.auth_token, body_aead.key_id):
+        with pytest.raises(ValueError):
+            call(secret)
+
+
+@pytest.mark.parametrize("mode", ["off", "required"])
+def test_enveloped_body_with_no_instance_secret_is_refused_before_opening(
+        monkeypatch, vault, mode):
+    """With no secret configured, an envelope would open under keys anyone can
+    derive. The wrapper refuses 401 d23_no_secret and never calls open_
+    (#104)."""
+    app = _app(monkeypatch, vault, mode)
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+
+    def _must_not_open(*args, **kwargs):
+        raise AssertionError("body_aead.open_ reached with an empty secret")
+
+    monkeypatch.setattr(body_aead, "open_", _must_not_open)
+    with TestClient(app) as client:
+        response = client.post(
+            "/test/echo", content=b"x" * 64,
+            headers={"content-type": body_aead.CONTENT_TYPE})
+    assert response.status_code == 401
+    assert response.json() == {"detail": {"error": "d23_no_secret"}}
+
+
+def test_clear_body_with_no_instance_secret_still_passes_in_off_mode(
+        monkeypatch, vault):
+    """Tightening is limited to the envelope: a deployment with no secret and
+    no envelope serves as before (that is a separate decision)."""
+    app = _app(monkeypatch, vault, "off")
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
+    with TestClient(app) as client:
+        response = client.post("/test/echo", content=b"clear payload")
+    assert response.status_code == 200
+    assert response.content == b"clear payload"
+
+
 @pytest.mark.parametrize("mode", ["unset", "invalid"])
 def test_mode_fails_closed_at_startup(monkeypatch, vault, mode):
     if mode == "unset":

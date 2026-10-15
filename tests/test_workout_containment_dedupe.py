@@ -206,6 +206,48 @@ def test_the_receiver_stores_one_row_and_says_what_it_refused(
     assert "workouts_contained_rejected=2" in detail["detail"]
 
 
+def test_health_does_not_serve_the_ingest_log_detail(
+    vault, vault_path, monkeypatch
+):
+    """/health is unauthenticated. The ingest log keeps its detail text for
+    operators reading the database, but the unauthenticated read must not
+    return it: it carries workout timestamps, durations and refusal evidence
+    (#104)."""
+    conn = vault.connect()
+    db.init_db(conn)
+    vault_mod.declare_vault(conn)
+    conn.commit()
+    conn.close()
+
+    payload = _payload(_workout("frag-a", FRAG_A), _workout("real", REAL_RUN),
+                       _workout("frag-b", FRAG_B))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "hk-secret")
+    with TestClient(receiver.create_app(vault)) as client:
+        posted = client.post("/v1/ingest", json=payload,
+                             headers={"x-health-secret": "hk-secret"})
+        assert posted.status_code == 200, posted.text
+        health = client.get("/health")     # no secret header
+    assert health.status_code == 200
+
+    # The log still holds the fragment line, so the assertions below are not
+    # vacuous: the text exists, and /health does not serve it.
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        stored = conn.execute(
+            "SELECT detail FROM ingest_log ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert "contained in" in stored["detail"]
+
+    last = health.json()["last_ingest"]
+    assert "detail" not in last
+    assert set(last) <= {"created_at", "source", "kind", "rows_seen", "rows_added"}
+    assert "created_at" in last
+    for fragment in ("2026-08-25T10:06", "2026-08-25T14:06", "contained in",
+                     "workouts_contained_rejected"):
+        assert fragment not in health.text
+
+
 def test_only_containment_is_refused(tmp_path):
     """Overlapping-but-not-contained, and a different activity type, both still
     store. Containment is the measured signature; overlap is a larger claim."""

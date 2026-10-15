@@ -121,6 +121,7 @@ class LocalChannelExecutor:
             stdout=bytes(buffers["stdout"]), stderr=bytes(buffers["stderr"]),
             returncode=proc.returncode, timed_out=False, killed_group=False,
             duration_s=time.monotonic() - start, pgid=proc.pid, run_dir=run,
+            reaped=True,
         )
         return self.last
 
@@ -398,7 +399,7 @@ def test_named_refusal_paths_keep_their_parent_authored_reasons(
                 fd3_bytes=b"", fd3_oversized=False, stdout=b"",
                 stderr=b"RuntimeMaxSec backstop", returncode=-9,
                 timed_out=True, killed_group=True, duration_s=0.01,
-                pgid=0, run_dir=Path(run_dir))
+                pgid=0, run_dir=Path(run_dir), reaped=True)
 
     timed_out = runner.run_analyst_code(
         "pass", str(vault_path), str(tmp_path / "timed-out"), TimedOut())
@@ -641,3 +642,215 @@ def test_seatbelt_fd3_limit_is_clamped_to_drain_ceiling(
         effective_limit = max(0, min(configured_limit, ceiling))
         assert result.fd3_oversized is (len(payload) > effective_limit)
         assert result.fd3_bytes == payload[:effective_limit]
+
+
+# --------------------------------------------------------------------------- #
+# The cite-enabled named-socket runner is built by str.replace on a template;
+# a replace whose anchor is gone must fail loudly, not leave it unadapted (#109)
+# --------------------------------------------------------------------------- #
+
+_CITE_ANCHORS = [
+    '_QUERY_SOCKET.connect(_os.environ["ANALYST_QUERY_SOCKET"])\n',
+    "_part = _sock.recv(_remaining)",
+    "class _QueryProxy:\n    def __repr__",
+    "conn = _QueryProxy()",
+]
+
+
+def test_cite_runner_source_applies_every_rewrite_today():
+    source = runner._named_socket_runner_source_with_cite("code.py")
+    assert "conn = _QueryProxy(_QUERY_FD)" in source
+    assert "_QUERY_FD = _QUERY_SOCKET.fileno()" in source
+
+
+@pytest.mark.parametrize("anchor", _CITE_ANCHORS)
+def test_cite_runner_source_refuses_a_template_missing_an_anchor(
+        monkeypatch, anchor):
+    assert runner.NAMED_SOCKET_RUNNER_TEMPLATE.count(anchor) == 1
+    monkeypatch.setattr(
+        runner, "NAMED_SOCKET_RUNNER_TEMPLATE",
+        runner.NAMED_SOCKET_RUNNER_TEMPLATE.replace(anchor, "", 1))
+    with pytest.raises(RuntimeError) as caught:
+        runner._named_socket_runner_source_with_cite("code.py")
+    assert anchor.strip().splitlines()[0][:20] in str(caught.value)
+
+
+def test_cite_runner_source_refuses_an_ambiguous_anchor(monkeypatch):
+    anchor = "conn = _QueryProxy()"
+    monkeypatch.setattr(
+        runner, "NAMED_SOCKET_RUNNER_TEMPLATE",
+        runner.NAMED_SOCKET_RUNNER_TEMPLATE + "\n" + anchor + "\n")
+    with pytest.raises(RuntimeError, match="conn = _QueryProxy"):
+        runner._named_socket_runner_source_with_cite("code.py")
+
+
+# --------------------------------------------------------------------------- #
+# A run whose process was never reaped is refused, and "killed" / "reaped" are
+# reported only when the kill call succeeded / wait() returned (#109)
+# --------------------------------------------------------------------------- #
+
+
+class _UnreapableProcess(_FakeProcess):
+    """A process whose wait() never returns: it was signalled but not reaped."""
+
+    def __init__(self, stdout, stderr):
+        super().__init__(stdout, stderr)
+        self.returncode = None
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+
+
+def _run_seatbelt_with(tmp_path, monkeypatch, process_cls, fake_killpg):
+    executor = _SeatbeltStub(tmp_path)
+    query_read, query_child = os.pipe()
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg)
+    monkeypatch.setattr(
+        runner.subprocess, "Popen",
+        lambda *a, **k: process_cls(_empty_stream(), _empty_stream()))
+
+    class ExplodingSelector:
+        def __init__(self):
+            self.registered = []
+
+        def register(self, fileobj, events, data):
+            self.registered.append((fileobj, data))
+
+        def get_map(self):
+            return self.registered
+
+        def select(self, timeout):
+            raise RuntimeError("synthetic selector polling failure")
+
+        def close(self):
+            self.registered.clear()
+
+    monkeypatch.setattr(runner.selectors, "DefaultSelector", ExplodingSelector)
+    try:
+        return runner._run_seatbelt(
+            executor, "pass", str(tmp_path / "run"), query_child,
+            runner.AnalystLimits(wall_clock_s=1.0), "unused-vault")
+    finally:
+        os.close(query_read)
+
+
+def test_seatbelt_run_whose_process_cannot_be_reaped_says_so(tmp_path, monkeypatch):
+    result = _run_seatbelt_with(
+        tmp_path, monkeypatch, _UnreapableProcess, lambda pid, sig: None)
+    assert result.killed_group is True      # the signal was delivered
+    assert result.reaped is False           # but wait() never returned
+
+
+def test_seatbelt_run_that_reaps_its_process_says_so(tmp_path, monkeypatch):
+    result = _run_seatbelt_with(
+        tmp_path, monkeypatch, _FakeProcess, lambda pid, sig: None)
+    assert result.killed_group is True
+    assert result.reaped is True
+
+
+def test_seatbelt_run_reports_no_kill_when_no_kill_call_succeeded(
+        tmp_path, monkeypatch):
+    def denied(pid, sig):
+        raise PermissionError("killpg denied")
+
+    class Stubborn(_UnreapableProcess):
+        def kill(self):
+            raise PermissionError("kill denied")
+
+    result = _run_seatbelt_with(tmp_path, monkeypatch, Stubborn, denied)
+    assert result.killed_group is False
+    assert result.reaped is False
+
+
+def test_seatbelt_kill_path_does_not_swallow_interrupts(tmp_path, monkeypatch):
+    def interrupted(pid, sig):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_seatbelt_with(tmp_path, monkeypatch, _FakeProcess, interrupted)
+
+
+def test_run_analyst_code_refuses_a_run_whose_process_was_not_reaped(
+        tmp_path, vault_path):
+    class Unreaped:
+        def run_with_query_channel(self, code, run_dir, query_fd, *,
+                                   runner_source, limits):
+            os.close(query_fd)
+            return sandbox.RawResult(
+                fd3_bytes=b'{"tables": []}', fd3_oversized=False, stdout=b"",
+                stderr=b"", returncode=0, timed_out=False, killed_group=True,
+                duration_s=0.01, pgid=0, run_dir=Path(run_dir), reaped=False)
+
+    outcome = runner.run_analyst_code(
+        "pass", str(vault_path), str(tmp_path / "unreaped"), Unreaped())
+    assert isinstance(outcome, env.Refusal)
+    assert "not reaped" in outcome.reason
+
+
+class _CollectProc:
+    """The few Popen attributes `_collect_process` touches."""
+
+    stdout = None
+    stderr = None
+    returncode = None
+
+    def __init__(self, *, wait_returns: bool, kill_error: Exception | None = None):
+        self._wait_returns = wait_returns
+        self._kill_error = kill_error
+        self.kill_calls = 0
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        if self._kill_error is not None:
+            raise self._kill_error
+
+    def wait(self, timeout=None):
+        if not self._wait_returns:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+        self.returncode = -9
+        return self.returncode
+
+
+def _collect(monkeypatch, proc, *, unit_kill_ok: bool):
+    executor = object.__new__(sandbox.TransientUnitExecutor)
+    monkeypatch.setattr(executor, "_kill_unit", lambda unit: unit_kill_ok)
+    return executor._collect_process(
+        proc, "unit", sandbox.RunLimits(wall_clock_s=0.0), time.monotonic())
+
+
+def test_transient_collect_reports_reaped_only_when_wait_returned(monkeypatch):
+    reaped = _collect(monkeypatch, _CollectProc(wait_returns=True),
+                      unit_kill_ok=True)
+    assert reaped[2:] == (True, True, True)       # timed_out, killed, reaped
+    stuck = _collect(monkeypatch, _CollectProc(wait_returns=False),
+                     unit_kill_ok=True)
+    assert stuck[2] is True and stuck[4] is False
+
+
+def test_transient_collect_reports_killed_only_when_a_kill_succeeded(monkeypatch):
+    proc = _CollectProc(wait_returns=False, kill_error=PermissionError("denied"))
+    _, _, timed_out, killed, reaped = _collect(
+        monkeypatch, proc, unit_kill_ok=False)
+    assert timed_out is True
+    assert killed is False
+    assert reaped is False
+
+
+def test_transient_kill_unit_reports_whether_systemctl_succeeded(monkeypatch):
+    executor = object.__new__(sandbox.TransientUnitExecutor)
+
+    def timed_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="systemctl", timeout=2)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", timed_out)
+    assert executor._kill_unit("unit") is False
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: Done())
+    assert executor._kill_unit("unit") is True

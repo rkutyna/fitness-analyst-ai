@@ -1603,11 +1603,13 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     counts its walk breaks, which overstates impact by roughly 2x. This buckets
     90-second interval still resolves, and counts a bucket as jogging when its
     start-bucket ``step_count`` sum multiplied by three is at least 140
-    steps/min and the bucket start lies inside any workout window. Workout type
-    and heart rate do not change that classification. The implausible-pace floor
-    and positive distance guard remain in force. Returns per-week (Monday
-    anchored) or per-day rows with jog_minutes, jog_miles, average jog pace,
-    walking equivalents, and jog_change_pct vs the previous period.
+    steps/min -- or at least 130 steps/min with a heart rate of 130 bpm or
+    over -- and the bucket start lies inside any workout window. Workout type
+    does not change that classification, and pace decides nothing beyond the
+    implausible-pace floor, which remains in force with the positive distance
+    guard. Returns per-week (Monday anchored) or per-day rows with jog_minutes,
+    jog_miles, average jog pace, walking equivalents, and jog_change_pct vs the
+    previous period.
 
     Jog minutes, not workout duration, are the volume dial; the two are not
     convertible. The plan's governing dials are the longest continuous jog

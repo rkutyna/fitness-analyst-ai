@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from health_advisor import chat, fact_template, llm, metrics, normalize
-from tests.conftest import seed_metric
+from tests.model_path_seed import _seed_model_path_vault  # noqa: F401
 
 WEEK = "2026-08-24:2026-08-30"
 
@@ -533,9 +533,6 @@ def test_the_default_scan_keeps_the_old_rule_for_other_callers():
 
 # The ask path, end to end: both census answers end in fallback, and the
 # repair turn is told which span to remove.
-@pytest.fixture(autouse=True)
-def _seed_model_path_vault(conn):
-    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 @pytest.mark.parametrize("draft,span", [

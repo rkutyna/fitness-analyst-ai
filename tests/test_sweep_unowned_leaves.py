@@ -157,7 +157,9 @@ KNOWN: dict[str, dict[str, str]] = {
             .jog_threshold_sensitivity[].jog_minutes
         """,
         "ST": """
-            .count .jog_cadence_threshold_steps_per_min .jog_near_threshold.buckets_near_cutoff
+            .count .jog_cadence_threshold_steps_per_min
+            .jog_effort_cadence_threshold_steps_per_min
+            .jog_effort_heart_rate_threshold_bpm .jog_near_threshold.buckets_near_cutoff
             .jog_near_threshold.jog_buckets .jog_near_threshold.pct_of_jog_buckets
             .jog_near_threshold.within_steps_per_min
             .jog_threshold_sensitivity[].cadence_min_steps_per_min

@@ -480,6 +480,26 @@ def test_sensitivity_at_the_live_cutoff_ignores_heart_rate(hrcliffdb, tools):
     assert at_live == pytest.approx(total, abs=0.35)
 
 
+def test_the_payload_publishes_both_lanes_of_the_jog_rule(cliffdb, tools):
+    """The rule has a gait line and an effort lane (cadence floor plus a heart
+    rate line); a payload that publishes only the first states half of it."""
+    out = tools.get_impact_volume("2026-06-01", "2026-06-07", by="week")
+    assert out["jog_cadence_threshold_steps_per_min"] == A.IMPACT_JOG_CADENCE_MIN
+    assert out["jog_effort_cadence_threshold_steps_per_min"] == 130.0
+    assert out["jog_effort_heart_rate_threshold_bpm"] == 130.0
+    assert out["jog_effort_cadence_threshold_steps_per_min"] == (
+        A.IMPACT_JOG_EFFORT_CADENCE_MIN)
+    assert out["jog_effort_heart_rate_threshold_bpm"] == A.IMPACT_JOG_HR_MIN
+    # The description names all three published thresholds, and says what a vault
+    # without step data yields.
+    doc = tools.get_impact_volume.__doc__
+    for key in ("jog_cadence_threshold_steps_per_min",
+                "jog_effort_cadence_threshold_steps_per_min",
+                "jog_effort_heart_rate_threshold_bpm"):
+        assert key in doc
+    assert "no jog minutes" in doc
+
+
 def test_sensitivity_reports_the_share_sitting_near_the_cliff(cliffdb, tools):
     out = tools.get_impact_volume("2026-06-01", "2026-06-07", by="week")
     near = out["jog_near_threshold"]

@@ -1607,7 +1607,12 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     over -- and the bucket start lies inside any workout window. Workout type
     does not change that classification, and pace decides nothing beyond the
     implausible-pace floor, which remains in force with the positive distance
-    guard. Returns per-week (Monday anchored) or per-day rows with jog_minutes,
+    guard. A bucket with no step data cannot be a jog bucket, so a session or
+    vault without ``step_count`` has no jog minutes at all. The two cadence
+    lines are published as ``jog_cadence_threshold_steps_per_min`` (the gait
+    line) and ``jog_effort_cadence_threshold_steps_per_min`` with
+    ``jog_effort_heart_rate_threshold_bpm`` (the heart-rate-confirmed lane).
+    Returns per-week (Monday anchored) or per-day rows with jog_minutes,
     jog_miles, average jog pace, walking equivalents, and jog_change_pct vs the
     previous period.
 
@@ -1691,7 +1696,14 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
 
     out = {"start": start, "end": end, "by": by, "as_of": as_of,
            "count": len(periods), "periods": periods,
-           "jog_cadence_threshold_steps_per_min": A.IMPACT_JOG_CADENCE_MIN}
+           # The whole jog rule's thresholds, not only the gait line: a bucket
+           # is jog at the gait cadence, or at the effort cadence with a heart
+           # rate at or over the effort heart-rate line. Publishing one number
+           # for a two-lane rule invites the model to state the rule from it.
+           "jog_cadence_threshold_steps_per_min": A.IMPACT_JOG_CADENCE_MIN,
+           "jog_effort_cadence_threshold_steps_per_min":
+               A.IMPACT_JOG_EFFORT_CADENCE_MIN,
+           "jog_effort_heart_rate_threshold_bpm": A.IMPACT_JOG_HR_MIN}
     for row in periods:
         if "jog_minutes" in row:
             _add_presentation(row, "jog_minutes", row.get("period"),

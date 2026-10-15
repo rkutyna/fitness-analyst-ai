@@ -222,6 +222,13 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
     Pure so it can be tested against captured buckets — a 68-minute run is 4,702
     records but 201 buckets, and the rule is defined on buckets.
 
+    A bucket is a link in a block iff its ``is_jog`` key is true
+    (``metrics.is_block_bucket``). The key is REQUIRED in effect, not in form: a
+    bucket dict without ``is_jog`` is read as not jog and silently makes no
+    block, and so does a series whose buckets all lack a cadence. Buckets from
+    ``metrics.bucket_series`` always carry it; a hand-built bucket must, with the
+    verdict taken from ``metrics.is_jog_bucket`` rather than typed in.
+
     Returns:
       unbridged_min          longest chain of jog buckets, bridge rule NOT applied
       bridged_min            longest chain with the bridge rule applied

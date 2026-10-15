@@ -558,6 +558,11 @@ def is_jog_bucket(*, in_workout: bool, pace_min_per_mi: float | None,
     decide, pace only vetoes the impossible. A missing heart rate cannot
     confirm the effort lane, and a missing cadence cannot make a jog.
 
+    So a session, or a whole vault, with no ``step_count`` has no jog bucket at
+    all: no jog minutes and no block. Before this rule the block dial could
+    still read such a session from pace alone; it no longer does, and that is
+    the rule working, not a gap in the data to be filled by guessing a cadence.
+
     ``gait_cadence_min`` exists only so the cadence-sensitivity diagnostic can
     move the gait line; every production caller leaves it at the default.
     """
@@ -596,7 +601,9 @@ def is_block_bucket(bucket: dict) -> bool:
 
     The row already carries ``is_jog``, set by ``is_jog_bucket`` in
     ``impact_bucket_rows``; this reads it rather than re-deriving it, so the
-    block dial and cardiac decoupling cannot hold a second opinion.
+    block dial and cardiac decoupling cannot hold a second opinion. A row
+    WITHOUT an ``is_jog`` key reads as not jog, silently: a hand-built bucket
+    must carry the verdict (``is_jog_bucket`` is the one place to get it).
     """
     return bool(bucket.get("is_jog"))
 

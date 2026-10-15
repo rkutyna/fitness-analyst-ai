@@ -54,7 +54,9 @@ ingest or aggregation. The short version:
   `metrics.is_jog_bucket` for jog minutes, `metrics.is_block_bucket` and
   `metrics.is_bridge_bucket` for the longest-block dial and any consumer that
   finds a block. Never write a second copy of it. Nothing coarser than
-  20-second samples produces a single jog minute.
+  20-second samples produces a single jog minute. A session or vault with no
+  `step_count` therefore has no jog minutes and no block: pace alone cannot
+  make a jog bucket.
 - **`_workout_arbitration` classifies device labels by role at query time**
   (`normalize.workout_source_role`: product type first, then localised role
   words such as watch/phone), then binds the raw labels into one SQL set per

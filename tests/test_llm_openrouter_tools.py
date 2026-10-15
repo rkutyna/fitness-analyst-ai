@@ -15,16 +15,11 @@ import httpx
 import pytest
 
 from health_advisor import llm
-from tests.conftest import seed_metric
+from tests.model_path_seed import _seed_model_path_vault  # noqa: F401
 
 # Captured before any fixture replaces it, so the one seam test that needs the
 # real tool surface can put it back.
 _REAL_REGISTRY = llm._registry
-
-
-@pytest.fixture(autouse=True)
-def _seed_model_path_vault(conn):
-    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 # --------------------------------------------------------------------------

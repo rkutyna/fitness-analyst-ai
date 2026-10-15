@@ -3,7 +3,6 @@ analysis.impact_volume aggregates. The consistency test at the bottom is the
 one that matters: it is what stops the two implementations drifting."""
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timezone
 from math import nextafter
 
@@ -14,45 +13,51 @@ from health_advisor import db
 from health_advisor import metrics as mx
 
 
-def test_snapshot_has_exactly_one_mixed_mirror_bucket():
-    """Pin the raw snapshot fact corrected in #24: one mixed bucket remains.
+def test_a_bucket_with_mirror_and_device_rows_is_the_only_one_reported(conn):
+    """The mixed-bucket query, run on synthetic rows in a temporary vault.
 
-    NOT marked `live` — that marker is for tests needing a local Ollama model,
-    and this one needs the snapshot, which it skips for explicitly below. It was
-    tagged `live` when written, which meant it never ran: a test pinning a
-    measured fact, silently skipped, is the same defect class as the rest of #24.
+    The query finds 20 s buckets that hold both a mirror row ("Sync Solver")
+    and a row from any other source. The rows here are invented; no real
+    sample is committed, so the test runs wherever the suite runs. Three
+    buckets are seeded: one mixed, one mirror-only and one device-only. Only
+    the mixed one may be reported.
     """
-    path = db.REPO_ROOT / "data" / "health.db"
-    if not path.exists():
-        pytest.skip("production snapshot is not present")
-    live = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    live.row_factory = sqlite3.Row
-    try:
-        rows = live.execute(
-            """
-            WITH bucketed AS (
-              SELECT local_date,
-                     CAST(strftime('%s', start_utc) / ? AS INTEGER) AS bkt,
-                     source
-                FROM records
-               WHERE metric = 'distance_walking_running'
-            )
-            SELECT local_date, bkt,
-                   SUM(CASE WHEN source = 'Sync Solver' THEN 1 ELSE 0 END) AS mirror_rows,
-                   SUM(CASE WHEN source <> 'Sync Solver' OR source IS NULL THEN 1 ELSE 0 END)
-                       AS non_mirror_rows
-              FROM bucketed
-          GROUP BY local_date, bkt
-            HAVING mirror_rows > 0 AND non_mirror_rows > 0
-          ORDER BY local_date, bkt
-            """,
-            (mx.IMPACT_BUCKET_SECONDS,),
-        ).fetchall()
-    finally:
-        live.close()
+    rows = [
+        ("2026-07-01T12:00:00Z", "2026-07-01", "Sync Solver"),
+        ("2026-07-01T12:00:05Z", "2026-07-01", "device-a"),
+        ("2026-07-01T13:00:00Z", "2026-07-01", "Sync Solver"),
+        ("2026-07-01T14:00:00Z", "2026-07-01", "device-a"),
+    ]
+    for start, local_date, source in rows:
+        conn.execute(
+            "INSERT INTO records (metric, start_utc, end_utc, local_date, value, "
+            "unit, source, dedupe_key) VALUES ('distance_walking_running', ?, ?, ?, "
+            "0.0125, 'mi', ?, ?)",
+            (start, start, local_date, source, f"m|{start}|{source}"))
+    conn.commit()
 
-    assert [(row["local_date"], row["mirror_rows"], row["non_mirror_rows"])
-            for row in rows] == [("2018-07-22", 1, 1)]
+    found = conn.execute(
+        """
+        WITH bucketed AS (
+          SELECT local_date,
+                 CAST(strftime('%s', start_utc) / ? AS INTEGER) AS bkt,
+                 source
+            FROM records
+           WHERE metric = 'distance_walking_running'
+        )
+        SELECT local_date, bkt,
+               SUM(CASE WHEN source = 'Sync Solver' THEN 1 ELSE 0 END) AS mirror_rows,
+               SUM(CASE WHEN source <> 'Sync Solver' OR source IS NULL THEN 1 ELSE 0 END)
+                   AS non_mirror_rows
+          FROM bucketed
+      GROUP BY local_date, bkt
+        HAVING mirror_rows > 0 AND non_mirror_rows > 0
+      ORDER BY local_date, bkt
+        """,
+        (mx.IMPACT_BUCKET_SECONDS,),
+    ).fetchall()
+
+    assert [(row[0], row[2], row[3]) for row in found] == [("2026-07-01", 1, 1)]
 
 
 @pytest.fixture()

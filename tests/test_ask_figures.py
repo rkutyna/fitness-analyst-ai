@@ -12,14 +12,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import chat, fact_template, llm, receiver
-from tests.conftest import seed_metric
+from tests.model_path_seed import _seed_model_path_vault  # noqa: F401
 
 PERIOD = "2026-08-10:2026-08-16"
-
-
-@pytest.fixture(autouse=True)
-def _seed_model_path_vault(conn):
-    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 def _ledger() -> list[dict]:

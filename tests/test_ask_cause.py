@@ -6,15 +6,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import chat, llm, receiver
-from tests.conftest import seed_metric
+from tests.model_path_seed import _seed_model_path_vault  # noqa: F401
 
 
 LEDGER_FIXTURE = Path(__file__).parent / "fixtures/jog_ledger_live_20260824_claims.jsonl"
-
-
-@pytest.fixture(autouse=True)
-def _seed_model_path_vault(conn):
-    seed_metric(conn, "fixture_metric", "2026-01-01", [1])
 
 
 def _ledger() -> list[dict]:

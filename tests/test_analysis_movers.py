@@ -127,7 +127,15 @@ def test_movers_ignores_days_whose_value_column_is_null(conn):
     seed_metric(conn, "resting_heart_rate", "2026-05-01", [60] * 23 + [75] * 7)
     conn.execute("UPDATE daily_metrics SET last = NULL WHERE date >= '2026-05-29'")
     conn.commit()
-    A.movers(conn, as_of="2026-05-30", scope="deep")   # must not raise
+    with_nulls = A.movers(conn, as_of="2026-05-30", scope="deep")
+    # The NULL days must count as absent: the same briefing as if those two
+    # rows had never been written.
+    conn.execute("DELETE FROM daily_metrics WHERE metric = 'resting_heart_rate' "
+                 "AND date >= '2026-05-29'")
+    conn.commit()
+    without_days = A.movers(conn, as_of="2026-05-30", scope="deep")
+    assert with_nulls == without_days
+    assert "resting_heart_rate" in {m["metric"] for m in with_nulls}
 
 
 def test_highlights_returns_list(conn):

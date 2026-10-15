@@ -32,6 +32,7 @@ from health_advisor import fact_template
 from health_advisor import llm
 from health_advisor.numeric_tokens import normalise_model_prose
 from tests.conftest import seed_metric
+from tests.fact_helpers import ride_ledger as _ride_ledger
 
 
 # ---------------------------------------------------------------------------
@@ -111,17 +112,6 @@ MARKS = ("\u200b", "\u0308", "\u2060", "\ufeff")
 @pytest.fixture
 def _seeded(conn):
     seed_metric(conn, "step_count", "2031-03-08", [1000])
-
-
-def _ride_ledger() -> list[dict]:
-    return [{
-        "sequence": 1,
-        "tool_name": "get_impact_volume",
-        "arguments": {"start": "2031-03-02", "end": "2031-03-08",
-                      "by": "week"},
-        "result": {"metric": "ride_minutes", "period": PERIOD,
-                   "ride_minutes": 77.5, "unit": "min"},
-    }]
 
 
 def _key() -> str:

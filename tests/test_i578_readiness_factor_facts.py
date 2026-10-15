@@ -24,6 +24,7 @@ import pytest
 
 from health_advisor import chat, fact_template, llm
 from tests.conftest import seed_metric
+from tests.fact_helpers import mine as _mine
 
 START = "2026-07-01"
 DAYS = 40
@@ -62,11 +63,6 @@ def _ledger(tools, *calls) -> list[dict]:
 def _factors(ledger) -> dict[str, dict]:
     return {f["component"]: f
             for f in ledger[0]["result"]["readiness"]["factors"]}
-
-
-def _mine(facts, metric, field):
-    return [f for f in facts.values()
-            if f["metric"] == metric and f["field"] == field]
 
 
 def test_current_and_baseline_are_published_under_their_own_true_windows(

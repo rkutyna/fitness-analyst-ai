@@ -2851,11 +2851,16 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     fn = call.get("function") or {}
                     name = fn.get("name")
                     args = fn.get("arguments") or {}
+                    args_undecodable = False
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except Exception:
+                            # Undecodable arguments have no defined meaning:
+                            # report it to the model, never run the tool with
+                            # defaults.
                             args = {}
+                            args_undecodable = True
                     if on_tool_call is not None:
                         try:
                             on_tool_call(name, tool_sequence)
@@ -2870,6 +2875,8 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}
+                    elif args_undecodable:
+                        result = {"error": "arguments were not valid JSON"}
                     else:
                         try:
                             result = entry[0](**args)
@@ -3148,14 +3155,21 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                     fn = call.get("function") or {}
                     name = fn.get("name")
                     args = fn.get("arguments") or {}
+                    args_undecodable = False
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except Exception:
+                            # Undecodable arguments have no defined meaning:
+                            # report it to the model, never run the tool with
+                            # defaults.
                             args = {}
+                            args_undecodable = True
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}
+                    elif args_undecodable:
+                        result = {"error": "arguments were not valid JSON"}
                     else:
                         try:
                             result = entry[0](**args)

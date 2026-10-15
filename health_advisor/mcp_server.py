@@ -3060,21 +3060,30 @@ def log_manual_jog_minutes(ctx: VaultContext, day: str, jog_minutes: float, sour
 
 
 def main(argv: "list[str] | None" = None, *, prog: "str | None" = None,
-         tools: "dict | None" = None) -> int:
+         tools: "dict | None" = None,
+         make_tools: "Callable[[VaultContext], dict] | None" = None) -> int:
     """Serve one session over stdio. The vault arrives on argv, not from the
     environment: an env var is ambient, and ambient is how a worker ends up
     serving the vault it happened to inherit.
 
     `prog` names the program in usage text and `tools` is passed through to
-    `build_server`; both default to the engine's own values."""
+    `build_server`; both default to the engine's own values. `make_tools`, when
+    given, is called with the context built from argv and its result is the
+    tool mapping served, so a caller can compose tools bound to that vault
+    without parsing argv itself. Passing both `tools` and `make_tools` is a
+    TypeError."""
     import argparse
 
+    if tools is not None and make_tools is not None:
+        raise TypeError("main() takes tools= or make_tools=, not both")
     ap = argparse.ArgumentParser(prog=prog or "python -m health_advisor.mcp_server")
     ap.add_argument("--vault", "--db", dest="vault", required=True,
                     help="path to the vault this session serves")
     ap.add_argument("--user", default="local", help="user id this vault belongs to")
     args = ap.parse_args(argv)
     ctx = VaultContext.local(args.vault, user_id=args.user, writable=True)
+    if make_tools is not None:
+        tools = make_tools(ctx)
     build_server(ctx, tools=tools).run(transport="stdio")
     return 0
 

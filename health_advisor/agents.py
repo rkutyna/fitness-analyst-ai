@@ -2,9 +2,8 @@
 health_advisor.llm (direct Ollama /api/chat); the model is only ever a text
 transformer here — Python owns the truth. extract_json parses model output
 (chat.py and split_claim_channel call it). The numeric grounding pattern is
-shared with the other narration gates. render_fallback is kept, but no
-production path calls it: its only caller is tests/test_agents.py. The live
-fallback for a failed answer is chat._fallback_answer.
+shared with the other narration gates. The live fallback for a failed answer
+is chat._fallback_answer.
 
 ``grounding_check`` is retained as a legacy, unscoped pre-filter for callers
 outside this package. Its result is not a grounding verdict: a nested briefing
@@ -968,14 +967,3 @@ def grounding_check(prose: str, briefing: dict, rel_tol: float = 0.005,
             continue
         bad.append(tok)
     return (len(bad) == 0, bad)
-
-
-def render_fallback(briefing: dict) -> str:
-    """Deterministic, guaranteed-correct prose from the briefing. Used when the
-    model's narration fails verification."""
-    lines = [tp["seed"] for tp in briefing.get("talking_points", [])]
-    body = "; ".join(lines).strip()
-    text = (body[:1].upper() + body[1:] + ".") if body else "No notable changes today."
-    for s in briefing.get("suggestions", []):
-        text += " " + s["text"]
-    return text

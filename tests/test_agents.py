@@ -117,15 +117,6 @@ def test_grounding_check_generated_unsupported_numbers_stay_rejected():
         assert not ok and bad, (token, bad)
 
 
-def test_render_fallback_uses_talking_points():
-    b = {"as_of": "2026-05-30",
-         "talking_points": [{"seed": "recovery readiness 72/100 (strong)"},
-                            {"seed": "training load ACWR 1.1 (sweet-spot)"}],
-         "suggestions": [{"text": "Good day to push."}]}
-    text = G.render_fallback(b)
-    assert "readiness 72/100" in text and "Good day to push" in text
-
-
 def test_grounding_check_ignores_iso_dates():
     briefing = {"readiness": {"score": 72}}
     ok, bad = G.grounding_check("On 2026-05-28 readiness was 72.", briefing)

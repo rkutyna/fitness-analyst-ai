@@ -1700,7 +1700,17 @@ def test_normal_vault_read_still_works(query_vault_path, tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="setsid process-group gap is macOS-only")
+@pytest.mark.xfail(
+    strict=True, raises=_EscapeStillOpen,
+    reason="engine #18: a setsid'd descendant leaves the killed process group",
+)
 def test_KNOWN_GAP_forked_setsid_descendant_escapes_process_group_kill(executor, vault_path, tmp_path):
+    """States the property we WANT: after the deadline kill, a forked
+    descendant stops writing. Today it does not on macOS, so this is a strict
+    xfail. When the gap closes the test XPASSes, strict mode turns that into a
+    failure, and the failure is the prompt to delete this marker (and the
+    KNOWN_GAPS entry). Only `_EscapeStillOpen` counts as the expected failure:
+    a broken precondition is an ordinary failure, not a hidden xfail."""
     run_dir = tmp_path / "setsid_escape"
     marker = run_dir / "work" / "marker.txt"
     code = """
@@ -1714,33 +1724,35 @@ if pid == 0:
         time.sleep(1)
     os._exit(0)
 """
-    res = _run(executor, code, vault_path, run_dir, wall_clock_s=2.0)
-    assert res.timed_out is True
+    try:
+        res = _run(executor, code, vault_path, run_dir, wall_clock_s=2.0)
+        assert res.timed_out is True
+        # The descendant has to have really started, or "it stopped writing"
+        # would be vacuously true.
+        deadline = time.monotonic() + 2.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), "the descendant never wrote its first marker line"
 
-    # Give the escaped, setsid'd grandchild time to keep writing well past
-    # the point `run()` already returned.
-    time.sleep(4.0)
-    assert marker.exists(), "expected the escaped descendant to still be alive and writing"
-    lines_written = len(marker.read_text().splitlines())
-    assert lines_written >= 2, (
-        f"expected the setsid'd descendant to keep running after the parent's "
-        f"kill attempt; observed {lines_written} marker line(s) — if this now "
-        f"fails, the escape may have been closed and this test (and the "
-        f"module docstring / report) should be updated, not silently deleted"
-    )
-
-    survivors = subprocess.run(
-        ["pgrep", "-f", str(run_dir)], capture_output=True, text=True
-    ).stdout.strip()
-    assert survivors, "expected a still-alive escaped descendant found by pgrep -f"
-
-    # Clean up: the escapee is no longer in our tracked group, so we have to
-    # find and kill it by pid directly, or it outlives the whole test run.
-    for pid_s in survivors.splitlines():
-        try:
-            os.kill(int(pid_s), 9)
-        except ProcessLookupError:
-            pass
+        # `run()` has already returned. Does the marker still advance?
+        before = len(marker.read_text().splitlines())
+        time.sleep(3.0)
+        after = len(marker.read_text().splitlines())
+        if after > before:
+            raise _EscapeStillOpen(
+                f"the descendant kept writing after the deadline kill "
+                f"({before} -> {after} marker lines)")
+    finally:
+        # An escapee is outside the tracked group; find it by its run
+        # directory and kill it by pid, or it outlives the test run.
+        found = subprocess.run(
+            ["pgrep", "-f", str(run_dir)], capture_output=True, text=True
+        ).stdout.split()
+        for pid_s in found:
+            try:
+                os.kill(int(pid_s), 9)
+            except (ProcessLookupError, ValueError):
+                pass
 
 
 # --------------------------------------------------------------------------- #

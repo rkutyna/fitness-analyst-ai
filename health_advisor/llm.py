@@ -1370,6 +1370,20 @@ def _client(timeout: float) -> httpx.Client:
     return httpx.Client(timeout=timeout, transport=_TRANSPORT)
 
 
+def _ollama_chat_post(payload: dict, *, timeout: float) -> dict:
+    """POST one body to Ollama's /api/chat and return the decoded response.
+
+    The one place that owns the client, the status check and the JSON decode.
+    Each caller keeps its own bookkeeping (``_record_model_call``, the status
+    it reports) in its own ``finally``, because what to record on failure is
+    the caller's contract, not the transport's.
+    """
+    with _client(timeout) as client:
+        resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _openrouter_reported_provider(body: bytes) -> str | None:
     """Extract a provider name from a complete or partial response body."""
     try:
@@ -1610,12 +1624,9 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                 return ""
             # Standard chat-completions fields only: `provider` and
             # `reasoning` are OpenRouter's and go nowhere else (#79).
-            payload = {
-                "model": request_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                **_openai_sampling(options, max_tokens=max_tokens),
-            }
+            payload = _openai_chat_payload(
+                [{"role": "user", "content": prompt}], model=request_model,
+                reasoning_mode=None, options=options, max_tokens=max_tokens)
         else:
             api_key = _openrouter_api_key()
             if not api_key:
@@ -1624,16 +1635,10 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                                      request_made=False,
                                      detail="OPENROUTER_API_KEY is unset")
                 return ""
-            payload = {
-                "model": request_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "reasoning": _openrouter_reasoning_field(openrouter_reasoning),
-                **_openai_sampling(options, max_tokens=max_tokens),
-            }
-            provider = _openrouter_provider(request_providers)
-            if provider:
-                payload["provider"] = provider
+            payload = _openai_chat_payload(
+                [{"role": "user", "content": prompt}], model=request_model,
+                reasoning_mode=openrouter_reasoning, options=options,
+                max_tokens=max_tokens, providers=request_providers)
         call_started = time.monotonic()
         data = {}
         try:
@@ -1680,10 +1685,7 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
     call_started = time.monotonic()
     data = {}
     try:
-        with _client(timeout) as client:
-            resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        data = _ollama_chat_post(payload, timeout=timeout)
         content = ((data.get("message") or {}).get("content")) or ""
         text = _strip_think(content).strip()
         _set_complete_status(
@@ -2536,6 +2538,39 @@ def _openrouter_ready(on_log=None) -> bool:
     return True
 
 
+def _openai_chat_payload(messages: list[dict], *, model: str,
+                         reasoning_mode: str | None, options: dict | None,
+                         max_tokens: int | None, tools=None,
+                         providers: str | None = None) -> dict:
+    """The JSON body of one OpenAI-dialect chat request.
+
+    ``reasoning_mode`` is the stated OpenRouter mode, and ``None`` selects the
+    standard-fields dialect of the bring-your-own endpoint: there ``reasoning``
+    and ``provider`` are OpenRouter's private fields and go nowhere else (#79).
+    ``providers`` is handed to :func:`_openrouter_provider` unchanged (``None``
+    meaning the process pin), and the block is added only when it is non-empty.
+    Key order is part of the wire and is kept: model, messages, stream,
+    reasoning, sampling, tools, tool_choice, provider.
+    """
+    openrouter = reasoning_mode is not None
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if openrouter:
+        payload["reasoning"] = _openrouter_reasoning_field(reasoning_mode)
+    payload.update(_openai_sampling(options, max_tokens=max_tokens))
+    if tools:
+        payload["tools"] = list(tools)
+        payload["tool_choice"] = "auto"
+    if openrouter:
+        provider = _openrouter_provider(providers)
+        if provider:
+            payload["provider"] = provider
+    return payload
+
+
 def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
                      max_tokens: int | None = None):
     """One OpenAI-dialect chat turn. Returns (assistant message, prompt tokens).
@@ -2552,32 +2587,17 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
         # completion; the reasoning level itself stays the global knob.
         max_tokens = max_tokens or TOOL_LOOP_MAX_TOKENS
     openrouter = BACKEND != OPENAI_COMPATIBLE
+    wire_messages = _payload_messages(messages)
     if openrouter:
         model, providers = OPENROUTER_MODEL, OPENROUTER_PROVIDERS
-        payload = {
-            "model": model,
-            "messages": _payload_messages(messages),
-            "stream": False,
-            "reasoning": _openrouter_reasoning_field(
-                _openrouter_reasoning_mode()),
-            **_openai_sampling(options, max_tokens=max_tokens),
-        }
+        reasoning_mode = _openrouter_reasoning_mode()
     else:
         # Standard fields only; OpenRouter's go to OpenRouter alone (#79).
         model, providers = OPENAI_COMPAT_MODEL, ""
-        payload = {
-            "model": model,
-            "messages": _payload_messages(messages),
-            "stream": False,
-            **_openai_sampling(options, max_tokens=max_tokens),
-        }
-    if tools:
-        payload["tools"] = list(tools)
-        payload["tool_choice"] = "auto"
-    if openrouter:
-        provider = _openrouter_provider()
-        if provider:
-            payload["provider"] = provider
+        reasoning_mode = None
+    payload = _openai_chat_payload(
+        wire_messages, model=model, reasoning_mode=reasoning_mode,
+        options=options, max_tokens=max_tokens, tools=tools)
     call_started = time.monotonic()
     data = {}
     finish_reason = None
@@ -2600,6 +2620,31 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
             time.monotonic() - call_started,
             data.get("usage") if isinstance(data, dict) else None,
             finish_reason=finish_reason)
+
+
+def _decode_call_args(call: dict) -> tuple[object, bool]:
+    """The arguments of one proposed tool call, and whether they were readable.
+
+    Returns ``(args, undecodable)``. Arguments arrive as a mapping (Ollama) or
+    as a JSON string (the OpenAI dialect); a missing value is ``{}``. A string
+    that does not decode has no defined meaning, so it comes back as
+    ``({}, True)`` and the caller must report that to the model and NOT run the
+    tool: running it with ``{}`` would let a tool whose parameters all have
+    defaults answer a question the model never asked (#102). A string that
+    decodes to something other than a mapping is returned as decoded, exactly
+    as the callers always received it.
+
+    This is not :func:`_submit_answer_decode`, which refuses a malformed
+    terminal call with a repair message instead.
+    """
+    fn = call.get("function") or {}
+    args = fn.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            return json.loads(args), False
+        except Exception:
+            return {}, True
+    return args, False
 
 
 def _openai_assistant_turn(msg: dict, turn: int) -> tuple[dict, list[dict]]:
@@ -2790,10 +2835,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                 call_started = time.monotonic()
                 data = {}
                 try:
-                    with _client(timeout) as client:
-                        resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-                        resp.raise_for_status()
-                        data = resp.json()
+                    data = _ollama_chat_post(payload, timeout=timeout)
                     msg = (data.get("message")) or {}
                 finally:
                     _record_model_call(time.monotonic() - call_started, data)
@@ -2857,17 +2899,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                     # and must not get a ledger entry behind it.)
                     fn = call.get("function") or {}
                     name = fn.get("name")
-                    args = fn.get("arguments") or {}
-                    args_undecodable = False
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            # Undecodable arguments have no defined meaning:
-                            # report it to the model, never run the tool with
-                            # defaults.
-                            args = {}
-                            args_undecodable = True
+                    args, args_undecodable = _decode_call_args(call)
                     if on_tool_call is not None:
                         try:
                             on_tool_call(name, tool_sequence)
@@ -3105,10 +3137,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
         call_started = time.monotonic()
         data = {}
         try:
-            with _client(timeout) as client:
-                resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            data = _ollama_chat_post(payload, timeout=timeout)
             return (data.get("message") or {}), int(
                 data.get("prompt_eval_count") or 0)
         finally:
@@ -3161,17 +3190,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                 for call in calls:
                     fn = call.get("function") or {}
                     name = fn.get("name")
-                    args = fn.get("arguments") or {}
-                    args_undecodable = False
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            # Undecodable arguments have no defined meaning:
-                            # report it to the model, never run the tool with
-                            # defaults.
-                            args = {}
-                            args_undecodable = True
+                    args, args_undecodable = _decode_call_args(call)
                     entry = reg.get(name)
                     if entry is None:
                         result = {"error": f"unknown tool {name!r}"}

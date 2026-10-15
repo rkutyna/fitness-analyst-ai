@@ -20,7 +20,7 @@ import tempfile
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import available_timezones
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -318,19 +318,39 @@ def local_timezone(conn: sqlite3.Connection) -> str | None:
     return _vault_meta_value(conn, "local_timezone")
 
 
+_ZONE_WITHOUT_SLASH = frozenset({"UTC", "GMT"})
+_ZONE_REFUSED_TREES = ("posix/", "right/")
+
+
+def validate_zone(zone: str) -> str:
+    """Return ``zone`` if it is a canonical IANA zone name, else raise ValueError.
+
+    Membership is exact, so a name is accepted only in the spelling the tz
+    database lists it under: a case variant that a case-insensitive filesystem
+    would resolve is refused, because it may not load on a case-sensitive host.
+    Slash-less entries other than UTC and GMT (``Factory``, ``EST``) are not zones,
+    and the ``posix/`` and ``right/`` trees repeat the zones they mirror.
+    """
+    if not isinstance(zone, str):
+        raise ValueError(f"unknown IANA time zone: {zone!r}")
+    if zone in _ZONE_WITHOUT_SLASH:
+        return zone
+    if ("/" not in zone or zone.startswith(_ZONE_REFUSED_TREES)
+            or zone not in available_timezones()):
+        raise ValueError(f"unknown IANA time zone: {zone!r}")
+    return zone
+
+
 def set_local_timezone(conn: sqlite3.Connection, zone: str | None) -> None:
     """Declare (or clear) the vault's zone. Caller owns the transaction.
 
-    Validated against the system tz database so a typo cannot be stored and
-    then silently mis-attribute dates later.
+    Validated by :func:`validate_zone` so a typo cannot be stored and then
+    silently mis-attribute dates later.
     """
     if zone is None:
         conn.execute("DELETE FROM vault_meta WHERE key = 'local_timezone'")
         return
-    try:
-        ZoneInfo(zone)
-    except (ZoneInfoNotFoundError, ValueError, TypeError):
-        raise ValueError(f"unknown IANA time zone: {zone!r}") from None
+    validate_zone(zone)
     conn.execute(
         "INSERT INTO vault_meta (key, value) VALUES ('local_timezone', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (zone,))

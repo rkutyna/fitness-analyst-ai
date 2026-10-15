@@ -1,12 +1,11 @@
 """`python -m health_advisor.db --reconcile-hr` — run the HR reconciliation
 over history, not just over the days a receiver POST happened to touch.
 
-Audit P3-5: reconcile_workout_heart_rate is only ever called from the receiver,
-scoped to the (metric, date) pairs in the payload just received. A workout that
-predates the receiver, or that arrived via export.zip on a day the phone did not
-sync, is never revisited — so its avg/max HR stays whatever the device summary
-said, or stays NULL, even when a dense heart_rate series covering it is sitting
-in `records`.
+Audit P3-5: the ingest paths reconcile only the dates they touch (the receiver,
+the dates of the batch just received; the backfill, the range it wrote — #96).
+A workout outside every such range is never revisited by them — so its avg/max
+HR stays whatever the device summary said, or stays NULL, even when a dense
+heart_rate series covering it is sitting in `records`.
 """
 from __future__ import annotations
 

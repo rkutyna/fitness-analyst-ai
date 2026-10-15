@@ -24,6 +24,7 @@ from health_advisor import chat
 from health_advisor import fact_template
 from health_advisor import llm
 from tests.conftest import seed_metric
+from tests.fact_helpers import ride_ledger as _ride_ledger
 
 
 QUESTION = "How often did I cycle last week?"
@@ -38,17 +39,6 @@ PERIOD = "2031-03-02:2031-03-08"
 def _seed_one_real_day(conn):
     """Keep this gate suite on the normal ask path after the day-zero guard."""
     seed_metric(conn, "step_count", "2031-03-08", [1000])
-
-
-def _ride_ledger() -> list[dict]:
-    return [{
-        "sequence": 1,
-        "tool_name": "get_impact_volume",
-        "arguments": {"start": "2031-03-02", "end": "2031-03-08",
-                      "by": "week"},
-        "result": {"metric": "ride_minutes", "period": PERIOD,
-                   "ride_minutes": 77.5, "unit": "min"},
-    }]
 
 
 # The defect: the count says three, the same sentence itemises two. Digit-free

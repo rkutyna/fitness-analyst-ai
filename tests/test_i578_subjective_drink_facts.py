@@ -10,11 +10,11 @@ also renders ``get_daily_series`` -- a half drink reads "2.5" in both.
 """
 from __future__ import annotations
 
-import json
 
 import pytest
 
 from health_advisor import chat, fact_template, llm
+from tests.fact_helpers import ledger as _ledger
 
 ASK = "How many alcohol drinks did I log?"
 DAYS = {"2026-08-01": (0, 3), "2026-08-02": (1, 2), "2026-08-03": (2.5, 1)}
@@ -26,16 +26,6 @@ def logged(tools):
         assert tools.log_subjective(
             day, alcohol_drinks=alcohol, caffeine_drinks=caffeine, stress=2)["ok"]
     return tools
-
-
-def _ledger(tools, *calls):
-    out = []
-    for sequence, (name, arguments) in enumerate(calls, start=1):
-        out.append({"sequence": sequence, "tool_name": name,
-                    "arguments": arguments, "result_elided": False,
-                    "result": json.loads(json.dumps(
-                        getattr(tools, name)(**arguments)))})
-    return out
 
 
 SUBJECTIVE = ("get_subjective",

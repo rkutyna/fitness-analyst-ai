@@ -15,7 +15,6 @@ Two things had to be true before they could be published honestly:
 """
 from __future__ import annotations
 
-import json
 
 import numpy as np
 import pytest
@@ -23,26 +22,13 @@ import pytest
 from health_advisor import chat, fact_template, llm
 from health_advisor import metrics as mx
 from tests.conftest import seed_metric
+from tests.fact_helpers import ledger as _ledger
+from tests.fact_helpers import mine as _mine
 
 START = "2026-07-01"
 DAYS = 30
 LAST = "2026-07-30"
 ASK = "What is the trend in my step count?"
-
-
-def _ledger(tools, *calls):
-    out = []
-    for sequence, (name, arguments) in enumerate(calls, start=1):
-        out.append({"sequence": sequence, "tool_name": name,
-                    "arguments": arguments, "result_elided": False,
-                    "result": json.loads(json.dumps(
-                        getattr(tools, name)(**arguments)))})
-    return out
-
-
-def _mine(facts, metric, field):
-    return [f for f in facts.values()
-            if f["metric"] == metric and f["field"] == field]
 
 
 @pytest.fixture

@@ -245,3 +245,7 @@ def test_the_provider_pin_and_reasoning_field_are_on_the_openrouter_wire(
     body = json.loads(posts[0]["body"])
     assert "provider" not in body and "reasoning" not in body
 
+
+def test_ollama_chat_is_posted_from_one_place():
+    source = Path(llm.__file__).read_text(encoding="utf-8")
+    assert source.count("/api/chat\"") == 1

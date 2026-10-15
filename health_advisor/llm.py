@@ -1370,6 +1370,20 @@ def _client(timeout: float) -> httpx.Client:
     return httpx.Client(timeout=timeout, transport=_TRANSPORT)
 
 
+def _ollama_chat_post(payload: dict, *, timeout: float) -> dict:
+    """POST one body to Ollama's /api/chat and return the decoded response.
+
+    The one place that owns the client, the status check and the JSON decode.
+    Each caller keeps its own bookkeeping (``_record_model_call``, the status
+    it reports) in its own ``finally``, because what to record on failure is
+    the caller's contract, not the transport's.
+    """
+    with _client(timeout) as client:
+        resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _openrouter_reported_provider(body: bytes) -> str | None:
     """Extract a provider name from a complete or partial response body."""
     try:
@@ -1680,10 +1694,7 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
     call_started = time.monotonic()
     data = {}
     try:
-        with _client(timeout) as client:
-            resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        data = _ollama_chat_post(payload, timeout=timeout)
         content = ((data.get("message") or {}).get("content")) or ""
         text = _strip_think(content).strip()
         _set_complete_status(
@@ -2790,10 +2801,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                 call_started = time.monotonic()
                 data = {}
                 try:
-                    with _client(timeout) as client:
-                        resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-                        resp.raise_for_status()
-                        data = resp.json()
+                    data = _ollama_chat_post(payload, timeout=timeout)
                     msg = (data.get("message")) or {}
                 finally:
                     _record_model_call(time.monotonic() - call_started, data)
@@ -3105,10 +3113,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
         call_started = time.monotonic()
         data = {}
         try:
-            with _client(timeout) as client:
-                resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            data = _ollama_chat_post(payload, timeout=timeout)
             return (data.get("message") or {}), int(
                 data.get("prompt_eval_count") or 0)
         finally:

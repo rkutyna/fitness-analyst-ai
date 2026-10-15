@@ -76,8 +76,8 @@ class TrackSample:
 def _reject_doctype(raw: bytes) -> None:
     """Refuse a route file carrying a DTD.
 
-    These GPX files are written by routes.py from the receiver payload, so they
-    are our own output rather than untrusted input, and stdlib ElementTree does
+    These GPX files come from earlier ingests, so they are our own output rather
+    than untrusted input, and stdlib ElementTree does
     not fetch external entities. What it does do is expand *internal* ones,
     which is the billion-laughs footgun. A real GPX track has no DTD, so
     refusing one outright costs nothing and needs no new dependency.

@@ -220,10 +220,6 @@ def propose(
         conn.close()
 
 
-# Descriptive aliases make the state transition explicit at call sites.
-record_proposed = propose
-propose_fact = propose
-
 
 def _current_fact(conn: sqlite3.Connection, fact_id: str) -> sqlite3.Row:
     row = conn.execute(
@@ -292,9 +288,6 @@ def reject(ctx: VaultContext, fact_id: str, *, stated_at: str | None = None,
     finally:
         conn.close()
 
-
-confirm_fact = confirm
-reject_fact = reject
 
 
 def _current_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -394,17 +387,11 @@ def delete_fact(ctx: VaultContext, fact_id: str) -> None:
         conn.close()
 
 
-remove_fact = delete_fact
-add_fact = record_stated
-get_facts = list_facts
-render_facts = render_context
-
-
 __all__ = [
     "FACT_STATES", "CONTEXT_STATES",
     "MAX_CONFIRMATION_REQUESTS_PER_CONVERSATION",
-    "record_stated", "propose", "propose_fact", "record_proposed",
-    "confirm", "confirm_fact", "reject", "reject_fact",
-    "list_facts", "get_facts", "context_facts", "render_context",
-    "render_facts", "delete_fact", "remove_fact", "add_fact",
+    "record_stated", "propose",
+    "confirm", "reject",
+    "list_facts", "context_facts", "render_context",
+    "delete_fact",
 ]

@@ -533,27 +533,6 @@ def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],
     }
 
 
-ASK_CAUSES = (
-    "ok",
-    "conversational",
-    "transport_failed",
-    "backend_unavailable",
-    "conversational_refused",
-    "conversational_scripted",
-    "empty_gather",
-    "gate_refused",
-    "no_gather_needed",
-    "judge_refused",
-    "denied_available_figure",
-    "withheld_available_figure",
-    "contradicted_day_count",
-    "restated_unit",
-    "unsupported_period_phrase",
-    "stale_window",
-    "no_data_yet",
-    "answer_truncated",
-)
-
 _BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
     "openrouter_not_approved", "openrouter_provider_mismatch",
     "openrouter_no_api_key", "binary_missing", "auth_failure", "no_api_key",

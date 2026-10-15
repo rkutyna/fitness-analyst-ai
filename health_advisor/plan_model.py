@@ -568,11 +568,6 @@ class Week:
         return cls.from_dict(json.loads(payload))
 
 
-def serialize_absence() -> None:
-    """The serial form of silence: no rule payload and therefore no row."""
-    return statement_to_dict(None)
-
-
 __all__ = [
     "PLAN_MODEL_SCHEMA_VERSION", "RULE_KINDS", "RuleKind", "Scope",
     "EffectiveInterval", "Interval", "Stated", "StatedValue", "Withdrawal",
@@ -581,5 +576,4 @@ __all__ = [
     "Provenance", "provenance_to_dict", "provenance_from_dict",
     "grading_policy_to_dict", "grading_policy_from_dict",
     "validate_enforced_from", "Rule", "Week", "DEFAULT_WEEK_DAYS", "week_span_end",
-    "serialize_absence",
 ]

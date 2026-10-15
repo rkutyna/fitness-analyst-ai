@@ -1,41 +1,7 @@
-"""GPX route writing and the workouts heart-rate columns / migration."""
+"""The workouts heart-rate columns and their migration."""
 import sqlite3
 
-from health_advisor import db, routes
-
-
-def _workout_with_route(tmp_ref="r"):
-    return {
-        "workout_type": "running", "start_utc": "2026-06-15T13:17:35+00:00",
-        "end_utc": "2026-06-15T13:28:35+00:00", "local_date": "2026-06-15",
-        "route_points": [
-            {"lat": 42.4267, "lon": -71.1885, "ele": 51.2, "time": "2026-06-15T13:17:35+00:00"},
-            {"lat": 42.4271, "lon": -71.1890, "ele": 52.0, "time": "2026-06-15T13:17:40+00:00"},
-        ],
-    }
-
-
-def test_write_gpx_creates_file_with_trackpoints(tmp_path):
-    w = _workout_with_route()
-    ref = routes.write_gpx(w, tmp_path)
-    assert ref is not None
-    f = tmp_path / ref
-    assert f.exists()
-    xml = f.read_text()
-    assert "<gpx" in xml and xml.count("<trkpt") == 2
-    assert 'lat="42.4267"' in xml and 'lon="-71.1885"' in xml
-    assert "<ele>51.2</ele>" in xml
-    assert "2026-06-15T13:17:35+00:00" in xml
-
-
-def test_write_gpx_returns_none_without_points(tmp_path):
-    assert routes.write_gpx({"workout_type": "yoga", "start_utc": "x",
-                             "route_points": []}, tmp_path) is None
-
-
-def test_write_gpx_filename_is_deterministic(tmp_path):
-    w = _workout_with_route()
-    assert routes.write_gpx(w, tmp_path) == routes.write_gpx(w, tmp_path)  # idempotent
+from health_advisor import db
 
 
 def test_migration_adds_hr_columns_to_existing_table(tmp_path):

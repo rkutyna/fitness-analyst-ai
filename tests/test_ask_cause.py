@@ -155,7 +155,7 @@ def test_publish_withholding_is_named_and_not_ok():
     assert chat._ask_cause(
         verification, ledger=[{"sequence": 1}], loop_outcomes=[],
         withheld_eligible_figure=True) == "withheld_available_figure"
-    assert "withheld_available_figure" in chat.ASK_CAUSES
+    assert "withheld_available_figure" in chat._ASK_CAUSES
 
 
 def test_a_kept_answer_with_no_judge_is_ok_not_judge_refused():

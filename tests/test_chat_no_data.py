@@ -83,7 +83,7 @@ def test_receiver_records_the_deterministic_answer_turn(monkeypatch, vault):
 
 
 def test_no_data_cause_is_closed_and_accepted_by_cause_helper():
-    assert "no_data_yet" in chat.ASK_CAUSES
+    assert "no_data_yet" in chat._ASK_CAUSES
     assert chat._ask_cause(
         {"ok": True}, ledger=[], loop_outcomes=[], no_data_yet=True
     ) == "no_data_yet"

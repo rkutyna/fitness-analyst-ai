@@ -13,7 +13,7 @@ from tests.fixture_loader import load_f84_wholeday
 def _seed_cadence_where_the_retired_pace_lane_fired(conn, workouts):
     """Give the cadence-blind fixture the step stream the block dial now needs.
 
-    This fixture has no step_count, and since the one jog rule (#604) pace no
+    This fixture has no step_count, and since the one jog rule (formula version 3) pace no
     longer makes a jog bucket, so without it every block here would read 0.0.
     The block assertions below guard the distance attribution (#189): they must
     keep seeing the same buckets as jog. So each workout window gets a 150 spm

@@ -96,7 +96,7 @@ def _workout(conn, day: str, workout_type: str, index: int = 0):
 def _cadenced_copy(conn, tmp_path, windows, *, retired_pace_lane_only=False):
     """A writable copy of ``conn``'s database with a synthetic step stream added.
 
-    The golden slice carries no step_count, and since the one jog rule (#604)
+    The golden slice carries no step_count, and since the one jog rule (formula version 3)
     only a bucket with a cadence can be a jog bucket, so every jog figure on the
     slice reads zero or none and a broken rule cannot be told from a working
     one. This is the positive control: a 150 steps/min sample (a synthetic
@@ -347,7 +347,7 @@ def test_published_vo2_and_easy_block_figures(golden_conn, tmp_path):
         golden_conn, sun_w7["start_utc"], sun_w7["end_utc"]
     )
     # The published figures are 9.0 min at HR 146 (week-07-review.md:42), read
-    # while the block dial still had a pace lane. The one jog rule (#604) has no
+    # while the block dial still had a pace lane. The one jog rule (formula version 3) has no
     # pace lane: a bucket is jog on cadence (or a near-running cadence at a
     # running heart rate), and this golden slice deliberately omits step_count --
     # golden_snapshot.py's _RECORD_METRICS excludes it so that

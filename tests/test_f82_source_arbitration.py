@@ -15,7 +15,7 @@ from tests.fixture_loader import load_f82_multi_source
 def _seed_cadence_where_the_retired_pace_lane_fired(conn, workout):
     """Give the cadence-blind fixture a step stream, so a jog bucket can exist.
 
-    The fixture has no step_count, and since the one jog rule (#604) only a
+    The fixture has no step_count, and since the one jog rule (formula version 3) only a
     bucket with a cadence can be a jog bucket, so without this every block
     figure here reads zero whether or not the rule works. A synthetic 150
     steps/min sample goes into each bucket of the workout's window that the
@@ -358,7 +358,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
         conn, workout["start_utc"], workout["end_utc"]))
 
     # This fixture predates the cadence stream, so neither volume result can
-    # classify a bucket as jogging -- and since the one jog rule (#604) the block
+    # classify a bucket as jogging -- and since the one jog rule (formula version 3) the block
     # dial cannot either: pace no longer makes a jog bucket, so a session with no
     # step data has no block. The block figures below were 57.3 (the duplicate
     # streams, pace-only) and 5.0 (the selected stream, five pace-lane reps)
@@ -428,7 +428,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
 def test_each_inflated_session_has_a_finite_selected_block_structure(conn):
     payload = load_f82_multi_source(conn)
     # 815 read 5.0 while the block dial had a pace lane; the fixture carries no
-    # step data, so under the one jog rule (#604) every session here has no
+    # step data, so under the one jog rule (formula version 3) every session here has no
     # block. The selected stream is checked on the bucket rows instead: each
     # session's bucket miles equal its recorded distance (809's 1.0802 is the
     # known whole-day Watch-vs-iPhone residue, see the ratios test above).

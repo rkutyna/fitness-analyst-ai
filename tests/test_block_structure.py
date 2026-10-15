@@ -2,7 +2,7 @@
 that also protects the impact-volume dial.
 
 Rule (metrics.is_jog_bucket, which the block dial reads through
-metrics.is_block_bucket since #604): a bucket inside a workout window counts as
+metrics.is_block_bucket since formula version 3): a bucket inside a workout window counts as
 jogging when its pace is not implausibly fast (IMPACT_IMPLAUSIBLE_PACE_MIN, when
 known) AND its cadence is present, at most IMPACT_CADENCE_PLAUSIBLE_MAX, and
 either
@@ -84,7 +84,7 @@ def test_fast_pace_with_known_walking_hr_does_not_count():
 
 def test_fast_pace_with_missing_hr_and_no_cadence_does_not_count():
     """Was test_fast_pace_with_missing_hr_counts: True while a pace lane
-    existed (a missing HR never vetoed it). Pace has no lane since #604, and
+    existed (a missing HR never vetoed it). Pace has no lane since formula version 3, and
     with no cadence there is nothing to count it on, so a pace-9 bucket is a
     walk bucket whatever the HR says."""
     b = _bucket(pace_min_per_mi=9.0, hr=None)

@@ -292,6 +292,31 @@ def _shared_secret_for_request() -> str:
 # batch's one-transaction atomicity.
 INGEST_CHUNK = int(os.environ.get("HA_INGEST_CHUNK", "10000"))
 
+# Tombstone lookups ask about many keys per statement. Each key binds at most
+# three values, so a chunk stays far under SQLite's bound-variable limit on any
+# build (the oldest default is 999).
+TOMBSTONE_LOOKUP_CHUNK = 250
+
+
+def _tombstoned_samples(conn, keys) -> set[tuple[str, str, str]]:
+    """Which ``(device_id, type_identifier, hk_uuid)`` keys carry a tombstone.
+
+    One statement per ``TOMBSTONE_LOOKUP_CHUNK`` distinct keys instead of one
+    per key. A key with a missing part can never match a NOT NULL tombstone
+    column, exactly as ``col = NULL`` never matched in the per-key query, so it
+    is left out of the question.
+    """
+    pending = sorted({key for key in keys if None not in key})
+    found: set[tuple[str, str, str]] = set()
+    for i in range(0, len(pending), TOMBSTONE_LOOKUP_CHUNK):
+        chunk = pending[i:i + TOMBSTONE_LOOKUP_CHUNK]
+        marks = ",".join(["(?, ?, ?)"] * len(chunk))
+        found.update(tuple(row) for row in conn.execute(
+            "SELECT device_id, type_identifier, hk_uuid FROM hk_deletions "
+            f"WHERE (device_id, type_identifier, hk_uuid) IN (VALUES {marks})",
+            [part for key in chunk for part in key]))
+    return found
+
 # How far back a consolidated daily total may describe, measured from the day
 # it was pulled (health_advisor#220: "do not let the re-pull become a
 # backfill"). The lag is `db.daily_total_lag_days` — the queried_at local date
@@ -1155,13 +1180,15 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # Filter tombstoned adds before constructing pairs. This matters
             # for a deletion of an unknown row followed by the same stale row:
             # it must not create either a raw row or a daily aggregate.
+            # The deletion loop above is the only writer of tombstones, so one
+            # lookup for the whole batch sees exactly what a per-record query
+            # would have.
+            tombstoned = _tombstoned_samples(conn, (
+                (row["hk_device_id"], row["hk_type_identifier"], row["hk_uuid"])
+                for row in parsed["records"]))
             for row in parsed["records"]:
-                tombstone = conn.execute(
-                    "SELECT 1 FROM hk_deletions WHERE device_id = ? "
-                    "AND type_identifier = ? AND hk_uuid = ?",
-                    (row["hk_device_id"], row["hk_type_identifier"], row["hk_uuid"]),
-                ).fetchone()
-                if tombstone is not None:
+                if (row["hk_device_id"], row["hk_type_identifier"],
+                        row["hk_uuid"]) in tombstoned:
                     diagnostic_rows.append({
                         "batch_id": parsed["batch_id"],
                         "point_kind": "sample",

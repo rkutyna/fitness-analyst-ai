@@ -185,3 +185,42 @@ def test_week_start_agrees_across_every_caller_for_two_years():
     out = metrics.downsample_weekly([d.isoformat() for d in days[:21]], [1.0] * 21, "sum")
     assert [row["date"] for row in out] == sorted(
         {(d - timedelta(days=d.weekday())).isoformat() for d in days[:21]})
+
+
+# --- numeric tolerance -------------------------------------------------------
+
+def _old_close(a, b, rel_tol=0.005, abs_floor=0.05):
+    """The body deepdive_verify._close and agents.grounding_check both carried."""
+    return abs(a - b) <= max(abs_floor, abs(b) * rel_tol)
+
+
+@pytest.mark.parametrize("value, reference", [
+    (100.0, 100.0), (100.4, 100.0), (100.6, 100.0), (99.0, 100.0), (1005.01, 1000.0),
+    (1004.9, 1000.0), (0.0, 0.0), (0.04, 0.0), (0.06, 0.0), (-52.0, -52.0),
+    (7.0, 7.0000001), (2.0, 1.0), (1.0, 2.0), (31.0, 30.9), (52.0, 52.2),
+])
+def test_close_matches_the_old_policy_with_the_reference_as_scale(value, reference):
+    from health_advisor import numeric_tokens
+    assert numeric_tokens.close(value, reference) == _old_close(value, reference)
+    assert numeric_tokens.close(value, reference, 0.02, 0.5) == _old_close(
+        value, reference, 0.02, 0.5)
+
+
+def test_close_scales_by_the_reference_not_the_value():
+    # 1005.01 against a supported 1000 is 5.01 out; the tolerance is 5.0 (0.5%
+    # of the reference). Scaled by the value it would be 5.025 and pass, which
+    # would loosen the claim check. Mutation check: flip the scale and this fails.
+    from health_advisor import numeric_tokens
+    assert numeric_tokens.close(1005.01, 1000.0) is False
+    assert numeric_tokens.close(1000.0, 1005.01) is True
+
+
+def test_grounding_check_keeps_the_reference_scale():
+    from health_advisor import agents
+    ok, bad = agents.grounding_check("Your figure is 1005.01 today.", {"value": 1000.0})
+    assert ok is False and bad == ["1005.01"]
+
+
+def test_retired_tolerance_copies_have_no_definition():
+    from health_advisor import deepdive_verify
+    assert not hasattr(deepdive_verify, "_close")

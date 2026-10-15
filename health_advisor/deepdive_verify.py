@@ -49,7 +49,7 @@ from . import agents as G
 from .claim_contract import (is_metricless_metric as _is_metricless_metric,
                              metricless_claim_instruction_sentence)
 from . import metrics as mx
-from .numeric_tokens import NUM_RE as _NUM_RE
+from .numeric_tokens import NUM_RE as _NUM_RE, close
 
 # Recomputable directly from one metric's series over one window.
 _SERIES_FIELDS = ("mean", "median", "min", "max", "std", "latest", "n_days",
@@ -228,14 +228,6 @@ def _claimable_value(value):
     return None
 
 
-def _close(a: float, b: float, rel_tol: float = 0.005,
-           abs_floor: float = 0.05) -> bool:
-    """Same tolerance policy as agents.grounding_check: relative, with a small
-    absolute floor so rounding of large values passes while a neighbouring
-    small integer (a fabricated 99 against a real 100) does not."""
-    return abs(a - b) <= max(abs_floor, abs(b) * rel_tol)
-
-
 def _payload_decimals(value) -> int | None:
     """Decimal places a published payload number carries, or None if unknown."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -258,7 +250,7 @@ def _same_scope_value(payload_actual: float, sql_actual: float) -> bool:
     1.8% and failed `_close` on every low-energy day (#568). Truncation is not
     rounding: 76 against 76.9 is still refused.
     """
-    if _close(payload_actual, sql_actual):
+    if close(payload_actual, sql_actual):
         return True
     places = _payload_decimals(payload_actual)
     if places is None:
@@ -341,7 +333,7 @@ def _signed_percentage_matches(prose: str, claims: list[dict],
             if claimed is None or claimed == 0 or (claimed < 0) != (direction < 0):
                 continue
             licensed = (_rule_r_matches(token, abs(claimed))
-                        if rule_r else _close(value, abs(claimed)))
+                        if rule_r else close(value, abs(claimed)))
             if licensed:
                 matches.append(token)
                 break
@@ -406,7 +398,7 @@ def _structural_matches(prose: str, claims: list[dict], *, rule_r: bool = False)
                     and claim.get("field") == "weeks_per_block"
                     and (_rule_r_matches(token, claim.get("value"))
                          if rule_r else
-                         _close(value, _as_float(claim.get("value"))))):
+                         close(value, _as_float(claim.get("value"))))):
                 matches.append(token)
                 break
     return matches
@@ -488,7 +480,7 @@ def _coach_grounding(prose: str, claims: list[dict], payload=None,
     remaining = [token_match.group() for token_match in
                  _NUM_RE.finditer(G.strip_dates_and_names(prose))
                  if not any(
-                     _close(float(token_match.group().replace(",", "")),
+                     close(float(token_match.group().replace(",", "")),
                             _as_float(claim.get("value")))
                      for claim in scoped_claims
                      if _as_float(claim.get("value")) is not None
@@ -1602,7 +1594,7 @@ def _verify_derivation(conn, num: dict, as_of: str | None, payload) -> dict:
     # _is_ledger for the same reason #85 gated it — coach_brief and pipeline
     # keep the legacy tolerance until #61.
     ok = (_rule_r_matches(str(num.get("value")), actual)
-          if _is_ledger(payload) else _close(claimed, actual))
+          if _is_ledger(payload) else close(claimed, actual))
     return {**base, "actual": actual, "ok": ok,
             "reason": "" if ok else f"claimed {claimed}, recomputed {actual}",
             "operands": resolved, "operation": operation}
@@ -1687,7 +1679,7 @@ def verify_number(conn, num: dict, as_of: str | None = None,
                     "sql_actual": sql_actual, "ok": False,
                     "reason": "payload/SQL scope disagreement"}
         ok = (_as_float(claimed) == _as_float(payload_actual)
-              if _is_ledger(payload) else _close(claimed, payload_actual))
+              if _is_ledger(payload) else close(claimed, payload_actual))
         verdict = {**base, "ok": ok, "exact": True, "actual": payload_actual,
                    "payload_actual": payload_actual, "sql_actual": sql_actual,
                    "scope": "payload", "tier": payload_hit.get("tier"),
@@ -1707,7 +1699,7 @@ def verify_number(conn, num: dict, as_of: str | None = None,
         actual = sql_hit.get("actual")
         if actual is None:
             return {**base, **sql_hit}
-        ok = _close(claimed, actual)
+        ok = close(claimed, actual)
         return {**base, "ok": ok, "exact": True, "actual": actual,
                 "scope": sql_hit.get("scope"), "window": sql_hit.get("window"),
                 "reason": "" if ok else f"claimed {claimed}, actual {actual}"}
@@ -1736,14 +1728,14 @@ def verify_number(conn, num: dict, as_of: str | None = None,
         actual = values.get(field)
         if actual is None:
             return {**base, "reason": f"{field} not derivable here"}
-        ok = _close(claimed, actual)
+        ok = close(claimed, actual)
         return {**base, "ok": ok, "exact": True, "actual": actual,
                 "reason": "" if ok else f"claimed {claimed}, actual {actual}"}
 
     candidates = [v for k, v in values.items()
                   if k != "_points" and isinstance(v, (int, float))]
     candidates += list(values.get("_points") or [])
-    ok = any(_close(claimed, c) for c in candidates)
+    ok = any(close(claimed, c) for c in candidates)
     return {**base, "ok": ok, "exact": False, "n_candidates": len(candidates),
             "reason": "" if ok else
             f"no value within tolerance among {len(candidates)} for "

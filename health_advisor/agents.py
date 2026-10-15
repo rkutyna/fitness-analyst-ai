@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from . import llm
-from .numeric_tokens import NUM_RE as _NUM_RE, strip_invisible
+from .numeric_tokens import NUM_RE as _NUM_RE, close, strip_invisible
 
 # The judge's pass mark, defined once here rather than in each caller.  This is
 # the gates module and both consumers (coach_brief, pipeline) already import it,
@@ -964,7 +964,7 @@ def grounding_check(prose: str, briefing: dict, rel_tol: float = 0.005,
             continue
         if _norm_num(val) in allowed:
             continue
-        if any(abs(val - a) <= max(abs_floor, abs(a) * rel_tol) for a in allowed_floats):
+        if any(close(val, a, rel_tol, abs_floor) for a in allowed_floats):
             continue
         bad.append(tok)
     return (len(bad) == 0, bad)

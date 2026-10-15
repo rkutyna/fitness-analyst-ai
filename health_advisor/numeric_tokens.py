@@ -289,3 +289,15 @@ def _strip_invisible(text):
             out.append(piece)
     flush()
     return "".join(out)
+
+
+def close(value: float, reference: float, rel_tol: float = 0.005,
+          abs_floor: float = 0.05) -> bool:
+    """Whether ``value`` is within tolerance of ``reference``.
+
+    The scale is the REFERENCE (the figure the data supports), never the value
+    being checked. Relative, with a small absolute floor so rounding of large
+    figures passes while a neighbouring small integer (a fabricated 99 against
+    a real 100) does not. Callers pass the supported figure second.
+    """
+    return abs(value - reference) <= max(abs_floor, abs(reference) * rel_tol)

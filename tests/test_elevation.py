@@ -284,3 +284,63 @@ def test_twenty_thousand_points_under_one_second():
     print(f"\n[Done-when 12] 20,000 samples elapsed={elapsed:.4f} s")
     assert result["n_used"] == 20_000
     assert elapsed < 1.0
+
+
+# --- presentation by the vault's unit system (#94, D1) ----------------------
+# compute_elevation is the storage convention and keeps both metres and feet.
+# What a vault is SHOWN follows its declared unit system: a metric vault never
+# sees the feet fields; an imperial or undeclared vault keeps the payload as is.
+
+_FEET_FIELDS = ("ascent_ft", "descent_ft")
+
+
+def test_storage_keeps_both_feet_and_metres():
+    result = _compute(_one_reversal())
+    for field in ("ascent_m", "descent_m") + _FEET_FIELDS:
+        assert field in result
+
+
+def test_a_metric_vault_is_not_shown_the_feet_fields():
+    result = _compute(_one_reversal())
+    shown = elevation.present_elevation(result, "metric")
+    for field in _FEET_FIELDS:
+        assert field not in shown
+    assert shown["ascent_m"] == result["ascent_m"] > 0
+    assert shown["descent_m"] == result["descent_m"]
+    # Presentation never mutates the stored result.
+    assert all(field in result for field in _FEET_FIELDS)
+
+
+@pytest.mark.parametrize("system", ["imperial", None])
+def test_an_imperial_or_undeclared_vault_keeps_the_payload(system):
+    result = _compute(_one_reversal())
+    assert elevation.present_elevation(result, system) == result
+
+
+def _route_conn(unit_system):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE workout_routes (start_utc TEXT, end_utc TEXT, encoding TEXT, points BLOB)")
+    conn.execute("CREATE TABLE vault_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    if unit_system is not None:
+        conn.execute("INSERT INTO vault_meta VALUES ('unit_system', ?)", (unit_system,))
+    offsets = list(range(40))
+    altitudes = [float(i) for i in range(20)] + [float(20 - i) for i in range(20)]
+    blob = b"".join(struct.pack("<40f", *array) for array in
+                    (offsets, altitudes, [5.0] * 40, [2.0] * 40))
+    conn.execute("INSERT INTO workout_routes VALUES (?, ?, ?, ?)", (
+        "2026-01-01T00:00:00Z", "2026-01-01T00:00:40Z", "float32le", blob))
+    return conn
+
+
+@pytest.mark.parametrize("system,feet_shown", [
+    ("metric", False), ("imperial", True), (None, True)])
+def test_route_climb_presents_by_the_vaults_unit_system(system, feet_shown):
+    conn = _route_conn(system)
+    try:
+        result = elevation.route_climb(
+            conn, "2026-01-01T00:00:00Z", "2026-01-01T00:00:40Z")
+    finally:
+        conn.close()
+    assert result["ascent_m"] > 0
+    for field in _FEET_FIELDS:
+        assert (field in result) is feet_shown

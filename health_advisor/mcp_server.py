@@ -2639,6 +2639,12 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
       period    the inclusive Monday-Sunday range, ``YYYY-MM-DD:YYYY-MM-DD``;
                 copy it verbatim into a claim
       mean      the week's mean
+      agg       the metric's own reducer: "sum", "last" or "mean"
+      total     (agg "sum") the week's total — quote this, not the mean, for
+                "how many steps that week"
+      latest    (agg "last") the week's final reading
+                ``total``/``latest`` are the figures get_daily_series reports
+                for the same week when it downsamples to weeks.
       n_days    how many days it rests on. A mean of two days and a mean of
                 seven are not the same claim. Say which you have.
       verification_status
@@ -2690,9 +2696,10 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
         for row in weeks:
             row["mean"] = _r(V.convert_for_unit_system(
                 row["mean"], stored_unit, unit_system)[0])
-            if "total" in row:
-                row["total"] = _r(V.convert_for_unit_system(
-                    row["total"], stored_unit, unit_system)[0])
+            for level in ("total", "latest"):
+                if level in row:
+                    row[level] = _r(V.convert_for_unit_system(
+                        row[level], stored_unit, unit_system)[0])
             for spread in ("sd_day", "mdc95"):
                 row[spread] = _convert_spread(
                     row[spread], stored_unit, unit_system)

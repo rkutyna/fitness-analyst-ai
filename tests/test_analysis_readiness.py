@@ -217,3 +217,22 @@ def test_stale_readiness_gets_a_check_your_watch_suggestion(conn):
     rd = A.readiness(conn, as_of="2026-06-09")
     sugg = A.suggestions(rd, {"status": "no_load_metric", "acwr": None})
     assert any("10 days" in s["because"] for s in sugg)
+
+
+def test_the_readiness_baseline_holds_the_full_window_on_a_complete_series(conn):
+    # Forty consecutive days, each value its own index, ending on as_of. The
+    # current mean takes the last READINESS_SMOOTH_DAYS days, and the baseline
+    # must be the READINESS_BASELINE_WINDOW days immediately before them: the
+    # fetch has to reach back far enough that excluding the recent days still
+    # leaves a full window, rather than a window shortened by the smoothing.
+    seed_metric(conn, "heart_rate_variability", "2026-05-01", list(range(40)))
+    detail = A._recent_and_baseline_detail(conn, "heart_rate_variability",
+                                           "2026-06-09")
+    window, smooth = A.READINESS_BASELINE_WINDOW, A.READINESS_SMOOTH_DAYS
+    assert window == 28
+    assert detail["n_baseline"] == window
+    assert detail["current_window"] == ("2026-06-07", "2026-06-09")
+    assert detail["baseline_window"] == ("2026-05-10", "2026-06-06")
+    # Indices 9..36 are the 28 baseline days; their median is 22.5.
+    first = 40 - smooth - window
+    assert detail["baseline"] == (first + (40 - smooth - 1)) / 2 == 22.5

@@ -1293,6 +1293,12 @@ def series(conn, metric, start_iso, end_iso):
 
 
 def stats(dates, vals):
+    """Summary statistics of one daily series.
+
+    ``std`` is the SAMPLE standard deviation (ddof 1), the convention every
+    published spread figure uses: the days are a sample of the athlete's days.
+    One day has no spread to estimate, so its ``std`` is None, not 0.0.
+    """
     if not vals:
         return {"n_days": 0}
     arr = np.array(vals, dtype=float)
@@ -1303,7 +1309,7 @@ def stats(dates, vals):
         "mean": r(arr.mean()), "median": r(np.median(arr)),
         "min": r(arr.min()), "min_date": dates[imin],
         "max": r(arr.max()), "max_date": dates[imax],
-        "std": r(arr.std()),
+        "std": r(arr.std(ddof=1)) if len(arr) > 1 else None,
     }
 
 

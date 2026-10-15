@@ -15,6 +15,8 @@ import sqlite3
 import struct
 from typing import Any
 
+from . import vault
+
 
 # Version-1 method constants.  Keep these together: changing one changes the
 # meaning of every figure produced by this module.
@@ -29,7 +31,7 @@ METRES_TO_FEET = 3.280839895013123
 # UUID-to-overlap fallback for workouts stored without a UUID.
 WORKOUT_ELEVATION_BACKFILL_GENERATION = 2
 
-__all__ = ["compute_elevation", "route_climb", "workout_climb",
+__all__ = ["compute_elevation", "present_elevation", "route_climb", "workout_climb",
            "WORKOUT_ELEVATION_BACKFILL_GENERATION"]
 
 
@@ -256,6 +258,11 @@ def compute_elevation(
     so a split loses the median window across its boundary; callers should
     bound that seam effect (the test suite does).  The ordinary result has no
     state field, keeping its persisted shape stable.
+
+    This is the storage convention and carries both metres and feet
+    (``ascent_m``/``ascent_ft``, ``descent_m``/``descent_ft``) whatever the
+    vault's unit system. What a vault is shown is ``present_elevation``'s
+    concern, which ``route_climb`` applies.
     """
     state = _validate_state(initial_state)
     rows, all_have_accuracy, n_points = _normalise_samples(
@@ -356,7 +363,34 @@ def route_climb(conn: sqlite3.Connection, start_utc: str, end_utc: str) -> dict[
     result = compute_elevation(samples)
     if result["n_used"] < MIN_USED_POINTS:
         return {"status": "too_few_points"}
-    return result
+    # The public reader is a presentation boundary: show the vault what its
+    # declared unit system asks for.
+    return present_elevation(result, vault.unit_system(conn))
+
+
+# Every imperial field compute_elevation emits, with its unit. Storage keeps
+# them beside their metric twins (``ascent_ft`` beside ``ascent_m``).
+_IMPERIAL_FIELDS = {"ascent_ft": "ft", "descent_ft": "ft"}
+
+
+def present_elevation(result: Mapping[str, Any],
+                      unit_system: str | None) -> dict[str, Any]:
+    """An elevation result as a vault with ``unit_system`` is shown it.
+
+    ``compute_elevation`` is the storage convention and keeps both feet and
+    metres. A vault that declared the metric system is not shown the feet
+    fields: the same ``vault.convert_for_unit_system`` boundary the series
+    tools use says that ``ft`` converts to ``m`` there, and every feet field's
+    metres twin is already in the result. An imperial or undeclared vault is
+    shown the payload unchanged. The stored result is never mutated.
+    """
+    shown = dict(result)
+    for field, unit in _IMPERIAL_FIELDS.items():
+        if field not in shown:
+            continue
+        if vault.convert_for_unit_system(None, unit, unit_system)[1] != unit:
+            del shown[field]
+    return shown
 
 
 def workout_climb(conn: sqlite3.Connection, workout_id: int) -> dict[str, Any]:

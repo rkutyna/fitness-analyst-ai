@@ -1344,7 +1344,8 @@ def _consolidated_days(conn, metric: str, start: str, end: str) -> set[str]:
         return set()
 
 
-def _wear_eligible(conn, metric, as_of, rows: list[tuple]) -> list[tuple]:
+def _wear_eligible(conn, metric, as_of, rows: list[tuple],
+                   hours: dict[str, float] | None = None) -> list[tuple]:
     """`rows`, minus the days that carry no wear evidence of EITHER kind (D19).
 
     Call this before sizing a denominator from `len(rows)`. A consolidated day
@@ -1367,18 +1368,24 @@ def _wear_eligible(conn, metric, as_of, rows: list[tuple]) -> list[tuple]:
     day D19 can produce is inside wear_hours' coverage. Specified anyway,
     because "expected to be unreachable" is precisely how silent behaviour gets
     written.
+
+    ``hours`` is a ``_wear_hours_map`` the caller already read over a window
+    that contains ``[rows[0][0], as_of]``; only dates inside ``rows`` are looked
+    up, so a wider map gives the same answer as the one read here.
     """
     if not rows:
         return []
     consolidated = _consolidated_days(conn, metric, rows[0][0], as_of)
     if not consolidated:
         return list(rows)
-    hours = _wear_hours_map(conn, rows[0][0], as_of)
+    if hours is None:
+        hours = _wear_hours_map(conn, rows[0][0], as_of)
     return [row for row in rows
             if row[0] not in consolidated or row[0] in hours]
 
 
-def _worn_rows(conn, metric, as_of, rows: list[tuple]) -> list[tuple]:
+def _worn_rows(conn, metric, as_of, rows: list[tuple],
+               hours: dict[str, float] | None = None) -> list[tuple]:
     """The subset of [(date, value, sample_count)] rows that describe a day the
     watch was actually worn. Measured hours where they exist, sample density
     otherwise. A no-op when the window is uniformly worn, so it only bites at a
@@ -1389,20 +1396,25 @@ def _worn_rows(conn, metric, as_of, rows: list[tuple]) -> list[tuple]:
     it does not, `_wear_eligible` has already removed the day, because `count`
     on such a row is not a wear-density signal. This is NOT
     "consolidated implies worn".
+
+    ``hours`` is an already-read ``_wear_hours_map`` covering at least
+    ``[rows[0][0], as_of]``; see ``_wear_eligible``.
     """
     if not rows:
         return []
-    rows = _wear_eligible(conn, metric, as_of, rows)
+    rows = _wear_eligible(conn, metric, as_of, rows, hours)
     if not rows:
         return []
-    hours = _wear_hours_map(conn, rows[0][0], as_of)
+    if hours is None:
+        hours = _wear_hours_map(conn, rows[0][0], as_of)
     floor = WEAR_DENSITY_FRACTION * _wear_reference(conn, metric, as_of)
     return [(d, v, c) for d, v, c in rows
             if (hours[d] >= WEAR_MIN_HOURS if d in hours else (c or 0) >= floor)]
 
 
-def _worn_values(conn, metric, as_of, rows: list[tuple]) -> list[float]:
-    return [v for _, v, _ in _worn_rows(conn, metric, as_of, rows)]
+def _worn_values(conn, metric, as_of, rows: list[tuple],
+                 hours: dict[str, float] | None = None) -> list[float]:
+    return [v for _, v, _ in _worn_rows(conn, metric, as_of, rows, hours)]
 
 
 def _band_acwr(ratio: float) -> str:
@@ -1636,15 +1648,21 @@ def movers(conn, as_of: str | None = None, scope: str = "daily",
     start = (date.fromisoformat(as_of) - timedelta(days=MOVER_WINDOW_DAYS - 1)).isoformat()
     found = []
     eligible_window = False
+    # Wear hours do not depend on the metric: read them once, for the whole
+    # window, the first time a metric is long enough to need them.
+    hours: dict[str, float] | None = None
     for m in _all_metrics(conn):
         dates, present_vals, unit = mx.series(conn, m, start, as_of)
         if len(present_vals) < MOVER_MIN_WINDOW_DAYS:
             continue
+        if hours is None:
+            hours = _wear_hours_map(conn, start, as_of)
         # Compare recent vs baseline over WORN days only, so a sparse/intermittent
         # baseline (e.g. backfill before live sync began) can't fabricate a swing.
         # Require most of the window to be worn, or there's no trustworthy baseline.
         vals = _worn_values(conn, m, as_of,
-                            _daily_load_rows(conn, m, as_of, MOVER_WINDOW_DAYS))
+                            _daily_load_rows(conn, m, as_of, MOVER_WINDOW_DAYS),
+                            hours)
         if len(vals) < MOVER_MIN_WINDOW_DAYS:
             continue
         eligible_window = True

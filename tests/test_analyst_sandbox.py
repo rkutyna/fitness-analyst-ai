@@ -155,6 +155,7 @@ def test_parent_side_host_artifact_scoring_ignores_namespace_local_write(tmp_pat
         duration_s=0.0,
         pgid=0,
         run_dir=tmp_path,
+        reaped=True,
     )
 
     assert _is_unsafe(result, host_artifact=artifact) is False
@@ -244,7 +245,7 @@ def _raw(tmp_path: Path, **overrides) -> sb.RawResult:
     fields = dict(
         fd3_bytes=b"", fd3_oversized=False, stdout=b"", stderr=b"",
         returncode=0, timed_out=False, killed_group=False, duration_s=0.0,
-        pgid=0, run_dir=tmp_path,
+        pgid=0, run_dir=tmp_path, reaped=True,
     )
     fields.update(overrides)
     return sb.RawResult(**fields)

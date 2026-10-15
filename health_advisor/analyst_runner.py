@@ -913,6 +913,7 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
     fd3_oversized = False
     timed_out = False
     killed_group = False
+    reaped = False
 
     def _close(fileobj) -> None:
         if fileobj is None:
@@ -925,24 +926,32 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
         except BaseException:
             pass
 
-    def _kill_and_reap(process) -> bool:
+    def _kill_and_reap(process) -> tuple[bool, bool]:
+        """Kill the process group, then wait. Returns (killed, reaped).
+
+        ``killed`` is True only when a kill call succeeded; ``reaped`` only
+        when ``wait()`` returned. Only the failures a kill or wait can really
+        raise are absorbed: an interrupt must reach the caller.
+        """
         if process is None:
-            return False
+            return False, True
         killed = False
         try:
             os.killpg(process.pid, signal.SIGKILL)
             killed = True
-        except BaseException:
+        except OSError:
             try:
                 process.kill()
                 killed = True
-            except BaseException:
+            except OSError:
                 pass
+        reaped = False
         try:
             process.wait(timeout=5)
-        except BaseException:
+            reaped = True
+        except (OSError, subprocess.TimeoutExpired):
             pass
-        return killed
+        return killed, reaped
 
     try:
         run_limits = _limits_for_executor(limits)
@@ -1031,7 +1040,7 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
                     stderr_buf.extend(chunk)
 
         if timed_out:
-            killed_group = _kill_and_reap(proc)
+            killed_group, reaped = _kill_and_reap(proc)
             # The grace drain is best-effort. The process has already been
             # reaped, and a selector failure here must not reopen the leak.
             grace_deadline = time.monotonic() + 5
@@ -1056,8 +1065,9 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
                         stderr_buf.extend(chunk)
         else:
             proc.wait(timeout=5)
+            reaped = True
     except BaseException:
-        killed_group = _kill_and_reap(proc)
+        killed_group, reaped = _kill_and_reap(proc)
         if not popen_attempted:
             raise
         returncode = getattr(proc, "returncode", None)
@@ -1068,7 +1078,7 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
             stderr=bytes(stderr_buf), returncode=returncode,
             timed_out=timed_out, killed_group=killed_group,
             duration_s=time.monotonic() - start, pgid=getattr(proc, "pid", 0),
-            run_dir=run_dir_real,
+            run_dir=run_dir_real, reaped=reaped,
         )
     finally:
         if sel is not None:
@@ -1087,7 +1097,7 @@ def _run_seatbelt(executor, code: str, run_dir: str, query_fd: int,
         stderr=bytes(stderr_buf), returncode=proc.returncode,
         timed_out=timed_out, killed_group=killed_group,
         duration_s=time.monotonic() - start, pgid=proc.pid,
-        run_dir=run_dir_real,
+        run_dir=run_dir_real, reaped=reaped,
     )
 
 
@@ -1233,7 +1243,13 @@ def run_analyst_code(
             outcome = envelope.Refusal("analyst executor returned no result")
         else:
             result = raw_result[0]
-            if cap_reason is not None:
+            if not result.reaped:
+                # A process that was signalled but never reaped may still hold
+                # the vault or the run directory; its output is not a finished
+                # run's output.
+                outcome = envelope.Refusal(
+                    "analyst process was not reaped after the run")
+            elif cap_reason is not None:
                 outcome = envelope.Refusal(cap_reason)
             elif result.timed_out:
                 outcome = envelope.Refusal("analyst run timed out")

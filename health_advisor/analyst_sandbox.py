@@ -161,6 +161,10 @@ class RawResult:
     duration_s: float
     pgid: int
     run_dir: Path
+    # True only when the executor's wait() on the direct child returned. A
+    # killed-but-unreaped process may still hold the vault or the run
+    # directory, so a caller must not treat such a run as finished.
+    reaped: bool
 
     def fd3_as_json(self):
         """Best-effort `json.loads` of the fd-3 payload. A convenience for
@@ -578,6 +582,7 @@ class SeatbeltExecutor:
             duration_s=duration_s,
             pgid=pgid,
             run_dir=run_dir_real,
+            reaped=proc.returncode is not None,
         )
 
 
@@ -798,6 +803,7 @@ class BwrapExecutor:
             duration_s=time.monotonic() - start,
             pgid=proc.pid,
             run_dir=run_dir_real,
+            reaped=proc.returncode is not None,
         )
 
     def run_with_query_channel(
@@ -1029,6 +1035,7 @@ class BwrapExecutor:
             duration_s=duration_s,
             pgid=pgid,
             run_dir=run_dir_real,
+            reaped=proc.returncode is not None,
         )
 
 
@@ -1110,15 +1117,17 @@ class TransientUnitExecutor(BwrapExecutor):
         ]
         return argv
 
-    def _kill_unit(self, unit: str) -> None:
+    def _kill_unit(self, unit: str) -> bool:
+        """Ask systemd to kill the unit; True only if systemctl said it did."""
         try:
-            subprocess.run(
+            done = subprocess.run(
                 [self.SYSTEMCTL, "--user", "kill", "--kill-who=all", unit],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=2, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            return False
+        return done.returncode == 0
 
     def _read_unit_result(self, unit: str) -> str:
         try:
@@ -1144,7 +1153,12 @@ class TransientUnitExecutor(BwrapExecutor):
             )
 
     def _collect_process(self, proc, unit: str, limits: RunLimits,
-                         start: float) -> tuple[bytes, bytes, bool, bool]:
+                         start: float) -> tuple[bytes, bytes, bool, bool, bool]:
+        """Drain the process; returns (stdout, stderr, timed_out, killed, reaped).
+
+        ``killed`` is True only when a kill call actually succeeded, and
+        ``reaped`` only when ``wait()`` returned. Neither is assumed.
+        """
         stdout_buf = bytearray()
         stderr_buf = bytearray()
         sel = selectors.DefaultSelector()
@@ -1159,13 +1173,15 @@ class TransientUnitExecutor(BwrapExecutor):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
-                self._kill_unit(unit)
+                killed = self._kill_unit(unit)
                 if proc.poll() is None:
                     try:
                         proc.kill()
+                        killed = True
                     except ProcessLookupError:
                         pass
-                killed = True
+                    except OSError:
+                        pass
                 break
             for key, _ in sel.select(min(remaining, 0.25)):
                 stream = key.fileobj
@@ -1178,22 +1194,29 @@ class TransientUnitExecutor(BwrapExecutor):
                     stream.close()
                 else:
                     key.data.extend(chunk)
+        reaped = False
         try:
             proc.wait(timeout=5)
+            reaped = True
         except subprocess.TimeoutExpired:
-            self._kill_unit(unit)
+            if self._kill_unit(unit):
+                killed = True
             try:
                 proc.kill()
+                killed = True
+            except OSError:
+                pass
+            try:
                 proc.wait(timeout=5)
+                reaped = True
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            killed = True
         for stream in (proc.stdout, proc.stderr):
             try:
                 stream.close()
             except (AttributeError, OSError):
                 pass
-        return bytes(stdout_buf), bytes(stderr_buf), timed_out, killed
+        return bytes(stdout_buf), bytes(stderr_buf), timed_out, killed, reaped
 
     def run_with_named_query_channel(
             self, code: str, run_dir: str, query_fd: int, *,
@@ -1263,7 +1286,7 @@ class TransientUnitExecutor(BwrapExecutor):
             )
             bridge_thread = threading.Thread(target=_bridge_worker, daemon=True)
             bridge_thread.start()
-            stdout, stderr, timed_out, killed = self._collect_process(
+            stdout, stderr, timed_out, killed, reaped = self._collect_process(
                 proc, unit, limits, start)
             result = self._read_unit_result(unit)
             self._require_ordinary_unit_result(result)
@@ -1280,7 +1303,7 @@ class TransientUnitExecutor(BwrapExecutor):
                 stdout=stdout, stderr=stderr, returncode=proc.returncode,
                 timed_out=timed_out, killed_group=killed,
                 duration_s=time.monotonic() - start, pgid=proc.pid,
-                run_dir=run_dir_real,
+                run_dir=run_dir_real, reaped=reaped,
             )
         except OSError as exc:
             raise TransientUnitError(

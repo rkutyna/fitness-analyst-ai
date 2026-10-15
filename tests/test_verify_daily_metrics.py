@@ -182,19 +182,17 @@ from pathlib import Path  # noqa: E402
 import pytest  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-# D19 step 1. The last commit before the correctness net learned about
+# D19 step 1. The last revision before the correctness net learned about
 # consolidated rows — the "today" that tests 13, 14 and 17 compare against.
-BASELINE_SHA = "2fb6bc0"
+# Vendored under tests/fixtures/ so it is always present. It used to be read
+# from git history, and a checkout without that commit skipped the six cases
+# that need it.
+PRE_D19_BASELINE = REPO / "tests" / "fixtures" / "verify_daily_metrics_pre_d19.py"
 TOTALS_UNIT = "count"
 
 
 def _baseline_source() -> str:
-    proc = subprocess.run(
-        ["git", "show", f"{BASELINE_SHA}:scripts/verify_daily_metrics.py"],
-        cwd=REPO, capture_output=True, text=True)
-    if proc.returncode != 0:
-        pytest.skip(f"pre-D19 script unavailable: {proc.stderr.strip()}")
-    return proc.stdout
+    return PRE_D19_BASELINE.read_text()
 
 
 def _current_source() -> str:

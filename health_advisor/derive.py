@@ -429,9 +429,15 @@ def update_for_days(conn, days) -> int:
                 (m, day),
             ).fetchone()
             # Python owns this decision. A current-stamped row that cannot be
-            # rebuilt is an unsupported claim and must disappear; NULL and
-            # older stamps are historical rows kept for legacy reporting.
-            if row and row["derived_version"] == mx.DERIVED_FORMULA_VERSION:
+            # rebuilt is an unsupported claim and must disappear. So is a row
+            # stamped by an older formula, or not stamped at all, when its
+            # source is still here and the recompute found nothing: the
+            # current rules decline that value, nothing can ever replace it,
+            # and it would be counted stale forever. A non-current row whose
+            # source is gone is the unrecomputable class: historical, kept for
+            # legacy reporting, untouched.
+            if row and (row["derived_version"] == mx.DERIVED_FORMULA_VERSION
+                        or _source_exists_for_metric(conn, m, day)):
                 conn.execute(
                     "DELETE FROM daily_metrics WHERE metric = ? AND date = ?",
                     (m, day),

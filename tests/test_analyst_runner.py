@@ -641,3 +641,43 @@ def test_seatbelt_fd3_limit_is_clamped_to_drain_ceiling(
         effective_limit = max(0, min(configured_limit, ceiling))
         assert result.fd3_oversized is (len(payload) > effective_limit)
         assert result.fd3_bytes == payload[:effective_limit]
+
+
+# --------------------------------------------------------------------------- #
+# The cite-enabled named-socket runner is built by str.replace on a template;
+# a replace whose anchor is gone must fail loudly, not leave it unadapted (#109)
+# --------------------------------------------------------------------------- #
+
+_CITE_ANCHORS = [
+    '_QUERY_SOCKET.connect(_os.environ["ANALYST_QUERY_SOCKET"])\n',
+    "_part = _sock.recv(_remaining)",
+    "class _QueryProxy:\n    def __repr__",
+    "conn = _QueryProxy()",
+]
+
+
+def test_cite_runner_source_applies_every_rewrite_today():
+    source = runner._named_socket_runner_source_with_cite("code.py")
+    assert "conn = _QueryProxy(_QUERY_FD)" in source
+    assert "_QUERY_FD = _QUERY_SOCKET.fileno()" in source
+
+
+@pytest.mark.parametrize("anchor", _CITE_ANCHORS)
+def test_cite_runner_source_refuses_a_template_missing_an_anchor(
+        monkeypatch, anchor):
+    assert runner.NAMED_SOCKET_RUNNER_TEMPLATE.count(anchor) == 1
+    monkeypatch.setattr(
+        runner, "NAMED_SOCKET_RUNNER_TEMPLATE",
+        runner.NAMED_SOCKET_RUNNER_TEMPLATE.replace(anchor, "", 1))
+    with pytest.raises(RuntimeError) as caught:
+        runner._named_socket_runner_source_with_cite("code.py")
+    assert anchor.strip().splitlines()[0][:20] in str(caught.value)
+
+
+def test_cite_runner_source_refuses_an_ambiguous_anchor(monkeypatch):
+    anchor = "conn = _QueryProxy()"
+    monkeypatch.setattr(
+        runner, "NAMED_SOCKET_RUNNER_TEMPLATE",
+        runner.NAMED_SOCKET_RUNNER_TEMPLATE + "\n" + anchor + "\n")
+    with pytest.raises(RuntimeError, match="conn = _QueryProxy"):
+        runner._named_socket_runner_source_with_cite("code.py")

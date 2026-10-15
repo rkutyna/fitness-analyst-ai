@@ -361,24 +361,42 @@ def _named_socket_runner_source(code_path: str) -> str:
     return NAMED_SOCKET_RUNNER_TEMPLATE.replace("__code_path__", repr(code_path))
 
 
+def _replace_once(source: str, anchor: str, replacement: str) -> str:
+    """Replace ``anchor`` in ``source``, which must contain it exactly once.
+
+    A bare ``str.replace`` returns the source unchanged when the anchor has
+    drifted out of the template, which would leave the runner silently
+    unadapted. A missing or ambiguous anchor is a template defect: raise.
+    """
+    found = source.count(anchor)
+    if found != 1:
+        raise RuntimeError(
+            f"named-socket runner template anchor matched {found} times, "
+            f"expected exactly 1: {anchor!r}")
+    return source.replace(anchor, replacement, 1)
+
+
 def _named_socket_runner_source_with_cite(code_path: str) -> str:
     """Adapt the named channel to the fixed anchors only for cite-enabled runs."""
     source = _named_socket_runner_source(code_path)
-    source = source.replace(
+    source = _replace_once(
+        source,
         '_QUERY_SOCKET.connect(_os.environ["ANALYST_QUERY_SOCKET"])\n',
         '_QUERY_SOCKET.connect(_os.environ["ANALYST_QUERY_SOCKET"])\n'
-        '_QUERY_FD = _QUERY_SOCKET.fileno()\n', 1)
-    source = source.replace(
+        '_QUERY_FD = _QUERY_SOCKET.fileno()\n')
+    source = _replace_once(
+        source,
         "_part = _sock.recv(_remaining)",
         "_part = (_sock.recv(_remaining) if hasattr(_sock, 'recv') "
-        "else _os.read(_sock, _remaining))", 1)
-    source = source.replace(
+        "else _os.read(_sock, _remaining))")
+    source = _replace_once(
+        source,
         "class _QueryProxy:\n    def __repr__",
         "class _QueryProxy:\n"
         "    def __init__(self, _fd):\n        del _fd\n\n"
-        "    def __repr__", 1)
-    source = source.replace(
-        "conn = _QueryProxy()", "conn = _QueryProxy(_QUERY_FD)", 1)
+        "    def __repr__")
+    source = _replace_once(
+        source, "conn = _QueryProxy()", "conn = _QueryProxy(_QUERY_FD)")
     return analyst_corpus.child_source_with_cite(source)
 
 

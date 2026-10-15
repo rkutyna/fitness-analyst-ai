@@ -106,16 +106,20 @@ def _starts_on_day(conn: sqlite3.Connection, first: str, as_of: str,
     from . import correlate as C
 
     horizon = (date.fromisoformat(as_of) + timedelta(days=365)).isoformat()
+    # Each surface builds its own probe set on demand: only the requested
+    # surface's set is computed, so asking for readiness never runs the movers
+    # DISTINCT scan.
     needed = {
-        "readiness": {"heart_rate_variability", "resting_heart_rate",
-                       "sleep_asleep"},
-        "training_load": set(A.ACWR_LOAD_METRICS) | {"wear_hours"},
-        "correlate": {m for m in (metric_x, metric_y) if m},
-        "movers": {row[0] for row in conn.execute(
+        "readiness": lambda: {"heart_rate_variability", "resting_heart_rate",
+                              "sleep_asleep"},
+        "training_load": lambda: set(A.ACWR_LOAD_METRICS) | {"wear_hours"},
+        "correlate": lambda: {m for m in (metric_x, metric_y) if m},
+        "movers": lambda: {row[0] for row in conn.execute(
             "SELECT DISTINCT metric FROM daily_metrics WHERE "
-            + mx.current_daily_metrics_predicate(conn) + " AND date <= ?", (as_of,)
+            + mx.current_daily_metrics_predicate(conn) + " AND date <= ?",
+            (as_of,)
         )},
-    }[surface]
+    }[surface]()
     probe = _probe(conn, as_of, horizon, needed)
     try:
         for day_number in range(1, 366):

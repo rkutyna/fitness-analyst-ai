@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from health_advisor import hk_parse, receiver, vault as vault_mod
+from tests.conftest import INGEST_HEADERS, INGEST_TEST_SECRET
 
 
 DEVICE = {"id": "synthetic-device", "name": "synthetic-phone",
@@ -52,8 +53,8 @@ def _payload(*, batch_id="synthetic-batch", workouts=None, **sections):
 
 
 def _client(vault, monkeypatch):
-    monkeypatch.setattr(receiver, "SHARED_SECRET", "")
-    return TestClient(receiver.create_app(vault))
+    monkeypatch.setattr(receiver, "SHARED_SECRET", INGEST_TEST_SECRET)
+    return TestClient(receiver.create_app(vault), headers=INGEST_HEADERS)
 
 
 def _stored_dob(vault):

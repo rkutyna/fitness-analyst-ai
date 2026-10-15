@@ -2579,6 +2579,18 @@ def get_ingest_diagnostics(ctx: VaultContext, metric: str, start: str,
     }
 
 
+def _convert_spread(value, unit, unit_system):
+    """A spread or difference (sd, minimum detectable change) in the declared
+    system. A difference of two temperatures scales but takes no offset, so it
+    is the conversion of the value minus the conversion of zero, using the one
+    conversion table rather than a second set of factors."""
+    if value is None:
+        return None
+    shifted = V.convert_for_unit_system(value, unit, unit_system)[0]
+    origin = V.convert_for_unit_system(0.0, unit, unit_system)[0]
+    return _r(shifted - origin)
+
+
 @tool
 def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> dict:
     """Weekly means of a metric, each with its day count and its noise floor.
@@ -2629,6 +2641,7 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
     """
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
+    unit_system = ctx.settings()["unit_system"]
     conn = ctx.read_only()
     try:
         if not A.mx.metric_exists(conn, metric):
@@ -2637,6 +2650,26 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
         floor = A.metric_noise_floor(conn, metric, end)
     finally:
         conn.close()
+    # The same presentation boundary get_daily_series applies: storage stays in
+    # canonical units, a vault that declared the metric system is shown the
+    # metric twin, and the presentation leaf below renders the converted value.
+    # The noise floor is a spread in the metric's own unit, so it travels with
+    # the mean it is compared against.
+    if weeks:
+        stored_unit = weeks[0]["unit"]
+        for row in weeks:
+            row["mean"] = _r(V.convert_for_unit_system(
+                row["mean"], stored_unit, unit_system)[0])
+            if "total" in row:
+                row["total"] = _r(V.convert_for_unit_system(
+                    row["total"], stored_unit, unit_system)[0])
+            for spread in ("sd_day", "mdc95"):
+                row[spread] = _convert_spread(
+                    row[spread], stored_unit, unit_system)
+            row["unit"] = V.convert_for_unit_system(
+                None, stored_unit, unit_system)[1]
+        floor = {**floor, "sd_day": _convert_spread(
+            floor.get("sd_day"), stored_unit, unit_system)}
     statuses = {row["verification_status"] for row in weeks}
     if not statuses or statuses == {A.mx.VERIFIED_STATUS}:
         status = A.mx.VERIFIED_STATUS

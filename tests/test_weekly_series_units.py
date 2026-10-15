@@ -137,3 +137,46 @@ def test_unitless_metric_is_identical_under_a_metric_declaration(tmp_path):
     a = build("imperial")["get_weekly_series"]("step_count", START.isoformat(), end)
     b = build("metric")["get_weekly_series"]("step_count", START.isoformat(), end)
     assert a == b
+
+
+# The field of a weekly row that carries the same figure the daily-series
+# tool's weekly downsample reports for that week, keyed by the metric's reducer.
+_AGG_FIELD = {"sum": "total", "last": "latest", "mean": "mean"}
+
+
+@pytest.mark.parametrize("system", ["imperial", "metric"])
+@pytest.mark.parametrize("metric", sorted(SERIES))
+def test_weekly_rows_name_the_reducer_and_carry_the_downsampled_figure(
+        tmp_path, monkeypatch, metric, system):
+    tools = _vault(tmp_path / f"{system}.db", system)
+    end = (START + timedelta(days=DAYS - 1)).isoformat()
+    # Force the daily-series tool onto its weekly downsample for this range.
+    monkeypatch.setattr(S, "MAX_SERIES_POINTS", 7)
+    daily = tools["get_daily_series"](metric, START.isoformat(), end)
+    weekly = _weekly(tools, metric)
+    assert daily["downsampled"] is True
+    assert len(daily["points"]) == len(weekly["weeks"]) == 6
+    expected_agg = SERIES[metric][1].replace("avg", "mean")
+    for point, row in zip(daily["points"], weekly["weeks"]):
+        assert row["agg"] == daily["downsample_agg"] == expected_agg
+        assert row["week_start"] == point["date"]
+        assert row["n_days"] == point["days"]
+        # In stored units the two figures are equal. A metric vault converts
+        # the weekly figure after it is rounded to 0.01 and the downsample
+        # before, so the two may differ by that one rounding step.
+        tolerance = 1e-9 if system == "imperial" else 0.0101
+        assert row[_AGG_FIELD[row["agg"]]] == pytest.approx(
+            point["value"], abs=tolerance)
+        # The weekly mean is kept for every metric, whatever its reducer.
+        assert "mean" in row
+        # A figure that does not describe this metric is not published.
+        for field in set(_AGG_FIELD.values()) - {"mean", _AGG_FIELD[row["agg"]]}:
+            assert field not in row
+
+
+def test_the_weekly_latest_is_the_weeks_final_reading_not_its_mean(tmp_path):
+    tools = _vault(tmp_path / "i.db", "imperial")
+    row = _weekly(tools, "body_mass")["weeks"][0]
+    stored = [_value(list(SERIES).index("body_mass"), i) for i in range(7)]
+    assert row["latest"] == pytest.approx(stored[-1], abs=0.006)
+    assert row["latest"] != row["mean"]

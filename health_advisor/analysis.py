@@ -490,8 +490,17 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
     saying which they had. `mdc95` is the smallest week-to-week change that is
     not noise — quote a delta smaller than it as movement and you are reading
     the instrument, not the athlete.
+
+    `mean` is kept for every metric, and every row also names the metric's own
+    reducer in `agg` ("sum", "last" or "mean") and carries the week's figure
+    under that reducer: `total` for a cumulative metric, `latest` (the week's
+    final reading) for a last-value metric. Those are the same numbers the
+    daily-series tool's weekly downsample (`mx.downsample_weekly`) reports for
+    the same Monday week, so the two tools no longer disagree about a week of
+    steps or body mass.
     """
     floor = metric_noise_floor(conn, metric, end)
+    reducer = mx.agg(metric)
     rows = mx.series_rows(conn, metric, start, end)
     unit = rows[0]["unit"] if rows else mx.nz.canonical_unit(metric, None)
     # `series_rows` orders by date, so these are the first/last dates the
@@ -539,6 +548,7 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
             "period": f"{period_start}:{period_end}",
             "partial": span_days < 7,
             "mean": mx.r(statistics.fmean(vs), 2),
+            "agg": reducer,
             "n_days": len(vs),
             "unit": unit,
             "verification_status": status,
@@ -547,8 +557,12 @@ def weekly_series(conn, metric: str, start: str, end: str) -> list[dict]:
             "mdc95": (mx.r(mdc95(floor["sd_day"], floor["rho"], len(vs)), 2)
                       if floor["sd_day"] is not None else None),
         }
-        if mx.agg(metric) == "sum" or metric in {"jog_minutes", "longest_block_min"}:
+        if reducer == "sum" or metric in {"jog_minutes", "longest_block_min"}:
             row["total"] = mx.r(sum(vs), 2)
+        elif reducer == "last":
+            # `series_rows` orders by date, so the last entry is the week's
+            # final reading — what the weekly downsample reports for it.
+            row["latest"] = mx.r(vs[-1], 2)
         out.append(row)
     return out
 

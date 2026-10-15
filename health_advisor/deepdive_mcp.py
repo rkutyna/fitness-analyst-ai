@@ -19,6 +19,7 @@ import hashlib
 import inspect
 import json
 import os
+import threading
 from datetime import date, timedelta
 
 from mcp.server.fastmcp import FastMCP
@@ -40,6 +41,9 @@ class _CallLedger:
         self.path = os.fspath(path)
         self.window_override = self._read_window_override()
         self._next_sequence = self._read_next_sequence()
+        # Held across sequence assignment and the write, so records land in
+        # sequence order and one append is never interleaved with another.
+        self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
 
     def _read_window_override(self):
@@ -92,10 +96,9 @@ class _CallLedger:
 
     def append(self, tool_name: str, arguments: dict, result,
                *, window_override: dict | None = None) -> int:
-        sequence = self._next_sequence
         result_value, result_elided, result_bytes = self._result_value(result)
         entry = {
-            "sequence": sequence,
+            "sequence": None,
             "tool_name": tool_name,
             "arguments": self._json_value(arguments),
             "result": result_value,
@@ -104,12 +107,26 @@ class _CallLedger:
         }
         if window_override is not None:
             entry["window_override"] = self._json_value(window_override)
-        with open(self.path, "a", encoding="utf-8") as fh:
-            json.dump(entry, fh, sort_keys=True, separators=(",", ":"))
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        self._next_sequence += 1
+        with self._lock:
+            sequence = self._next_sequence
+            entry["sequence"] = sequence
+            # One complete line, serialised in memory and handed to the kernel
+            # in a single write on an O_APPEND descriptor: a reader opening the
+            # file concurrently sees the line whole or not at all. The reader
+            # discards the entire ledger on one undecodable line, so a visible
+            # half-line would blank every citation of the turn.
+            line = (json.dumps(entry, sort_keys=True, separators=(",", ":"))
+                    + "\n").encode("utf-8")
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                         0o666)
+            try:
+                view = memoryview(line)
+                while view:  # a short write is retried with the remainder
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            self._next_sequence += 1
         return sequence
 
 

@@ -146,3 +146,84 @@ def test_claim_period_spans_the_last_bucket_by_measured_spacing():
 def test_claim_period_with_one_bucket_uses_the_payloads_own_end():
     """Spacing is unknowable from a single start; the payload's end is honest."""
     assert _vocab("2026-06-29", "2026-07-05", ["2026-06-29"]) == "2026-06-29:2026-07-05"
+
+
+# --- Atomic line writes (#103) ----------------------------------------------
+#
+# The ledger's reader treats one undecodable line as "the whole file is
+# unreadable", so a reader that catches the file mid-append would blank every
+# citation. The writer therefore hands the kernel one complete line in a single
+# write, under the ledger's lock.
+
+
+def test_each_record_reaches_the_file_in_exactly_one_write(tmp_path, monkeypatch):
+    """The record is one complete newline-terminated line in one os.write."""
+    import os as _os
+
+    writes = []
+    real_write = _os.write
+
+    def spy(fd, data):
+        writes.append(bytes(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(D.os, "write", spy)
+    ledger = D._CallLedger(str(tmp_path / "ledger.jsonl"))
+
+    # Larger than any stdio buffer, so a buffered json.dump would split it.
+    ledger.append("big", {"n": 1}, {"text": "x" * 100_000})
+    ledger.append("small", {}, {"ok": True})
+
+    assert len(writes) == 2
+    for data in writes:
+        assert data.endswith(b"\n") and data.count(b"\n") == 1
+        json.loads(data)
+    assert b"".join(writes) == (tmp_path / "ledger.jsonl").read_bytes()
+
+
+def test_a_concurrent_reader_never_sees_a_partial_line(tmp_path):
+    """Hammer the writer from threads while a reader parses every snapshot."""
+    import threading
+
+    path = tmp_path / "ledger.jsonl"
+    ledger = D._CallLedger(str(path))
+    per_thread, n_threads = 25, 4
+    done = threading.Event()
+    problems = []
+
+    def reader():
+        while not done.is_set():
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            if not data:
+                continue
+            if not data.endswith(b"\n"):
+                problems.append("partial tail")
+                return
+            try:
+                for line in data.splitlines():
+                    json.loads(line)
+            except ValueError:
+                problems.append("undecodable line")
+                return
+
+    def writer(i):
+        for j in range(per_thread):
+            ledger.append("t", {"i": i, "j": j}, {"text": "y" * 60_000})
+
+    watcher = threading.Thread(target=reader)
+    watcher.start()
+    workers = [threading.Thread(target=writer, args=(i,))
+               for i in range(n_threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    done.set()
+    watcher.join()
+
+    assert problems == []
+    sequences = [r["sequence"] for r in _ledger_records(path)]
+    assert sequences == list(range(1, per_thread * n_threads + 1))

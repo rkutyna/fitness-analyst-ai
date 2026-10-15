@@ -2484,9 +2484,12 @@ def _ledger_index_leaf(entry: dict) -> str:
 def _ledger_index_text(ledger_path) -> str:
     """Index every ledger record written so far. "" when there is nothing yet.
 
-    Never raises: an unreadable or half-written ledger yields the records it
-    could parse, and the loop simply appends no index rather than losing the
-    conversation to a file error.
+    Follows the verifier's rule (``chat._read_ledger``): the index lists records
+    only if the WHOLE file decodes. One undecodable line (a torn tail, a
+    corrupt record) yields no index and one log line, because the verifier then
+    accepts no citation at all and an index of the surviving records would
+    invite the model to cite what will be refused. Never raises: an unreadable
+    ledger yields no index rather than losing the conversation to a file error.
     """
     from .deepdive_verify import _ledger_scopes
 
@@ -2498,11 +2501,21 @@ def _ledger_index_text(ledger_path) -> str:
                     continue
                 try:
                     record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except ValueError as exc:  # JSONDecodeError, UnicodeDecodeError
+                    _announce("ledger_index_undecodable",
+                              f"{type(exc).__name__}: {exc}; the index is empty "
+                              "because the verifier reads no records from a "
+                              "ledger with an undecodable line")
+                    return ""
                 if isinstance(record, dict):
                     records.append(record)
-    except OSError:
+    except FileNotFoundError:
+        return ""
+    except ValueError as exc:  # a whole-file decode failure raised by the read
+        _announce("ledger_index_undecodable", f"{type(exc).__name__}: {exc}")
+        return ""
+    except OSError as exc:
+        _announce("ledger_index_unreadable", f"{type(exc).__name__}: {exc}")
         return ""
     if not records:
         return ""

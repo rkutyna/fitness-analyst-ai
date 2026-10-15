@@ -573,6 +573,12 @@ def session_hr_scopes(conn, start_utc: str, end_utc: str,
     return out
 
 
+def check_impact_volume_by(by: str) -> None:
+    """Refuse a grouping ``impact_volume`` cannot produce, before any scan."""
+    if by not in ("week", "day"):
+        raise ValueError("by must be 'week' or 'day'")
+
+
 def impact_volume(conn, start: str, end: str, by: str = "week", *,
                   metric_units: bool = False,
                   bucket_rows: list[dict] | None = None) -> list[dict]:
@@ -588,8 +594,7 @@ def impact_volume(conn, start: str, end: str, by: str = "week", *,
     ``start``..``end`` window pass the result in; it is read, never changed.
     Left out, the buckets are classified here.
     """
-    if by not in ("week", "day"):
-        raise ValueError("by must be 'week' or 'day'")
+    check_impact_volume_by(by)
     bucket_min = IMPACT_BUCKET_SECONDS / 60.0
     if bucket_rows is None:
         bucket_rows = mx.impact_bucket_rows(

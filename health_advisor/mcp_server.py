@@ -1691,6 +1691,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                     "reason": "window_after_as_of"}
 
         effective_end = min(date.fromisoformat(end), as_of_date).isoformat()
+        A.check_impact_volume_by(by)
         # One classification of the window feeds both the period rows and the
         # cadence-sensitivity table, so they cannot disagree and the vault's
         # raw samples are bucketed once.

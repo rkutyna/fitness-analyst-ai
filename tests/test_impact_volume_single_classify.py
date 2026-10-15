@@ -144,3 +144,12 @@ def test_published_payload_matches_two_independent_classifications(vault, by):
         start: published[start] for start in (r["period_start"] for r in rows)}
     assert _dump(out["jog_threshold_sensitivity"]) == _dump(sens["sensitivity"])
     assert _dump(out["jog_near_threshold"]) == _dump(sens["near"])
+
+
+def test_bad_grouping_is_refused_before_any_scan(vault, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mx, "impact_bucket_rows",
+                        lambda *a, **k: calls.append(a) or [])
+    out = vault.tools.get_impact_volume(start=DAYS[0], end=DAYS[2], by="month")
+    assert out == {"error": "by must be 'week' or 'day'"}
+    assert calls == []

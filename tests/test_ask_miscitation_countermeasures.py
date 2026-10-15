@@ -263,6 +263,56 @@ def test_an_unreadable_or_empty_ledger_yields_no_index_and_no_raise(tmp_path):
     assert llm._ledger_index_text(empty) == ""
 
 
+def test_the_index_is_empty_when_any_line_fails_to_decode_as_the_verifier_is(
+        tmp_path, capsys):
+    """#102(d): the index and the verifier must agree about what the ledger holds.
+
+    ``chat._read_ledger`` returns nothing for a file with one undecodable line,
+    so every citation is refused; an index that still listed the good records
+    would invite the model to cite what the verifier will not accept.
+    """
+    from health_advisor import chat
+
+    path = tmp_path / "ledger.jsonl"
+    _write_ledger(path, _MISCITED_LEDGER[:1])
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write('{"sequence": 3, "tool_name": "get_metric_su')  # torn tail
+    assert chat._read_ledger(str(path)) == []
+
+    assert llm._ledger_index_text(str(path)) == ""
+    assert capsys.readouterr().err.count("ledger_index_undecodable") == 1
+
+
+def test_a_bad_line_in_the_middle_also_empties_the_index(tmp_path):
+    from health_advisor import chat
+
+    path = tmp_path / "ledger.jsonl"
+    good = [json.dumps(r, sort_keys=True) for r in _MISCITED_LEDGER[:2]]
+    path.write_text("\n".join([good[0], "not json", good[1]]) + "\n",
+                    encoding="utf-8")
+    assert chat._read_ledger(str(path)) == []
+    assert llm._ledger_index_text(str(path)) == ""
+
+
+def test_an_undecodable_byte_sequence_empties_the_index_and_does_not_raise(
+        tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    path.write_bytes(b"\xff\xfe not utf-8\n")
+    assert llm._ledger_index_text(str(path)) == ""
+
+
+def test_a_permission_error_logs_and_yields_no_index(tmp_path, monkeypatch,
+                                                      capsys):
+    path = _write_ledger(tmp_path / "ledger.jsonl", _MISCITED_LEDGER)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(llm, "open", refuse, raising=False)
+    assert llm._ledger_index_text(path) == ""
+    assert capsys.readouterr().err.count("ledger_index_unreadable") == 1
+
+
 def test_the_index_message_is_appended_only_when_the_flag_is_on(openrouter,
                                                                 monkeypatch,
                                                                 vault, tmp_path):

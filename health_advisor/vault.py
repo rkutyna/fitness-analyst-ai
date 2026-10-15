@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import db
+from . import hr_zones
 from . import metrics
 
 
@@ -521,6 +522,35 @@ def set_block_qualify_hr_max(
     conn.execute(
         "INSERT INTO vault_meta (key, value) VALUES ('block_qualify_hr_max', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(ceiling),))
+
+
+def date_of_birth(conn: sqlite3.Connection) -> date | None:
+    """The vault's declared birth date, or ``None`` if it has not been stated.
+
+    Read by the zone arithmetic only. Never log or return it in a response.
+    """
+    value = _vault_meta_value(conn, "date_of_birth")
+    return date.fromisoformat(value) if value is not None else None
+
+
+def set_date_of_birth(conn: sqlite3.Connection, value: date | None) -> None:
+    """Declare (or clear) the vault's birth date. Caller owns the transaction.
+
+    Refused, and nothing written, unless the date is not in the future relative
+    to the vault's own local today and gives an age from 10 to 100 (see
+    :func:`hr_zones.check_date_of_birth`). The refusal message names the rule,
+    never the value.
+    """
+    if value is None:
+        conn.execute("DELETE FROM vault_meta WHERE key = 'date_of_birth'")
+        return
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise ValueError("date of birth must be a date or None")
+    hr_zones.check_date_of_birth(value, on=local_today(conn))
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('date_of_birth', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (value.isoformat(),))
 
 
 def units(conn: sqlite3.Connection) -> dict[str, str] | None:

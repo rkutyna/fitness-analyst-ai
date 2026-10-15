@@ -317,6 +317,24 @@ def _tombstoned_samples(conn, keys) -> set[tuple[str, str, str]]:
             [part for key in chunk for part in key]))
     return found
 
+
+def _tombstoned_route_uuids(conn, uuids) -> set[str]:
+    """Which route UUIDs carry a tombstone from ANY device.
+
+    A route's own device is not known, so the lookup is on ``hk_uuid`` alone,
+    as it always was; this asks about a whole batch of routes in one statement
+    per ``TOMBSTONE_LOOKUP_CHUNK`` instead of one table scan per route.
+    """
+    pending = sorted({uuid for uuid in uuids if uuid is not None})
+    found: set[str] = set()
+    for i in range(0, len(pending), TOMBSTONE_LOOKUP_CHUNK):
+        chunk = pending[i:i + TOMBSTONE_LOOKUP_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        found.update(row[0] for row in conn.execute(
+            f"SELECT hk_uuid FROM hk_deletions WHERE hk_uuid IN ({marks})",
+            chunk))
+    return found
+
 # How far back a consolidated daily total may describe, measured from the day
 # it was pulled (health_advisor#220: "do not let the re-pull become a
 # backfill"). The lag is `db.daily_total_lag_days` — the queried_at local date
@@ -1290,14 +1308,13 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # as well as routes in this batch, all inside the batch transaction.
             db.attach_unmatched_workout_routes(conn)
             route_rows = []
+            tombstoned_routes = _tombstoned_route_uuids(conn, (
+                route["hk_route_uuid"] for route in parsed["workout_routes"]
+                if route["n_points"] != 0))
             for route in parsed["workout_routes"]:
                 if route["n_points"] == 0:
                     continue
-                tombstone = conn.execute(
-                    "SELECT 1 FROM hk_deletions WHERE hk_uuid = ?",
-                    (route["hk_route_uuid"],),
-                ).fetchone()
-                if tombstone is None:
+                if route["hk_route_uuid"] not in tombstoned_routes:
                     route_rows.append(route)
             routes_added = db.insert_workout_routes(conn, route_rows)
             db.attach_unmatched_workout_routes(conn)

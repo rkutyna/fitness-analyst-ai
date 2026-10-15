@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
             dbmod.init_db(conn)
         existing = conn.execute(
             "SELECT COUNT(*) FROM metric_source_months").fetchone()[0] \
-            if _has_table(conn) else 0
+            if dbmod.has_table(conn, "metric_source_months") else 0
 
         started = time.perf_counter()
         rows = conn.execute(
@@ -65,12 +65,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         conn.close()
-
-
-def _has_table(conn) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' "
-        "AND name='metric_source_months'").fetchone() is not None
 
 
 if __name__ == "__main__":

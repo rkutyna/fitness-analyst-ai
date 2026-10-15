@@ -3644,14 +3644,6 @@ def _answer_question_inner(ctx: VaultContext, question: str, *,
                 pass
 
 
-def _has_table(conn, table_name: str) -> bool:
-    """Return whether a conversation table exists, without migrating the vault."""
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone() is not None
-
-
 def create_conversation(ctx: VaultContext, *, conversation_id: str | None = None) -> dict[str, str]:
     """Create and persist one empty conversation in ``ctx``'s vault."""
     conversation_id = conversation_id or uuid.uuid4().hex
@@ -3802,7 +3794,7 @@ def _append_turn_locked(
         raise ValueError("mode is only valid for assistant turns")
     if mode is not None and mode not in {"narration", "fallback", "status"}:
         raise ValueError("mode must be narration, fallback or status")
-    if not _has_table(conn, "conversations") or not _has_table(
+    if not db.has_table(conn, "conversations") or not db.has_table(
         conn, "conversation_turns"
     ):
         raise KeyError(f"unknown conversation: {conversation_id}")
@@ -3907,7 +3899,7 @@ def list_turns(ctx: VaultContext, conversation_id: str) -> list[dict[str, Any]]:
     """Read all turns in sequence order; the original rows are returned."""
     conn = ctx.read_only()
     try:
-        if not _has_table(conn, "conversation_turns"):
+        if not db.has_table(conn, "conversation_turns"):
             return []
         return _turn_rows(conn, conversation_id)
     finally:
@@ -3921,7 +3913,7 @@ def list_recent_turns(
     limit = max(1, min(100, limit))
     conn = ctx.read_only()
     try:
-        if not _has_table(conn, "conversation_turns"):
+        if not db.has_table(conn, "conversation_turns"):
             return []
 
         # Keep the read compatible with vaults from before each additive turn
@@ -4012,7 +4004,7 @@ def get_undelivered_turn(
     """
     conn = ctx.read_only()
     try:
-        if not _has_table(conn, "conversation_turns"):
+        if not db.has_table(conn, "conversation_turns"):
             return None
         columns = {row["name"] for row in conn.execute(
             "PRAGMA table_info(conversation_turns)")}
@@ -4070,7 +4062,7 @@ def get_conversation(ctx: VaultContext, conversation_id: str) -> dict[str, Any] 
     """Return one conversation with its ordered turns, or ``None``."""
     conn = ctx.read_only()
     try:
-        if not _has_table(conn, "conversations"):
+        if not db.has_table(conn, "conversations"):
             return None
         row = conn.execute(
             "SELECT id, created_at, updated_at FROM conversations WHERE id = ?",
@@ -4079,7 +4071,7 @@ def get_conversation(ctx: VaultContext, conversation_id: str) -> dict[str, Any] 
         if row is None:
             return None
         conversation = dict(row)
-        if _has_table(conn, "conversation_turns"):
+        if db.has_table(conn, "conversation_turns"):
             conversation["turns"] = _turn_rows(conn, conversation_id)
         else:
             conversation["turns"] = []
@@ -4246,7 +4238,7 @@ def list_conversations(ctx: VaultContext) -> list[dict[str, str]]:
     """Return this vault's conversation identities in creation order."""
     conn = ctx.read_only()
     try:
-        if not _has_table(conn, "conversations"):
+        if not db.has_table(conn, "conversations"):
             return []
         return [dict(row) for row in conn.execute(
             "SELECT id, created_at, updated_at FROM conversations "

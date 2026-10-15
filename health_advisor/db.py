@@ -2333,10 +2333,21 @@ def _recompute_core(
     return written
 
 
-def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+def has_table(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether ``name`` exists as a table in this database."""
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
         (name,)).fetchone() is not None
+
+
+def has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Whether ``table.column`` exists.
+
+    Reads PRAGMA table_info column 1 by position, so it holds whether or not
+    the caller set ``row_factory``.
+    """
+    return any(row[1] == column
+               for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
 def apply_consolidated_totals(
@@ -2369,7 +2380,7 @@ def apply_consolidated_totals(
     existence the way `_arbitration` guards on `workouts`, so a database that
     predates D19 still works.
     """
-    if not _has_table(conn, "hk_daily_totals"):
+    if not has_table(conn, "hk_daily_totals"):
         return 0
     # `pairs` is filtered in Python rather than bound into an IN list: it is
     # caller-sized (an ingest batch's whole affected set) and SQLite's bind limit
@@ -2448,7 +2459,7 @@ def daily_total_revision_report(conn: sqlite3.Connection) -> dict:
 
     Read-only; one scan of a table that holds a few rows per metric per day.
     """
-    if not _has_table(conn, "hk_daily_total_revisions"):
+    if not has_table(conn, "hk_daily_total_revisions"):
         return {"metrics": {}}
     metrics: dict[str, dict] = {}
     rows = conn.execute(

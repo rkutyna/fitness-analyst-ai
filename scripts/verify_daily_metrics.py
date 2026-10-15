@@ -91,22 +91,8 @@ CONSOLIDATED = "apple_consolidated"
 # `hk_daily_totals`; check 6 exists precisely to catch that table being empty.
 
 
-def _has_table(conn, name: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (name,)).fetchone() is not None
-
-
-def _has_column(conn, table: str, column: str) -> bool:
-    """Whether `table.column` exists. `main` opens the database read-only and
-    never calls `init_db`, so a pre-D19 vault genuinely lacks these — detect, do
-    not assume. Same probe `_apply_column_migrations` uses at `db.py:161`, and
-    indexed the same way: a PRAGMA row is a plain tuple unless the caller set
-    `row_factory`, so take column 1 by position rather than by name."""
-    return any(row[1] == column
-               for row in conn.execute(f"PRAGMA table_info({table})"))
-
-
+# `main` opens the database read-only and never calls init_db, so a pre-D19
+# vault genuinely lacks these columns and tables: detect, do not assume.
 def d19_storage_present(conn) -> bool:
     """Whether this database knows about consolidated totals at all.
 
@@ -115,7 +101,7 @@ def d19_storage_present(conn) -> bool:
     lost `hk_daily_totals` is not a pre-D19 database — it is a post-D19 database
     missing its totals, which is a discrepancy (check 5), not a reason to skip.
     """
-    return _has_column(conn, "daily_metrics", "source_kind")
+    return dbmod.has_column(conn, "daily_metrics", "source_kind")
 
 
 def _comparison_rows(conn, holes: str, kind: str) -> list[dict]:
@@ -150,7 +136,7 @@ def historical_minmax_count(conn, minmax_from: str | None) -> int:
         return 0
     holes = ",".join("?" * len(DERIVED_METRICS))
     kind = ("COALESCE(d.source_kind, 'records')"
-            if _has_column(conn, "daily_metrics", "source_kind") else "'records'")
+            if dbmod.has_column(conn, "daily_metrics", "source_kind") else "'records'")
     return sum(
         row["date"] < minmax_from
         and row["r_metric"] is not None
@@ -184,7 +170,7 @@ def diffs(conn, minmax_from: str | None = None) -> list[dict]:
     # the literal every row would have had. The predicate then reduces to the
     # pre-D19 one term for term.
     kind = ("COALESCE(d.source_kind, 'records')"
-            if _has_column(conn, "daily_metrics", "source_kind") else "'records'")
+            if dbmod.has_column(conn, "daily_metrics", "source_kind") else "'records'")
     conn.execute("""
         CREATE TEMP TABLE rebuilt AS
         SELECT metric, local_date AS date, COUNT(*) count, SUM(value) sum,
@@ -254,7 +240,7 @@ def diffs(conn, minmax_from: str | None = None) -> list[dict]:
     # Python because their comparison must reuse sums_match(), not SQL ==.
     holes = ",".join("?" * len(DERIVED_METRICS))
     kind = ("COALESCE(d.source_kind, 'records')"
-            if _has_column(conn, "daily_metrics", "source_kind") else "'records'")
+            if dbmod.has_column(conn, "daily_metrics", "source_kind") else "'records'")
     details = _comparison_rows(conn, holes, kind)
     detail_by_key = {(row["metric"], row["date"]): row for row in details}
     out = []
@@ -370,7 +356,7 @@ def consolidated_pairs_checked(conn) -> int:
     pairs = {(r["metric"], r["date"]) for r in conn.execute(
         "SELECT metric, date FROM daily_metrics WHERE source_kind = ?",
         (CONSOLIDATED,))}
-    if _has_table(conn, "hk_daily_totals"):
+    if dbmod.has_table(conn, "hk_daily_totals"):
         pairs |= {(r["metric"], r["local_date"]) for r in conn.execute(
             "SELECT metric, local_date FROM hk_daily_totals")}
     return len(pairs)
@@ -419,7 +405,7 @@ def consolidated_diffs(conn) -> list[dict]:
     if not d19_storage_present(conn):
         return []
     totals = {}
-    if _has_table(conn, "hk_daily_totals"):
+    if dbmod.has_table(conn, "hk_daily_totals"):
         totals = {(r["metric"], r["local_date"]): r for r in conn.execute(
             "SELECT metric, local_date, value, unit FROM hk_daily_totals")}
 
@@ -494,7 +480,7 @@ def _expected_totals_diffs(conn, totals: dict, orphaned: set) -> list[dict]:
         row = conn.execute(
             "SELECT value FROM vault_meta WHERE key = ?",
             (f"daily_totals_expected_from:{metric}",)
-        ).fetchone() if _has_table(conn, "vault_meta") else None
+        ).fetchone() if dbmod.has_table(conn, "vault_meta") else None
         # A metric whose first total has never arrived is not yet expected.
         if row is None:
             continue

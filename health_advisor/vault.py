@@ -152,7 +152,7 @@ def declare_empty_vault(conn: sqlite3.Connection) -> None:
     """
     populated = [
         table for table in _COPY_ORDER
-        if db._has_table(conn, table)
+        if db.has_table(conn, table)
         and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
     ]
     if populated:
@@ -641,7 +641,7 @@ def compacted_sample(conn: sqlite3.Connection,
     also the answer for a UUID it never held at all. The receiver uses this to
     date a deletion whose `records` row is already gone (engine #28).
     """
-    if not db._has_table(conn, "compacted_samples"):
+    if not db.has_table(conn, "compacted_samples"):
         return None
     row = conn.execute(
         "SELECT s.local_day, m.metric FROM compacted_samples s "
@@ -703,7 +703,7 @@ def compact(conn: sqlite3.Connection, *, through: str) -> dict[str, int]:
         )
         return {}
 
-    if not db._has_table(conn, "compacted_samples"):
+    if not db.has_table(conn, "compacted_samples"):
         # A vault migrated before engine #28 lacks the table; schema.sql is
         # the one declaration of it, so migrate rather than repeat the DDL.
         db.init_db(conn)

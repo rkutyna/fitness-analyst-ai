@@ -21,12 +21,6 @@ CONTEXT_STATES = frozenset({"stated", "confirmed"})
 MAX_CONFIRMATION_REQUESTS_PER_CONVERSATION = 1
 
 
-def _has_table(conn: sqlite3.Connection) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_facts'"
-    ).fetchone() is not None
-
-
 def _validate_text(value: str, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -305,7 +299,7 @@ def list_facts(ctx: VaultContext, *, include_history: bool = False) -> list[dict
         return []
     conn = ctx.read_only()
     try:
-        if not _has_table(conn):
+        if not db.has_table(conn, "user_facts"):
             return []
         if not include_history:
             return _current_rows(conn)

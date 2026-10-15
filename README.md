@@ -197,14 +197,17 @@ unconfined.
 ## LLM backends
 
 The LLM layer is pluggable and is the only module that talks to a model. Select a
-backend with `HA_LLM_BACKEND`:
+backend with `HA_LLM_BACKEND`. **There is no default**: if the variable is unset
+the process refuses to start, with a message naming the variable and the accepted
+values (`ollama`, `openai_compatible`, `openrouter`, `codex`). A backend that
+receives your health data is chosen by naming it, never by absence:
 
 | Backend | What it is | Where data goes |
 |---|---|---|
 | `ollama` | Direct `/api/chat` against a local Ollama server | Stays on your machine |
 | `openai_compatible` | Any OpenAI-compatible chat-completions endpoint you name | Wherever you point it, and only hosts you list |
 | `openrouter` | OpenRouter, with the engine's built-in reviewed provider profile | A third party you must explicitly pin |
-| `codex` | A `codex exec` subprocess using ChatGPT auth | A third party |
+| `codex` | A `codex exec` subprocess using ChatGPT auth; chosen only by setting `HA_LLM_BACKEND=codex` | A third party |
 
 The OpenRouter path will not start without an explicit provider pin, with
 OpenRouter's own fallback routing **off**, and it validates the endpoint host

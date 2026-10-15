@@ -135,7 +135,9 @@ a model — at the entry point of every provider-facing process, and again on th
 response.
 
 **1. The backend must be on an allow-list.** `ollama`, `openai_compatible`,
-`openrouter`, and `codex`. Anything else refuses to start. Being on the list
+`openrouter`, and `codex`. Anything else refuses to start, and so does naming
+nothing: an unset `HA_LLM_BACKEND` has no default and is refused with a message
+listing these values. `codex` is available only by naming it. Being on the list
 admits a backend's name only. `openai_compatible` also needs you to state its
 URL, its model and the hosts you approve (`HA_OPENAI_COMPAT_APPROVED_HOSTS`).
 The engine ships no approved host for it, loopback included. `openrouter` names

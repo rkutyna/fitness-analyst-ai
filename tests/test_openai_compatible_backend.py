@@ -416,7 +416,7 @@ def test_compat_hosts_do_not_widen_the_openrouter_profile(monkeypatch):
 
 
 def test_the_profile_is_never_selected_by_absence(monkeypatch):
-    """With no backend named the process is on codex, not on the OpenRouter
-    profile; the profile is reached only by naming it."""
+    """With no backend named the process is on no backend at all, not on the
+    OpenRouter profile; the profile is reached only by naming it (#99)."""
     llm = _llm(monkeypatch)
-    assert llm.BACKEND == "codex"
+    assert llm.BACKEND == ""

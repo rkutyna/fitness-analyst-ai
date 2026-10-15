@@ -63,6 +63,67 @@ def test_codex_is_unaffected(monkeypatch):
          HA_CODEX_BIN="codex-test").assert_backend_approved()
 
 
+def test_unset_backend_is_refused_even_with_codex_on_path(monkeypatch, tmp_path):
+    """#99: no default backend. A codex binary being findable must not make an
+    unset HA_LLM_BACKEND pass the gate."""
+    fake = tmp_path / "codex"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    llm = _llm(monkeypatch)
+    assert llm.BACKEND == ""
+    with pytest.raises(RuntimeError) as err:
+        llm.assert_backend_approved()
+    message = str(err.value)
+    assert "HA_LLM_BACKEND" in message
+    for name in ("ollama", "openrouter", "openai_compatible", "codex"):
+        assert name in message
+
+
+def test_empty_backend_variable_is_refused_like_an_unset_one(monkeypatch):
+    llm = _llm(monkeypatch, HA_LLM_BACKEND="")
+    with pytest.raises(RuntimeError, match="HA_LLM_BACKEND"):
+        llm.assert_backend_approved()
+
+
+def test_unset_backend_complete_returns_empty_without_a_request(monkeypatch):
+    """The per-call paths must not fall through to the Ollama transport."""
+    llm = _llm(monkeypatch)
+
+    def _no_network(*args, **kwargs):
+        raise AssertionError("an unnamed backend reached a transport")
+
+    monkeypatch.setattr(llm.httpx, "Client", _no_network)
+    monkeypatch.setattr(llm, "_codex_exec", _no_network)
+    assert llm.complete("hello") == ""
+    status = llm.last_complete_status()
+    assert status["outcome"] == "backend_error"
+    assert status["request_made"] is False
+    assert "HA_LLM_BACKEND" in status["detail"]
+
+
+def test_unset_backend_loops_refuse_without_a_request(monkeypatch):
+    llm = _llm(monkeypatch)
+
+    def _no_network(*args, **kwargs):
+        raise AssertionError("an unnamed backend reached a transport")
+
+    monkeypatch.setattr(llm.httpx, "Client", _no_network)
+    monkeypatch.setattr(llm, "_codex_exec", _no_network)
+    answer = llm.tool_loop("q", ctx=None, tools=[])
+    assert not answer.text
+    assert llm.last_loop_status()["outcome"] == "unset_not_approved"
+    answer = llm.research_loop("q", ctx=None, extra_tools={}, compact_state=None)
+    assert not answer.text
+    assert llm.last_loop_status()["outcome"] == "unset_not_approved"
+
+
+def test_codex_is_chosen_only_by_naming_it(monkeypatch):
+    """#99 keeps codex approved as an explicit opt-in."""
+    assert "codex" in _llm(monkeypatch, HA_LLM_BACKEND="codex",
+                           HA_CODEX_BIN="codex-test").APPROVED_BACKENDS
+
+
 def test_codex_without_binary_is_refused_at_approval(monkeypatch, tmp_path):
     """No configured or discoverable binary reaches subprocess execution."""
     monkeypatch.setenv("PATH", str(tmp_path))

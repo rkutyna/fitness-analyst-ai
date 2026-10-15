@@ -2,7 +2,10 @@
 The ONLY module that talks to the model. Four backends, selected by
 HA_LLM_BACKEND:
 
-- "codex" (default): GPT via a `codex exec` subprocess (ChatGPT auth). Tool-less
+There is no default backend: an unset HA_LLM_BACKEND refuses at start, and
+every backend below is chosen by naming it (#99).
+
+- "codex" (explicit opt-in only): GPT via a `codex exec` subprocess (ChatGPT auth). Tool-less
   calls run sandboxed read-only with MCP disabled; the researcher paths run a
   single agentic `codex exec` with the curated health-deepdive MCP server.
 - "ollama": the original direct Ollama /api/chat transport (local fallback;
@@ -268,7 +271,11 @@ def _measured_model_call():
     finally:
         _record_model_call(time.monotonic() - started, usage)
 
-BACKEND = os.environ.get("HA_LLM_BACKEND", "codex")
+# #99: there is NO default backend. An unset HA_LLM_BACKEND is the empty string,
+# which assert_backend_approved() refuses with a message naming the variable and
+# the accepted values; a backend that receives health data is chosen by naming
+# it, never by absence. `codex` stays available, but only when named.
+BACKEND = os.environ.get("HA_LLM_BACKEND", "")
 CODEX_MODEL = os.environ.get("HA_CODEX_MODEL", "gpt-5.6-luna")
 CODEX_BIN = os.environ.get("HA_CODEX_BIN") or shutil.which("codex")
 
@@ -421,8 +428,8 @@ APPROVED_BACKENDS = frozenset({"ollama", "openrouter", OPENAI_COMPATIBLE,
 # OPENROUTER_PROVIDER_TAGS is the policy that `HA_LLM_BACKEND=openrouter`
 # opts into: the endpoint host is openrouter.ai, and a provider pin is admitted
 # only if every name in it is in the reviewed per-model table below. The
-# profile is selected by NAMING that backend and never by absence -- the default
-# backend is codex, and an openrouter process still refuses without an explicit
+# profile is selected by NAMING that backend and never by absence -- there is no
+# default backend, and an openrouter process still refuses without an explicit
 # model, pin and reasoning mode. A deployment that wants a different endpoint or
 # policy states it through `openai_compatible` instead of editing this table.
 
@@ -797,8 +804,19 @@ def _assert_openai_compat_configured() -> None:
             "both set but disagree; remove one or make them identical.")
 
 
+def _unset_backend_message() -> str:
+    """The refusal for a process that never named a backend (#99)."""
+    accepted = ", ".join(sorted(APPROVED_BACKENDS))
+    return (
+        "LLM backend is not set: HA_LLM_BACKEND is unset and there is no "
+        f"default. Set HA_LLM_BACKEND to one of: {accepted}. A backend that "
+        "receives health data is chosen by naming it, never by absence.")
+
+
 def assert_backend_approved() -> None:
     """Refuse a provider-facing process whose backend is outside D15's list."""
+    if not BACKEND:
+        raise RuntimeError(_unset_backend_message())
     if BACKEND not in APPROVED_BACKENDS:
         raise RuntimeError(
             f"LLM backend '{BACKEND}' is not approved under D15."
@@ -1573,6 +1591,13 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
     if flow not in ("daily", "plan"):
         raise ValueError(f"unsupported completion flow {flow!r}")
     _begin_complete()
+    if not BACKEND:
+        # No default backend (#99): without this the unnamed process would fall
+        # through every named branch to the Ollama transport below.
+        _set_complete_status(outcome="backend_error", response_received=False,
+                             request_made=False,
+                             detail=_unset_backend_message())
+        return ""
     request_model = OPENROUTER_MODEL if flow == "daily" else _plan_model()
     request_providers = (OPENROUTER_PROVIDERS if flow == "daily"
                          else _plan_providers())
@@ -2526,7 +2551,7 @@ def _openrouter_ready(on_log=None) -> bool:
     try:
         assert_backend_approved()
     except Exception as exc:
-        _announce(f"{BACKEND}_not_approved", str(exc), on_log=on_log)
+        _announce(f"{BACKEND or 'unset'}_not_approved", str(exc), on_log=on_log)
         return False
     if BACKEND == OPENAI_COMPATIBLE:
         # A key is optional here: a local server usually takes none.
@@ -2766,7 +2791,9 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
                       json.dumps(last_codex_status(), sort_keys=True))
         return answer
     openai_dialect = BACKEND in _OPENAI_DIALECT_BACKENDS
-    if openai_dialect and not _openrouter_ready():
+    # An unnamed backend (#99) goes through the same gate so it refuses here
+    # instead of falling through to the Ollama loop.
+    if (openai_dialect or not BACKEND) and not _openrouter_ready():
         return ResearchResponse()
     if analyst_query_fn is None:
         if citation_fn is None:
@@ -3092,7 +3119,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                 sort_keys=True), on_log=on_log)
         return answer
     openai_dialect = BACKEND in _OPENAI_DIALECT_BACKENDS
-    if openai_dialect and not _openrouter_ready(on_log):
+    if (openai_dialect or not BACKEND) and not _openrouter_ready(on_log):
         return ResearchResponse()
     reg = {**_registry(ctx), **extra_tools}
     if openai_dialect:

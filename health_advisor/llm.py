@@ -1624,12 +1624,9 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                 return ""
             # Standard chat-completions fields only: `provider` and
             # `reasoning` are OpenRouter's and go nowhere else (#79).
-            payload = {
-                "model": request_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                **_openai_sampling(options, max_tokens=max_tokens),
-            }
+            payload = _openai_chat_payload(
+                [{"role": "user", "content": prompt}], model=request_model,
+                reasoning_mode=None, options=options, max_tokens=max_tokens)
         else:
             api_key = _openrouter_api_key()
             if not api_key:
@@ -1638,16 +1635,10 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                                      request_made=False,
                                      detail="OPENROUTER_API_KEY is unset")
                 return ""
-            payload = {
-                "model": request_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "reasoning": _openrouter_reasoning_field(openrouter_reasoning),
-                **_openai_sampling(options, max_tokens=max_tokens),
-            }
-            provider = _openrouter_provider(request_providers)
-            if provider:
-                payload["provider"] = provider
+            payload = _openai_chat_payload(
+                [{"role": "user", "content": prompt}], model=request_model,
+                reasoning_mode=openrouter_reasoning, options=options,
+                max_tokens=max_tokens, providers=request_providers)
         call_started = time.monotonic()
         data = {}
         try:
@@ -2547,6 +2538,39 @@ def _openrouter_ready(on_log=None) -> bool:
     return True
 
 
+def _openai_chat_payload(messages: list[dict], *, model: str,
+                         reasoning_mode: str | None, options: dict | None,
+                         max_tokens: int | None, tools=None,
+                         providers: str | None = None) -> dict:
+    """The JSON body of one OpenAI-dialect chat request.
+
+    ``reasoning_mode`` is the stated OpenRouter mode, and ``None`` selects the
+    standard-fields dialect of the bring-your-own endpoint: there ``reasoning``
+    and ``provider`` are OpenRouter's private fields and go nowhere else (#79).
+    ``providers`` is handed to :func:`_openrouter_provider` unchanged (``None``
+    meaning the process pin), and the block is added only when it is non-empty.
+    Key order is part of the wire and is kept: model, messages, stream,
+    reasoning, sampling, tools, tool_choice, provider.
+    """
+    openrouter = reasoning_mode is not None
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if openrouter:
+        payload["reasoning"] = _openrouter_reasoning_field(reasoning_mode)
+    payload.update(_openai_sampling(options, max_tokens=max_tokens))
+    if tools:
+        payload["tools"] = list(tools)
+        payload["tool_choice"] = "auto"
+    if openrouter:
+        provider = _openrouter_provider(providers)
+        if provider:
+            payload["provider"] = provider
+    return payload
+
+
 def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
                      max_tokens: int | None = None):
     """One OpenAI-dialect chat turn. Returns (assistant message, prompt tokens).
@@ -2563,32 +2587,17 @@ def _openrouter_post(messages: list[dict], *, tools, timeout, options=None,
         # completion; the reasoning level itself stays the global knob.
         max_tokens = max_tokens or TOOL_LOOP_MAX_TOKENS
     openrouter = BACKEND != OPENAI_COMPATIBLE
+    wire_messages = _payload_messages(messages)
     if openrouter:
         model, providers = OPENROUTER_MODEL, OPENROUTER_PROVIDERS
-        payload = {
-            "model": model,
-            "messages": _payload_messages(messages),
-            "stream": False,
-            "reasoning": _openrouter_reasoning_field(
-                _openrouter_reasoning_mode()),
-            **_openai_sampling(options, max_tokens=max_tokens),
-        }
+        reasoning_mode = _openrouter_reasoning_mode()
     else:
         # Standard fields only; OpenRouter's go to OpenRouter alone (#79).
         model, providers = OPENAI_COMPAT_MODEL, ""
-        payload = {
-            "model": model,
-            "messages": _payload_messages(messages),
-            "stream": False,
-            **_openai_sampling(options, max_tokens=max_tokens),
-        }
-    if tools:
-        payload["tools"] = list(tools)
-        payload["tool_choice"] = "auto"
-    if openrouter:
-        provider = _openrouter_provider()
-        if provider:
-            payload["provider"] = provider
+        reasoning_mode = None
+    payload = _openai_chat_payload(
+        wire_messages, model=model, reasoning_mode=reasoning_mode,
+        options=options, max_tokens=max_tokens, tools=tools)
     call_started = time.monotonic()
     data = {}
     finish_reason = None

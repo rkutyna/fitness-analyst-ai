@@ -828,6 +828,51 @@ def _trace(event: str, **fields) -> None:
     print(f"ingest-trace {event} {parts}", file=sys.stderr, flush=True)
 
 
+def _reconcile_dates(affected, workout_dates) -> set[str]:
+    """The workout local_dates a batch's heart-rate reconciliation covers.
+
+    Every date the batch touched, plus the day before each date that gained or
+    lost heart-rate samples: a workout is dated by its START, so an evening
+    workout running past midnight owns samples dated the next day.
+    """
+    from datetime import date, timedelta
+
+    days = {day for _, day in affected} | set(workout_dates)
+    for metric, day in affected:
+        if metric == "heart_rate":
+            try:
+                days.add((date.fromisoformat(day) - timedelta(days=1)).isoformat())
+            except (TypeError, ValueError):
+                pass
+    return days
+
+
+def _reconcile_workout_hr(conn, days, source: str) -> int:
+    """Run `db.reconcile_workout_heart_rate` over `days` and commit (#96).
+
+    Called after the batch is durable and its replay key recorded, so it is
+    best-effort by construction: a failure rolls back only the reconciliation,
+    is logged (stderr and `ingest_log` kind `reconcile_hr_error`), and returns
+    0. Raising here would 500 a batch that was in fact applied and make the
+    client re-offer it. The evidence gates are the function's own, unchanged.
+    """
+    try:
+        n = db.reconcile_workout_heart_rate(conn, local_dates=days)
+        conn.commit()
+        return n
+    except Exception as exc:              # noqa: BLE001 - never fail a durable ingest
+        if conn.in_transaction:
+            conn.rollback()
+        logger.warning("workout heart-rate reconciliation failed (%s)",
+                       type(exc).__name__)
+        try:
+            db.log_ingest(conn, source, "reconcile_hr_error", 0, 0,
+                          repr(exc)[:500])
+        except Exception:                  # noqa: BLE001
+            pass
+        return 0
+
+
 def _batch_span(parsed) -> tuple[str | None, str | None, int]:
     """(min local_date, max local_date, n) over all dated batch entries."""
     dates = [r["local_date"] for r in parsed.get("records", []) if r.get("local_date")]
@@ -1477,6 +1522,14 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     derive_conn = ctx.connect()
     try:
         derive_days = {day for _, day in affected} | parsed["workout_dates"]
+        # Workout avg/max HR from the raw samples, where the device summary
+        # contradicts a dense series (#96). Scoped to this batch's dates, and
+        # before derive so everything after it reads the reconciled row.
+        hr_reconciled = _reconcile_workout_hr(
+            derive_conn,
+            _reconcile_dates(affected, parsed["workout_dates"]),
+            "healthkit",
+        )
         derived = derive.update_after_ingest(
             # This positional is derive's `source`, which lands in
             # ingest_log.source — not records.origin either (#133).
@@ -1509,6 +1562,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 f"daily_totals_added={daily_totals_added} "
                 f"daily_totals_skipped_settled={daily_totals_skipped_settled} "
                 f"daily_pairs={dm} derived={derived} "
+                f"hr_reconciled={hr_reconciled} "
                 f"history_imported_through={history or '-'} "
                 + (f"compacted_through={compacted_through} "
                    f"compacted_refused_samples={len(refused_samples)} "

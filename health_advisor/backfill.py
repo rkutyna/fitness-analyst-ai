@@ -258,6 +258,31 @@ def _reattribute_sleep(conn) -> int:
     return len(moves)
 
 
+def _reconcile_workout_hr(conn, span) -> int:
+    """Reconcile workout avg/max HR over the backfilled local_date span; commit.
+
+    The receiver runs `db.reconcile_workout_heart_rate` after every batch; a
+    backfill applies the same rule over the range it wrote (#96). An export.zip
+    workout carries no HR summary, so on first backfill this mostly FILLS a
+    missing figure from the samples; a summary that contradicts a dense series
+    is overruled exactly as at ingest, behind the same evidence gates.
+    Idempotent: a second run changes nothing. A failure is reported and logged,
+    never raised -- every row the backfill wrote is already committed.
+    """
+    if not span:
+        return 0
+    try:
+        n = db.reconcile_workout_heart_rate(conn, since=span[0], until=span[1])
+        conn.commit()
+        return n
+    except Exception as exc:  # noqa: BLE001 - the backfilled rows are durable
+        if conn.in_transaction:
+            conn.rollback()
+        print(f"workout HR reconciliation failed: {exc!r}", file=sys.stderr)
+        db.log_ingest(conn, "backfill", "reconcile_hr_error", 0, 0, repr(exc)[:500])
+        return 0
+
+
 def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
         workouts_only=False) -> dict:
     """workouts_only=True ingests only workouts + workout_events and leaves
@@ -272,6 +297,14 @@ def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
     ev_buf: list[dict] = []
     rec_seen = rec_added = wk_seen = wk_added = ev_seen = ev_added = skipped = 0
     n = 0
+    # The local_date span of the workouts and heart-rate samples this run
+    # backfilled: the range the workout HR reconciliation covers (#96).
+    hr_span: list[str] = []
+
+    def _widen(day):
+        if day:
+            hr_span[:] = [min(hr_span[0], day), max(hr_span[1], day)] \
+                if hr_span else [day, day]
 
     with open_xml(zip_path, xml_path, inner) as stream:
         it = ET.iterparse(stream, events=("start", "end"))
@@ -289,6 +322,9 @@ def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
                 if rows:
                     rec_buf.extend(rows)
                     rec_seen += len(rows)
+                    for row in rows:
+                        if row["metric"] == "heart_rate":
+                            _widen(row["local_date"])
                 else:
                     skipped += 1
                 elem.clear()
@@ -297,6 +333,7 @@ def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
                 if wr:
                     wk_buf.append(wr)
                     wk_seen += 1
+                    _widen(wr["local_date"])
                     evs = list(_event_rows(elem, wr["dedupe_key"]))
                     ev_buf.extend(evs)
                     ev_seen += len(evs)
@@ -346,16 +383,20 @@ def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
         derived = derive.update_after_ingest(conn, derive.all_source_days(conn), "backfill")
         print(f"Derived {derived} sleep-timing/wear rows", file=sys.stderr)
 
+    hr_reconciled = _reconcile_workout_hr(conn, hr_span)
+
     db.log_ingest(conn, "backfill", "records", rec_seen, rec_added,
                   detail=f"workouts_seen={wk_seen} workouts_added={wk_added} "
                          f"workout_events_seen={ev_seen} workout_events_added={ev_added} "
                          f"skipped_records={skipped} daily_metric_rows={dm} "
-                         f"sleep_records_reattributed={sleep_moved}")
+                         f"sleep_records_reattributed={sleep_moved} "
+                         f"workouts_hr_reconciled={hr_reconciled}")
     summary = dict(records_seen=rec_seen, records_added=rec_added,
                    workouts_seen=wk_seen, workouts_added=wk_added,
                    workout_events_seen=ev_seen, workout_events_added=ev_added,
                    skipped_records=skipped, daily_metric_rows=dm,
-                   sleep_records_reattributed=sleep_moved)
+                   sleep_records_reattributed=sleep_moved,
+                   workouts_hr_reconciled=hr_reconciled)
     conn.close()
     return summary
 

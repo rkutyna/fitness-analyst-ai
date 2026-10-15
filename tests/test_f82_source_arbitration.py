@@ -12,6 +12,41 @@ from health_advisor import metrics
 from tests.fixture_loader import load_f82_multi_source
 
 
+def _seed_cadence_where_the_retired_pace_lane_fired(conn, workout):
+    """Give the cadence-blind fixture a step stream, so a jog bucket can exist.
+
+    The fixture has no step_count, and since the one jog rule (#604) only a
+    bucket with a cadence can be a jog bucket, so without this every block
+    figure here reads zero whether or not the rule works. A synthetic 150
+    steps/min sample goes into each bucket of the workout's window that the
+    retired pace lane counted (pace 5-16 min/mi, heart rate not known to be under
+    130), which restores the buckets the block expectations were recorded
+    against. Returns the number of buckets seeded.
+    """
+    seeded = 0
+    for bucket in metrics.bucket_series(
+            conn, workout["start_utc"], workout["end_utc"]):
+        pace, hr = bucket["pace_min_per_mi"], bucket["hr"]
+        if not (pace is not None and 5.0 <= pace <= 16.0
+                and not (hr is not None and hr < 130.0)):
+            continue
+        start = bucket["bucket_start_utc"]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO records (metric, value, unit, start_utc, "
+            "end_utc, local_date, source, origin, dedupe_key) VALUES "
+            "('step_count', ?, 'count', ?, ?, ?, 'cadence-seed', 'test', ?)",
+            (150.0 / 3.0, start, start, bucket["local_date"],
+             f"f82-cadence|{start}"))
+        seeded += cur.rowcount
+    conn.commit()
+    return seeded
+
+
+def _clear_cadence_seed(conn):
+    conn.execute("DELETE FROM records WHERE source = 'cadence-seed'")
+    conn.commit()
+
+
 def _ratio(conn, workout_id: int, clause: str = "", args=()) -> float | None:
     workout = conn.execute(
         "SELECT start_utc, end_utc, distance_mi FROM workouts WHERE id = ?",
@@ -364,6 +399,31 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
     assert after_block["reps"] == []
     assert after_block["bridged_min"] == pytest.approx(0.0, abs=0.2)
 
+    # Positive control. Zero block minutes with or without arbitration is what a
+    # cadence-blind fixture reads and also what a jog rule that never fires
+    # reads, so the zeros above cannot tell the two apart. Give the fixture a
+    # synthetic step stream in the buckets the retired pace lane counted and the
+    # recorded figures must come back, and must still tell the duplicate streams
+    # (one 57.3-minute block) from the selected stream (five 5.0-minute reps).
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "_workout_arbitration", lambda *a, **k: ("", []))
+        assert _seed_cadence_where_the_retired_pace_lane_fired(conn, workout) > 0
+        seeded_before = analysis.longest_block(
+            conn, workout["start_utc"], workout["end_utc"])
+        seeded_before_volume = analysis.impact_volume(
+            conn, "2026-08-25", "2026-08-25", by="day")[0]
+    _clear_cadence_seed(conn)
+    assert _seed_cadence_where_the_retired_pace_lane_fired(conn, workout) > 0
+    seeded_after = analysis.longest_block(
+        conn, workout["start_utc"], workout["end_utc"])
+    seeded_after_volume = analysis.impact_volume(
+        conn, "2026-08-25", "2026-08-25", by="day")[0]
+    assert seeded_before["bridged_min"] == pytest.approx(57.3, abs=0.1)
+    assert seeded_before_volume["jog_minutes"] == pytest.approx(57.3, abs=0.1)
+    assert len(seeded_after["reps"]) == 5
+    assert seeded_after["bridged_min"] == pytest.approx(5.0, abs=0.2)
+    assert seeded_after_volume["jog_minutes"] == pytest.approx(20.0, abs=0.1)
+
 
 def test_each_inflated_session_has_a_finite_selected_block_structure(conn):
     payload = load_f82_multi_source(conn)
@@ -390,6 +450,25 @@ def test_each_inflated_session_has_a_finite_selected_block_structure(conn):
     assert set(payload["multi_source_workout_ids"]) == {
         746, 748, 762, 809, 810, 812, 815
     }
+
+    # Positive control: the same four sessions with a synthetic step stream in the
+    # buckets the retired pace lane counted, which is where the recorded block
+    # figures were read. 815 is the only one of the four with any such bucket; its
+    # five 5.0-minute reps are the selected stream's block structure, and the
+    # three controls stay at no block.
+    expected_seeded = {809: 0.0, 810: 0.0, 812: 0.0, 815: 5.0}
+    for workout_id, expected in expected_seeded.items():
+        workout = conn.execute(
+            "SELECT start_utc, end_utc FROM workouts WHERE id = ?",
+            (workout_id,),
+        ).fetchone()
+        seeded = _seed_cadence_where_the_retired_pace_lane_fired(conn, workout)
+        block = analysis.longest_block(
+            conn, workout["start_utc"], workout["end_utc"])
+        assert (seeded > 0) == (expected > 0)
+        assert bool(block["reps"]) == (expected > 0)
+        assert block["bridged_min"] == pytest.approx(expected, abs=0.2)
+        _clear_cadence_seed(conn)
 
 
 def test_arbitrated_pairs_reports_only_the_three_changed_dates(conn):

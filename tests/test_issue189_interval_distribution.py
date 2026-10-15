@@ -1,6 +1,8 @@
 """Regression coverage for #189's post-boundary interval attribution."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from health_advisor import analysis
@@ -103,3 +105,26 @@ def test_no_post_boundary_bucket_implies_impossible_travel(conn):
     assert impossible == [], (
         f"{len(impossible)} bucket(s) imply faster-than-human travel; "
         f"fastest {min(impossible):.2f} min/mi")
+
+    # Positive control. The loop above reads the pace of every bucket and none of
+    # it depends on the jog rule, so on its own it cannot see the rule at all.
+    # Put a running cadence (synthetic, 150 steps/min) into every bucket inside a
+    # workout window: now the floor is exercised -- the rule must call buckets
+    # jog, and every one of them must be at a human pace.
+    for row in rows:
+        if not row["in_workout"]:
+            continue
+        start = datetime.fromtimestamp(
+            row["bkt"] * mx.IMPACT_BUCKET_SECONDS, timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "INSERT INTO records (metric, value, unit, start_utc, end_utc, "
+            "local_date, source, origin, dedupe_key) VALUES "
+            "('step_count', ?, 'count', ?, ?, ?, 'cadence-seed', 'test', ?)",
+            (150.0 / 3.0, start, start, row["local_date"], f"i604|{start}"))
+    conn.commit()
+    seeded = mx.impact_bucket_rows(
+        conn, "local_date BETWEEN ? AND ?", ("2026-06-01", "2026-12-31"))
+    jog_paces = [bucket_min / r["mi"] for r in seeded if r["is_jog"]]
+    assert jog_paces, "a running cadence inside a workout made no jog bucket"
+    assert min(jog_paces) >= mx.IMPACT_IMPLAUSIBLE_PACE_MIN

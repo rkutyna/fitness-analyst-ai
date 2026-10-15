@@ -64,6 +64,8 @@ def test_incline_walk_does_not_count():
     """A slow jog pace and running-effort HR, but cadence ~105 says walking."""
     b = _bucket(pace_min_per_mi=17.0, hr=150.0, cadence_spm=105.0)
     assert _is_jog(b) is False
+    # Control: only the cadence differs, and at a running cadence it counts.
+    assert _is_jog({**b, "cadence_spm": 150.0}) is True
 
 
 def test_fatigued_bucket_counts_on_effort():
@@ -76,6 +78,8 @@ def test_fast_pace_with_known_walking_hr_does_not_count():
     """A treadmill pace at an obvious walking heart rate, no cadence."""
     b = _bucket(pace_min_per_mi=9.0, hr=100.0)
     assert _is_jog(b) is False
+    # Control: with a running cadence the same bucket counts, whatever the HR.
+    assert _is_jog({**b, "cadence_spm": 150.0}) is True
 
 
 def test_fast_pace_with_missing_hr_and_no_cadence_does_not_count():
@@ -85,6 +89,7 @@ def test_fast_pace_with_missing_hr_and_no_cadence_does_not_count():
     walk bucket whatever the HR says."""
     b = _bucket(pace_min_per_mi=9.0, hr=None)
     assert _is_jog(b) is False
+    assert _is_jog({**b, "cadence_spm": 150.0}) is True
 
 
 def test_glitch_cadence_does_not_count():
@@ -93,6 +98,8 @@ def test_glitch_cadence_does_not_count():
     b = _bucket(cadence_spm=2961.0, hr=135.0, is_jog=True,
                 pace_min_per_mi=18.0)
     assert _is_jog(b) is False
+    # Control: the same bucket at a plausible cadence is a jog.
+    assert _is_jog({**b, "cadence_spm": 150.0}) is True
 
 
 def test_glitch_cadence_at_exactly_the_ceiling_counts():
@@ -127,7 +134,7 @@ def _record(conn, metric: str, start: str, value: float, end: str | None = None)
 def test_impact_bucket_rows_does_not_set_is_jog_for_glitch_cadence(conn):
     """The canonical is_jog inherits the plausible ceiling: a four-figure step
     sample cannot set impact-volume jogging."""
-    _workout(conn, "2001-07-01T12:00:00Z", 20)
+    _workout(conn, "2001-07-01T12:00:00Z", 40)
     _record(conn, "distance_walking_running", "2001-07-01T12:00:00Z", 0.03)
     _record(conn, "step_count", "2001-07-01T12:00:00Z", 2961.0 / 3.0)
     conn.commit()
@@ -141,6 +148,18 @@ def test_impact_bucket_rows_does_not_set_is_jog_for_glitch_cadence(conn):
     assert len(rows) == 1
     assert rows[0]["cadence_spm"] == pytest.approx(2961.0)
     assert rows[0]["is_jog"] == 0
+
+    # Control: a plausible cadence in the next bucket of the same workout is a
+    # jog bucket, so the zero above is the ceiling's doing.
+    _record(conn, "distance_walking_running", "2001-07-01T12:00:20Z", 0.03)
+    _record(conn, "step_count", "2001-07-01T12:00:20Z", 150.0 / 3.0)
+    conn.commit()
+    both = metrics.impact_bucket_rows(
+        conn, "start_utc >= ? AND start_utc < ?",
+        ("2001-07-01T12:00:00Z", "2001-07-01T12:01:00Z"),
+        arbitration_window=("2001-07-01T12:00:00Z", "2001-07-01T12:01:00Z"),
+        arbitration_window_kind="utc")
+    assert [row["is_jog"] for row in both] == [0, 1]
 
 
 def test_bridge_spans_a_gap_of_at_most_two_buckets():

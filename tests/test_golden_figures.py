@@ -11,12 +11,15 @@ only way to find out which, short of shipping.
 """
 from __future__ import annotations
 
+import shutil
 import sqlite3
+from datetime import date, datetime, timedelta
 from statistics import fmean
 
 import pytest
 
 from health_advisor import analysis as A
+from health_advisor import metrics as mx
 from health_advisor import vault
 from tests.fixtures.golden_snapshot import (
     PRODUCTION_SNAPSHOT,
@@ -90,7 +93,57 @@ def _workout(conn, day: str, workout_type: str, index: int = 0):
     return rows[index]
 
 
-def test_published_jog_minutes_and_pace(golden_conn):
+def _cadenced_copy(conn, tmp_path, windows, *, retired_pace_lane_only=False):
+    """A writable copy of ``conn``'s database with a synthetic step stream added.
+
+    The golden slice carries no step_count, and since the one jog rule (#604)
+    only a bucket with a cadence can be a jog bucket, so every jog figure on the
+    slice reads zero or none and a broken rule cannot be told from a working
+    one. This is the positive control: a 150 steps/min sample (a synthetic
+    value, not a recorded one) goes into each bucket of the given UTC windows
+    that is plausibly a person moving (pace 5 min/mi or slower). With
+    ``retired_pace_lane_only`` it goes only where the retired pace lane counted
+    a bucket (pace 5-16 min/mi, heart rate not known to be under 130), which
+    restores the buckets the published block figures were read from.
+
+    Returns ``(copy_connection, seeded)`` where ``seeded`` maps each seeded
+    bucket's UTC start to its local date.
+    """
+    source = conn.execute("PRAGMA database_list").fetchone()["file"]
+    target = tmp_path / "cadenced.db"
+    shutil.copy(source, target)
+    copy = sqlite3.connect(target)
+    copy.row_factory = sqlite3.Row
+    seeded: dict[str, str] = {}
+    for start_utc, end_utc in windows:
+        opens = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+        for bucket in mx.bucket_series(copy, start_utc, end_utc):
+            # The first bucket reaches back to before the workout opened and is
+            # not inside its window, so it can never be a jog bucket.
+            if datetime.fromisoformat(
+                    bucket["bucket_start_utc"].replace("Z", "+00:00")) < opens:
+                continue
+            pace, hr = bucket["pace_min_per_mi"], bucket["hr"]
+            if pace is None or pace < mx.IMPACT_IMPLAUSIBLE_PACE_MIN:
+                continue
+            if retired_pace_lane_only and not (
+                    pace <= 16.0 and not (hr is not None and hr < 130.0)):
+                continue
+            start = bucket["bucket_start_utc"]
+            if start in seeded:
+                continue
+            copy.execute(
+                "INSERT INTO records (metric, value, unit, start_utc, end_utc, "
+                "local_date, source, origin, dedupe_key) VALUES "
+                "('step_count', ?, 'count', ?, ?, ?, 'cadence-seed', 'test', ?)",
+                (150.0 / 3.0, start, start, bucket["local_date"],
+                 f"golden-cadence|{start}"))
+            seeded[start] = bucket["local_date"]
+    copy.commit()
+    return copy, seeded
+
+
+def test_published_jog_minutes_and_pace(golden_conn, tmp_path):
     rows = {
         row["period_start"]: row
         for row in A.impact_volume(
@@ -105,6 +158,37 @@ def test_published_jog_minutes_and_pace(golden_conn):
         assert rows[day]["jog_minutes"] == pytest.approx(0.0)
     assert rows["2026-08-03"]["jog_pace_min_per_mi"] is None
     assert rows["2026-08-10"]["jog_pace_min_per_mi"] is None
+
+    # Positive control. The zeros above only say that a slice with no cadence
+    # has no jog minutes -- which a broken jog rule would also say. So give the
+    # same slice a synthetic step stream and require the rule to find it: every
+    # seeded bucket sits inside a workout window at a human pace, so every one is
+    # a jog bucket and the weekly minutes are exactly the seeded count.
+    windows = golden_conn.execute(
+        "SELECT start_utc, end_utc FROM workouts "
+        "WHERE local_date BETWEEN '2026-07-20' AND '2026-08-16'").fetchall()
+    cadenced, seeded = _cadenced_copy(
+        golden_conn, tmp_path, [(w["start_utc"], w["end_utc"]) for w in windows])
+    try:
+        per_week: dict[str, int] = {}
+        for local_date in seeded.values():
+            day = date.fromisoformat(local_date)
+            monday = (day - timedelta(days=day.weekday())).isoformat()
+            per_week[monday] = per_week.get(monday, 0) + 1
+        assert per_week, "the control seeded nothing"
+        seeded_rows = {
+            row["period_start"]: row
+            for row in A.impact_volume(
+                cadenced, "2026-07-20", "2026-08-16", by="week")
+        }
+        bucket_min = mx.IMPACT_BUCKET_SECONDS / 60.0
+        for monday in ("2026-07-20", "2026-07-27", "2026-08-03", "2026-08-10"):
+            assert per_week[monday] > 0
+            assert seeded_rows[monday]["jog_minutes"] == pytest.approx(
+                per_week[monday] * bucket_min, abs=0.1), monday
+            assert seeded_rows[monday]["jog_pace_min_per_mi"] is not None
+    finally:
+        cadenced.close()
 
 
 def test_published_weekly_steps(golden_conn):
@@ -246,7 +330,7 @@ def test_published_session_figures(golden_conn):
     assert hike["avg_heart_rate"] == pytest.approx(118, abs=0.5)
 
 
-def test_published_vo2_and_easy_block_figures(golden_conn):
+def test_published_vo2_and_easy_block_figures(golden_conn, tmp_path):
     # week-04-review.md:57; 0.1 mL/min·kg matches the published one-decimal VO2.
     assert _daily_metric(
         golden_conn, "vo2_max", "2026-07-26", "2026-07-26", "last"
@@ -277,3 +361,22 @@ def test_published_vo2_and_easy_block_figures(golden_conn):
     assert block["qualified_min"] is None
     assert block["avg_hr_longest_block"] is None
     assert block["bridged_min"] == pytest.approx(0.0, abs=0.1)
+
+    # Positive control: the zeros above are what a slice with no cadence reads,
+    # and a broken rule reads them too. Put a synthetic 150 steps/min stream into
+    # exactly the buckets the retired pace lane counted on this session and the
+    # block must come back -- the published 9.0 min at HR 146 -- through the one
+    # rule's cadence lane alone.
+    cadenced, seeded = _cadenced_copy(
+        golden_conn, tmp_path,
+        [(sun_w7["start_utc"], sun_w7["end_utc"])], retired_pace_lane_only=True)
+    try:
+        assert seeded
+        again = A.longest_block(
+            cadenced, sun_w7["start_utc"], sun_w7["end_utc"])
+        # week-07-review.md:42; same tolerances as the original assertions.
+        assert again["qualified_min"] == pytest.approx(9.0, abs=0.1)
+        assert again["avg_hr_longest_block"] == pytest.approx(146.0, abs=0.5)
+        assert again["bridged_min"] == pytest.approx(9.0, abs=0.1)
+    finally:
+        cadenced.close()

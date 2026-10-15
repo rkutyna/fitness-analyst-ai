@@ -104,6 +104,9 @@ def test_incline_walk_is_not_jog():
     # Pace 14 and HR 140 would have made this a jog under the old pace lane;
     # cadence 110 says walking and cadence is the only thing that can say jog.
     assert _jog(pace_min_per_mi=14.0, cadence_spm=110.0, hr=140.0) is False
+    # Control: the same pace and heart rate at a running cadence IS a jog, so
+    # the False above is the cadence's doing and not a predicate that never fires.
+    assert _jog(pace_min_per_mi=14.0, cadence_spm=150.0, hr=140.0) is True
 
 
 def test_cadence_140_is_jog_with_or_without_heart_rate():
@@ -138,6 +141,8 @@ def test_pace_alone_is_never_jog():
     assert _jog(pace_min_per_mi=15.0, cadence_spm=120.0, hr=140.0) is False
     assert _jog(pace_min_per_mi=9.0, cadence_spm=None, hr=None) is False
     assert _jog(pace_min_per_mi=9.0, cadence_spm=None, hr=150.0) is False
+    # Control: give the same bucket a cadence and it is a jog.
+    assert _jog(pace_min_per_mi=9.0, cadence_spm=150.0, hr=150.0) is True
 
 
 def test_pace_floor_vetoes_both_lanes_when_pace_is_known():
@@ -152,6 +157,9 @@ def test_pace_floor_vetoes_both_lanes_when_pace_is_known():
 def test_outside_a_workout_nothing_is_jog():
     assert _jog(in_workout=False, cadence_spm=150.0, hr=150.0) is False
     assert _jog(in_workout=False, cadence_spm=135.0, hr=150.0) is False
+    # Control: the same two buckets inside a workout are jogs.
+    assert _jog(in_workout=True, cadence_spm=150.0, hr=150.0) is True
+    assert _jog(in_workout=True, cadence_spm=135.0, hr=150.0) is True
 
 
 # --- the bridge -----------------------------------------------------------
@@ -186,15 +194,20 @@ def test_standstill_bucket_does_not_bridge():
 # --- through the real pipeline: records -> buckets -> jog minutes -> block ---
 
 def test_incline_walk_session_has_no_jog_minutes_and_no_block(conn):
+    # An incline walk after six genuine jog buckets: the walk adds no jog minute
+    # and does not lengthen the block. The jog flank is the control -- it is
+    # there, counted, and exactly the size the walk would have to change.
+    jog = {"pace": 9.0, "cadence": 160.0, "hr": 150.0}
     walk = {"pace": 14.0, "cadence": 110.0, "hr": 140.0}
-    start, end, buckets = _series(conn, [walk] * 12)
-    assert len(buckets) == 12
-    assert not any(b["is_jog"] for b in buckets)
+    start, end, buckets = _series(conn, [jog] * 6 + [walk] * 12)
+    assert len(buckets) == 18
+    assert [b["is_jog"] for b in buckets] == [True] * 6 + [False] * 12
     assert A.impact_volume(conn, "2026-07-01", "2026-07-01", by="day"
-                           )[0]["jog_minutes"] == 0.0
+                           )[0]["jog_minutes"] == pytest.approx(
+                               6 * BUCKET_MIN, abs=0.05)
     block = A.longest_block(conn, start, end)
-    assert block["bridged_min"] == 0.0
-    assert block["unbridged_min"] == 0.0
+    assert block["bridged_min"] == pytest.approx(6 * BUCKET_MIN, abs=0.05)
+    assert block["unbridged_min"] == pytest.approx(6 * BUCKET_MIN, abs=0.05)
 
 
 def test_cadence_135_at_hr_140_session_is_jog_and_one_block(conn):
@@ -209,18 +222,25 @@ def test_cadence_135_at_hr_140_session_is_jog_and_one_block(conn):
 
 def test_pace_15_at_cadence_120_and_hr_140_is_not_a_block_bucket(conn):
     # The old pace lane (5-16 unless HR < 130) made this a block bucket.
+    jog = {"pace": 9.0, "cadence": 160.0, "hr": 150.0}
     slow = {"pace": 15.0, "cadence": 120.0, "hr": 140.0}
-    start, end, buckets = _series(conn, [slow] * 12)
-    assert not any(b["is_jog"] for b in buckets)
-    assert not any(mx.is_block_bucket(b) for b in buckets)
-    assert A.longest_block(conn, start, end)["bridged_min"] == 0.0
+    start, end, buckets = _series(conn, [jog] * 6 + [slow] * 12)
+    assert all(b["is_jog"] for b in buckets[:6])
+    assert not any(b["is_jog"] for b in buckets[6:])
+    assert all(mx.is_block_bucket(b) for b in buckets[:6])
+    assert not any(mx.is_block_bucket(b) for b in buckets[6:])
+    assert A.longest_block(conn, start, end)["bridged_min"] == pytest.approx(
+        6 * BUCKET_MIN, abs=0.05)
 
 
 def test_pace_without_cadence_is_not_a_block_bucket(conn):
     # No step data at all: pace and HR cannot make a jog.
-    start, end, buckets = _series(conn, [{"pace": 9.0, "hr": 150.0}] * 12)
-    assert not any(b["is_jog"] for b in buckets)
-    assert A.longest_block(conn, start, end)["bridged_min"] == 0.0
+    jog = {"pace": 9.0, "cadence": 160.0, "hr": 150.0}
+    start, end, buckets = _series(
+        conn, [jog] * 6 + [{"pace": 9.0, "hr": 150.0}] * 12)
+    assert [b["is_jog"] for b in buckets] == [True] * 6 + [False] * 12
+    assert A.longest_block(conn, start, end)["bridged_min"] == pytest.approx(
+        6 * BUCKET_MIN, abs=0.05)
 
 
 def test_standstill_gap_does_not_bridge(conn):
@@ -241,6 +261,20 @@ def test_standstill_bucket_without_pace_does_not_bridge():
     after = {**jog, "bucket_start_utc": _iso(2)}
     block = A.longest_block_from_buckets([jog, standing, after])
     assert block["bridged_min"] == pytest.approx(BUCKET_MIN, abs=0.05)
+
+
+def test_a_hand_built_bucket_without_the_is_jog_key_makes_no_block():
+    # Documented behaviour of longest_block_from_buckets: the verdict is read
+    # from the key, so a bucket that lacks it is not jog. The control is the same
+    # series carrying the verdict.
+    bare = [{"bucket_start_utc": _iso(i), "pace_min_per_mi": 9.0, "hr": 150.0,
+             "cadence_spm": 160.0} for i in range(6)]
+    assert A.longest_block_from_buckets(bare)["bridged_min"] == 0.0
+    with_verdict = [{**b, "is_jog": mx.is_jog_bucket(
+        in_workout=True, pace_min_per_mi=b["pace_min_per_mi"],
+        cadence_spm=b["cadence_spm"], hr=b["hr"])} for b in bare]
+    assert A.longest_block_from_buckets(with_verdict)["bridged_min"] == (
+        pytest.approx(6 * BUCKET_MIN, abs=0.05))
 
 
 def test_two_bucket_gap_at_pace_17_and_hr_140_bridges(conn):
@@ -342,12 +376,26 @@ def test_a_jog_bucket_outside_a_workout_window_is_not_jog(conn):
         workout=False)
     assert len(buckets) == 6
     assert not any(b["is_jog"] for b in buckets)
+    assert A.longest_block(conn, start, end)["bridged_min"] == 0.0
+    # Control: the same samples, once a workout window covers them, are jog
+    # buckets and a block -- the window is the only thing that changed.
+    conn.execute(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "duration_min, source, dedupe_key) VALUES "
+        "('running', ?, ?, ?, ?, 'test', 'w|control')",
+        (start, end, start[:10], 6 * BUCKET_MIN))
+    conn.commit()
+    assert all(b["is_jog"] for b in mx.bucket_series(conn, start, end))
+    assert A.longest_block(conn, start, end)["bridged_min"] == pytest.approx(
+        6 * BUCKET_MIN, abs=0.05)
 
 
 def test_a_pace_14_cadence_110_bucket_is_walking_not_jogging(conn):
-    _, _, buckets = _series(conn, [{"pace": 14.0, "cadence": 110.0,
-                                    "hr": 140.0}] * 3)
-    assert all((not b["is_jog"]) and b["is_walk"] for b in buckets)
+    jog = {"pace": 9.0, "cadence": 160.0, "hr": 150.0}
+    _, _, buckets = _series(conn, [jog] * 3 + [{"pace": 14.0, "cadence": 110.0,
+                                                "hr": 140.0}] * 3)
+    assert all(b["is_jog"] and not b["is_walk"] for b in buckets[:3])
+    assert all((not b["is_jog"]) and b["is_walk"] for b in buckets[3:])
 
 
 def test_an_effort_lane_bucket_is_jogging_so_it_is_no_longer_walking(conn):

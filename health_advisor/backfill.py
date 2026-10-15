@@ -54,6 +54,26 @@ def open_xml(zip_path: str | None, xml_path: str | None, inner: str):
             zf.close()
 
 
+_UNIT_RESOLUTIONS: dict = {}
+
+
+def _unit_resolution(metric: str, raw_unit):
+    """`(convert, canonical_unit)` for a (metric, unit), or None if unplaceable.
+
+    Resolved once per pair, as the receiver's parser does with
+    `nz.unit_converter`, so the two ingest paths convert identically. The
+    refusal is announced once per pair rather than once per sample.
+    """
+    key = (metric, raw_unit)
+    if key not in _UNIT_RESOLUTIONS:
+        try:
+            _UNIT_RESOLUTIONS[key] = nz.unit_converter(metric, raw_unit)
+        except nz.UnitError as exc:
+            print(f"dropping {metric} samples: {exc}", file=sys.stderr)
+            _UNIT_RESOLUTIONS[key] = None
+    return _UNIT_RESOLUTIONS[key]
+
+
 def _record_rows(attrib: dict):
     """Yield 0+ normalized record-row dicts from one <Record> element's attribs."""
     rtype = attrib.get("type", "")
@@ -111,9 +131,11 @@ def _record_rows(attrib: dict):
         except ValueError:
             return
         metric = nz.hk_quantity_to_canonical(rtype)
-        value, _ = nz.apply_unit(value, attrib.get("unit"))
-        value = nz.canonical_value(metric, value)
-        unit = nz.canonical_unit(metric, attrib.get("unit"))
+        resolved = _unit_resolution(metric, attrib.get("unit"))
+        if resolved is None:
+            return          # a unit that cannot be placed is dropped, not stored
+        convert, unit = resolved
+        value = nz.canonical_value(metric, convert(value))
         local_date = nz.local_date_of(start_dt)
         yield _mk_row(metric, value, unit, start_utc, end_utc, start_local, local_date,
                       source, source_metric=rtype, source_value=raw_value)
@@ -219,6 +241,23 @@ def _to_float(s):
         return None
 
 
+def _reattribute_sleep(conn) -> int:
+    """Apply session attribution over every stored sleep-stage day; commit.
+
+    Returns the number of records whose `local_date` moved. Idempotent: the
+    rule is a function of the timestamps, so a second run moves nothing.
+    """
+    ph = ",".join("?" * len(derive._STAGE_METRICS))
+    first, last = conn.execute(
+        f"SELECT MIN(local_date), MAX(local_date) FROM records "
+        f"WHERE metric IN ({ph})", derive._STAGE_METRICS).fetchone()
+    if first is None:
+        return 0
+    moves = derive.reattribute_sleep(conn, first, last, apply=True)
+    conn.commit()
+    return len(moves)
+
+
 def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
         workouts_only=False) -> dict:
     """workouts_only=True ingests only workouts + workout_events and leaves
@@ -291,9 +330,16 @@ def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
         ev_added += db.insert_workout_events(conn, ev_buf)
     conn.commit()
 
+    sleep_moved = 0
     if workouts_only:
         dm = 0
     else:
+        # Session attribution is the rule the receiver applies to every batch:
+        # a stage sample belongs to the day its sleep SESSION ends, not the day
+        # the sample itself ends. It runs before the full rebuild below, which
+        # recomputes every aggregate and the per-month source counts from
+        # `records`, so the moved rows need no pair-scoped recompute here.
+        sleep_moved = _reattribute_sleep(conn)
         print("Rebuilding daily_metrics ...", file=sys.stderr)
         dm = db.recompute_daily_metrics(conn, full=True)
         conn.commit()
@@ -303,11 +349,13 @@ def run(zip_path=None, xml_path=None, *, db_path, inner=INNER_XML,
     db.log_ingest(conn, "backfill", "records", rec_seen, rec_added,
                   detail=f"workouts_seen={wk_seen} workouts_added={wk_added} "
                          f"workout_events_seen={ev_seen} workout_events_added={ev_added} "
-                         f"skipped_records={skipped} daily_metric_rows={dm}")
+                         f"skipped_records={skipped} daily_metric_rows={dm} "
+                         f"sleep_records_reattributed={sleep_moved}")
     summary = dict(records_seen=rec_seen, records_added=rec_added,
                    workouts_seen=wk_seen, workouts_added=wk_added,
                    workout_events_seen=ev_seen, workout_events_added=ev_added,
-                   skipped_records=skipped, daily_metric_rows=dm)
+                   skipped_records=skipped, daily_metric_rows=dm,
+                   sleep_records_reattributed=sleep_moved)
     conn.close()
     return summary
 

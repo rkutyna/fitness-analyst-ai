@@ -9,8 +9,9 @@ would invite comparison against population values that do not apply. See the
 design spec, section 11.2.
 
 Plan compliance is a separate three-band measure over the same bedtime
-encoding: inside the 23:00 anchor, the ungraded 23:00-00:30 social-night band,
-and past the 00:30 limit. Its canonical plan constants live in metrics.py.
+encoding: inside the anchor, the ungraded social-night band from the anchor to
+00:30, and past the 00:30 limit. The anchor is a parameter, supplied by the
+caller's plan; metrics.py holds only the engine default and the social limit.
 
 The sleep-timing series is typically the largest coherent one in the DB and
 runs continuously through gaps in watch coverage, which can make it the only
@@ -295,8 +296,16 @@ def cosinor(dates, values) -> dict:
     }
 
 
-def compliance_from_bedtimes(bedtimes) -> dict:
+def compliance_from_bedtimes(bedtimes, *,
+                             anchor_h: float = BEDTIME_ANCHOR_H) -> dict:
     """Count the plan's bedtime bands. Pure, for testing.
+
+    ``anchor_h`` is the bedtime anchor on the since-noon scale (hours since the
+    previous day's noon, as ``night_interval`` reads it). A caller that holds a
+    plan passes that plan's anchor. It defaults to ``BEDTIME_ANCHOR_H``, which is
+    an engine default and not a deployment value: the anchor belongs to the
+    caller's plan, and the social band starts just after whichever anchor is
+    passed, so the three bands always move together.
 
     The social-night band is deliberately not classified as either a hit or a
     failure, so there is no single "compliance" figure to report and the key is
@@ -314,12 +323,12 @@ def compliance_from_bedtimes(bedtimes) -> dict:
             "social_nights": 0,
             "past_limit": 0,
             "inside_anchor_pct": None,
-            "anchor_h": BEDTIME_ANCHOR_H,
+            "anchor_h": anchor_h,
             "social_limit_h": BEDTIME_SOCIAL_LIMIT_H,
         }
-    inside = sum(1 for b in clean if b <= BEDTIME_ANCHOR_H)
+    inside = sum(1 for b in clean if b <= anchor_h)
     social = sum(1 for b in clean
-                 if BEDTIME_ANCHOR_H < b <= BEDTIME_SOCIAL_LIMIT_H)
+                 if anchor_h < b <= BEDTIME_SOCIAL_LIMIT_H)
     past = sum(1 for b in clean if b > BEDTIME_SOCIAL_LIMIT_H)
     return {
         "n_nights": len(clean),
@@ -327,15 +336,19 @@ def compliance_from_bedtimes(bedtimes) -> dict:
         "social_nights": social,
         "past_limit": past,
         "inside_anchor_pct": mx.r(inside / len(clean) * 100.0),
-        "anchor_h": BEDTIME_ANCHOR_H,
+        "anchor_h": anchor_h,
         "social_limit_h": BEDTIME_SOCIAL_LIMIT_H,
     }
 
 
-def plan_compliance(conn, start: str, end: str) -> dict:
-    """Report the inside-anchor, social-night, and past-limit bands."""
+def plan_compliance(conn, start: str, end: str, *,
+                    anchor_h: float = BEDTIME_ANCHOR_H) -> dict:
+    """Report the inside-anchor, social-night, and past-limit bands.
+
+    ``anchor_h`` is passed through to ``compliance_from_bedtimes``; see there.
+    """
     rows = conn.execute(
         "SELECT last AS v FROM daily_metrics WHERE metric = 'sleep_bedtime' AND "
         + mx.current_daily_metrics_predicate(conn) +
         " AND date BETWEEN ? AND ? AND last IS NOT NULL", (start, end)).fetchall()
-    return compliance_from_bedtimes([r["v"] for r in rows])
+    return compliance_from_bedtimes([r["v"] for r in rows], anchor_h=anchor_h)

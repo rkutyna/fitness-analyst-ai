@@ -560,6 +560,15 @@ APPROVED_OPENROUTER_PROVIDERS = {
         "novita/fp8", "fireworks", "deepinfra/fp8", "siliconflow/fp8",
         "baseten/fp4", "nextbit/fp8", "digitalocean", "parasail/fp8",
         "coreweave/fp8", "together"}),
+    # ADMITTED 2026-10-24 -- exactly the pin the consumer's #667 benchmark ran.
+    # Both endpoints are green-shield on OpenRouter's provider table: no
+    # training on prompts and zero data retention. That benchmark measured 53
+    # of 63 in-app weekly reviews valid on the first try and a step-6 call p50
+    # of 10.7 s, on the engine's unchanged request body (full sampling profile,
+    # `require_parameters: true`). Both display names were already mapped in
+    # OPENROUTER_PROVIDER_TAGS, so the response check needs no new entry.
+    "minimax/minimax-m3.1-flash": frozenset({
+        "together", "parasail/fp8"}),
 }
 # `coreweave/fp8` and `together` are green-shield on OpenRouter's provider table and carry these
 # tags on the Flash listing, but were NOT serving V4 Pro when the endpoints

@@ -1312,8 +1312,14 @@ def _impact_change_pct(periods: list[dict], by: str) -> None:
                     f"reports a drop that has not happened")
         elif prev is None:
             note = f"no preceding {unit} inside the requested range"
+        elif p["jog_minutes"] is None:
+            note = (f"this {unit} has no samples in the vault, so its jog "
+                    "minutes are not measured and no change can be computed")
         elif prev["partial"]:
             note = f"the preceding {unit} is partial, so the two are not comparable"
+        elif prev["jog_minutes"] is None:
+            note = (f"the preceding {unit} has no samples in the vault, so the "
+                    "change is not measured")
         elif not prev["jog_minutes"]:
             note = (f"the preceding {unit} recorded no jogging; a percentage "
                     "change off zero is undefined")
@@ -1407,8 +1413,16 @@ def _jog_threshold_sensitivity(conn, start: str, end: str, *,
 def _impact_periods(rows: list[dict], start: str, end: str,
                     by: str, *, as_of: str | None = None,
                     local_timezone: tzinfo | None = None,
-                    metric_units: bool = False) -> list[dict]:
+                    metric_units: bool = False,
+                    unsynced_days: frozenset[str] = frozenset()) -> list[dict]:
     """Return the gap-filled impact periods with their completeness labels.
+
+    ``unsynced_days`` are local dates that hold a running, walking or hiking
+    workout whose samples are not in the vault yet, and that have no impact row.
+    They are unmeasured, not zero. A day in it is published as None with
+    ``samples: "not_synced"``. A week lists them in ``samples_not_synced_days``
+    and its total covers only the measured days. A day with no workout at all
+    stays a true zero.
 
     Both the ordinary impact tool and its block-comparison mode need exactly
     this sequence. Keeping it here means the aggregate cannot accidentally
@@ -1438,12 +1452,29 @@ def _impact_periods(rows: list[dict], start: str, end: str,
         bucket_end = min(key + timedelta(days=6), end_date).isoformat()
         covered = _impact_days_covered(
             key, by, start, end, as_of=as_of, local_timezone=local_timezone)
-        row = have.get(iso) or {
-            "period_start": iso, "jog_minutes": 0.0, distance_key: 0.0,
-            pace_key: None, "walk_minutes": 0.0, walk_key: 0.0,
-            "jog_change_pct": None,
-        }
-        periods.append({**row, "no_data": iso not in have,
+        if by == "day" and iso in unsynced_days and iso not in have:
+            # The day's workout exists but its samples are not in the vault:
+            # unmeasured, so jog/walk figures are None, never a published 0.
+            row = {
+                "period_start": iso, "jog_minutes": None,
+                distance_key: None, pace_key: None,
+                "walk_minutes": None, walk_key: None,
+                "jog_change_pct": None, "samples": "not_synced",
+            }
+        else:
+            row = have.get(iso) or {
+                "period_start": iso, "jog_minutes": 0.0, distance_key: 0.0,
+                pace_key: None, "walk_minutes": 0.0, walk_key: 0.0,
+                "jog_change_pct": None,
+            }
+        extra = {}
+        if by == "week":
+            unsynced_here = sorted(
+                d for d in unsynced_days
+                if key.isoformat() <= d <= bucket_end)
+            if unsynced_here:
+                extra["samples_not_synced_days"] = unsynced_here
+        periods.append({**row, **extra, "no_data": iso not in have,
                         # This labels only the canonical jog-minute series.
                         # Other fields in the row are impact context and stay
                         # available for Tier 1 path provenance.
@@ -1520,7 +1551,7 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
         total = round(sum(values), 1)
         mean = round(total / len(values), 1)
         starts = [row["period_start"] for row in rows]
-        return {
+        out = {
             "metric": "jog_minutes",
             "period": {
                 "start": starts[0], "end": starts[-1],
@@ -1538,6 +1569,13 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
             "total": total,
             "mean": mean,
         }
+        # Days whose samples are not synced are left out of the total, not
+        # counted as zero; they are named here so the total is never silent.
+        unsynced = [d for row in rows
+                    for d in row.get("samples_not_synced_days", [])]
+        if unsynced:
+            out["samples_not_synced_days"] = sorted(set(unsynced))
+        return out
 
     recent_block, prior_block = block(recent), block(prior)
     total_delta = round(recent_block["total"] - prior_block["total"], 1)
@@ -1614,6 +1652,33 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
     }
 
 
+def _impact_unsynced_days(conn, start: str, end: str, bucket_rows: list[dict],
+                          *, metric_units: bool) -> frozenset[str]:
+    """Local dates with a running, walking or hiking workout whose window holds
+    no distance buckets, and with no impact row of their own.
+
+    A day with no workout at all is not in the set: it is a real rest day and
+    stays a measured zero. A day with a manual jog entry or any bucket is
+    measured too, so it is excluded.
+    """
+    active = db.workout_mark_condition(conn, "w")
+    workouts = conn.execute(
+        "SELECT w.local_date, w.start_utc, w.end_utc FROM workouts AS w "
+        "WHERE w.local_date BETWEEN ? AND ? "
+        "AND w.workout_type IN ('running', 'walking', 'hiking') "
+        f"AND {active}", (start, end)).fetchall()
+    measured = {b["local_date"] for b in bucket_rows}
+    measured |= set(db.manual_jog_by_day(conn, start, end))
+    unsynced = set()
+    for w in workouts:
+        if w["local_date"] in measured:
+            continue
+        if not mx.bucket_series(conn, w["start_utc"], w["end_utc"],
+                                metric_units=metric_units):
+            unsynced.add(w["local_date"])
+    return frozenset(unsynced)
+
+
 @tool
 def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                       weeks_per_block: int | None = None,
@@ -1649,7 +1714,10 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     7 reads as a 71% drop that did not happen. 'partial' and 'days_covered' say
     how much of the period has happened; 'no_data' marks a period with no
     distance samples at all (those are emitted as zeros so the sequence has no
-    gaps to compare across).
+    gaps to compare across). A day that holds a running, walking or hiking
+    workout whose samples have not synced is different: it is unmeasured, so
+    its figures are null with ``samples`` "not_synced", and a week lists such
+    days in ``samples_not_synced_days`` with a total over the measured days.
 
     'jog_threshold_sensitivity' gives jog_minutes recomputed at CADENCE cutoffs
     either side of the live one, and 'jog_near_threshold' the share of eligible
@@ -1703,13 +1771,16 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                                bucket_rows=bucket_rows)
         sens = _jog_threshold_sensitivity(conn, start, effective_end,
                                           bucket_rows=bucket_rows)
+        unsynced = _impact_unsynced_days(
+            conn, start, effective_end, bucket_rows, metric_units=metric_units)
         # Fill periods analysis had no rows for, then recompute the change
         # column over the complete sequence. The same labelled rows feed block
         # comparison. Do this while the read-only connection is open only
         # because the source rows are computed here; the helper itself is pure.
         periods = _impact_periods(
             rows, start, effective_end, by, as_of=as_of,
-            local_timezone=local_timezone, metric_units=metric_units)
+            local_timezone=local_timezone, metric_units=metric_units,
+            unsynced_days=unsynced)
     except ValueError as e:
         return {"error": str(e)}
     finally:
@@ -1905,6 +1976,11 @@ def get_training_load_detail(ctx: VaultContext, start: str | None = None,
         conn.close()
 
 
+NOT_SYNCED_FORM_REFUSAL = {"status": "samples_not_synced",
+                           "reason": "samples_not_synced",
+                           "jog_minutes": None}
+
+
 @tool
 def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str | None = None,
                  end: str | None = None) -> dict:
@@ -1969,16 +2045,24 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
                     "error": f"no running workout on {workout_date}"
                              if workout_date else "no running workouts on record"}
 
+        buckets = A.mx.bucket_series(conn, row["start_utc"], row["end_utc"],
+                                     metric_units=metric_units)
+        if buckets:
+            efficiency = RF.efficiency_change_from_buckets(
+                buckets, metric_units=metric_units)
+            walk = RF.walk_structure_from_buckets(
+                buckets, metric_units=metric_units)
+        else:
+            # Zero buckets means the samples are not in the vault yet. That is
+            # unmeasured, not "0 min of jogging", so it gets its own refusal.
+            efficiency = walk = dict(NOT_SYNCED_FORM_REFUSAL)
+
         return {
             "mode": "session",
             "found": True,
             "date": row["local_date"],
-            "efficiency_change": RF.jog_efficiency_change(
-                conn, row["start_utc"], row["end_utc"],
-                metric_units=metric_units),
-            "walk_structure": RF.walk_structure(
-                conn, row["start_utc"], row["end_utc"],
-                metric_units=metric_units),
+            "efficiency_change": efficiency,
+            "walk_structure": walk,
             "personal_reference": RF.personal_reference(
                 conn, "2026-01-01", row["local_date"],
                 exclude_start_utc=row["start_utc"], metric_units=metric_units),

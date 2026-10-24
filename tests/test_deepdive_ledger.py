@@ -1,12 +1,21 @@
 """Tests for the server-owned deep-dive tool-call ledger."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import os
+import re
+import threading
 
+import httpx
 import pytest
 
+from health_advisor import chat
 from health_advisor import deepdive_mcp as D
+from health_advisor import ledger_lock
 from health_advisor import llm
+from scripts import trace_researcher_answer as trace
 
 
 def _server_tool(server, name):
@@ -148,12 +157,19 @@ def test_claim_period_with_one_bucket_uses_the_payloads_own_end():
     assert _vocab("2026-06-29", "2026-07-05", ["2026-06-29"]) == "2026-06-29:2026-07-05"
 
 
-# --- Atomic line writes (#103) ----------------------------------------------
+# --- Atomic line writes (#103) and the reader's lock (#116) ------------------
 #
 # The ledger's reader treats one undecodable line as "the whole file is
 # unreadable", so a reader that catches the file mid-append would blank every
 # citation. The writer therefore hands the kernel one complete line in a single
 # write, under the ledger's lock.
+#
+# One write is not enough on Linux: a read there does not wait for a write in
+# progress, and an unlocked reader saw a partial last line in 11 of 50 runs on
+# overlayfs and 14 of 50 on ext4 (#116), every partial snapshot ending on a
+# 4096-byte page boundary while the writer issued exactly one full-length write
+# per record. So the append holds an exclusive flock and every reader a shared
+# one (health_advisor.ledger_lock).
 
 
 def test_each_record_reaches_the_file_in_exactly_one_write(tmp_path, monkeypatch):
@@ -182,7 +198,11 @@ def test_each_record_reaches_the_file_in_exactly_one_write(tmp_path, monkeypatch
 
 
 def test_a_concurrent_reader_never_sees_a_partial_line(tmp_path):
-    """Hammer the writer from threads while a reader parses every snapshot."""
+    """Hammer the writer from threads while a reader parses every snapshot.
+
+    The reader reads the way every engine reader of the ledger does, under
+    ``ledger_lock.lock_for_read``. Without that lock this fails on Linux (#116).
+    """
     import threading
 
     path = tmp_path / "ledger.jsonl"
@@ -194,7 +214,9 @@ def test_a_concurrent_reader_never_sees_a_partial_line(tmp_path):
     def reader():
         while not done.is_set():
             try:
-                data = path.read_bytes()
+                with open(path, "rb") as fh:
+                    ledger_lock.lock_for_read(fh)
+                    data = fh.read()
             except FileNotFoundError:
                 continue
             if not data:
@@ -227,3 +249,163 @@ def test_a_concurrent_reader_never_sees_a_partial_line(tmp_path):
     assert problems == []
     sequences = [r["sequence"] for r in _ledger_records(path)]
     assert sequences == list(range(1, per_thread * n_threads + 1))
+
+
+# --- Deterministic: an append in progress, held the way the writer holds it ---
+#
+# The hammer test above needs the race to happen, and on macOS it never did.
+# These do not need a race. Each one holds the ledger the way the writer does
+# mid-append -- the exclusive flock taken and the first half of the line on
+# disk -- and requires the reader under test to wait for the rest. A reader
+# that skips the lock returns at once on every platform, with the torn tail:
+# [] from the verifier, an empty index, a skipped sequence or a decode error.
+
+# An unlocked reader of a two-record file returns in milliseconds; a locked one
+# stays blocked for as long as the lock is held, so this cannot pass by luck.
+_BLOCKED_FOR_S = 0.3
+
+
+def _record(sequence):
+    return {"sequence": sequence, "tool_name": "get_latest",
+            "arguments": {"metric": "body_mass"},
+            "result": {"metric": "body_mass", "value": 80.0 + sequence},
+            "result_elided": False}
+
+
+def _line(record):
+    return (json.dumps(record, sort_keys=True, separators=(",", ":"))
+            + "\n").encode("utf-8")
+
+
+@contextlib.contextmanager
+def _append_in_progress(path, record):
+    """Hold ``path`` mid-append: exclusive flock, half of ``record`` written.
+
+    Leaving the block writes the other half and closes, releasing the lock.
+    """
+    line = _line(record)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, line[:len(line) // 2])
+        yield
+        os.write(fd, line[len(line) // 2:])
+    finally:
+        os.close(fd)
+
+
+def _start(fn):
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # surfaced by the test, not lost here
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, box
+
+
+def _index_sequences(path):
+    text = llm._ledger_index_text(path)
+    return [int(n) for n in re.findall(r"^sequence (\d+) — ", text, re.M)]
+
+
+_READERS = {
+    "chat._read_ledger (the verifier)":
+        (lambda p: [r["sequence"] for r in chat._read_ledger(p)], [1, 2]),
+    "llm._ledger_index_text (the model's index)":
+        (_index_sequences, [1, 2]),
+    "_CallLedger continuing a reused path":
+        (lambda p: D._CallLedger(p)._next_sequence, 3),
+    "scripts/trace_researcher_answer.read_ledger":
+        (lambda p: [r["sequence"] for r in trace.read_ledger(p)], [1, 2]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_READERS))
+def test_every_ledger_reader_waits_for_an_append_in_progress(tmp_path, name):
+    read, expected = _READERS[name]
+    path = str(tmp_path / "ledger.jsonl")
+    with open(path, "wb") as fh:
+        fh.write(_line(_record(1)))
+
+    with _append_in_progress(path, _record(2)):
+        thread, box = _start(lambda: read(path))
+        thread.join(_BLOCKED_FOR_S)
+        returned_mid_append = not thread.is_alive()
+        seen_mid_append = dict(box)
+    thread.join(10)
+
+    assert not returned_mid_append, (
+        f"{name} read the ledger mid-append and returned {seen_mid_append}")
+    assert "error" not in box, box.get("error")
+    assert box["value"] == expected
+
+
+def test_the_tool_loop_sequence_scan_waits_for_an_append_in_progress(
+        tmp_path, monkeypatch, vault):
+    """``tool_loop`` numbers its calls by scanning the ledger it continues."""
+    # Isolate the scan: the loop's own _CallLedger would otherwise read the
+    # file first and do the waiting for it.
+    monkeypatch.setattr(llm, "_ledgered", lambda reg, ledger_path: reg)
+    monkeypatch.setattr(llm, "_registry", lambda ctx, include=None: {})
+    monkeypatch.setattr(llm, "BACKEND", "openrouter")
+    monkeypatch.setattr(llm, "OPENROUTER_API_KEY", "unit-test-key")
+    monkeypatch.setattr(llm, "OPENROUTER_MODEL", "deepseek/deepseek-v4-flash-0731")
+    monkeypatch.setattr(llm, "OPENROUTER_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(llm, "OPENROUTER_PROVIDERS", "coreweave/fp8")
+    monkeypatch.setattr(llm, "OPENROUTER_PROVIDER_SORT", "")
+    monkeypatch.setattr(llm, "OPENROUTER_REASONING", "off")
+    turns = {"n": 0}
+
+    def reply(message):
+        return httpx.Response(200, json={
+            "choices": [{"message": message, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    def handler(request):
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return reply({"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "get_latest", "arguments": "{}"}}]})
+        return reply({"role": "assistant", "content": "done"})
+
+    monkeypatch.setattr(llm, "_TRANSPORT", httpx.MockTransport(handler))
+    path = str(tmp_path / "ledger.jsonl")
+    with open(path, "wb") as fh:
+        fh.write(_line(_record(1)))
+    numbered = []
+
+    with _append_in_progress(path, _record(2)):
+        thread, box = _start(lambda: llm.tool_loop(
+            "q", ctx=vault, tools=[], max_turns=3, ledger_path=path,
+            on_tool_call=lambda name, sequence: numbered.append(sequence)))
+        thread.join(_BLOCKED_FOR_S)
+        returned_mid_append = not thread.is_alive()
+    thread.join(10)
+
+    assert not returned_mid_append
+    assert "error" not in box, box.get("error")
+    assert numbered == [3]
+
+
+def test_an_append_waits_while_a_reader_holds_the_ledger(tmp_path):
+    """The writer's half of the protocol: no write lands under a reader's lock."""
+    path = tmp_path / "ledger.jsonl"
+    ledger = D._CallLedger(str(path))
+    with open(path, "ab") as reader:
+        fcntl.flock(reader.fileno(), fcntl.LOCK_SH)
+        thread, box = _start(lambda: ledger.append("t", {}, {"ok": True}))
+        thread.join(_BLOCKED_FOR_S)
+        appended_under_read_lock = not thread.is_alive()
+        size_under_read_lock = path.stat().st_size
+    thread.join(10)
+
+    assert not appended_under_read_lock
+    assert size_under_read_lock == 0
+    assert box == {"value": 1}
+    assert [r["sequence"] for r in _ledger_records(path)] == [1]

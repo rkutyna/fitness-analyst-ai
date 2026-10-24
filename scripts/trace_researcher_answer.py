@@ -18,7 +18,7 @@ from typing import Any, Iterator
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from health_advisor.agents import _PROSE_DATE_RE  # noqa: E402
-from health_advisor import llm  # noqa: E402
+from health_advisor import ledger_lock, llm  # noqa: E402
 from health_advisor.context import VaultContext  # noqa: E402
 from health_advisor.numeric_tokens import NUM_RE  # noqa: E402
 
@@ -164,6 +164,7 @@ def _matching_arguments(token: str, context: str,
 def read_ledger(path: str | Path) -> list[dict[str, Any]]:
     """Read the server-written JSONL ledger, preserving record order."""
     with Path(path).open(encoding="utf-8") as ledger_file:
+        ledger_lock.lock_for_read(ledger_file)
         return [json.loads(line) for line in ledger_file if line.strip()]
 
 

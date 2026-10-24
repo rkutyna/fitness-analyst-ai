@@ -56,6 +56,7 @@ import httpx
 import urllib.parse
 
 from . import claim_contract as _CLAIM_CONTRACT
+from . import ledger_lock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -2505,6 +2506,7 @@ def _ledger_index_text(ledger_path) -> str:
     records: list[dict] = []
     try:
         with open(os.fspath(ledger_path), encoding="utf-8") as fh:
+            ledger_lock.lock_for_read(fh)  # waits out an append in progress (#116)
             for line in fh:
                 if not line.strip():
                     continue
@@ -2849,6 +2851,7 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
     if ledger_path:
         try:
             with open(ledger_path, encoding="utf-8") as fh:
+                ledger_lock.lock_for_read(fh)
                 existing_sequences = []
                 for line in fh:
                     try:

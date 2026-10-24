@@ -313,6 +313,41 @@ def longest_block(conn, start_utc: str, end_utc: str, bridge: bool = True) -> di
     )
 
 
+IMPACT_WORKOUT_TYPES = ("running", "walking", "hiking")
+
+
+def unsynced_workout_days(conn, start: str, end: str, *,
+                          measured_days: frozenset[str] = frozenset(),
+                          metric_units: bool = False) -> frozenset[str]:
+    """Local dates whose running, walking or hiking sessions are all unsynced.
+
+    A session is unsynced when its window holds no distance buckets: its
+    per-sample distance, step and heart-rate series are not in the vault yet,
+    so its figures are unmeasured, never zero. A day is in the set when it has
+    at least one such session, no session with buckets, and is not in
+    ``measured_days`` (days the caller measures another way, such as a manual
+    jog entry). A day with no running, walking or hiking session is NOT in the
+    set: it is a real rest day.
+    """
+    active = db.workout_mark_condition(conn, "w")
+    marks = ",".join("?" * len(IMPACT_WORKOUT_TYPES))
+    sessions = conn.execute(
+        "SELECT w.local_date, w.start_utc, w.end_utc FROM workouts AS w "
+        f"WHERE w.local_date BETWEEN ? AND ? AND w.workout_type IN ({marks}) "
+        f"AND {active}", (start, end, *IMPACT_WORKOUT_TYPES)).fetchall()
+    with_session: set[str] = set()
+    measured = set(measured_days)
+    for w in sessions:
+        day = w["local_date"]
+        with_session.add(day)
+        if day in measured:
+            continue
+        if mx.bucket_series(conn, w["start_utc"], w["end_utc"],
+                            metric_units=metric_units):
+            measured.add(day)
+    return frozenset(with_session - measured)
+
+
 NOISE_FLOOR_WINDOW_DAYS = 365
 NOISE_FLOOR_MIN_PAIRS = 20
 

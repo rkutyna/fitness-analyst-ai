@@ -396,3 +396,60 @@ def test_block_comparison_sums_measured_days_and_names_the_unsynced_one(
     assert prior["total"] == 13.3
     assert recent["samples_not_synced_days"] == [UNSYNCED_IN_RECENT]
     assert "samples_not_synced_days" not in prior
+
+
+# ---- (e) a week with no measured day is unmeasured, a true rest week is 0.0 ----
+
+WEEK_ALL_UNSYNCED = "2026-07-06"     # Mon..Sun; only an unsynced run on 07-08
+WEEK_REST = "2026-07-13"             # no workout of any kind
+
+
+def test_all_unsynced_week_totals_are_none_not_zero(conn, tools):
+    _measured_session(conn, "2026-06-30T12:00:00Z", "2026-06-30", 40)  # earlier
+    _unsynced_session(conn, "2026-07-08T12:00:00Z", UNSYNCED_IN_RECENT)
+    conn.commit()
+
+    out = tools.get_impact_volume(start="2026-06-29", end="2026-07-12",
+                                  by="week")
+
+    week = _period(out, WEEK_ALL_UNSYNCED)
+    assert week["samples"] == "not_synced"
+    assert week["jog_minutes"] is None
+    assert week["jog_miles"] is None
+    assert week["walk_minutes"] is None
+    assert week["walk_miles"] is None
+    assert week["no_data"] is True
+    assert week["samples_not_synced_days"] == [UNSYNCED_IN_RECENT]
+    assert "presentation" not in week
+
+
+def test_true_rest_week_total_stays_a_literal_zero(conn, tools):
+    _measured_session(conn, "2026-06-30T12:00:00Z", "2026-06-30", 40)  # earlier
+    _unsynced_session(conn, "2026-07-08T12:00:00Z", UNSYNCED_IN_RECENT)
+    conn.commit()
+
+    out = tools.get_impact_volume(start="2026-06-29", end="2026-07-19", by="week")
+
+    week = _period(out, WEEK_REST)
+    assert week["jog_minutes"] == 0.0 and type(week["jog_minutes"]) is float
+    assert week["walk_minutes"] == 0.0
+    assert "samples" not in week
+    assert "samples_not_synced_days" not in week
+
+
+def test_block_with_all_unsynced_week_has_no_total_and_no_change(conn, tools):
+    _measured_session(conn, "2026-07-01T12:00:00Z", "2026-07-01", 40)  # prior
+    _unsynced_session(conn, "2026-07-08T12:00:00Z", UNSYNCED_IN_RECENT)
+    conn.commit()
+
+    out = tools.get_impact_volume(start="2026-06-29", end="2026-07-12",
+                                  by="week", weeks_per_block=1,
+                                  anchor="last_complete_week")
+
+    blocks = out["block_comparison"]["blocks"]
+    assert blocks["recent"]["total"] is None
+    assert blocks["recent"]["mean"] is None
+    assert blocks["recent"]["samples_not_synced_days"] == [UNSYNCED_IN_RECENT]
+    assert blocks["prior"]["total"] == 13.3
+    assert out["block_comparison"]["change"]["total_delta"] is None
+    assert out["block_comparison"]["change"]["total_delta_pct"] is None

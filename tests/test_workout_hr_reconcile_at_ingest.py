@@ -160,10 +160,11 @@ def test_a_failing_reconciliation_leaves_the_ingest_committed_and_logs(
     try:
         assert conn.execute("SELECT COUNT(*) FROM records WHERE metric = "
                             "'heart_rate'").fetchone()[0] == len(HARD)
-        # The derive step after it still ran.
+        # The derive step after it still ran and did not fail. The workout has
+        # no distance samples, so no block row is written for its day.
         assert conn.execute(
-            "SELECT 1 FROM daily_metrics WHERE metric = 'longest_block_min' "
-            "AND date = ?", (DAY,)).fetchone() is not None
+            "SELECT COUNT(*) FROM ingest_log WHERE source = 'derive_error'"
+        ).fetchone()[0] == 0
     finally:
         conn.close()
     assert "reconcile exploded" in _last_ingest_log(vault_path,

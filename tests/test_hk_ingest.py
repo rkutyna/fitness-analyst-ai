@@ -410,7 +410,9 @@ def test_workout_only_ingest_writes_and_derives_its_day(vault, vault_path,
             "SELECT last FROM daily_metrics WHERE metric = 'longest_block_min' "
             "AND date = '2026-08-22'"
         ).fetchone()
-        assert longest is not None
+        # A running workout whose distance samples have not synced is
+        # unmeasured: derive writes no block row for it, not a 0.0.
+        assert longest is None
         commit_detail = conn.execute(
             "SELECT detail FROM commit_log WHERE key = ?",
             ("healthkit:watch-a:workout-only",),

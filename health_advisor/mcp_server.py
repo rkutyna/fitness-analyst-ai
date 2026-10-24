@@ -1414,7 +1414,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
                     by: str, *, as_of: str | None = None,
                     local_timezone: tzinfo | None = None,
                     metric_units: bool = False,
-                    unsynced_days: frozenset[str] = frozenset()) -> list[dict]:
+                    unsynced_days: frozenset[str] = frozenset(),
+                    unsynced_weeks: frozenset[str] = frozenset()) -> list[dict]:
     """Return the gap-filled impact periods with their completeness labels.
 
     ``unsynced_days`` are local dates that hold a running, walking or hiking
@@ -1422,7 +1423,8 @@ def _impact_periods(rows: list[dict], start: str, end: str,
     They are unmeasured, not zero. A day in it is published as None with
     ``samples: "not_synced"``. A week lists them in ``samples_not_synced_days``
     and its total covers only the measured days. A day with no workout at all
-    stays a true zero.
+    stays a true zero. A week in ``unsynced_weeks`` holds no measured day at
+    all, so its totals are None with ``samples: "not_synced"`` rather than 0.0.
 
     Both the ordinary impact tool and its block-comparison mode need exactly
     this sequence. Keeping it here means the aggregate cannot accidentally
@@ -1452,8 +1454,11 @@ def _impact_periods(rows: list[dict], start: str, end: str,
         bucket_end = min(key + timedelta(days=6), end_date).isoformat()
         covered = _impact_days_covered(
             key, by, start, end, as_of=as_of, local_timezone=local_timezone)
-        if by == "day" and iso in unsynced_days and iso not in have:
-            # The day's workout exists but its samples are not in the vault:
+        unmeasured = iso not in have and (
+            (by == "day" and iso in unsynced_days)
+            or (by == "week" and iso in unsynced_weeks))
+        if unmeasured:
+            # The workout exists but its samples are not in the vault:
             # unmeasured, so jog/walk figures are None, never a published 0.
             row = {
                 "period_start": iso, "jog_minutes": None,
@@ -1547,10 +1552,15 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
         return {"error": "the selected trailing week is partial"}
 
     def block(rows: list[dict]) -> dict:
-        values = [float(row["jog_minutes"]) for row in rows]
-        total = round(sum(values), 1)
-        mean = round(total / len(values), 1)
         starts = [row["period_start"] for row in rows]
+        if any(row["jog_minutes"] is None for row in rows):
+            # A week with no synced samples is unmeasured: the block total is
+            # not a sum of measured weeks, so it is None, never a published 0.
+            total = mean = None
+        else:
+            values = [float(row["jog_minutes"]) for row in rows]
+            total = round(sum(values), 1)
+            mean = round(total / len(values), 1)
         out = {
             "metric": "jog_minutes",
             "period": {
@@ -1578,21 +1588,26 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
         return out
 
     recent_block, prior_block = block(recent), block(prior)
-    total_delta = round(recent_block["total"] - prior_block["total"], 1)
-    mean_delta = round(recent_block["mean"] - prior_block["mean"], 1)
-    prior_total = prior_block["total"]
     change_note = None
-    if not prior_total:
-        change_pct = None
-        change_note = "a percentage change off a zero prior total is undefined"
-    elif abs(mean_delta) <= 0.1:
-        change_pct = None
-        change_note = (
-            "the published mean changed by at most one 0.1-minute rounding unit; "
-            "the percentage is not resolvable at the payload's precision"
-        )
+    if recent_block["total"] is None or prior_block["total"] is None:
+        total_delta = mean_delta = change_pct = None
+        change_note = ("a week in a compared block has no synced samples, "
+                       "so the change is not measured")
     else:
-        change_pct = round(total_delta / prior_total * 100, 1)
+        total_delta = round(recent_block["total"] - prior_block["total"], 1)
+        mean_delta = round(recent_block["mean"] - prior_block["mean"], 1)
+        prior_total = prior_block["total"]
+        if not prior_total:
+            change_pct = None
+            change_note = "a percentage change off a zero prior total is undefined"
+        elif abs(mean_delta) <= 0.1:
+            change_pct = None
+            change_note = (
+                "the published mean changed by at most one 0.1-minute rounding unit; "
+                "the percentage is not resolvable at the payload's precision"
+            )
+        else:
+            change_pct = round(total_delta / prior_total * 100, 1)
 
     if canonical_anchor == "last_complete_week":
         anchor_period = periods[anchor_index]
@@ -1653,30 +1668,24 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
 
 
 def _impact_unsynced_days(conn, start: str, end: str, bucket_rows: list[dict],
-                          *, metric_units: bool) -> frozenset[str]:
-    """Local dates with a running, walking or hiking workout whose window holds
-    no distance buckets, and with no impact row of their own.
+                          *, metric_units: bool
+                          ) -> tuple[frozenset[str], frozenset[str]]:
+    """Local dates, and Monday weeks, whose running, walking or hiking sessions
+    have no distance buckets and no measured value of their own.
 
-    A day with no workout at all is not in the set: it is a real rest day and
-    stays a measured zero. A day with a manual jog entry or any bucket is
-    measured too, so it is excluded.
+    The day rule is analysis.unsynced_workout_days, shared with derive. A day
+    with a manual jog entry or any bucket is measured, so it is excluded. A week
+    is unsynced only when it holds an unsynced day and no measured day: its
+    total would otherwise be a sum over measured days that were never zero.
     """
-    active = db.workout_mark_condition(conn, "w")
-    workouts = conn.execute(
-        "SELECT w.local_date, w.start_utc, w.end_utc FROM workouts AS w "
-        "WHERE w.local_date BETWEEN ? AND ? "
-        "AND w.workout_type IN ('running', 'walking', 'hiking') "
-        f"AND {active}", (start, end)).fetchall()
-    measured = {b["local_date"] for b in bucket_rows}
-    measured |= set(db.manual_jog_by_day(conn, start, end))
-    unsynced = set()
-    for w in workouts:
-        if w["local_date"] in measured:
-            continue
-        if not mx.bucket_series(conn, w["start_utc"], w["end_utc"],
-                                metric_units=metric_units):
-            unsynced.add(w["local_date"])
-    return frozenset(unsynced)
+    measured = ({b["local_date"] for b in bucket_rows}
+                | set(db.manual_jog_by_day(conn, start, end)))
+    days = A.unsynced_workout_days(
+        conn, start, end, measured_days=frozenset(measured),
+        metric_units=metric_units)
+    measured_weeks = {A._week_start(d) for d in measured}
+    weeks = frozenset(A._week_start(d) for d in days) - measured_weeks
+    return days, weeks
 
 
 @tool
@@ -1771,7 +1780,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                                bucket_rows=bucket_rows)
         sens = _jog_threshold_sensitivity(conn, start, effective_end,
                                           bucket_rows=bucket_rows)
-        unsynced = _impact_unsynced_days(
+        unsynced, unsynced_weeks = _impact_unsynced_days(
             conn, start, effective_end, bucket_rows, metric_units=metric_units)
         # Fill periods analysis had no rows for, then recompute the change
         # column over the complete sequence. The same labelled rows feed block
@@ -1780,7 +1789,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
         periods = _impact_periods(
             rows, start, effective_end, by, as_of=as_of,
             local_timezone=local_timezone, metric_units=metric_units,
-            unsynced_days=unsynced)
+            unsynced_days=unsynced, unsynced_weeks=unsynced_weeks)
     except ValueError as e:
         return {"error": str(e)}
     finally:

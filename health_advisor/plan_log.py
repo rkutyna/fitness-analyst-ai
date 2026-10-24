@@ -7,10 +7,14 @@ it while projecting a week and never updates one of its rows in place.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Mapping
 
 from . import db
@@ -331,16 +335,107 @@ def _rule_from_row(row: Mapping[str, Any]) -> plan_model.Rule:
     )
 
 
+#: How many parsed logs one process keeps. Each entry is a whole log, and one
+#: process serves many vaults, so the memo is bounded rather than left to grow
+#: with the number of vaults or states it has seen.
+_RULES_CACHE_LIMIT = 32
+#: (vault id, file identity, file stamp, largest sequence, row count) -> parse.
+_RULES_CACHE: OrderedDict[tuple, tuple[plan_model.Rule, ...]] = OrderedDict()
+_RULES_CACHE_LOCK = threading.Lock()
+#: The two triggers that make plan_statement_log append-only in SQL. Without
+#: both, a row can change in place and leave the key below unchanged, so such a
+#: log is parsed on every read.
+_APPEND_ONLY_TRIGGERS = ("plan_statement_log_no_update",
+                         "plan_statement_log_no_delete")
+
+
+def _rules_cache_clear() -> None:
+    """Forget every memoised parse. Tests use this; production never does."""
+    with _RULES_CACHE_LOCK:
+        _RULES_CACHE.clear()
+
+
+def _file_stamp(st: os.stat_result) -> tuple:
+    """Whether the file has been written: size, mtime and ctime.
+
+    ctime is set by the kernel on every write and cannot be set from user
+    space, so a rewrite in place that keeps the old mtime (``cp -p``) and the
+    same size still moves it.
+    """
+    return (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _file_signature(path: Path) -> tuple | None:
+    """Which file is at ``path`` (resolved name, device, inode) and its stamp.
+
+    None when the path cannot be stat'd; the caller then reads without the memo
+    and lets the database raise whatever it raised before.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.realpath(path), st.st_dev, st.st_ino), _file_stamp(st)
+
+
+def _log_state(conn: sqlite3.Connection) -> tuple[int | None, int, bool]:
+    """The log's largest sequence, its row count, and whether it is append-only."""
+    row = conn.execute(
+        "SELECT max(sequence), count(*), "
+        "(SELECT count(*) FROM sqlite_master "
+        " WHERE type = 'trigger' AND name IN (?, ?)) "
+        "FROM plan_statement_log",
+        _APPEND_ONLY_TRIGGERS,
+    ).fetchone()
+    return row[0], row[1], row[2] == len(_APPEND_ONLY_TRIGGERS)
+
+
+def _parse_log(conn: sqlite3.Connection) -> tuple[plan_model.Rule, ...]:
+    rows = conn.execute(
+        "SELECT * FROM plan_statement_log ORDER BY sequence"
+    ).fetchall()
+    return tuple(_rule_from_row(row) for row in rows)
+
+
 def read_rules(ctx: VaultContext) -> list[plan_model.Rule]:
-    """Read all log statements in append order."""
+    """Read all log statements in append order.
+
+    The parse is memoised per vault file and log state, so a projection that
+    reads the log once per day does not re-parse it once per day. Every call
+    still goes through ``ctx.read_only()``, so the READ capability, ownership
+    and any version pin are checked whether or not the memo holds the answer.
+    The caller gets a new list each time. The Rules in it are frozen.
+    """
     if not isinstance(ctx, VaultContext):
         raise TypeError("read_rules requires a VaultContext")
+    before = _file_signature(ctx.db_path)
     conn = ctx.read_only()
     try:
-        rows = conn.execute(
-            "SELECT * FROM plan_statement_log ORDER BY sequence"
-        ).fetchall()
-        return [_rule_from_row(row) for row in rows]
+        if before is None:
+            return list(_parse_log(conn))
+        max_sequence, count, append_only = _log_state(conn)
+        # The connection may have been opened on a file that replaced the one
+        # identified above. Trust the state only if the path still names that
+        # file, unchanged, once the state has been read; otherwise read uncached.
+        if not append_only or _file_signature(ctx.db_path) != before:
+            return list(_parse_log(conn))
+        key = (ctx.vault_id, before, max_sequence, count)
+        with _RULES_CACHE_LOCK:
+            cached = _RULES_CACHE.get(key)
+            if cached is not None:
+                _RULES_CACHE.move_to_end(key)
+        if cached is not None:
+            return list(cached)
+        # A write during this parse can leave rows newer than `key`. Once the
+        # file is written again its stamp moves on, so no later read computes
+        # `key` again and the newer rows are never served under it.
+        rules = _parse_log(conn)
+        with _RULES_CACHE_LOCK:
+            _RULES_CACHE[key] = rules
+            _RULES_CACHE.move_to_end(key)
+            while len(_RULES_CACHE) > _RULES_CACHE_LIMIT:
+                _RULES_CACHE.popitem(last=False)
+        return list(rules)
     finally:
         conn.close()
 

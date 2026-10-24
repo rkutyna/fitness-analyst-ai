@@ -453,3 +453,49 @@ def test_block_with_all_unsynced_week_has_no_total_and_no_change(conn, tools):
     assert blocks["prior"]["total"] == 13.3
     assert out["block_comparison"]["change"]["total_delta"] is None
     assert out["block_comparison"]["change"]["total_delta_pct"] is None
+
+
+# ---- indoor and treadmill sessions: unmeasured, and never going to sync ----
+
+DAY_INDOOR = "2026-07-08"
+NOT_RECORDED_REFUSAL = {"status": "samples_not_recorded",
+                        "reason": "samples_not_recorded",
+                        "jog_minutes": None}
+
+
+def _indoor_session(conn, base: str, day: str):
+    """A 40-minute treadmill run: running_speed samples, no distance rows."""
+    for i in range(120):
+        _record(conn, "running_speed", _iso(base, i), 2.7, "m/s")
+    conn.execute(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "duration_min, avg_heart_rate, is_indoor, fitness_machine, source, "
+        "dedupe_key) VALUES ('running', ?, ?, ?, 40.0, NULL, 1, 'treadmill', "
+        "'test', ?)", (base, _iso(base, 120), day, f"w|{base}|running"))
+
+
+def test_indoor_day_publishes_jog_minutes_none_as_not_recorded(conn, tools):
+    _vault_with_sessions(conn)
+    _indoor_session(conn, "2026-07-08T12:00:00Z", DAY_INDOOR)
+    conn.commit()
+
+    out = tools.get_impact_volume(start=DAY_MEASURED, end=DAY_INDOOR, by="day")
+
+    row = _period(out, DAY_INDOOR)
+    assert row["jog_minutes"] is None
+    assert row["walk_minutes"] is None
+    assert row["samples"] == "not_recorded"
+    assert "presentation" not in row
+    assert _period(out, DAY_UNSYNCED)["samples"] == "not_synced"
+
+
+def test_indoor_session_run_form_refuses_as_not_recorded(conn, tools):
+    _indoor_session(conn, "2026-07-08T12:00:00Z", DAY_INDOOR)
+    conn.commit()
+
+    out = tools.get_run_form(workout_date=DAY_INDOOR)
+
+    assert out["mode"] == "session" and out["found"] is True
+    assert out["efficiency_change"] == NOT_RECORDED_REFUSAL
+    assert out["walk_structure"] == NOT_RECORDED_REFUSAL
+    assert "samples_not_synced" not in json.dumps(out)

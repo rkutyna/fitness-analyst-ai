@@ -316,27 +316,41 @@ def longest_block(conn, start_utc: str, end_utc: str, bridge: bool = True) -> di
 IMPACT_WORKOUT_TYPES = ("running", "walking", "hiking")
 
 
-def unsynced_workout_days(conn, start: str, end: str, *,
-                          measured_days: frozenset[str] = frozenset(),
-                          metric_units: bool = False) -> frozenset[str]:
-    """Local dates whose running, walking or hiking sessions are all unsynced.
+def recorded_indoors(row) -> bool:
+    """True for a session GymKit recorded indoors or on a connected machine.
 
-    A session is unsynced when its window holds no distance buckets: its
-    per-sample distance, step and heart-rate series are not in the vault yet,
-    so its figures are unmeasured, never zero. A day is in the set when it has
-    at least one such session, no session with buckets, and is not in
-    ``measured_days`` (days the caller measures another way, such as a manual
-    jog entry). A day with no running, walking or hiking session is NOT in the
-    set: it is a real rest day.
+    A treadmill or indoor session records no per-sample distance, so its zero
+    buckets are permanent, not a sync delay. is_indoor NULL means "the device
+    did not say", so it does not count here.
+    """
+    return bool(row["is_indoor"]) or bool(row["fitness_machine"])
+
+
+def unmeasured_workout_days(conn, start: str, end: str, *,
+                            measured_days: frozenset[str] = frozenset(),
+                            metric_units: bool = False
+                            ) -> tuple[frozenset[str], frozenset[str]]:
+    """Local dates whose running, walking or hiking sessions have no buckets.
+
+    Returns ``(unsynced, not_recorded)``. A session with zero distance buckets
+    is unmeasured. An outdoor one may still sync, so its day is ``unsynced``.
+    An indoor or machine session never will, so its day is ``not_recorded``.
+    A day that has any bucket, or is in ``measured_days`` (a manual jog entry
+    or similar), is measured and in neither set. A day in both sets is listed
+    only in ``unsynced``, because it may still become measured. A day with no
+    running, walking or hiking session is in neither set: a real rest day.
     """
     active = db.workout_mark_condition(conn, "w")
     marks = ",".join("?" * len(IMPACT_WORKOUT_TYPES))
     sessions = conn.execute(
-        "SELECT w.local_date, w.start_utc, w.end_utc FROM workouts AS w "
+        "SELECT w.local_date, w.start_utc, w.end_utc, w.is_indoor, "
+        "w.fitness_machine FROM workouts AS w "
         f"WHERE w.local_date BETWEEN ? AND ? AND w.workout_type IN ({marks}) "
         f"AND {active}", (start, end, *IMPACT_WORKOUT_TYPES)).fetchall()
     with_session: set[str] = set()
     measured = set(measured_days)
+    outdoor_unsynced: set[str] = set()
+    indoor: set[str] = set()
     for w in sessions:
         day = w["local_date"]
         with_session.add(day)
@@ -345,7 +359,26 @@ def unsynced_workout_days(conn, start: str, end: str, *,
         if mx.bucket_series(conn, w["start_utc"], w["end_utc"],
                             metric_units=metric_units):
             measured.add(day)
-    return frozenset(with_session - measured)
+        elif recorded_indoors(w):
+            indoor.add(day)
+        else:
+            outdoor_unsynced.add(day)
+    unsynced = frozenset(outdoor_unsynced - measured)
+    not_recorded = frozenset((indoor - measured) - unsynced)
+    return unsynced, not_recorded
+
+
+def unsynced_workout_days(conn, start: str, end: str, *,
+                          measured_days: frozenset[str] = frozenset(),
+                          metric_units: bool = False) -> frozenset[str]:
+    """Local dates whose outdoor running, walking or hiking samples are unsynced.
+
+    The first element of :func:`unmeasured_workout_days`. Indoor days are not
+    here; they are in its second element, ``not_recorded``.
+    """
+    return unmeasured_workout_days(
+        conn, start, end, measured_days=measured_days,
+        metric_units=metric_units)[0]
 
 
 NOISE_FLOOR_WINDOW_DAYS = 365

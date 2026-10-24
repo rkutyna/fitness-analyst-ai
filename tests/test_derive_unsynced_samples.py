@@ -113,3 +113,21 @@ def test_stale_zero_block_row_is_removed_by_recompute(conn):
     conn.commit()
 
     assert _block_value(conn, DAY_UNSYNCED) is None
+
+
+def test_indoor_only_day_writes_no_block_row(conn):
+    """An indoor run never gets samples, so it must not write a block row."""
+    base = "2026-07-08T12:00:00Z"
+    for i in range(120):
+        _record(conn, "running_speed", _iso(base, i), 2.7, "m/s")
+    conn.execute(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "duration_min, avg_heart_rate, is_indoor, source, dedupe_key) "
+        "VALUES ('running', ?, ?, '2026-07-08', 40.0, NULL, 1, 'test', ?)",
+        (base, _iso(base, 120), f"w|{base}|running"))
+    conn.commit()
+
+    derive.update_for_days(conn, ["2026-07-08"])
+    conn.commit()
+
+    assert _block_value(conn, "2026-07-08") is None

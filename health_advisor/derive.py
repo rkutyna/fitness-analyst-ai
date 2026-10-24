@@ -362,11 +362,13 @@ def _dial_for_day(conn, day: str) -> dict:
     jog = rows[0].get("jog_minutes") if rows else None
     if jog is not None:
         out[JOG_MINUTES_METRIC] = float(jog)
-    if day in A.unsynced_workout_days(conn, day, day):
-        # Every running/walking/hiking session that day has no distance buckets
-        # yet. max([0.0]) would publish an unmeasured block as a measured zero,
-        # so no block row is written, exactly as for a day with no session. The
-        # row is filled by the first derive that sees the samples.
+    # Every running/walking/hiking session that day has no distance buckets:
+    # either not synced yet, or indoor and never recorded. max([0.0]) would
+    # publish an unmeasured block as a measured zero, so no block row is
+    # written, exactly as for a day with no session. An outdoor row is
+    # filled by the first derive that sees the samples.
+    unsynced, not_recorded = A.unmeasured_workout_days(conn, day, day)
+    if day in unsynced or day in not_recorded:
         return out
     blocks = [A.longest_block(conn, w["start_utc"], w["end_utc"])["bridged_min"]
               for w in conn.execute(

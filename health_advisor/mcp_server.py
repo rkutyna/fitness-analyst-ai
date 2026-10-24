@@ -1415,16 +1415,21 @@ def _impact_periods(rows: list[dict], start: str, end: str,
                     local_timezone: tzinfo | None = None,
                     metric_units: bool = False,
                     unsynced_days: frozenset[str] = frozenset(),
-                    unsynced_weeks: frozenset[str] = frozenset()) -> list[dict]:
+                    unsynced_weeks: frozenset[str] = frozenset(),
+                    not_recorded_days: frozenset[str] = frozenset(),
+                    not_recorded_weeks: frozenset[str] = frozenset()) -> list[dict]:
     """Return the gap-filled impact periods with their completeness labels.
 
-    ``unsynced_days`` are local dates that hold a running, walking or hiking
-    workout whose samples are not in the vault yet, and that have no impact row.
-    They are unmeasured, not zero. A day in it is published as None with
-    ``samples: "not_synced"``. A week lists them in ``samples_not_synced_days``
-    and its total covers only the measured days. A day with no workout at all
-    stays a true zero. A week in ``unsynced_weeks`` holds no measured day at
-    all, so its totals are None with ``samples: "not_synced"`` rather than 0.0.
+    ``unsynced_days`` are local dates that hold an outdoor running, walking or
+    hiking workout whose samples are not in the vault yet, and that have no
+    impact row. ``not_recorded_days`` are local dates whose only zero-bucket
+    sessions are indoor or on a machine, which never record per-sample distance.
+    Both are unmeasured, not zero. A day in either is published as None with
+    ``samples`` "not_synced" or "not_recorded". A week lists them in
+    ``samples_not_synced_days`` / ``samples_not_recorded_days`` and its total
+    covers only the measured days. A day with no workout at all stays a true
+    zero. A week in ``unsynced_weeks`` or ``not_recorded_weeks`` holds no
+    measured day at all, so its totals are None rather than 0.0.
 
     Both the ordinary impact tool and its block-comparison mode need exactly
     this sequence. Keeping it here means the aggregate cannot accidentally
@@ -1454,17 +1459,22 @@ def _impact_periods(rows: list[dict], start: str, end: str,
         bucket_end = min(key + timedelta(days=6), end_date).isoformat()
         covered = _impact_days_covered(
             key, by, start, end, as_of=as_of, local_timezone=local_timezone)
-        unmeasured = iso not in have and (
-            (by == "day" and iso in unsynced_days)
-            or (by == "week" and iso in unsynced_weeks))
-        if unmeasured:
-            # The workout exists but its samples are not in the vault:
-            # unmeasured, so jog/walk figures are None, never a published 0.
+        if iso in have:
+            label = None
+        elif by == "day":
+            label = ("not_synced" if iso in unsynced_days
+                     else "not_recorded" if iso in not_recorded_days else None)
+        else:
+            label = ("not_synced" if iso in unsynced_weeks
+                     else "not_recorded" if iso in not_recorded_weeks else None)
+        if label is not None:
+            # The workout exists but it has no distance samples: unmeasured, so
+            # jog/walk figures are None, never a published 0.
             row = {
                 "period_start": iso, "jog_minutes": None,
                 distance_key: None, pace_key: None,
                 "walk_minutes": None, walk_key: None,
-                "jog_change_pct": None, "samples": "not_synced",
+                "jog_change_pct": None, "samples": label,
             }
         else:
             row = have.get(iso) or {
@@ -1479,6 +1489,11 @@ def _impact_periods(rows: list[dict], start: str, end: str,
                 if key.isoformat() <= d <= bucket_end)
             if unsynced_here:
                 extra["samples_not_synced_days"] = unsynced_here
+            recorded_here = sorted(
+                d for d in not_recorded_days
+                if key.isoformat() <= d <= bucket_end)
+            if recorded_here:
+                extra["samples_not_recorded_days"] = recorded_here
         periods.append({**row, **extra, "no_data": iso not in have,
                         # This labels only the canonical jog-minute series.
                         # Other fields in the row are impact context and stay
@@ -1581,10 +1596,10 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
         }
         # Days whose samples are not synced are left out of the total, not
         # counted as zero; they are named here so the total is never silent.
-        unsynced = [d for row in rows
-                    for d in row.get("samples_not_synced_days", [])]
-        if unsynced:
-            out["samples_not_synced_days"] = sorted(set(unsynced))
+        for key in ("samples_not_synced_days", "samples_not_recorded_days"):
+            named = [d for row in rows for d in row.get(key, [])]
+            if named:
+                out[key] = sorted(set(named))
         return out
 
     recent_block, prior_block = block(recent), block(prior)
@@ -1669,23 +1684,29 @@ def _impact_block_comparison(periods: list[dict], start: str, end: str,
 
 def _impact_unsynced_days(conn, start: str, end: str, bucket_rows: list[dict],
                           *, metric_units: bool
-                          ) -> tuple[frozenset[str], frozenset[str]]:
+                          ) -> tuple[frozenset[str], frozenset[str],
+                                     frozenset[str], frozenset[str]]:
     """Local dates, and Monday weeks, whose running, walking or hiking sessions
     have no distance buckets and no measured value of their own.
 
-    The day rule is analysis.unsynced_workout_days, shared with derive. A day
-    with a manual jog entry or any bucket is measured, so it is excluded. A week
-    is unsynced only when it holds an unsynced day and no measured day: its
-    total would otherwise be a sum over measured days that were never zero.
+    Returns ``(unsynced_days, unsynced_weeks, not_recorded_days,
+    not_recorded_weeks)``. The day rule is analysis.unmeasured_workout_days,
+    shared with derive. A day with a manual jog entry or any bucket is measured,
+    so it is excluded. A week is unmeasured only when it holds an unmeasured day
+    and no measured day: its total would otherwise be a sum over measured days
+    that were never zero. A week with an unsynced day is "unsynced" even if it
+    also holds an indoor day; the two never overlap.
     """
     measured = ({b["local_date"] for b in bucket_rows}
                 | set(db.manual_jog_by_day(conn, start, end)))
-    days = A.unsynced_workout_days(
+    days, recorded = A.unmeasured_workout_days(
         conn, start, end, measured_days=frozenset(measured),
         metric_units=metric_units)
     measured_weeks = {A._week_start(d) for d in measured}
     weeks = frozenset(A._week_start(d) for d in days) - measured_weeks
-    return days, weeks
+    recorded_weeks = (frozenset(A._week_start(d) for d in recorded)
+                      - measured_weeks - weeks)
+    return days, weeks, recorded, recorded_weeks
 
 
 @tool
@@ -1780,7 +1801,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                                bucket_rows=bucket_rows)
         sens = _jog_threshold_sensitivity(conn, start, effective_end,
                                           bucket_rows=bucket_rows)
-        unsynced, unsynced_weeks = _impact_unsynced_days(
+        unsynced, unsynced_weeks, recorded, recorded_weeks = _impact_unsynced_days(
             conn, start, effective_end, bucket_rows, metric_units=metric_units)
         # Fill periods analysis had no rows for, then recompute the change
         # column over the complete sequence. The same labelled rows feed block
@@ -1789,7 +1810,8 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
         periods = _impact_periods(
             rows, start, effective_end, by, as_of=as_of,
             local_timezone=local_timezone, metric_units=metric_units,
-            unsynced_days=unsynced, unsynced_weeks=unsynced_weeks)
+            unsynced_days=unsynced, unsynced_weeks=unsynced_weeks,
+            not_recorded_days=recorded, not_recorded_weeks=recorded_weeks)
     except ValueError as e:
         return {"error": str(e)}
     finally:
@@ -1988,6 +2010,9 @@ def get_training_load_detail(ctx: VaultContext, start: str | None = None,
 NOT_SYNCED_FORM_REFUSAL = {"status": "samples_not_synced",
                            "reason": "samples_not_synced",
                            "jog_minutes": None}
+NOT_RECORDED_FORM_REFUSAL = {"status": "samples_not_recorded",
+                             "reason": "samples_not_recorded",
+                             "jog_minutes": None}
 
 
 @tool
@@ -2040,13 +2065,15 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
         active = db.workout_mark_condition(conn, "w")
         if workout_date:
             row = conn.execute(
-                "SELECT w.start_utc, w.end_utc, w.local_date FROM workouts AS w "
+                "SELECT w.start_utc, w.end_utc, w.local_date, w.is_indoor, "
+                "w.fitness_machine FROM workouts AS w "
                 "WHERE w.workout_type = 'running' AND w.local_date = ? "
                 f"AND {active} ORDER BY w.duration_min DESC LIMIT 1",
                 (workout_date,)).fetchone()
         else:
             row = conn.execute(
-                "SELECT w.start_utc, w.end_utc, w.local_date FROM workouts AS w "
+                "SELECT w.start_utc, w.end_utc, w.local_date, w.is_indoor, "
+                "w.fitness_machine FROM workouts AS w "
                 f"WHERE w.workout_type = 'running' AND {active} "
                 "ORDER BY w.start_utc DESC LIMIT 1").fetchone()
         if not row:
@@ -2062,9 +2089,12 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
             walk = RF.walk_structure_from_buckets(
                 buckets, metric_units=metric_units)
         else:
-            # Zero buckets means the samples are not in the vault yet. That is
-            # unmeasured, not "0 min of jogging", so it gets its own refusal.
-            efficiency = walk = dict(NOT_SYNCED_FORM_REFUSAL)
+            # Zero buckets is unmeasured, not "0 min of jogging". An indoor or
+            # machine session never records distance; any other session's
+            # samples may still sync. Each gets its own refusal.
+            refusal = (NOT_RECORDED_FORM_REFUSAL if A.recorded_indoors(row)
+                       else NOT_SYNCED_FORM_REFUSAL)
+            efficiency = walk = dict(refusal)
 
         return {
             "mode": "session",
@@ -2858,6 +2888,8 @@ def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
 
 NOT_SYNCED_NOTE = ("this session's minute-by-minute distance and step samples "
                    "are not in the vault yet, so its blocks cannot be measured")
+NOT_RECORDED_NOTE = ("an indoor or treadmill session records no per-sample "
+                     "distance, so its blocks cannot be measured")
 
 
 @tool
@@ -2890,8 +2922,9 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
     and no recording time is missing. Without it, one GPS wobble splits a run in
     two — a 9.3-minute continuous jog gets reported as 4.0.
 
-    A treadmill session returns zeros: GymKit records no per-sample distance, so
-    there are no buckets to chain. That is a known blind spot, not a rest day.
+    A treadmill or other indoor session has no buckets either: GymKit records no
+    per-sample distance, so its block figures are null with samples
+    "not_recorded", never zero.
 
     A running session whose distance, step and heart-rate samples have not synced
     yet has no buckets at all. It is NOT a zero: its block figures are null, it
@@ -2906,7 +2939,8 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         marked = db.workout_mark_condition(conn, "w", marked=True)
         rows = conn.execute(
             "SELECT w.id, w.workout_type, w.start_utc, w.end_utc, w.duration_min, "
-            "w.avg_heart_rate FROM workouts AS w WHERE w.local_date = ? "
+            "w.avg_heart_rate, w.is_indoor, w.fitness_machine FROM workouts AS w "
+            "WHERE w.local_date = ? "
             "AND w.workout_type IN ('running', 'walking', 'hiking') "
             f"AND {active} ORDER BY w.start_utc", (day,)).fetchall()
         excluded = conn.execute(
@@ -2932,11 +2966,15 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 "reps": block["reps"],
             }
             if hr["n_buckets"] == 0:
-                # Zero buckets is "not synced", not "ran zero minutes".
+                # Zero buckets is unmeasured, not "ran zero minutes". Indoor and
+                # machine sessions never record distance; the rest may sync.
+                indoor = A.recorded_indoors(w)
                 entry.update(longest_block_min=None, qualified_block_min=None,
                              unbridged_min=None, avg_hr_longest_block=None,
-                             reps=[], samples="not_synced",
-                             note=NOT_SYNCED_NOTE)
+                             reps=[], samples="not_recorded" if indoor
+                             else "not_synced",
+                             note=NOT_RECORDED_NOTE if indoor
+                             else NOT_SYNCED_NOTE)
             sessions.append(entry)
         hr_ceiling = A.mx.block_qualify_hr_max(conn)
     finally:
@@ -2948,9 +2986,12 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 "note": "no session with measurable block structure on this day"}
     measured = [s for s in sessions if s["longest_block_min"] is not None]
     if not measured:
+        # Any unsynced session makes the day "not_synced": it may still measure.
+        unsynced = any(s["samples"] == "not_synced" for s in sessions)
         return {"day": day, "sessions": sessions, "excluded_count": excluded,
                 "longest_block_min": None, "qualified_block_min": None,
-                "samples": "not_synced", "note": NOT_SYNCED_NOTE,
+                "samples": "not_synced" if unsynced else "not_recorded",
+                "note": NOT_SYNCED_NOTE if unsynced else NOT_RECORDED_NOTE,
                 "hr_ceiling_for_qualifying": hr_ceiling}
     best = max(measured, key=lambda s: s["longest_block_min"])
     qualified = [s["qualified_block_min"] for s in measured

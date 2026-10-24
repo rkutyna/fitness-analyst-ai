@@ -164,3 +164,85 @@ def test_day_with_measured_and_unsynced_session_reports_the_measured_block(
     assert unsynced["note"] == NOT_SYNCED_NOTE
     assert out["longest_block_min"] == 4.0
     assert out["qualified_block_min"] == 4.0
+
+
+# ---- indoor and treadmill sessions: zero buckets that will never sync ----
+
+INDOOR_DAY = "2026-07-08"
+INDOOR_NOT_RECORDED_NOTE = ("an indoor or treadmill session records no "
+                            "per-sample distance, so its blocks cannot be measured")
+
+
+def _indoor_session(conn, base: str, day: str, *, is_indoor, fitness_machine):
+    """A 40-minute run with running_speed samples only and no distance, step or
+    heart-rate rows: what GymKit writes for a treadmill run."""
+    for i in range(120):
+        _record(conn, "running_speed", _iso(base, i), 2.7, "m/s")
+    conn.execute(
+        "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+        "duration_min, avg_heart_rate, is_indoor, fitness_machine, source, "
+        "dedupe_key) VALUES ('running', ?, ?, ?, 40.0, NULL, ?, ?, 'test', ?)",
+        (base, _iso(base, 120), day, is_indoor, fitness_machine,
+         f"w|{base}|running"))
+
+
+def test_indoor_running_session_publishes_none_as_not_recorded(conn, tools):
+    _indoor_session(conn, "2026-07-08T12:00:00Z", INDOOR_DAY,
+                    is_indoor=1, fitness_machine=None)
+    conn.commit()
+
+    out = tools.get_block_structure(day=INDOOR_DAY)
+
+    assert out["sessions"] == [{
+        "workout_type": "running",
+        "duration_min": 40.0,
+        "longest_block_min": None,
+        "qualified_block_min": None,
+        "unbridged_min": None,
+        "avg_hr_longest_block": None,
+        "avg_hr_all_jog": None,
+        "avg_hr_session": None,
+        "reps": [],
+        "samples": "not_recorded",
+        "note": INDOOR_NOT_RECORDED_NOTE,
+    }]
+    assert out["longest_block_min"] is None
+    assert out["qualified_block_min"] is None
+    assert out["samples"] == "not_recorded"
+    assert out["note"] == INDOOR_NOT_RECORDED_NOTE
+    assert _no_zero_figures(out) == []
+
+
+def test_treadmill_machine_alone_is_not_recorded(conn, tools):
+    """fitness_machine set while is_indoor is NULL ("the device did not say")
+    still means a machine session: it records no distance either."""
+    _indoor_session(conn, "2026-07-08T12:00:00Z", INDOOR_DAY,
+                    is_indoor=None, fitness_machine="treadmill")
+    conn.commit()
+
+    out = tools.get_block_structure(day=INDOOR_DAY)
+
+    assert out["sessions"][0]["samples"] == "not_recorded"
+    assert out["samples"] == "not_recorded"
+    assert out["longest_block_min"] is None
+
+
+def test_indoor_day_beside_an_outdoor_unsynced_run_is_not_synced(conn, tools):
+    """The day stays "not_synced" while an outdoor run may still sync; the
+    indoor session is individually "not_recorded" and never becomes a 0."""
+    _indoor_session(conn, "2026-07-08T12:00:00Z", INDOOR_DAY,
+                    is_indoor=1, fitness_machine=None)
+    _unsynced_session(conn, "2026-07-08T18:00:00Z", INDOOR_DAY)
+    conn.commit()
+
+    out = tools.get_block_structure(day=INDOOR_DAY)
+
+    indoor, outdoor = out["sessions"]
+    assert indoor["samples"] == "not_recorded"
+    assert indoor["note"] == INDOOR_NOT_RECORDED_NOTE
+    assert outdoor["samples"] == "not_synced"
+    assert outdoor["note"] == NOT_SYNCED_NOTE
+    assert out["samples"] == "not_synced"
+    assert out["note"] == NOT_SYNCED_NOTE
+    assert out["longest_block_min"] is None
+    assert _no_zero_figures(out) == []

@@ -2763,6 +2763,10 @@ def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
         conn.close()
 
 
+NOT_SYNCED_NOTE = ("this session's minute-by-minute distance and step samples "
+                   "are not in the vault yet, so its blocks cannot be measured")
+
+
 @tool
 def get_block_structure(ctx: VaultContext, day: str) -> dict:
     """How long the user ran CONTINUOUSLY, and whether it was easy enough to count.
@@ -2795,6 +2799,11 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
 
     A treadmill session returns zeros: GymKit records no per-sample distance, so
     there are no buckets to chain. That is a known blind spot, not a rest day.
+
+    A running session whose distance, step and heart-rate samples have not synced
+    yet has no buckets at all. It is NOT a zero: its block figures are null, it
+    carries samples "not_synced" and a note, and the day's longest block is taken
+    over the measured sessions only (null when none is measured).
     """
     if err := _bad_dates(day=day):
         return {"error": err}
@@ -2818,7 +2827,7 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 continue          # a walk with no jog block is not a session here
             hr = A.mx.session_hr_figures(conn, w["start_utc"], w["end_utc"],
                                          w["avg_heart_rate"])
-            sessions.append({
+            entry = {
                 "workout_type": w["workout_type"],
                 "duration_min": A.mx.r(w["duration_min"], 1),
                 "longest_block_min": block["bridged_min"],
@@ -2828,7 +2837,14 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 "avg_hr_all_jog": hr["avg_hr_all_jog"],
                 "avg_hr_session": hr["avg_hr_session"],
                 "reps": block["reps"],
-            })
+            }
+            if hr["n_buckets"] == 0:
+                # Zero buckets is "not synced", not "ran zero minutes".
+                entry.update(longest_block_min=None, qualified_block_min=None,
+                             unbridged_min=None, avg_hr_longest_block=None,
+                             reps=[], samples="not_synced",
+                             note=NOT_SYNCED_NOTE)
+            sessions.append(entry)
         hr_ceiling = A.mx.block_qualify_hr_max(conn)
     finally:
         conn.close()
@@ -2837,8 +2853,14 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 "excluded_count": excluded,
                 "qualified_block_min": None,
                 "note": "no session with measurable block structure on this day"}
-    best = max(sessions, key=lambda s: s["longest_block_min"])
-    qualified = [s["qualified_block_min"] for s in sessions
+    measured = [s for s in sessions if s["longest_block_min"] is not None]
+    if not measured:
+        return {"day": day, "sessions": sessions, "excluded_count": excluded,
+                "longest_block_min": None, "qualified_block_min": None,
+                "samples": "not_synced", "note": NOT_SYNCED_NOTE,
+                "hr_ceiling_for_qualifying": hr_ceiling}
+    best = max(measured, key=lambda s: s["longest_block_min"])
+    qualified = [s["qualified_block_min"] for s in measured
                  if s["qualified_block_min"] is not None]
     return {
         "day": day, "sessions": sessions, "excluded_count": excluded,

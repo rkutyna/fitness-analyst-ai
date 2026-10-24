@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-from health_advisor import backfill, db, receiver
+from health_advisor import backfill, db, derive, receiver
 
 
 DEVICE = {"id": "watch-a", "name": "iPhone", "model": "iPhone17,1"}
@@ -148,6 +148,15 @@ def test_a_failing_reconciliation_leaves_the_ingest_committed_and_logs(
     def boom(*_a, **_k):
         raise RuntimeError("reconcile exploded")
     monkeypatch.setattr(db, "reconcile_workout_heart_rate", boom)
+    # Spy on the derive call the receiver makes after the reconcile; delegate
+    # to the real function so the derive still runs and can still fail.
+    real_derive = derive.update_after_ingest
+    derive_calls: list[set] = []
+
+    def spy_derive(conn, days, source, **kw):
+        derive_calls.append(set(days))
+        return real_derive(conn, days, source, **kw)
+    monkeypatch.setattr(derive, "update_after_ingest", spy_derive)
 
     with caplog.at_level(logging.WARNING, logger=receiver.__name__):
         with _client(vault, monkeypatch) as client:
@@ -156,12 +165,13 @@ def test_a_failing_reconciliation_leaves_the_ingest_committed_and_logs(
 
     assert body["workouts_added"] == 1
     assert _hr(vault_path) == (120.0, 130.0)          # durable, unreconciled
+    # The derive step after it ran for this workout's day (the spy delegates
+    # to the real function), and did not fail.
+    assert any(DAY in days for days in derive_calls)
     conn = db.connect(vault_path, read_only=True)
     try:
         assert conn.execute("SELECT COUNT(*) FROM records WHERE metric = "
                             "'heart_rate'").fetchone()[0] == len(HARD)
-        # The derive step after it still ran and did not fail. The workout has
-        # no distance samples, so no block row is written for its day.
         assert conn.execute(
             "SELECT COUNT(*) FROM ingest_log WHERE source = 'derive_error'"
         ).fetchone()[0] == 0

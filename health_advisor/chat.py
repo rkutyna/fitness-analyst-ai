@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping
 
 from . import db
 from . import facts as fact_store
+from . import ledger_lock
 from . import steering
 from . import vault
 from .context import VaultContext
@@ -223,9 +224,14 @@ def _render_history(history: list[dict[str, Any]] | None) -> str:
 
 
 def _read_ledger(path: str) -> list[dict]:
-    """Read the append-only call ledger produced by the tool wrapper."""
+    """Read the append-only call ledger produced by the tool wrapper.
+
+    The shared lock waits out an append in progress, which a Linux read would
+    otherwise return half-written (#116); a torn line still empties the result.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
+            ledger_lock.lock_for_read(fh)
             return [json.loads(line) for line in fh if line.strip()]
     except (FileNotFoundError, json.JSONDecodeError):
         return []

@@ -25,6 +25,7 @@ from datetime import date, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from . import deepdive_memory as mem
+from . import ledger_lock
 from . import llm
 from . import mcp_server as S
 from .context import VaultContext
@@ -59,6 +60,7 @@ class _CallLedger:
         """Continue a ledger if a caller deliberately reuses its run path."""
         try:
             with open(self.path, encoding="utf-8") as fh:
+                ledger_lock.lock_for_read(fh)
                 sequences = []
                 for line in fh:
                     try:
@@ -111,15 +113,19 @@ class _CallLedger:
             sequence = self._next_sequence
             entry["sequence"] = sequence
             # One complete line, serialised in memory and handed to the kernel
-            # in a single write on an O_APPEND descriptor: a reader opening the
-            # file concurrently sees the line whole or not at all. The reader
-            # discards the entire ledger on one undecodable line, so a visible
-            # half-line would blank every citation of the turn.
+            # in a single write on an O_APPEND descriptor, under the ledger's
+            # exclusive flock. The single write orders writers; the flock is
+            # what keeps a reader from seeing the line half-written, because
+            # on Linux a read does not wait for a write in progress (#116).
+            # Every reader takes the shared lock (ledger_lock.lock_for_read)
+            # and discards the entire ledger on one undecodable line, so a
+            # visible half-line would blank every citation of the turn.
             line = (json.dumps(entry, sort_keys=True, separators=(",", ":"))
                     + "\n").encode("utf-8")
             fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
                          0o666)
             try:
+                ledger_lock.lock_for_append(fd)  # released by the close below
                 view = memoryview(line)
                 while view:  # a short write is retried with the remainder
                     view = view[os.write(fd, view):]

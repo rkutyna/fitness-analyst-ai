@@ -3,6 +3,8 @@ the MCP tools and analysis.py share ONE implementation (no numeric divergence).
 All functions are pure given a connection; callers manage the connection."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 import math
 
@@ -659,10 +661,86 @@ BEDTIME_ANCHOR_H = 11.0
 BEDTIME_SOCIAL_LIMIT_H = 12.5
 
 
+# The active bucket memo, or None when no ``bucket_memo()`` block is open.
+# A ContextVar rather than a module global, so concurrent requests on other
+# threads or tasks never see each other's memo.
+_BUCKET_MEMO: ContextVar[dict | None] = ContextVar(
+    "impact_bucket_memo", default=None)
+
+
+@contextmanager
+def bucket_memo():
+    """Compute each distinct ``impact_bucket_rows`` window once inside this block.
+
+    One read of a day or a week can ask for the same workout's buckets several
+    times, once per figure built from them (jog minutes, the longest block,
+    decoupling, heart-rate scopes). Each ask runs the same bucketing query.
+    Inside this block the first call for a set of arguments runs the query and
+    later identical calls reuse its rows.
+
+    The memo is keyed by the connection object and by every argument that
+    selects the rows: the window predicate, the window arguments, the
+    arbitration window and its kind. Keying on the object, not ``id(conn)``,
+    means a closed connection's reused id can never alias a new one. The memo
+    holds those connections, and the rows, until the block exits.
+
+    Every call returns fresh dicts, so a caller that edits its rows cannot
+    change what a later call receives. Outside the block nothing is cached and
+    the function behaves exactly as it does without the memo. Nested blocks
+    share the outermost block's memo.
+
+    Use it around read-only work. A write to the vault through a memoised
+    connection inside the block is not seen by a window already computed.
+    """
+    if _BUCKET_MEMO.get() is not None:
+        yield
+        return
+    token = _BUCKET_MEMO.set({})
+    try:
+        yield
+    finally:
+        _BUCKET_MEMO.reset(token)
+
+
 def impact_bucket_rows(conn, window_predicate: str,
                        window_args: tuple[str, str], *,
                        arbitration_window: tuple[str, str] | None = None,
                        arbitration_window_kind: str = "local_date") -> list[dict]:
+    """Return the shared classified impact buckets for a parameterised window.
+
+    Inside a ``bucket_memo()`` block an identical call reuses the first call's
+    rows (as fresh copies); outside one, every call runs the query. The rule
+    itself lives in ``_impact_bucket_rows_uncached``, documented below.
+    """
+    memo = _BUCKET_MEMO.get()
+    if memo is None:
+        return _impact_bucket_rows_uncached(
+            conn, window_predicate, window_args,
+            arbitration_window=arbitration_window,
+            arbitration_window_kind=arbitration_window_kind)
+    # Every argument goes into the key as given. An omitted arbitration window
+    # stays None rather than being resolved to the read window, so the read
+    # window is the only thing that tells two such calls apart.
+    key = (conn, window_predicate, tuple(window_args),
+           tuple(arbitration_window) if arbitration_window is not None
+           else None,
+           arbitration_window_kind)
+    rows = memo.get(key)
+    if rows is None:
+        rows = _impact_bucket_rows_uncached(
+            conn, window_predicate, window_args,
+            arbitration_window=arbitration_window,
+            arbitration_window_kind=arbitration_window_kind)
+        memo[key] = rows
+    # Each row holds only scalars (ints, floats, strings, None), so a new dict
+    # per row is a complete copy.
+    return [dict(row) for row in rows]
+
+
+def _impact_bucket_rows_uncached(
+        conn, window_predicate: str, window_args: tuple[str, str], *,
+        arbitration_window: tuple[str, str] | None = None,
+        arbitration_window_kind: str = "local_date") -> list[dict]:
     """Return the shared classified impact buckets for a parameterised window.
 
     ``metrics.bucket_series`` and ``analysis.impact_volume`` both depend on

@@ -1,4 +1,4 @@
-"""The cross-request cache for ``impact_buckets.impact_bucket_rows_py`` (#692 S2-4b).
+"""The cross-request cache for ``impact_buckets.impact_bucket_rows_py``.
 
 The cache key is a digest of every field of ``BucketInputs``. These tests pin:
 

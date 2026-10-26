@@ -759,7 +759,7 @@ def _impact_bucket_rows_uncached(
 
     The port is ``impact_buckets.impact_bucket_rows_py``. It was proven to
     return the same rows as ``_impact_bucket_rows_sql``, the SQL reference, on
-    every oracle call (dev and live vaults). Import is lazy because
+    every workout window, day and week of two multi-year vaults. Import is lazy because
     ``impact_buckets`` imports this module.
     """
     from . import impact_buckets

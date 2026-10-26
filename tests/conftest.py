@@ -76,6 +76,21 @@ def seed_workout(conn: sqlite3.Connection, workout_type: str, local_date: str,
 
 
 @pytest.fixture(autouse=True)
+def _fresh_impact_bucket_cache():
+    """Start and end every test with an empty impact bucket cache.
+
+    The cache keys on the fetched inputs, not on code, so a result computed by
+    one test must never reach another that patches a helper ``_compute`` uses.
+    A test that patches such a helper partway through still clears the cache at
+    its own patch boundary (see test_f82_source_arbitration).
+    """
+    from health_advisor import impact_buckets
+    impact_buckets.clear_impact_bucket_cache()
+    yield
+    impact_buckets.clear_impact_bucket_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_db(request, tmp_path, monkeypatch):
     """Give every test its own vault, and make opening the production DB a hard
     error.

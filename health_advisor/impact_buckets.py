@@ -3,8 +3,8 @@
 ``metrics.impact_bucket_rows`` computes its rows here (through
 ``metrics._impact_bucket_rows_uncached``). The SQL it replaces,
 ``metrics._impact_bucket_rows_sql``, is kept as the reference: this port was
-proven to return bit-identical rows to it on every oracle call (2526 on the dev
-vault, 2710 on the live vault), and the tests pin the same equality.
+checked to return bit-identical rows to it over every workout window, sub-window,
+day and week of two multi-year vaults, and the tests pin the same equality.
 
 The SQL computes classified 20-second buckets with one recursive CTE. This
 module returns the same rows from indexed raw-row reads: the distribution of
@@ -538,11 +538,17 @@ def _compute(inputs: BucketInputs, window_predicate: str,
 # the digest, and nothing can be served stale. There is no TTL and no
 # invalidation hook. The fetch always runs (it is needed to form the key), so a
 # hit saves the computation only.
+#
+# The key covers the inputs, not the code. That is safe in a running service
+# because the cache lives in this process and new code arrives with a new
+# process. Within one process, a caller that monkeypatches a helper
+# ``_compute`` uses (the jog rule, the arbitration step) must clear the cache at
+# the patch boundary; the test suite's conftest clears it between tests.
 
-# Total cached rows across all entries. The oracle's live call set returns
-# 290,731 rows in all; a budget below that would evict every entry before its
-# next use under the oracle's repeated pass, so the budget covers that set with
-# headroom. An entry costs max(len(rows), 1) so that empty results still count.
+# Total cached rows across all entries. A week window of dense per-second
+# samples is a few thousand rows, so this holds months of day and week windows
+# in roughly 100 MB. An entry costs max(len(rows), 1) so that empty results
+# still count.
 IMPACT_BUCKET_CACHE_MAX_ROWS = 400_000
 
 _CACHE: "OrderedDict[bytes, tuple]" = OrderedDict()   # digest -> (keys, values, cost)

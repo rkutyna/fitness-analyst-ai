@@ -739,6 +739,18 @@ def impact_bucket_rows(conn, window_predicate: str,
     return [dict(row) for row in rows]
 
 
+def clear_impact_bucket_cache() -> None:
+    """Empty the process-wide impact bucket cache (see ``impact_buckets``)."""
+    from . import impact_buckets
+    impact_buckets.clear_impact_bucket_cache()
+
+
+def impact_bucket_cache_info() -> dict:
+    """Read-only entries, rows, hits and misses of the impact bucket cache."""
+    from . import impact_buckets
+    return impact_buckets.impact_bucket_cache_info()
+
+
 def _impact_bucket_rows_uncached(
         conn, window_predicate: str, window_args: tuple[str, str], *,
         arbitration_window: tuple[str, str] | None = None,

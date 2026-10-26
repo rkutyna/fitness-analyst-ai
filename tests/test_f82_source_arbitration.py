@@ -13,6 +13,16 @@ from health_advisor import metrics
 from tests.fixture_loader import load_f82_multi_source
 
 
+def _clear_bucket_cache():
+    """Drop the impact bucket cache at a patch boundary.
+
+    The cache keys on the fetched inputs, which the arbitration patches leave
+    unchanged, while the patched ``_arbitration_losers`` changes the rows. A
+    result cached inside a patch must not be served after it, or before one.
+    """
+    impact_buckets.clear_impact_bucket_cache()
+
+
 def _seed_cadence_where_the_retired_pace_lane_fired(conn, workout):
     """Give the cadence-blind fixture a step stream, so a jog bucket can exist.
 
@@ -341,6 +351,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
     workout = conn.execute(
         "SELECT start_utc, end_utc FROM workouts WHERE id = 815"
     ).fetchone()
+    _clear_bucket_cache()
     with monkeypatch.context() as patch:
         # Arbitration off, in both implementations of the bucket rows: the SQL
         # reference reads its clause from db._workout_arbitration, and the live
@@ -354,6 +365,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
 
         before_miles = sum(row["miles"] for row in metrics.bucket_series(
             conn, workout["start_utc"], workout["end_utc"]))
+    _clear_bucket_cache()
 
     after_volume = analysis.impact_volume(
         conn, "2026-08-25", "2026-08-25", by="day")[0]
@@ -410,6 +422,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
     # synthetic step stream in the buckets the retired pace lane counted and the
     # recorded figures must come back, and must still tell the duplicate streams
     # (one 57.3-minute block) from the selected stream (five 5.0-minute reps).
+    _clear_bucket_cache()
     with monkeypatch.context() as patch:
         patch.setattr(db, "_workout_arbitration", lambda *a, **k: ("", []))
         patch.setattr(impact_buckets, "_arbitration_losers", lambda *a, **k: set())
@@ -418,6 +431,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
             conn, workout["start_utc"], workout["end_utc"])
         seeded_before_volume = analysis.impact_volume(
             conn, "2026-08-25", "2026-08-25", by="day")[0]
+    _clear_bucket_cache()
     _clear_cadence_seed(conn)
     assert _seed_cadence_where_the_retired_pace_lane_fired(conn, workout) > 0
     seeded_after = analysis.longest_block(
@@ -433,6 +447,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
 
 def test_each_inflated_session_has_a_finite_selected_block_structure(conn):
     payload = load_f82_multi_source(conn)
+    _clear_bucket_cache()
     # 815 read 5.0 while the block dial had a pace lane; the fixture carries no
     # step data, so under the one jog rule (formula version 3) every session here has no
     # block. The selected stream is checked on the bucket rows instead: each

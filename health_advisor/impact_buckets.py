@@ -31,6 +31,10 @@ other predicate is delegated to the SQL reference, ``metrics._impact_bucket_rows
 from __future__ import annotations
 
 import bisect
+import hashlib
+import marshal
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -525,6 +529,121 @@ def _compute(inputs: BucketInputs, window_predicate: str,
     return out
 
 
+# ------------------------------------------------------------------ cache
+#
+# A process-wide, least-recently-used cache of computed bucket rows, keyed on a
+# digest of the whole ``BucketInputs`` value. ``_compute`` is a pure function of
+# that value, so an entry is reused only when every input is byte-for-byte the
+# same: a new sample, an edited value, a mark, a label or a cutoff all change
+# the digest, and nothing can be served stale. There is no TTL and no
+# invalidation hook. The fetch always runs (it is needed to form the key), so a
+# hit saves the computation only.
+
+# Total cached rows across all entries. The oracle's live call set returns
+# 290,731 rows in all; a budget below that would evict every entry before its
+# next use under the oracle's repeated pass, so the budget covers that set with
+# headroom. An entry costs max(len(rows), 1) so that empty results still count.
+IMPACT_BUCKET_CACHE_MAX_ROWS = 400_000
+
+_CACHE: "OrderedDict[bytes, tuple]" = OrderedDict()   # digest -> (keys, values, cost)
+_CACHE_LOCK = threading.Lock()
+_CACHE_STATE = {"cost": 0, "rows": 0, "hits": 0, "misses": 0}
+
+# Digest-safe types, as marshal encodes them: any other type is refused.
+_MARSHAL_SCALARS = (type(None), bool, int, float, str, bytes)
+
+
+def _canonical(value):
+    """Return ``value`` with every list turned into a tuple, recursively.
+
+    Only ints, floats, strings, bytes, bools and None are allowed as leaves; any
+    other type raises ``TypeError`` rather than being digested by accident.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonical(item) for item in value)
+    if isinstance(value, _MARSHAL_SCALARS):
+        return value
+    raise TypeError(f"cannot digest {type(value).__name__} in BucketInputs")
+
+
+def _inputs_digest(inputs: BucketInputs) -> bytes:
+    """A 32-byte digest of every field of ``inputs``, in a fixed order.
+
+    Marshal version 2 is used because version 3 and later record object sharing
+    (back-references), so equal values built separately could encode
+    differently. Version 2 encodes floats in binary, so their exact bits are kept.
+    """
+    arb = inputs.arbitration
+    canonical = _canonical((
+        inputs.cutoff,
+        inputs.distance_rows,
+        (arb.enabled, arb.iphone, arb.watch, arb.gymkit, arb.watch_days,
+         arb.workouts, arb.gym_starts, arb.watch_starts),
+        inputs.heart_rows,
+        inputs.step_rows,
+        inputs.workout_rows,
+    ))
+    return hashlib.blake2b(marshal.dumps(canonical, 2), digest_size=32).digest()
+
+
+def _cache_lookup(key: bytes):
+    """Return the stored (keys, values) for ``key``, or None; counts the hit or miss."""
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if entry is None:
+            _CACHE_STATE["misses"] += 1
+            return None
+        _CACHE.move_to_end(key)
+        _CACHE_STATE["hits"] += 1
+        return entry[0], entry[1]
+
+
+def _cache_store(key: bytes, keys: tuple, values: tuple) -> None:
+    """Store one entry and evict least-recently-used entries until under budget.
+
+    An entry whose cost alone exceeds the budget is not stored.
+    """
+    cost = max(len(values), 1)
+    if cost > IMPACT_BUCKET_CACHE_MAX_ROWS:
+        return
+    with _CACHE_LOCK:
+        old = _CACHE.pop(key, None)
+        if old is not None:
+            _CACHE_STATE["cost"] -= old[2]
+            _CACHE_STATE["rows"] -= len(old[1])
+        _CACHE[key] = (keys, values, cost)
+        _CACHE_STATE["cost"] += cost
+        _CACHE_STATE["rows"] += len(values)
+        while _CACHE_STATE["cost"] > IMPACT_BUCKET_CACHE_MAX_ROWS:
+            _, (_, evicted, evicted_cost) = _CACHE.popitem(last=False)
+            _CACHE_STATE["cost"] -= evicted_cost
+            _CACHE_STATE["rows"] -= len(evicted)
+
+
+def clear_impact_bucket_cache() -> None:
+    """Drop every cached entry and reset the hit and miss counters."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+        _CACHE_STATE.update(cost=0, rows=0, hits=0, misses=0)
+
+
+def impact_bucket_cache_info() -> dict:
+    """A read-only snapshot: entries, cached rows, hits, misses and the row budget."""
+    with _CACHE_LOCK:
+        return {
+            "entries": len(_CACHE),
+            "rows": _CACHE_STATE["rows"],
+            "hits": _CACHE_STATE["hits"],
+            "misses": _CACHE_STATE["misses"],
+            "max_rows": IMPACT_BUCKET_CACHE_MAX_ROWS,
+        }
+
+
+def _rows_from_entry(keys: tuple, values: tuple) -> list[dict]:
+    """Rebuild fresh dicts from a stored entry, so a caller never shares a dict with the cache."""
+    return [dict(zip(keys, row)) for row in values]
+
+
 def impact_bucket_rows_py(conn, window_predicate: str,
                           window_args: tuple[str, str], *,
                           arbitration_window: tuple[str, str] | None = None,
@@ -532,9 +651,10 @@ def impact_bucket_rows_py(conn, window_predicate: str,
     """Return the impact buckets for a window, computed in Python (the live path).
 
     ``metrics.impact_bucket_rows`` returns these rows. The SQL reference they
-    must equal is ``metrics._impact_bucket_rows_sql``. It is
-    ``_compute(_fetch_inputs(...), ...)``: every read happens in the fetch,
-    and the computation is pure.
+    must equal is ``metrics._impact_bucket_rows_sql``. The inputs are fetched
+    (every read happens there), their digest is the cache key, and on a miss
+    ``_compute`` (pure) runs and its rows are stored. Every call returns a new
+    list of new dicts.
 
     Each row is a dict with keys bkt, local_date, mi, hr, cadence_spm,
     in_workout, is_jog and is_walk, in the order the SQL selects them.
@@ -548,7 +668,15 @@ def impact_bucket_rows_py(conn, window_predicate: str,
         conn, window_predicate, window_args,
         arbitration_window=arbitration_window,
         arbitration_window_kind=arbitration_window_kind)
-    return _compute(
+    key = _inputs_digest(inputs)
+    hit = _cache_lookup(key)
+    if hit is not None:
+        return _rows_from_entry(*hit)
+    rows = _compute(
         inputs, window_predicate, window_args,
         arbitration_window=arbitration_window,
         arbitration_window_kind=arbitration_window_kind)
+    keys = tuple(rows[0]) if rows else ()
+    values = tuple(tuple(row[k] for k in keys) for row in rows)
+    _cache_store(key, keys, values)
+    return rows

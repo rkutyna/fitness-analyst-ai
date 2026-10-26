@@ -23,7 +23,7 @@ from health_advisor import db
 from health_advisor import impact_buckets as ib
 from health_advisor import metrics as mx
 from tests.test_impact_buckets_py import (
-    LOCAL_WINDOW, POST_DAY, _distance, _heart, _iso, _steps, _workout)
+    LOCAL_WINDOW, POST_DAY, _distance, _heart, _iso, _record, _steps, _workout)
 
 WORKOUT_A = (_iso(POST_DAY, "11:00:00"), _iso(POST_DAY, "11:30:00"))
 WORKOUT_B = (_iso(POST_DAY, "12:00:00"), _iso(POST_DAY, "12:10:00"))
@@ -145,3 +145,41 @@ def test_compute_takes_no_connection():
     assert "conn" not in params
     assert not any(p.annotation is sqlite3.Connection
                    for p in params.values())
+
+
+def test_span_guard_drops_twelve_hour_and_longer_samples_and_null_bounds(conn):
+    """The span guard moved from SQL into ``_fetch_inputs``; its rule is pinned here.
+
+    The guard keeps a distance sample only when end - start < 43200 s (12 h,
+    a hand-written literal below). Hand-computed on POST_DAY:
+    * 00:10:00-00:10:30 (30 s): kept.
+    * 00:00:00-11:59:59 (43199 s): kept, one second under the limit.
+    * 00:00:00-12:00:00 (43200 s): dropped, the limit itself.
+    * 00:00:00-18:00:00 (64800 s): dropped.
+    * 09:00:00 with an unparseable end: dropped, strftime gives NULL and the
+      SQL comparison is NULL (end_utc is NOT NULL, so the text is not NULL).
+    The two survivors carry 0.1 mi each, so the buckets hold 0.2 mi.
+    """
+    assert ib._SPAN_S == 12 * 60 * 60
+    _distance(conn, 0.1, _iso(POST_DAY, "00:10:00"),
+              _iso(POST_DAY, "00:10:30"), POST_DAY, "Apple Watch", tag="short")
+    _distance(conn, 0.1, _iso(POST_DAY, "00:00:00"),
+              _iso(POST_DAY, "11:59:59"), POST_DAY, "Apple Watch", tag="under")
+    _distance(conn, 0.1, _iso(POST_DAY, "00:00:00"),
+              _iso(POST_DAY, "12:00:00"), POST_DAY, "Apple Watch", tag="limit")
+    _distance(conn, 0.1, _iso(POST_DAY, "00:00:00"),
+              _iso(POST_DAY, "18:00:00"), POST_DAY, "Apple Watch", tag="long")
+    _record(conn, "distance_walking_running", 0.1, "mi",
+            _iso(POST_DAY, "09:00:00"), "not-a-time", POST_DAY, "Apple Watch",
+            "null")
+    conn.commit()
+
+    inputs = ib._fetch_inputs(conn, LOCAL_WINDOW, DAY_ARGS,
+                              arbitration_window=None,
+                              arbitration_window_kind="local_date")
+    assert [row[2] for row in inputs.distance_rows] == [
+        _iso(POST_DAY, "00:10:00"), _iso(POST_DAY, "00:00:00")]
+
+    public = ib.impact_bucket_rows_py(conn, LOCAL_WINDOW, DAY_ARGS)
+    assert public == mx._impact_bucket_rows_sql(conn, LOCAL_WINDOW, DAY_ARGS)
+    assert sum(row["mi"] for row in public) == pytest.approx(0.2, abs=1e-12)

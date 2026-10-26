@@ -312,6 +312,28 @@ def _arbitration_losers(rows, arb: ArbitrationInputs, cutoff) -> set[int]:
     return losers
 
 
+def _plain_rows(conn, sql: str, args: tuple) -> tuple:
+    """Every row of one query as a plain tuple, read through a local cursor.
+
+    The cursor's row factory is set to None on that cursor only, so the caller's
+    connection keeps its sqlite3.Row factory. Plain tuples skip building a Row
+    per row, which is most of the cost of a large scan.
+    """
+    cur = conn.cursor()
+    cur.row_factory = None
+    return tuple(cur.execute(sql, args).fetchall())
+
+
+def _within_span(start_s, end_s) -> bool:
+    """The SQL span guard, ``end_s - start_s < _SPAN_S``, with its NULL rule.
+
+    A NULL bound makes the SQL comparison NULL, which drops the row; so does
+    this. The integers are the same ones the SELECT returned.
+    """
+    return (start_s is not None and end_s is not None
+            and end_s - start_s < _SPAN_S)
+
+
 def _fetch_inputs(conn, window_predicate: str, window_args: tuple[str, str], *,
                   arbitration_window: tuple[str, str] | None = None,
                   arbitration_window_kind: str = "local_date") -> BucketInputs:
@@ -332,36 +354,31 @@ def _fetch_inputs(conn, window_predicate: str, window_args: tuple[str, str], *,
 
     # Distance: every sample in the window that passes the span guard. Source
     # arbitration (_arbitration_losers) and the NULL filter run in _compute.
-    distance_rows = tuple(tuple(row) for row in conn.execute(
+    # The span guard runs in Python on the epoch bounds the SELECT already
+    # computes: SQLite would evaluate both strftime calls twice per row.
+    distance_rows = tuple(row for row in _plain_rows(conn, (
         "SELECT local_date, source, start_utc, value, "
         "CAST(strftime('%s', start_utc) AS INTEGER) AS start_s, "
         "CAST(strftime('%s', end_utc) AS INTEGER) AS end_s "
         "FROM records WHERE metric = 'distance_walking_running' "
         f"AND {window_predicate} "
-        "AND CAST(strftime('%s', end_utc) AS INTEGER) "
-        "- CAST(strftime('%s', start_utc) AS INTEGER) < ? "
-        f"ORDER BY {scan_key}, id",
-        (*window_args, _SPAN_S)).fetchall())
+        f"ORDER BY {scan_key}, id"), window_args) if _within_span(row[4], row[5]))
     arbitration = _fetch_arbitration(
         conn, arbitration_window, arbitration_window_kind, cutoff)
 
-    heart_rows = tuple(tuple(row) for row in conn.execute(
+    heart_rows = _plain_rows(conn, (
         "SELECT local_date, value, "
         "CAST(strftime('%s', start_utc) AS INTEGER) "
         "FROM records WHERE metric = 'heart_rate' "
-        f"AND {window_predicate} ORDER BY {scan_key}, id",
-        window_args).fetchall())
+        f"AND {window_predicate} ORDER BY {scan_key}, id"), window_args)
 
-    step_rows = tuple(tuple(row) for row in conn.execute(
+    step_rows = tuple(row for row in _plain_rows(conn, (
         "SELECT source, value, "
         "CAST(strftime('%s', start_utc) AS INTEGER) AS start_s, "
         "CAST(strftime('%s', end_utc) AS INTEGER) AS end_s "
         "FROM records WHERE metric = 'step_count' "
         f"AND {window_predicate} "
-        "AND CAST(strftime('%s', end_utc) AS INTEGER) "
-        "- CAST(strftime('%s', start_utc) AS INTEGER) < ? "
-        f"ORDER BY {scan_key}, id",
-        (*window_args, _SPAN_S)).fetchall())
+        f"ORDER BY {scan_key}, id"), window_args) if _within_span(row[2], row[3]))
 
     workout_rows = _fetch_workout_rows(conn, window_args)
     return BucketInputs(

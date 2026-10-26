@@ -93,7 +93,7 @@ def computations(monkeypatch):
 
 def _fresh(conn, predicate, args, **kwargs):
     return copy.deepcopy(
-        mx._impact_bucket_rows_uncached(conn, predicate, args, **kwargs))
+        mx._impact_bucket_rows_sql(conn, predicate, args, **kwargs))
 
 
 def test_the_memo_runs_each_distinct_window_once(vault, computations):

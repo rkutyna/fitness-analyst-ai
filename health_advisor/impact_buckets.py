@@ -1,4 +1,10 @@
-"""Python port of the impact bucket query in ``metrics._impact_bucket_rows_uncached``.
+"""Python port of the impact bucket query. This is the live path.
+
+``metrics.impact_bucket_rows`` computes its rows here (through
+``metrics._impact_bucket_rows_uncached``). The SQL it replaces,
+``metrics._impact_bucket_rows_sql``, is kept as the reference: this port was
+proven to return bit-identical rows to it on every oracle call (2526 on the dev
+vault, 2710 on the live vault), and the tests pin the same equality.
 
 The SQL computes classified 20-second buckets with one recursive CTE. This
 module returns the same rows from indexed raw-row reads: the distribution of
@@ -20,7 +26,7 @@ approximated:
   only through ``strftime('%s', ...)``, which is exactly what the SQL does.
 
 Only the two window predicates the SQL treats as known have a Python path. Any
-other predicate is delegated to ``metrics._impact_bucket_rows_uncached``.
+other predicate is delegated to the SQL reference, ``metrics._impact_bucket_rows_sql``.
 """
 from __future__ import annotations
 
@@ -233,13 +239,16 @@ def impact_bucket_rows_py(conn, window_predicate: str,
                           window_args: tuple[str, str], *,
                           arbitration_window: tuple[str, str] | None = None,
                           arbitration_window_kind: str = "local_date") -> list[dict]:
-    """Return the same rows as ``metrics.impact_bucket_rows``, computed in Python.
+    """Return the impact buckets for a window, computed in Python (the live path).
+
+    ``metrics.impact_bucket_rows`` returns these rows. The SQL reference they
+    must equal is ``metrics._impact_bucket_rows_sql``.
 
     Each row is a dict with keys bkt, local_date, mi, hr, cadence_spm,
     in_workout, is_jog and is_walk, in the order the SQL selects them.
     """
     if window_predicate not in KNOWN_WINDOW_PREDICATES:
-        return mx._impact_bucket_rows_uncached(
+        return mx._impact_bucket_rows_sql(
             conn, window_predicate, window_args,
             arbitration_window=arbitration_window,
             arbitration_window_kind=arbitration_window_kind)

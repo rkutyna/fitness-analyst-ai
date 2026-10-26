@@ -709,8 +709,10 @@ def impact_bucket_rows(conn, window_predicate: str,
     """Return the shared classified impact buckets for a parameterised window.
 
     Inside a ``bucket_memo()`` block an identical call reuses the first call's
-    rows (as fresh copies); outside one, every call runs the query. The rule
-    itself lives in ``_impact_bucket_rows_uncached``, documented below.
+    rows (as fresh copies); outside one, every call runs the query. The live
+    computation is the Python port ``impact_buckets.impact_bucket_rows_py``,
+    reached through ``_impact_bucket_rows_uncached``. The SQL it was proven
+    identical against is ``_impact_bucket_rows_sql``, kept as the reference.
     """
     memo = _BUCKET_MEMO.get()
     if memo is None:
@@ -741,7 +743,31 @@ def _impact_bucket_rows_uncached(
         conn, window_predicate: str, window_args: tuple[str, str], *,
         arbitration_window: tuple[str, str] | None = None,
         arbitration_window_kind: str = "local_date") -> list[dict]:
-    """Return the shared classified impact buckets for a parameterised window.
+    """Compute the impact buckets for one window with the Python port (the live path).
+
+    The port is ``impact_buckets.impact_bucket_rows_py``. It was proven to
+    return the same rows as ``_impact_bucket_rows_sql``, the SQL reference, on
+    every oracle call (dev and live vaults). Import is lazy because
+    ``impact_buckets`` imports this module.
+    """
+    from . import impact_buckets
+    return impact_buckets.impact_bucket_rows_py(
+        conn, window_predicate, window_args,
+        arbitration_window=arbitration_window,
+        arbitration_window_kind=arbitration_window_kind)
+
+
+def _impact_bucket_rows_sql(
+        conn, window_predicate: str, window_args: tuple[str, str], *,
+        arbitration_window: tuple[str, str] | None = None,
+        arbitration_window_kind: str = "local_date") -> list[dict]:
+    """Reference implementation: the SQL bucket query. Not on the live path.
+
+    Kept so ``impact_buckets.impact_bucket_rows_py`` can be checked against it
+    and so unknown window predicates still get the SQL's answer. Do not
+    optimise this for speed; its purpose is to be the plain definition.
+
+    Return the shared classified impact buckets for a parameterised window.
 
     ``metrics.bucket_series`` and ``analysis.impact_volume`` both depend on
     this one b/h/c rule.  Callers supply their question's window predicate:

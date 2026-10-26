@@ -1,7 +1,7 @@
 """``impact_buckets.impact_bucket_rows_py`` must return the SQL's rows exactly.
 
 Each test builds a small synthetic vault, runs the Python port and the engine's
-SQL (``metrics._impact_bucket_rows_uncached``) over the same window, and asserts
+SQL (``metrics._impact_bucket_rows_sql``) over the same window, and asserts
 the two lists are equal, value for value, including the floats. The arithmetic
 cases also assert a literal computed by hand from the sample durations, so a bug
 that moved both implementations together would still fail here.
@@ -73,7 +73,7 @@ def conn(tmp_path):
 def _both(conn, predicate, args, **kwargs):
     """The Python rows and the SQL rows for one call."""
     return (ib.impact_bucket_rows_py(conn, predicate, args, **kwargs),
-            mx._impact_bucket_rows_uncached(conn, predicate, args, **kwargs))
+            mx._impact_bucket_rows_sql(conn, predicate, args, **kwargs))
 
 
 def _bucket_of(hms_utc: str, day: str) -> int:
@@ -253,6 +253,6 @@ def test_bad_arbitration_kind_raises_as_the_sql_does(conn):
         ib.impact_bucket_rows_py(conn, LOCAL_WINDOW, (POST_DAY, POST_DAY),
                                  arbitration_window_kind="bogus")
     with pytest.raises(ValueError):
-        mx._impact_bucket_rows_uncached(conn, LOCAL_WINDOW,
-                                        (POST_DAY, POST_DAY),
+        mx._impact_bucket_rows_sql(conn, LOCAL_WINDOW,
+                                   (POST_DAY, POST_DAY),
                                         arbitration_window_kind="bogus")

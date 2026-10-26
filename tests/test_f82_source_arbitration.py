@@ -8,6 +8,7 @@ import pytest
 
 from health_advisor import analysis
 from health_advisor import db
+from health_advisor import impact_buckets
 from health_advisor import metrics
 from tests.fixture_loader import load_f82_multi_source
 
@@ -341,7 +342,11 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
         "SELECT start_utc, end_utc FROM workouts WHERE id = 815"
     ).fetchone()
     with monkeypatch.context() as patch:
+        # Arbitration off, in both implementations of the bucket rows: the SQL
+        # reference reads its clause from db._workout_arbitration, and the live
+        # Python path removes rows through impact_buckets._arbitration_losers.
         patch.setattr(db, "_workout_arbitration", lambda *a, **k: ("", []))
+        patch.setattr(impact_buckets, "_arbitration_losers", lambda *a, **k: set())
         before_volume = analysis.impact_volume(
             conn, "2026-08-25", "2026-08-25", by="day")[0]
         before_block = analysis.longest_block(
@@ -407,6 +412,7 @@ def test_metric_path_uses_one_selected_distance_stream_for_volume_and_blocks(
     # (one 57.3-minute block) from the selected stream (five 5.0-minute reps).
     with monkeypatch.context() as patch:
         patch.setattr(db, "_workout_arbitration", lambda *a, **k: ("", []))
+        patch.setattr(impact_buckets, "_arbitration_losers", lambda *a, **k: set())
         assert _seed_cadence_where_the_retired_pace_lane_fired(conn, workout) > 0
         seeded_before = analysis.longest_block(
             conn, workout["start_utc"], workout["end_utc"])

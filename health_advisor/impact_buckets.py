@@ -31,6 +31,7 @@ other predicate is delegated to the SQL reference, ``metrics._impact_bucket_rows
 from __future__ import annotations
 
 import bisect
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from . import db as dbmod
@@ -70,7 +71,43 @@ def _first_bucket(row) -> int:
     return _trunc_div(row[2], _BUCKET_S)
 
 
-def _workout_candidates(conn, window_args):
+@dataclass(frozen=True)
+class ArbitrationInputs:
+    """The rows source arbitration reads, as plain values.
+
+    ``enabled`` is False when the vault has no workouts table, in which case
+    the SQL reference removes nothing and the other fields are empty.
+    """
+    enabled: bool
+    iphone: tuple[str, ...]
+    watch: tuple[str, ...]
+    gymkit: tuple[str, ...]
+    watch_days: tuple[str, ...]
+    workouts: tuple[tuple[str, str], ...]
+    gym_starts: tuple[str, ...]
+    watch_starts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BucketInputs:
+    """Every database read ``impact_bucket_rows_py`` makes, as one immutable value.
+
+    ``distance_rows`` are (local_date, source, start_utc, value, start_s, end_s)
+    in the SQL's scan order, before arbitration. ``heart_rows`` are
+    (local_date, value, start_s). ``step_rows`` are (source, value, start_s,
+    end_s). ``workout_rows`` are the (start_s, end_s) epoch bounds of the
+    unmarked workouts near the window, and may hold NULLs as the SQL returns
+    them. Fields hold plain scalars and tuples only, so the value is hashable.
+    """
+    cutoff: str
+    distance_rows: tuple[tuple, ...]
+    arbitration: ArbitrationInputs
+    heart_rows: tuple[tuple, ...]
+    step_rows: tuple[tuple, ...]
+    workout_rows: tuple[tuple, ...]
+
+
+def _fetch_workout_rows(conn, window_args):
     """Epoch bounds of the workouts the SQL considers: local_date within a day of the window."""
     start = (date.fromisoformat(window_args[0][:10])
              - timedelta(days=1)).isoformat()
@@ -83,7 +120,13 @@ def _workout_candidates(conn, window_args):
         "FROM workouts AS w WHERE w.local_date >= ? AND w.local_date <= ? "
         f"AND {active}",
         (start, end)).fetchall()
-    return [(s, e) for s, e in rows if s is not None and e is not None]
+    return tuple(tuple(row) for row in rows)
+
+
+def _candidate_ranges(workout_rows):
+    """The merged workout bucket ranges from the candidate rows (NULL bounds dropped)."""
+    return _in_workout_ranges(
+        [(s, e) for s, e in workout_rows if s is not None and e is not None])
 
 
 def _in_workout_ranges(candidates):
@@ -115,25 +158,21 @@ def _is_in_workout(bkt, index) -> bool:
     return i >= 0 and bkt < merged[i][1]
 
 
-def _arbitration_losers(conn, rows, arbitration_window, kind, cutoff):
-    """Return the set of row indices that source arbitration removes.
+_NO_ARBITRATION = ArbitrationInputs(
+    enabled=False, iphone=(), watch=(), gymkit=(), watch_days=(),
+    workouts=(), gym_starts=(), watch_starts=())
 
-    Mirrors ``db._workout_arbitration_query`` for the distance metric. A
-    sample loses when either:
 
-    * it is a post-cutoff iPhone sample and a watch sample on the same
-      local date is in the arbitration window (the day rule), or
-    * it sits inside a post-cutoff workout (the workout rule) and is an iPhone
-      sample while a watch or GymKit sample starts inside that workout, or is a
-      watch sample while a GymKit sample does.
+def _fetch_arbitration(conn, arbitration_window, kind, cutoff) -> ArbitrationInputs:
+    """Read the source labels and the arbitration rows; the losers are decided later.
 
-    The labels are resolved by ``db._workout_source_labels``, so an unusable
-    post-cutoff label raises the same ``ValueError`` the SQL path raises.
+    Validation and the workouts-table probe run here, in the order the SQL
+    path runs them, so the same ``ValueError`` is raised at the same point.
     """
     if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workouts'"
     ).fetchone() is None:
-        return set()
+        return _NO_ARBITRATION
     if len(arbitration_window) != 2:
         raise ValueError("arbitration_window must be (start, end)")
     if kind not in ("utc", "local_date"):
@@ -155,22 +194,21 @@ def _arbitration_losers(conn, rows, arbitration_window, kind, cutoff):
         conn, source_table="records", date=None,
         arbitration_window=arbitration_window,
         arbitration_window_kind=kind, scoped=scoped)
-    iphone = set(labels["iphone"])
-    watch = set(labels["watch"])
-    gymkit = set(labels["gymkit"])
-    losers: set[int] = set()
+    iphone = tuple(sorted(set(labels["iphone"])))
+    watch = tuple(sorted(set(labels["watch"])))
+    gymkit = tuple(sorted(set(labels["gymkit"])))
 
     # The day rule: local dates holding a watch sample in the arbitration window.
-    watch_days: set[str] = set()
+    watch_days: tuple[str, ...] = ()
     if watch:
         marks = ",".join("?" for _ in watch)
         scope = ("local_date >= ? AND local_date <= ?" if kind == "local_date"
                  else "start_utc >= ? AND start_utc < ?")
-        watch_days = {row[0] for row in conn.execute(
+        watch_days = tuple(row[0] for row in conn.execute(
             "SELECT DISTINCT local_date FROM records "
             "WHERE metric = 'distance_walking_running' "
-            f"AND source IN ({marks}) AND {scope}",
-            (*watch, aw_start, aw_end)).fetchall()}
+            f"AND source IN ({marks}) AND {scope} ORDER BY local_date",
+            (*watch, aw_start, aw_end)).fetchall())
 
     # The workout rule: post-cutoff workouts in the arbitration window.
     if kind == "local_date":
@@ -190,25 +228,64 @@ def _arbitration_losers(conn, rows, arbitration_window, kind, cutoff):
             "AND workout.local_date <= ? AND workout.start_utc >= ? "
             "AND workout.start_utc < ?",
             (start_day, cutoff, end_day, aw_start, aw_end)).fetchall()
-    workouts = [(s, e) for s, e in workouts]
+    workouts = tuple((s, e) for s, e in workouts)
+
+    gym_starts: tuple[str, ...] = ()
+    watch_starts: tuple[str, ...] = ()
     if workouts and (gymkit or watch):
         lo = min(s for s, _ in workouts)
         hi = max(e for _, e in workouts)
-        kinds = sorted(gymkit | watch)
+        kinds = sorted(set(gymkit) | set(watch))
         marks = ",".join("?" for _ in kinds)
-        gym_starts: list[str] = []
-        watch_starts: list[str] = []
+        gymkit_set = set(gymkit)
+        watch_set = set(watch)
+        gym: list[str] = []
+        wat: list[str] = []
         for start_utc, source in conn.execute(
                 "SELECT start_utc, source FROM records "
                 "WHERE metric = 'distance_walking_running' "
                 f"AND start_utc >= ? AND start_utc < ? AND source IN ({marks})",
                 (lo, hi, *kinds)).fetchall():
-            if source in gymkit:
-                gym_starts.append(start_utc)
-            if source in watch:
-                watch_starts.append(start_utc)
-        gym_starts.sort()
-        watch_starts.sort()
+            if source in gymkit_set:
+                gym.append(start_utc)
+            if source in watch_set:
+                wat.append(start_utc)
+        gym_starts = tuple(sorted(gym))
+        watch_starts = tuple(sorted(wat))
+
+    return ArbitrationInputs(
+        enabled=True, iphone=iphone, watch=watch, gymkit=gymkit,
+        watch_days=watch_days, workouts=workouts,
+        gym_starts=gym_starts, watch_starts=watch_starts)
+
+
+def _arbitration_losers(rows, arb: ArbitrationInputs, cutoff) -> set[int]:
+    """Return the set of row indices that source arbitration removes.
+
+    Mirrors ``db._workout_arbitration_query`` for the distance metric. A
+    sample loses when either:
+
+    * it is a post-cutoff iPhone sample and a watch sample on the same
+      local date is in the arbitration window (the day rule), or
+    * it sits inside a post-cutoff workout (the workout rule) and is an iPhone
+      sample while a watch or GymKit sample starts inside that workout, or is a
+      watch sample while a GymKit sample does.
+
+    Pure: the labels and rows it reads were fetched by ``_fetch_arbitration``.
+    """
+    if not arb.enabled:
+        return set()
+    iphone = set(arb.iphone)
+    watch = set(arb.watch)
+    gymkit = set(arb.gymkit)
+    watch_days = set(arb.watch_days)
+    workouts = list(arb.workouts)
+    losers: set[int] = set()
+
+    # The workout rule: post-cutoff workouts in the arbitration window.
+    if workouts and (gymkit or watch):
+        gym_starts = list(arb.gym_starts)
+        watch_starts = list(arb.watch_starts)
 
         def any_start(starts, lo_text, hi_text):
             idx = bisect.bisect_left(starts, lo_text)
@@ -235,23 +312,15 @@ def _arbitration_losers(conn, rows, arbitration_window, kind, cutoff):
     return losers
 
 
-def impact_bucket_rows_py(conn, window_predicate: str,
-                          window_args: tuple[str, str], *,
-                          arbitration_window: tuple[str, str] | None = None,
-                          arbitration_window_kind: str = "local_date") -> list[dict]:
-    """Return the impact buckets for a window, computed in Python (the live path).
+def _fetch_inputs(conn, window_predicate: str, window_args: tuple[str, str], *,
+                  arbitration_window: tuple[str, str] | None = None,
+                  arbitration_window_kind: str = "local_date") -> BucketInputs:
+    """Read every row ``_compute`` needs, and nothing else, from ``conn``.
 
-    ``metrics.impact_bucket_rows`` returns these rows. The SQL reference they
-    must equal is ``metrics._impact_bucket_rows_sql``.
-
-    Each row is a dict with keys bkt, local_date, mi, hr, cadence_spm,
-    in_workout, is_jog and is_walk, in the order the SQL selects them.
+    The reads run in the order ``impact_bucket_rows_py`` always ran them, so
+    the same errors surface at the same point. The result holds no connection
+    or cursor, and the same window on an unchanged vault gives an equal value.
     """
-    if window_predicate not in KNOWN_WINDOW_PREDICATES:
-        return mx._impact_bucket_rows_sql(
-            conn, window_predicate, window_args,
-            arbitration_window=arbitration_window,
-            arbitration_window_kind=arbitration_window_kind)
     if arbitration_window is None:
         arbitration_window = window_args
     cutoff = dbmod.workout_source_arbitration_cutoff(conn)
@@ -261,11 +330,9 @@ def impact_bucket_rows_py(conn, window_predicate: str,
     scan_key = ("local_date" if window_predicate.startswith("local_date")
                 else "start_utc")
 
-    # Distance: the samples in the window that survive source arbitration and
-    # the span guard. Arbitration runs in Python (_arbitration_losers) rather
-    # than as the per-row NOT EXISTS subquery the SQL uses, which dominated the
-    # cost of the query.
-    fetched = conn.execute(
+    # Distance: every sample in the window that passes the span guard. Source
+    # arbitration (_arbitration_losers) and the NULL filter run in _compute.
+    distance_rows = tuple(tuple(row) for row in conn.execute(
         "SELECT local_date, source, start_utc, value, "
         "CAST(strftime('%s', start_utc) AS INTEGER) AS start_s, "
         "CAST(strftime('%s', end_utc) AS INTEGER) AS end_s "
@@ -274,9 +341,47 @@ def impact_bucket_rows_py(conn, window_predicate: str,
         "AND CAST(strftime('%s', end_utc) AS INTEGER) "
         "- CAST(strftime('%s', start_utc) AS INTEGER) < ? "
         f"ORDER BY {scan_key}, id",
-        (*window_args, _SPAN_S)).fetchall()
-    losers = _arbitration_losers(
-        conn, fetched, arbitration_window, arbitration_window_kind, cutoff)
+        (*window_args, _SPAN_S)).fetchall())
+    arbitration = _fetch_arbitration(
+        conn, arbitration_window, arbitration_window_kind, cutoff)
+
+    heart_rows = tuple(tuple(row) for row in conn.execute(
+        "SELECT local_date, value, "
+        "CAST(strftime('%s', start_utc) AS INTEGER) "
+        "FROM records WHERE metric = 'heart_rate' "
+        f"AND {window_predicate} ORDER BY {scan_key}, id",
+        window_args).fetchall())
+
+    step_rows = tuple(tuple(row) for row in conn.execute(
+        "SELECT source, value, "
+        "CAST(strftime('%s', start_utc) AS INTEGER) AS start_s, "
+        "CAST(strftime('%s', end_utc) AS INTEGER) AS end_s "
+        "FROM records WHERE metric = 'step_count' "
+        f"AND {window_predicate} "
+        "AND CAST(strftime('%s', end_utc) AS INTEGER) "
+        "- CAST(strftime('%s', start_utc) AS INTEGER) < ? "
+        f"ORDER BY {scan_key}, id",
+        (*window_args, _SPAN_S)).fetchall())
+
+    workout_rows = _fetch_workout_rows(conn, window_args)
+    return BucketInputs(
+        cutoff=cutoff, distance_rows=distance_rows, arbitration=arbitration,
+        heart_rows=heart_rows, step_rows=step_rows, workout_rows=workout_rows)
+
+
+def _compute(inputs: BucketInputs, window_predicate: str,
+             window_args: tuple[str, str], *,
+             arbitration_window: tuple[str, str] | None = None,
+             arbitration_window_kind: str = "local_date") -> list[dict]:
+    """Turn fetched inputs into the bucket rows. Pure: no connection, no database.
+
+    ``window_predicate``, ``window_args`` and the arbitration arguments are
+    accepted so the call matches ``_fetch_inputs``; every value they select is
+    already in ``inputs``, so they are not read here.
+    """
+    cutoff = inputs.cutoff
+    fetched = inputs.distance_rows
+    losers = _arbitration_losers(fetched, inputs.arbitration, cutoff)
     # A NULL value contributes to no SUM, so a bucket of only NULLs never
     # exists; dropping those rows here is the same result.
     distance = [(row[0], row[3], row[4], row[5])
@@ -325,12 +430,7 @@ def impact_bucket_rows_py(conn, window_predicate: str,
 
     # Heart rate: the mean of the samples whose start falls in each bucket.
     heart_sums: dict[tuple[str, int], list] = {}
-    for local_date, value, start_s in conn.execute(
-            "SELECT local_date, value, "
-            "CAST(strftime('%s', start_utc) AS INTEGER) "
-            "FROM records WHERE metric = 'heart_rate' "
-            f"AND {window_predicate} ORDER BY {scan_key}, id",
-            window_args).fetchall():
+    for local_date, value, start_s in inputs.heart_rows:
         if start_s is None:
             continue
         key = (local_date, _trunc_div(start_s, _BUCKET_S))
@@ -342,17 +442,7 @@ def impact_bucket_rows_py(conn, window_predicate: str,
 
     # Step cadence: each bucket takes the largest per-source step total. The
     # same summation order as the distance buckets, grouped by (bucket, source).
-    step_rows = conn.execute(
-        "SELECT source, value, "
-        "CAST(strftime('%s', start_utc) AS INTEGER) AS start_s, "
-        "CAST(strftime('%s', end_utc) AS INTEGER) AS end_s "
-        "FROM records WHERE metric = 'step_count' "
-        f"AND {window_predicate} "
-        "AND CAST(strftime('%s', end_utc) AS INTEGER) "
-        "- CAST(strftime('%s', start_utc) AS INTEGER) < ? "
-        f"ORDER BY {scan_key}, id",
-        (*window_args, _SPAN_S)).fetchall()
-    step_rows = [row for row in step_rows
+    step_rows = [row for row in inputs.step_rows
                  if row[1] is not None and row[2] is not None
                  and row[3] is not None]
     per_source: dict[tuple[int, object], list] = {}
@@ -388,7 +478,7 @@ def impact_bucket_rows_py(conn, window_predicate: str,
     cadence = {bkt: total * (60.0 / _BUCKET_S)
                for bkt, total in best_steps.items()}
 
-    workout_index = _in_workout_ranges(_workout_candidates(conn, window_args))
+    workout_index = _candidate_ranges(inputs.workout_rows)
 
     out: list[dict] = []
     for (local_date, bkt) in sorted(buckets, key=lambda k: (k[1], k[0])):
@@ -416,3 +506,32 @@ def impact_bucket_rows_py(conn, window_predicate: str,
                               <= implausible_mi_ceiling) else 0),
         })
     return out
+
+
+def impact_bucket_rows_py(conn, window_predicate: str,
+                          window_args: tuple[str, str], *,
+                          arbitration_window: tuple[str, str] | None = None,
+                          arbitration_window_kind: str = "local_date") -> list[dict]:
+    """Return the impact buckets for a window, computed in Python (the live path).
+
+    ``metrics.impact_bucket_rows`` returns these rows. The SQL reference they
+    must equal is ``metrics._impact_bucket_rows_sql``. It is
+    ``_compute(_fetch_inputs(...), ...)``: every read happens in the fetch,
+    and the computation is pure.
+
+    Each row is a dict with keys bkt, local_date, mi, hr, cadence_spm,
+    in_workout, is_jog and is_walk, in the order the SQL selects them.
+    """
+    if window_predicate not in KNOWN_WINDOW_PREDICATES:
+        return mx._impact_bucket_rows_sql(
+            conn, window_predicate, window_args,
+            arbitration_window=arbitration_window,
+            arbitration_window_kind=arbitration_window_kind)
+    inputs = _fetch_inputs(
+        conn, window_predicate, window_args,
+        arbitration_window=arbitration_window,
+        arbitration_window_kind=arbitration_window_kind)
+    return _compute(
+        inputs, window_predicate, window_args,
+        arbitration_window=arbitration_window,
+        arbitration_window_kind=arbitration_window_kind)

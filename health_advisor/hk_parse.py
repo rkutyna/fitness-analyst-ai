@@ -36,7 +36,14 @@ _TOP_FIELDS = frozenset({
     "workout_elevation",
     "workout_context",
     "characteristics",
+    "history_backfill",
 })
+# #696 E2: a history_backfill batch carries only daily totals. Every other
+# content section (the envelope's required lists included) must be empty.
+_BACKFILL_FORBIDDEN_FIELDS = (
+    "samples", "deletions", "workouts", "anchors", "workout_routes",
+    "workout_elevation", "workout_context", "characteristics",
+)
 # The optional envelope section a client states about the person (#113).
 _CHARACTERISTICS_FIELDS = frozenset({"date_of_birth"})
 _DEVICE_FIELDS = frozenset({"id", "name", "model"})
@@ -877,6 +884,15 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
             f"payload is missing required envelope field(s): {', '.join(missing)}")
     if envelope["protocol_version"] != 1:
         raise PayloadError(f"unsupported protocol_version {envelope['protocol_version']!r}")
+    history_backfill = envelope.get("history_backfill", False)
+    if not isinstance(history_backfill, bool):
+        raise PayloadError("payload.history_backfill must be a boolean")
+    if history_backfill:
+        carried = [name for name in _BACKFILL_FORBIDDEN_FIELDS if envelope.get(name)]
+        if carried:
+            raise PayloadError(
+                "history_backfill batch may carry only daily_totals; refused "
+                f"non-empty field(s): {', '.join(carried)}")
     device = _mapping(envelope["device"], "payload.device")
     _reject_unknown(device, _DEVICE_FIELDS, "payload.device")
     if not all(_text(device.get(field)) for field in _DEVICE_FIELDS):
@@ -1029,6 +1045,7 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "characteristics": characteristics,
         "daily_totals": daily_totals,
         "daily_total_dates": daily_total_dates,
+        "history_backfill": history_backfill,
         "workout_routes": parsed_routes,
         "route_dates": route_dates,
         "routes_present": routes_present,

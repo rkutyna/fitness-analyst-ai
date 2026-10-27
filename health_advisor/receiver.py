@@ -877,6 +877,49 @@ def _reconcile_workout_hr(conn, days, source: str) -> int:
         return 0
 
 
+# #696 E2: the history-backfill lane. A `history_backfill` batch carries only
+# daily totals; each point is either accepted (a settled sum for a day that has
+# no total yet, outside the re-pull window, in a vault with no imported-history
+# watermark) or refused and counted under one of these reasons. Counts and
+# diagnostics name the reason only, never the value.
+BACKFILL_SKIP_REASONS = (
+    "backfill_history_vault",
+    "backfill_inside_window",
+    "backfill_existing_skip",
+    "backfill_not_settled",
+)
+_BACKFILL_SKIP_DETAIL = {
+    "backfill_history_vault": (
+        "vault declares imported history (history_imported_through); a "
+        "backfill is not written into it (#696)"),
+    "backfill_inside_window": (
+        "day is inside the re-pull window; a live re-pull settles it, a "
+        "backfill does not (#696)"),
+    "backfill_existing_skip": (
+        "a daily total already exists for this day; a backfill never "
+        "overwrites (#696)"),
+    "backfill_not_settled": (
+        "a backfill accepts settled totals only (#696)"),
+}
+
+
+def _backfill_skip_reason(conn, row: dict, history: str | None) -> str | None:
+    """The reason a backfill point is refused, or None when it is accepted."""
+    if history is not None:
+        return "backfill_history_vault"
+    if db.daily_total_lag_days(row["queried_at"], row["local_date"]) <= DAILY_TOTAL_REPULL_WINDOW_DAYS:
+        return "backfill_inside_window"
+    existing = conn.execute(
+        "SELECT 1 FROM hk_daily_totals WHERE metric = ? AND local_date = ?",
+        (row["metric"], row["local_date"]),
+    ).fetchone()
+    if existing is not None:
+        return "backfill_existing_skip"
+    if row["state"] != "settled":
+        return "backfill_not_settled"
+    return None
+
+
 def _batch_span(parsed) -> tuple[str | None, str | None, int]:
     """(min local_date, max local_date, n) over all dated batch entries."""
     dates = [r["local_date"] for r in parsed.get("records", []) if r.get("local_date")]
@@ -1030,6 +1073,11 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     workout_fragments: list[str] = []
     dm = 0
     applied = True
+    # #696 E2: a backfill batch is filtered point by point (below) instead of
+    # by the whole-batch guards; `parsed` only ever carries daily totals here.
+    is_backfill = parsed["history_backfill"]
+    backfill_rows: list[dict] = []
+    backfill_skips = {reason: 0 for reason in BACKFILL_SKIP_REASONS}
 
     conn = ctx.connect()
     try:
@@ -1050,6 +1098,35 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # Check before the first mutation. The guard must release the
             # BEGIN IMMEDIATE writer lock before _log_reject opens its fresh
             # connection; its evidence belongs in ingest_log, never commit_log.
+            # #696 E2: a backfill point is refused or accepted here, before the
+            # watermark and re-pull guards. An accepted point is not a live
+            # re-pull, so it skips the window guard below.
+            normal_totals = [] if is_backfill else parsed["daily_totals"]
+            if is_backfill:
+                backfill_history = vault.history_imported_through(conn)
+                for row in parsed["daily_totals"]:
+                    reason = _backfill_skip_reason(conn, row, backfill_history)
+                    if reason is None:
+                        backfill_rows.append(row)
+                        continue
+                    _trace("skip-backfill", metric=row["metric"],
+                           day=row["local_date"], reason=reason,
+                           batch_id=parsed["batch_id"])
+                    diagnostic_rows.append({
+                        "batch_id": parsed["batch_id"],
+                        "point_kind": "daily_total",
+                        "point_index": row["_point_index"],
+                        "metric": row["metric"],
+                        "type_identifier": None,
+                        "local_date": row["local_date"],
+                        "source": None,
+                        "device_id": row["device_id"],
+                        "hk_uuid": None,
+                        "unit": row["unit"],
+                        "reason": reason,
+                        "detail": _BACKFILL_SKIP_DETAIL[reason],
+                    })
+                    backfill_skips[reason] += 1
             history = vault.history_imported_through(conn)
             if history is not None:
                 record_offending = min(
@@ -1059,7 +1136,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     (day for day in parsed["workout_dates"] if day <= history),
                     default=None)
                 total_offending = min(
-                    (day for day in parsed["daily_total_dates"] if day <= history),
+                    (day for day in ([] if is_backfill else parsed["daily_total_dates"])
+                     if day <= history),
                     default=None)
                 offending = min(
                     (day for day in (record_offending, workout_offending,
@@ -1103,7 +1181,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # the watermark guard, so a day that is both below the watermark
             # and too old still gets the parseable history detail a client
             # uses to advance its cursor.
-            for row in parsed["daily_totals"]:
+            for row in normal_totals:
                 lag = db.daily_total_lag_days(row["queried_at"], row["local_date"])
                 if lag > DAILY_TOTAL_REPULL_WINDOW_DAYS:
                     _trace("reject-409-repull-window", metric=row["metric"],
@@ -1141,7 +1219,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # never with the arriving value: a re-pull of a closed day is not a
             # correction and must not be logged as a candidate one.
             writable_totals: list[dict] = []
-            for row in parsed["daily_totals"]:
+            for row in normal_totals:
                 prior = conn.execute(
                     "SELECT state FROM hk_daily_totals "
                     "WHERE metric = ? AND local_date = ?",
@@ -1408,10 +1486,16 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # The parser assigns wire indexes while walking the list. Keep the
             # same positional traversal here; accepted totals are not copied
             # into the rejection-only diagnostics table.
-            for _, row in enumerate(writable_totals):
+            for _, row in enumerate(writable_totals + backfill_rows):
                 affected.add((row["metric"], row["local_date"]))
-            daily_totals_added = db.insert_daily_totals(
-                conn, writable_totals, batch_id=parsed["batch_id"])
+            if is_backfill:
+                # #696 E2: INSERT-only settled writes that never touch
+                # vault_meta.daily_totals_expected_from (see db.py).
+                daily_totals_added = db.insert_backfill_daily_totals(
+                    conn, backfill_rows, batch_id=parsed["batch_id"])
+            else:
+                daily_totals_added = db.insert_daily_totals(
+                    conn, writable_totals, batch_id=parsed["batch_id"])
             db.log_ingest_diagnostics(conn, diagnostic_rows)
             dm = db.recompute_daily_metrics(conn, pairs=sorted(affected))
 
@@ -1645,6 +1729,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         # (consumer #501). Present only when non-zero, so an ordinary batch's
         # response bytes are unchanged.
         response["daily_totals_skipped_settled"] = daily_totals_skipped_settled
+    if is_backfill:
+        # #696 E2: per-reason counts only, never values. Present on every
+        # backfill ack (zeros included) so a client reads a stable shape.
+        response["daily_totals_backfill_skipped"] = dict(backfill_skips)
     if parsed["rejected_anchors"]:
         response["anchor_results"] = parsed["anchor_results"]
     if parsed["routes_present"]:

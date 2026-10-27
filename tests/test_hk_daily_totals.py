@@ -607,3 +607,120 @@ def test_revision_report_counts_changed_days_by_lag_and_delta(conn):
 
 def test_revision_report_is_empty_on_a_vault_without_totals(conn):
     assert dbmod.daily_total_revision_report(conn) == {"metrics": {}}
+
+
+# --- #696 E2: the history-backfill lane for daily SUM totals -----------------
+
+def _post_backfill(client, *rows, batch_id="backfill", extra=None):
+    payload = _daily_payload(*rows, batch_id=batch_id)
+    payload["history_backfill"] = True
+    payload.update(extra or {})
+    return client.post("/v1/ingest", json=payload,
+                       headers={"x-health-secret": "hk-secret"})
+
+
+def _seed_settled_step_total(conn, local_date, value):
+    """A settled total written straight to storage, so no expected_from key
+    is stamped: the seed must not be the thing the assertions measure."""
+    conn.execute(
+        "INSERT INTO hk_daily_totals (metric, local_date, value, unit, interval, "
+        "state, device_id, queried_at, first_seen_at, settled_at, migration_id) "
+        "VALUES ('step_count', ?, ?, 'count', 'day', 'settled', 'dev-1', "
+        "'2026-09-02T09:00:00-04:00', '2026-09-02T09:00:00Z', "
+        "'2026-09-02T09:00:00Z', NULL)", (local_date, value))
+    dbmod.apply_consolidated_totals(conn, pairs=[("step_count", local_date)])
+    conn.commit()
+
+
+def test_backfill_writes_settled_old_days_and_skips_the_rest(
+        conn, vault, vault_path, monkeypatch):
+    """Seed 2026-09-01 = 9000 settled. Backfill from 2026-10-26 posts 2025-01-10
+    = 1234 (accepted), 2026-09-01 = 5555 (already exists), 2026-10-20 = 10
+    (inside the 15-day window). Only 2025-01-10 is written, as settled SUM."""
+    _seed_settled_step_total(conn, "2026-09-01", 9000.0)
+    pulled = "2026-10-26T09:00:00-04:00"
+    with _client(vault, monkeypatch) as client:
+        response = _post_backfill(
+            client,
+            _wire_total(local_date="2025-01-10", value=1234.0, state="settled",
+                        queried_at=pulled),
+            _wire_total(local_date="2026-09-01", value=5555.0, state="settled",
+                        queried_at=pulled),
+            _wire_total(local_date="2026-10-20", value=10.0, state="settled",
+                        queried_at=pulled),
+            batch_id="backfill-1")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["daily_totals_added"] == 1
+    assert body["daily_totals_backfill_skipped"] == {
+        "backfill_history_vault": 0,
+        "backfill_inside_window": 1,
+        "backfill_existing_skip": 1,
+        "backfill_not_settled": 0,
+    }
+    assert "1234" not in str(body) and "5555" not in str(body)
+    assert conn.execute(
+        "SELECT value, state, migration_id FROM hk_daily_totals "
+        "WHERE metric = 'step_count' AND local_date = '2025-01-10'"
+    ).fetchone()[:] == (1234.0, "settled", None)
+    assert conn.execute(
+        "SELECT value, state FROM hk_daily_totals WHERE metric = 'step_count' "
+        "AND local_date = '2026-09-01'").fetchone()[:] == (9000.0, "settled")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_totals WHERE local_date = '2026-10-20'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT sum, source_kind FROM daily_metrics "
+        "WHERE metric = 'step_count' AND date = '2025-01-10'").fetchone()[:] == (
+        1234.0, "apple_consolidated")
+    assert conn.execute(
+        "SELECT sum FROM daily_metrics "
+        "WHERE metric = 'step_count' AND date = '2026-09-01'").fetchone()[0] == 9000.0
+    # The backfill must never move the live expectation marker (#430 defect 2).
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vault_meta "
+        "WHERE key = 'daily_totals_expected_from:step_count'").fetchone()[0] == 0
+
+
+def test_backfill_into_a_vault_with_imported_history_writes_nothing(
+        conn, vault, monkeypatch):
+    """The vault declares its history imported: every backfill point is refused
+    by the vault gate, the batch answers 200, zero rows are written."""
+    vault_mod.set_history_imported_through(conn, "2026-01-01")
+    conn.commit()
+    with _client(vault, monkeypatch) as client:
+        response = _post_backfill(
+            client,
+            _wire_total(local_date="2025-01-10", value=1234.0, state="settled",
+                        queried_at="2026-10-26T09:00:00-04:00"),
+            batch_id="backfill-gated")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["daily_totals_added"] == 0
+    assert body["daily_totals_backfill_skipped"]["backfill_history_vault"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM hk_daily_totals").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM hk_daily_total_revisions").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM daily_metrics WHERE metric = 'step_count'"
+    ).fetchone()[0] == 0
+
+
+def test_backfill_batch_carrying_a_sample_is_a_400_and_writes_nothing(
+        conn, vault, monkeypatch):
+    with _client(vault, monkeypatch) as client:
+        response = _post_backfill(
+            client,
+            _wire_total(local_date="2025-01-10", value=1234.0, state="settled",
+                        queried_at="2026-10-26T09:00:00-04:00"),
+            batch_id="backfill-with-sample",
+            extra={"samples": [{"placeholder": True}]})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "history_backfill batch may carry only daily_totals" in detail
+    assert "samples" in detail
+    assert conn.execute("SELECT COUNT(*) FROM hk_daily_totals").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM commit_log").fetchone()[0] == 0

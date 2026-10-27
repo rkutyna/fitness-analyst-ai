@@ -2728,6 +2728,89 @@ def write_historical_consolidated_totals(
     return written
 
 
+def insert_backfill_daily_totals(
+    conn: sqlite3.Connection,
+    rows: Iterable[dict],
+    *,
+    batch_id: str,
+) -> int:
+    """Write backfilled Apple-consolidated SUM totals as `settled` (#696 E2).
+
+    The history-backfill lane's only write. It is `write_historical_consolidated_totals`
+    without a migration: each row is INSERTed `settled` with `migration_id` NULL
+    (the settled-immutable trigger protects it, exactly as an ordinary settled
+    row), and each write leaves one `hk_daily_total_revisions` row with the
+    `daily_metrics.sum`/`source_kind` it overwrote recorded in
+    `prior_sum`/`prior_source_kind`.
+
+    Deliberately does NOT call `insert_daily_totals`: that writes
+    `vault_meta.daily_totals_expected_from:<metric>`, the affirmative expectation
+    `verify_daily_metrics` check 6 reads. A backfill covers days long before this
+    deployment's first live pull, so writing that key would move the marker back
+    years (see `write_historical_consolidated_totals`, #430 review defect 2).
+
+    Refuses the whole call if ANY (metric, local_date) already has an
+    `hk_daily_totals` row of any kind; the receiver filters those out first and
+    counts them, so reaching this refusal is a caller bug. INSERT only, never an
+    UPDATE. Wrapped in one SAVEPOINT so a failure leaves zero partial rows.
+
+    Returns the number of days written.
+    """
+    rows = list(rows)
+    now = utcnow_iso()
+
+    conn.execute("SAVEPOINT insert_backfill_daily_totals")
+    try:
+        conflicts: list[tuple[str, str]] = []
+        for row in rows:
+            exists = conn.execute(
+                "SELECT 1 FROM hk_daily_totals "
+                "WHERE metric = ? AND local_date = ?",
+                (row["metric"], row["local_date"])).fetchone()
+            if exists is not None:
+                conflicts.append((row["metric"], row["local_date"]))
+        if conflicts:
+            shown = ", ".join(f"{m}@{d}" for m, d in conflicts[:8])
+            raise ValueError(
+                f"insert_backfill_daily_totals: {len(conflicts)} pair(s) already "
+                f"have an hk_daily_totals row: {shown}; this never overwrites")
+
+        written = 0
+        pairs: list[tuple[str, str]] = []
+        for row in rows:
+            metric, day = row["metric"], row["local_date"]
+            prior_dm = conn.execute(
+                "SELECT sum, source_kind FROM daily_metrics "
+                "WHERE metric = ? AND date = ?", (metric, day)).fetchone()
+            lag_days = daily_total_lag_days(row["queried_at"], day)
+            conn.execute(
+                "INSERT INTO hk_daily_totals (metric, local_date, value, unit, "
+                "interval, state, device_id, queried_at, first_seen_at, "
+                "settled_at, migration_id) "
+                "VALUES (?, ?, ?, ?, ?, 'settled', ?, ?, ?, ?, NULL)",
+                (metric, day, row["value"], row["unit"], row["interval"],
+                 row["device_id"], row["queried_at"], now, now))
+            conn.execute(
+                "INSERT INTO hk_daily_total_revisions (metric, local_date, "
+                "from_value, to_value, from_state, to_state, lag_days, "
+                "batch_id, recorded_at, migration_id, prior_sum, "
+                "prior_source_kind) "
+                "VALUES (?, ?, NULL, ?, NULL, 'settled', ?, ?, ?, NULL, ?, ?)",
+                (metric, day, row["value"], lag_days, batch_id, now,
+                 prior_dm["sum"] if prior_dm else None,
+                 prior_dm["source_kind"] if prior_dm else None))
+            pairs.append((metric, day))
+            written += 1
+        apply_consolidated_totals(conn, pairs=pairs)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT insert_backfill_daily_totals")
+        conn.execute("RELEASE SAVEPOINT insert_backfill_daily_totals")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT insert_backfill_daily_totals")
+    return written
+
+
 def revert_historical_migration(conn: sqlite3.Connection, migration_id: str) -> dict:
     """Undo one `write_historical_consolidated_totals` batch, in full.
 

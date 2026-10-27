@@ -903,6 +903,30 @@ _BACKFILL_SKIP_DETAIL = {
 }
 
 
+# #696 E3: the reasons a backfill daily STATISTIC can be refused. A statistic
+# has no state, so "not settled" does not apply.
+BACKFILL_STAT_SKIP_REASONS = (
+    "backfill_history_vault",
+    "backfill_inside_window",
+    "backfill_existing_skip",
+)
+
+
+def _backfill_stat_skip_reason(conn, row: dict, history: str | None) -> str | None:
+    """The reason a backfill daily statistic is refused, or None when accepted."""
+    if history is not None:
+        return "backfill_history_vault"
+    if db.daily_total_lag_days(row["queried_at"], row["local_date"]) <= DAILY_TOTAL_REPULL_WINDOW_DAYS:
+        return "backfill_inside_window"
+    existing = conn.execute(
+        "SELECT 1 FROM hk_daily_stats WHERE metric = ? AND local_date = ?",
+        (row["metric"], row["local_date"]),
+    ).fetchone()
+    if existing is not None:
+        return "backfill_existing_skip"
+    return None
+
+
 def _backfill_skip_reason(conn, row: dict, history: str | None) -> str | None:
     """The reason a backfill point is refused, or None when it is accepted."""
     if history is not None:
@@ -1078,6 +1102,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     is_backfill = parsed["history_backfill"]
     backfill_rows: list[dict] = []
     backfill_skips = {reason: 0 for reason in BACKFILL_SKIP_REASONS}
+    backfill_stat_rows: list[dict] = []
+    backfill_stat_skips = {reason: 0 for reason in BACKFILL_STAT_SKIP_REASONS}
 
     conn = ctx.connect()
     try:
@@ -1127,6 +1153,15 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                         "detail": _BACKFILL_SKIP_DETAIL[reason],
                     })
                     backfill_skips[reason] += 1
+                for row in parsed["daily_stats"]:
+                    reason = _backfill_stat_skip_reason(conn, row, backfill_history)
+                    if reason is None:
+                        backfill_stat_rows.append(row)
+                        continue
+                    _trace("skip-backfill-stat", metric=row["metric"],
+                           day=row["local_date"], reason=reason,
+                           batch_id=parsed["batch_id"])
+                    backfill_stat_skips[reason] += 1
             history = vault.history_imported_through(conn)
             if history is not None:
                 record_offending = min(
@@ -1493,6 +1528,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 # vault_meta.daily_totals_expected_from (see db.py).
                 daily_totals_added = db.insert_backfill_daily_totals(
                     conn, backfill_rows, batch_id=parsed["batch_id"])
+                # #696 E3: INSERT-only statistics; recomputed below, where the
+                # fill-only rule decides whether they reach daily_metrics.
+                db.insert_backfill_daily_stats(
+                    conn, backfill_stat_rows, batch_id=parsed["batch_id"])
+                affected.update((row["metric"], row["local_date"])
+                                for row in backfill_stat_rows)
             else:
                 daily_totals_added = db.insert_daily_totals(
                     conn, writable_totals, batch_id=parsed["batch_id"])
@@ -1733,6 +1774,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         # #696 E2: per-reason counts only, never values. Present on every
         # backfill ack (zeros included) so a client reads a stable shape.
         response["daily_totals_backfill_skipped"] = dict(backfill_skips)
+        response["daily_stats_backfill_skipped"] = dict(backfill_stat_skips)
     if parsed["rejected_anchors"]:
         response["anchor_results"] = parsed["anchor_results"]
     if parsed["routes_present"]:

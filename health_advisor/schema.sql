@@ -451,7 +451,7 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
     max    REAL,
     last   REAL,                         -- final raw sample by observation time
     unit   TEXT,
-    -- 'records' | 'apple_consolidated'. Which provenance the `sum` in THIS row
+    -- 'records' | 'apple_consolidated' | 'apple_statistics'. Which provenance the `sum` in THIS row
     -- currently carries (D19, #218). 'apple_consolidated' means `sum` came from
     -- hk_daily_totals — Apple's own consolidated daily total — while every other
     -- aggregate column stayed derived from `records`. Consequence, stated so it
@@ -526,6 +526,41 @@ BEFORE DELETE ON hk_daily_totals
 WHEN OLD.state = 'settled' AND OLD.migration_id IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'hk_daily_totals: settled totals are not deletable');
+END;
+
+-- ---------------------------------------------------------------------------
+-- hk_daily_stats: Apple's own daily STATISTICS for a history day (#696 E3).
+--
+-- Non-sum metrics only (DAILY_STAT_METRICS in hk_parse): HRV is a day average,
+-- resting heart rate a most-recent value. Stored as received and never
+-- summed. db.apply_daily_stats fills daily_metrics from these rows ONLY where
+-- the day has no raw samples (count = 0 or no row), so raw data always wins.
+-- Immutable once written: a backfill is INSERT-only, and a row is never
+-- revised or removed by any path.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hk_daily_stats (
+    metric        TEXT NOT NULL,       -- canonical: heart_rate_variability, resting_heart_rate
+    local_date    TEXT NOT NULL,       -- local YYYY-MM-DD
+    value         REAL NOT NULL,       -- Apple's statistic, canonical unit
+    unit          TEXT NOT NULL,
+    statistic     TEXT NOT NULL CHECK (statistic IN ('average','most_recent')),
+    device_id     TEXT,                -- which install pulled it
+    queried_at    TEXT NOT NULL,       -- phone clock at the pull that wrote this value
+    batch_id      TEXT NOT NULL,       -- the history_backfill batch that wrote it
+    first_seen_at TEXT NOT NULL,       -- UTC, the write
+    PRIMARY KEY (metric, local_date)
+);
+
+CREATE TRIGGER IF NOT EXISTS hk_daily_stats_no_update
+BEFORE UPDATE ON hk_daily_stats
+BEGIN
+    SELECT RAISE(ABORT, 'hk_daily_stats: a daily statistic is immutable once written (#696)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS hk_daily_stats_no_delete
+BEFORE DELETE ON hk_daily_stats
+BEGIN
+    SELECT RAISE(ABORT, 'hk_daily_stats: daily statistics are not deletable (#696)');
 END;
 
 -- ---------------------------------------------------------------------------

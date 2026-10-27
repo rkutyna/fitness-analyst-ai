@@ -2158,6 +2158,9 @@ def recompute_daily_metrics(
     # test 12c calls recompute_daily_metrics(pairs=[]) and requires the override
     # to have run.
     apply_consolidated_totals(conn, pairs=None if full else pairs)
+    # #696 E3: fill-only, after the consolidated override, so a day with a raw
+    # sample (count > 0) keeps the records-derived row it was just given.
+    apply_daily_stats(conn, pairs=None if full else pairs)
     return written
 
 
@@ -2411,6 +2414,58 @@ def apply_consolidated_totals(
                 "VALUES (?, ?, 0, ?, NULL, NULL, NULL, NULL, ?, "
                 "'apple_consolidated')",
                 (metric, day, value, unit))
+        written += 1
+    return written
+
+
+def apply_daily_stats(conn: sqlite3.Connection, *, pairs=None) -> int:
+    """Fill daily_metrics from `hk_daily_stats` where no raw samples exist (#696 E3).
+
+    FILL-ONLY, and the rule is the whole point: a (metric, date) whose
+    daily_metrics row has count > 0 is records-derived and is never touched. A
+    day with no row, or a count = 0 row, takes Apple's statistic in the metric's
+    value column (`metrics.value_col`: avg for HRV, last for resting HR), with
+    source_kind 'apple_statistics' and the current derived_version stamp, so the
+    derived readers accept it. A later raw sample for the day goes through the
+    normal recompute path, which overwrites this row with count >= 1 and
+    source_kind 'records'.
+
+    `pairs` restricts the update, with the same reading as apply_consolidated_
+    totals: None, and an empty sequence, mean every stored statistic. Returns
+    the number of daily_metrics rows written.
+    """
+    if not has_table(conn, "hk_daily_stats"):
+        return 0
+    from . import metrics as mx
+    wanted = {(m, d) for m, d in pairs} if pairs else None
+    written = 0
+    for row in conn.execute(
+            "SELECT metric, local_date, value, unit FROM hk_daily_stats"
+    ).fetchall():
+        metric, day, value, unit = (row["metric"], row["local_date"],
+                                    row["value"], row["unit"])
+        if wanted is not None and (metric, day) not in wanted:
+            continue
+        existing = conn.execute(
+            "SELECT count FROM daily_metrics WHERE metric = ? AND date = ?",
+            (metric, day)).fetchone()
+        if existing is not None and (existing["count"] or 0) > 0:
+            continue
+        column = mx.value_col(metric)
+        values = {"sum": None, "avg": None, "min": None, "max": None,
+                  "last": None}
+        values[column] = value
+        conn.execute(
+            "INSERT INTO daily_metrics (metric, date, count, sum, avg, min, "
+            "max, last, unit, source_kind, derived_version) "
+            "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, 'apple_statistics', ?) "
+            "ON CONFLICT(metric, date) DO UPDATE SET count = 0, "
+            "sum = excluded.sum, avg = excluded.avg, min = excluded.min, "
+            "max = excluded.max, last = excluded.last, unit = excluded.unit, "
+            "source_kind = 'apple_statistics', "
+            "derived_version = excluded.derived_version",
+            (metric, day, values["sum"], values["avg"], values["min"],
+             values["max"], values["last"], unit, mx.DERIVED_FORMULA_VERSION))
         written += 1
     return written
 
@@ -2808,6 +2863,52 @@ def insert_backfill_daily_totals(
         raise
     else:
         conn.execute("RELEASE SAVEPOINT insert_backfill_daily_totals")
+    return written
+
+
+def insert_backfill_daily_stats(conn: sqlite3.Connection, rows, *,
+                                batch_id: str) -> int:
+    """INSERT the accepted history-backfill daily statistics (#696 E3).
+
+    INSERT only, never an UPDATE: the table's triggers refuse both, and a
+    statistic already stored is refused here. Refuses the whole call if ANY
+    (metric, local_date) already has an hk_daily_stats row (the receiver filters
+    those out and counts them, so reaching this is a caller bug). One SAVEPOINT,
+    so a failure leaves zero partial rows. Returns the number of rows written.
+    """
+    rows = list(rows)
+    now = utcnow_iso()
+
+    conn.execute("SAVEPOINT insert_backfill_daily_stats")
+    try:
+        conflicts: list[tuple[str, str]] = []
+        for row in rows:
+            exists = conn.execute(
+                "SELECT 1 FROM hk_daily_stats WHERE metric = ? AND local_date = ?",
+                (row["metric"], row["local_date"])).fetchone()
+            if exists is not None:
+                conflicts.append((row["metric"], row["local_date"]))
+        if conflicts:
+            shown = ", ".join(f"{m}@{d}" for m, d in conflicts[:8])
+            raise ValueError(
+                f"insert_backfill_daily_stats: {len(conflicts)} pair(s) already "
+                f"have an hk_daily_stats row: {shown}; this never overwrites")
+        written = 0
+        for row in rows:
+            conn.execute(
+                "INSERT INTO hk_daily_stats (metric, local_date, value, unit, "
+                "statistic, device_id, queried_at, batch_id, first_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["metric"], row["local_date"], row["value"], row["unit"],
+                 row["statistic"], row["device_id"], row["queried_at"],
+                 batch_id, now))
+            written += 1
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT insert_backfill_daily_stats")
+        conn.execute("RELEASE SAVEPOINT insert_backfill_daily_stats")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT insert_backfill_daily_stats")
     return written
 
 

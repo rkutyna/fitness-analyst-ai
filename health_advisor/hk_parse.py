@@ -31,7 +31,7 @@ HEALTHKIT_ORIGIN = "healthkit"
 _TOP_FIELDS = frozenset({
     "protocol_version", "device", "app_version", "batch_id",
     "batch_sequence", "sent_at", "anchors", "samples", "deletions",
-    "workouts", "daily_totals",
+    "workouts", "daily_totals", "daily_stats",
     "workout_routes",
     "workout_elevation",
     "workout_context",
@@ -78,6 +78,11 @@ _DAILY_TOTAL_FIELDS = frozenset({
     "type_identifier", "local_date", "value", "unit", "interval",
     "state", "queried_at",
 })
+# #696 E3: a daily statistic has no interval or state; it is a settled value
+# by construction and only ever arrives in a history_backfill batch.
+_DAILY_STAT_FIELDS = frozenset({
+    "type_identifier", "local_date", "value", "unit", "statistic", "queried_at",
+})
 _ROUTE_FIELDS = frozenset({
     "hk_route_uuid", "start", "end", "source_name", "workout_hk_uuid",
     "start_lat_1dp", "start_lon_1dp", "points",
@@ -99,6 +104,15 @@ D19_TOTAL_METRICS = (
     "distance_walking_running", "flights_climbed", "step_count",
 )
 DAILY_TOTAL_METRICS = D19_TOTAL_METRICS
+# #696 E3: Apple's daily STATISTICS for a history day, for the non-sum metrics
+# only. A statistic is never summed; it is the value of the metric's own
+# aggregate for that day (average for HRV, most recent for resting HR). The
+# statistic on the wire must be the one named here, so a client cannot write a
+# resting-HR "average" that the stored metric would misread.
+DAILY_STAT_METRICS = {
+    "heart_rate_variability": "average",
+    "resting_heart_rate": "most_recent",
+}
 
 
 class PayloadError(ValueError):
@@ -769,6 +783,85 @@ def _parse_daily_total(total: dict, index: int, device_id: str,
     daily_total_dates.add(total["local_date"])
 
 
+def _daily_stat_unhandled(unhandled: list[str], index: int, reason: str) -> None:
+    unhandled.append(f"daily_stats[{index}]: {reason}")
+
+
+def _parse_daily_stat(stat: dict, index: int, device_id: str,
+                      daily_stats: list[dict], unhandled: _Unhandled) -> None:
+    required = ("type_identifier", "local_date", "value", "unit", "statistic",
+                "queried_at")
+    missing = _required(stat, required, f"daily_stats[{index}]")
+    if missing:
+        _daily_stat_unhandled(
+            unhandled, index,
+            f"missing required field(s): {', '.join(missing)}")
+        return
+    if not _text(stat["type_identifier"]):
+        _daily_stat_unhandled(unhandled, index,
+                              "type_identifier must be a non-empty string")
+        return
+    type_identifier = stat["type_identifier"]
+    if type_identifier not in nz.HK_QUANTITY:
+        _daily_stat_unhandled(
+            unhandled, index,
+            f"unknown type_identifier {type_identifier!r}")
+        return
+    metric = nz.hk_quantity_to_canonical(type_identifier)
+    if metric not in DAILY_STAT_METRICS:
+        # A statistic is applied to daily_metrics as the day's value, so only
+        # the metrics named in DAILY_STAT_METRICS may pass. Refused, not counted.
+        raise PayloadError(
+            f"daily_stats[{index}]: type_identifier {type_identifier!r} is not "
+            "a daily statistic metric; refused")
+    if stat["statistic"] != DAILY_STAT_METRICS[metric]:
+        raise PayloadError(
+            f"daily_stats[{index}]: statistic {stat['statistic']!r} is not the "
+            f"statistic for {metric} ({DAILY_STAT_METRICS[metric]!r}); refused")
+    if not _text(stat["local_date"]):
+        _daily_stat_unhandled(unhandled, index,
+                              "local_date must be a non-empty string")
+        return
+    try:
+        parsed_date = date.fromisoformat(stat["local_date"])
+    except (TypeError, ValueError):
+        parsed_date = None
+    if parsed_date is None or parsed_date.isoformat() != stat["local_date"]:
+        _daily_stat_unhandled(unhandled, index, "local_date must be YYYY-MM-DD")
+        return
+    value = _json_number(stat["value"])
+    if value is None or value < 0:
+        _daily_stat_unhandled(
+            unhandled, index, "value is not a non-negative finite number")
+        return
+    if not _text(stat["unit"]):
+        _daily_stat_unhandled(unhandled, index,
+                              "unit must be a non-empty string")
+        return
+    queried_at = _parse_dt(stat["queried_at"])
+    if queried_at is None:
+        _daily_stat_unhandled(unhandled, index,
+                              "queried_at must be an aware ISO timestamp")
+        return
+    try:
+        convert, unit = nz.unit_converter(metric, stat["unit"])
+        value = nz.hk_canonical_value(type_identifier, metric, convert(value))
+    except nz.UnitError as exc:
+        _daily_stat_unhandled(unhandled, index, f"{exc}; point dropped")
+        return
+
+    daily_stats.append({
+        "metric": metric,
+        "local_date": stat["local_date"],
+        "value": value,
+        "unit": unit,
+        "statistic": stat["statistic"],
+        "device_id": device_id,
+        "queried_at": stat["queried_at"],
+        "_point_index": index,
+    })
+
+
 def _rounded_coordinate(value: Any, field: str, index: int) -> float | None:
     if value is None:
         return None
@@ -893,6 +986,9 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise PayloadError(
                 "history_backfill batch may carry only daily_totals; refused "
                 f"non-empty field(s): {', '.join(carried)}")
+    if envelope.get("daily_stats") and not history_backfill:
+        raise PayloadError(
+            "daily_stats is accepted only in a history_backfill batch (#696)")
     device = _mapping(envelope["device"], "payload.device")
     _reject_unknown(device, _DEVICE_FIELDS, "payload.device")
     if not all(_text(device.get(field)) for field in _DEVICE_FIELDS):
@@ -1024,6 +1120,15 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         f"payload.daily_totals[{i}]")
         _parse_daily_total(total, i, device["id"], daily_totals,
                            daily_total_dates, unhandled)
+    daily_stats_wire = _list(envelope.get("daily_stats", []),
+                             "payload.daily_stats")
+    daily_stats: list[dict] = []
+    for i, stat in enumerate(daily_stats_wire):
+        if not isinstance(stat, dict):
+            raise PayloadError(f"payload.daily_stats[{i}] must be a JSON object")
+        _reject_unknown(stat, _DAILY_STAT_FIELDS,
+                        f"payload.daily_stats[{i}]")
+        _parse_daily_stat(stat, i, device["id"], daily_stats, unhandled)
     routes_present = "workout_routes" in envelope
     routes_wire = _list(envelope.get("workout_routes", []),
                         "payload.workout_routes")
@@ -1045,6 +1150,7 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "characteristics": characteristics,
         "daily_totals": daily_totals,
         "daily_total_dates": daily_total_dates,
+        "daily_stats": daily_stats,
         "history_backfill": history_backfill,
         "workout_routes": parsed_routes,
         "route_dates": route_dates,

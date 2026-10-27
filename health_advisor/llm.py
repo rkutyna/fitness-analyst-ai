@@ -963,6 +963,12 @@ def _not_called_complete_status() -> dict:
 def last_complete_status() -> dict:
     """Return the calling thread's most recent single-shot completion status.
 
+    Outcomes include ``success``, ``empty_response``, ``timeout``,
+    ``backend_error``, ``no_api_key``, ``not_called``, and
+    ``provider_key_refused`` (HTTP 401/402/403 from OpenRouter: the key is
+    expired, revoked, or out of credit). Its ``detail`` carries the status
+    code only, never a response body.
+
     The return value of :func:`complete` deliberately stays a string.  A
     non-empty answer has ``outcome == "success"`` and
     ``response_received == True``; an empty answer has a different outcome and
@@ -1691,6 +1697,16 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
                 text_length=len(text),
             )
             return text
+        except httpx.HTTPStatusError as exc:
+            # A refused key (expired, revoked, out of credit) is a distinct
+            # outcome, not a generic backend failure. Only the status code goes
+            # into the detail: a body can echo account details.
+            code = exc.response.status_code
+            outcome = ("provider_key_refused" if code in (401, 402, 403)
+                       else "backend_error")
+            _set_complete_status(outcome=outcome, response_received=False,
+                                 request_made=True, detail=f"HTTP {code}")
+            return ""
         except httpx.TimeoutException as exc:
             # A timeout is NOT a dead backend. The sweep aborts on the first
             # no-response job by design (#178); one slow generation must not

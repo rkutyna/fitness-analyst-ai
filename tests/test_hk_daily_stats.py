@@ -112,11 +112,11 @@ def test_backfill_stats_fill_days_that_have_no_raw_samples(
     hrv = _dm(conn, "heart_rate_variability", "2025-01-10")
     assert (hrv["count"], hrv["avg"], hrv["unit"]) == (0, 48.5, "ms")
     assert hrv["source_kind"] == "apple_statistics"
-    assert hrv["derived_version"] == 3
+    assert hrv["derived_version"] is None, "HRV is not a versioned derived metric"
     rhr = _dm(conn, "resting_heart_rate", "2025-01-10")
     assert (rhr["count"], rhr["last"], rhr["unit"]) == (0, 61.0, "count/min")
     assert rhr["source_kind"] == "apple_statistics"
-    assert rhr["derived_version"] == 3
+    assert rhr["derived_version"] is None
 
 
 def test_raw_samples_win_over_a_backfilled_statistic(conn, vault, monkeypatch):

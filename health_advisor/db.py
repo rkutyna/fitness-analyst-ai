@@ -2425,8 +2425,10 @@ def apply_daily_stats(conn: sqlite3.Connection, *, pairs=None) -> int:
     daily_metrics row has count > 0 is records-derived and is never touched. A
     day with no row, or a count = 0 row, takes Apple's statistic in the metric's
     value column (`metrics.value_col`: avg for HRV, last for resting HR), with
-    source_kind 'apple_statistics' and the current derived_version stamp, so the
-    derived readers accept it. A later raw sample for the day goes through the
+    source_kind 'apple_statistics' and derived_version NULL — the stamp exists
+    only for `metrics.VERSIONED_DERIVED_METRICS`, and neither metric is one, so
+    this row carries what its records-derived sibling and
+    `apply_consolidated_totals` carry: no stamp. A later raw sample for the day goes through the
     normal recompute path, which overwrites this row with count >= 1 and
     source_kind 'records'.
 
@@ -2437,15 +2439,17 @@ def apply_daily_stats(conn: sqlite3.Connection, *, pairs=None) -> int:
     if not has_table(conn, "hk_daily_stats"):
         return 0
     from . import metrics as mx
-    wanted = {(m, d) for m, d in pairs} if pairs else None
+    select = "SELECT metric, local_date, value, unit FROM hk_daily_stats"
+    if pairs:
+        # A batch names its days; look those up rather than scanning a decade.
+        rows = [r for m, d in sorted(set(pairs)) for r in conn.execute(
+            select + " WHERE metric = ? AND local_date = ?", (m, d)).fetchall()]
+    else:
+        rows = conn.execute(select).fetchall()
     written = 0
-    for row in conn.execute(
-            "SELECT metric, local_date, value, unit FROM hk_daily_stats"
-    ).fetchall():
+    for row in rows:
         metric, day, value, unit = (row["metric"], row["local_date"],
                                     row["value"], row["unit"])
-        if wanted is not None and (metric, day) not in wanted:
-            continue
         existing = conn.execute(
             "SELECT count FROM daily_metrics WHERE metric = ? AND date = ?",
             (metric, day)).fetchone()
@@ -2458,14 +2462,14 @@ def apply_daily_stats(conn: sqlite3.Connection, *, pairs=None) -> int:
         conn.execute(
             "INSERT INTO daily_metrics (metric, date, count, sum, avg, min, "
             "max, last, unit, source_kind, derived_version) "
-            "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, 'apple_statistics', ?) "
+            "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, 'apple_statistics', NULL) "
             "ON CONFLICT(metric, date) DO UPDATE SET count = 0, "
             "sum = excluded.sum, avg = excluded.avg, min = excluded.min, "
             "max = excluded.max, last = excluded.last, unit = excluded.unit, "
             "source_kind = 'apple_statistics', "
-            "derived_version = excluded.derived_version",
+            "derived_version = NULL",
             (metric, day, values["sum"], values["avg"], values["min"],
-             values["max"], values["last"], unit, mx.DERIVED_FORMULA_VERSION))
+             values["max"], values["last"], unit))
         written += 1
     return written
 

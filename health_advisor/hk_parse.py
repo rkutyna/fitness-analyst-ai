@@ -734,6 +734,13 @@ def _parse_daily_total(total: dict, index: int, device_id: str,
             f"unknown type_identifier {type_identifier!r}")
         return
     metric = nz.hk_quantity_to_canonical(type_identifier)
+    if metric not in DAILY_TOTAL_METRICS:
+        # Every accepted total is applied as a SUM override downstream, so
+        # only the consolidated-statistics metrics may pass.
+        _daily_total_unhandled(
+            unhandled, index,
+            f"type_identifier {type_identifier!r} is not a daily total metric")
+        return
     try:
         convert, unit = nz.unit_converter(metric, total["unit"])
         value = nz.hk_canonical_value(type_identifier, metric, convert(value))

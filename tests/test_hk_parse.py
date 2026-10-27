@@ -324,3 +324,36 @@ def test_unknown_daily_total_type_is_unhandled():
     assert out["daily_totals"] == []
     assert out["daily_total_dates"] == set()
     assert "unknown type_identifier" in out["unhandled"][-1]
+
+
+def test_non_daily_total_quantity_type_is_unhandled_and_step_count_still_parses():
+    """#696 E1. Only D19 consolidated metrics may become SUM overrides.
+
+    An HRV SDNN daily total is a statistic, not a sum, so applying it as a
+    daily override would corrupt the metric. It is reported like any other
+    rejected daily total; the step_count control in the same batch still parses.
+    """
+    out = hk_parse.parse_payload(_payload(daily_totals=[
+        _daily_total(type_identifier=
+                     "HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
+                     value=42.5, unit="ms"),
+        _daily_total(value=10173),
+    ]))
+    assert len(out["daily_totals"]) == 1
+    kept = out["daily_totals"][0]
+    assert kept["metric"] == "step_count"
+    assert kept["value"] == 10173
+    assert kept["_point_index"] == 1
+    assert out["daily_total_dates"] == {"2026-08-25"}
+    assert len(out["unhandled"]) == 1
+    assert out["unhandled"][0].startswith("daily_totals[0]:")
+    assert "HeartRateVariabilitySDNN" in out["unhandled"][0]
+
+
+def test_only_non_daily_total_entry_leaves_no_daily_totals():
+    out = hk_parse.parse_payload(_payload(daily_totals=[_daily_total(
+        type_identifier="HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
+        value=42.5, unit="ms")]))
+    assert out["daily_totals"] == []
+    assert out["daily_total_dates"] == set()
+    assert out["unhandled"][-1].startswith("daily_totals[0]:")

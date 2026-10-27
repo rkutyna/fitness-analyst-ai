@@ -680,7 +680,8 @@ def test_the_d19_predicate_is_equivalent_to_the_pre_d19_one_without_the_column(
     holes = ",".join("?" * len(derive.DERIVED_METRICS))
     old = _final_select(_baseline_source()).format(holes=holes)
     new = _final_select(_current_source()).format(
-        holes=holes, kind="'records'", CONSOLIDATED="apple_consolidated")
+        holes=holes, kind="'records'", CONSOLIDATED="apple_consolidated",
+        STATISTICS="apple_statistics")
     assert old != new, "the predicates are textually identical; nothing to prove"
 
     conn = db.connect(tmp_path / "predicate.db")
@@ -808,3 +809,37 @@ def test_frozen_split_is_empty_without_a_watermark(tmp_path):
     rows = [{"metric": "basal_energy", "date": DAY, "r_count": None}]
     assert V.split_frozen(conn, rows) == ([], rows, None)
     conn.close()
+
+
+# --- #696 E5: apple_statistics rows are not records-comparison discrepancies - #
+
+def test_17_statistics_only_hrv_row_is_not_a_records_discrepancy(tmp_path):
+    """17 (#696 E5). A statistics-only HRV day has no records by design, so it
+    must not be reported, while a corrupted records HRV row on another day is.
+
+    The corrupted avg (999.0) is a literal, so the oracle cannot follow the code.
+    """
+    # d3=False: an unfiltered database, so HRV divergence is genuine, not the
+    # D3-filtered category one that would hide the corrupted row.
+    path, conn = _database(tmp_path, "heart_rate_variability", [40.0, 50.0],
+                           d3=False, name="hrv-stats")
+    stats_day = "2026-08-10"
+    db.insert_backfill_daily_stats(conn, [{
+        "metric": "heart_rate_variability", "local_date": stats_day,
+        "value": 48.5, "unit": "ms", "statistic": "average",
+        "device_id": "dev-1", "queried_at": f"{stats_day}T23:00:00+00:00",
+    }], batch_id="stats-test")
+    db.apply_daily_stats(conn)
+    conn.execute(
+        "UPDATE daily_metrics SET avg = 999.0 WHERE metric = "
+        "'heart_rate_variability' AND date = ?", (DAY,))
+    conn.commit()
+    conn.close()
+
+    result = _run(path)
+
+    assert result.returncode == 1, result.stdout
+    assert f"{DAY}  heart_rate_variability" in result.stdout
+    assert stats_day not in result.stdout
+    assert "apple statistics rows excluded from the records comparison: 1" \
+        in result.stdout

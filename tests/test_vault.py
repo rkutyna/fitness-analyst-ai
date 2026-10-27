@@ -953,3 +953,88 @@ def test_receiver_marking_skips_zero_width_rows_before_bounding_the_window(
         assert vault.raw_resolution_seconds(conn, "step_count") == 0
     finally:
         conn.close()
+
+
+# --- #696 E5: Apple daily statistics survive a rebuild ---------------------- #
+
+def _ingest_daily_stats(path, rows) -> None:
+    """Statistics written the way the history_backfill receiver writes them."""
+    conn = db.connect(path)
+    db.insert_backfill_daily_stats(conn, [{
+        "metric": metric, "local_date": day, "value": value, "unit": unit,
+        "statistic": statistic, "device_id": "test-device",
+        "queried_at": "2026-08-21T09:00:00",
+    } for metric, day, value, unit, statistic in rows], batch_id="stats-test")
+    db.apply_daily_stats(conn)
+    conn.commit()
+    conn.close()
+
+
+_HRV_STATS = [
+    ("heart_rate_variability", "2026-08-10", 48.5, "ms", "average"),
+    ("heart_rate_variability", "2026-08-11", 52.0, "ms", "average"),
+    ("heart_rate_variability", "2026-08-12", 45.25, "ms", "average"),
+]
+
+
+def test_19_rebuild_preserves_apple_daily_statistics(tmp_path):
+    """19 (#696 E5). Statistics on days with no raw samples survive a rebuild.
+
+    The oracle is the literal HRV values ingested above, never the code's own
+    output. The source has no HRV records at all, so the only route to these
+    rows is the carry-forward plus apply_daily_stats.
+    """
+    source = tmp_path / "source.db"
+    vault_path = tmp_path / "vault.db"
+    _consolidated_source(source)
+    build_vault(source, vault_path, measure_gzip=False)
+    _ingest_daily_stats(vault_path, _HRV_STATS)
+
+    build_vault(source, vault_path, replace=True, measure_gzip=False)
+
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        stats = [tuple(r) for r in conn.execute(
+            "SELECT metric, local_date, value FROM hk_daily_stats "
+            "ORDER BY local_date")]
+        metrics = {r["date"]: (r["count"], r["avg"], r["source_kind"])
+                   for r in conn.execute(
+            "SELECT date, count, avg, source_kind FROM daily_metrics "
+            "WHERE metric = 'heart_rate_variability'")}
+    finally:
+        conn.close()
+    assert stats == [
+        ("heart_rate_variability", "2026-08-10", 48.5),
+        ("heart_rate_variability", "2026-08-11", 52.0),
+        ("heart_rate_variability", "2026-08-12", 45.25),
+    ]
+    assert metrics == {
+        "2026-08-10": (0, 48.5, "apple_statistics"),
+        "2026-08-11": (0, 52.0, "apple_statistics"),
+        "2026-08-12": (0, 45.25, "apple_statistics"),
+    }
+
+
+def test_19b_rebuild_of_a_vault_from_before_e3_is_unchanged(tmp_path):
+    """19b (#696 E5). A source vault with no hk_daily_stats table rebuilds."""
+    source = tmp_path / "source.db"
+    vault_path = tmp_path / "vault.db"
+    _consolidated_source(source)
+    build_vault(source, vault_path, measure_gzip=False)
+    conn = db.connect(vault_path)
+    conn.execute("DROP TABLE hk_daily_stats")
+    conn.commit()
+    conn.close()
+
+    build_vault(source, vault_path, replace=True, measure_gzip=False)
+
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        assert db.has_table(conn, "hk_daily_stats")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hk_daily_stats").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT sum FROM daily_metrics WHERE metric = 'step_count' "
+            "AND date = '2026-08-20'").fetchone()[0] == 10.0
+    finally:
+        conn.close()

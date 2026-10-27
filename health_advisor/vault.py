@@ -1328,6 +1328,26 @@ def _history_at(
         conn.close()
 
 
+def _daily_stats_at(path: Path) -> tuple[int, list]:
+    """Apple daily statistics (#696 E3) of an existing vault, to survive a rebuild.
+
+    Same reasoning as the hk_daily_totals carry in ``_history_at``: the rows are
+    history the source cannot know, and dropping them would silently turn a
+    statistic-filled day back into an empty one. A vault that predates E3 has
+    no hk_daily_stats table and reads as (0, []), so it rebuilds unchanged.
+    """
+    conn = db.connect(path, read_only=True)
+    try:
+        if not db.has_table(conn, "hk_daily_stats"):
+            return 0, []
+        rows = [tuple(r) for r in conn.execute(
+            "SELECT metric, local_date, value, unit, statistic, device_id, "
+            "queried_at, batch_id, first_seen_at FROM hk_daily_stats")]
+        return len(rows), rows
+    finally:
+        conn.close()
+
+
 def _tuning_settings_at(path: Path) -> dict[str, str]:
     """Read the two analysis settings that a rebuild must carry forward."""
     conn = db.connect(path, read_only=True)
@@ -1643,6 +1663,8 @@ def build_vault(
         else (0, [], None, None, None, 0, [], [], {}))
     existing_tuning = (_tuning_settings_at(vault_path)
                        if vault_path.exists() else {})
+    existing_stats, existing_stat_rows = (
+        _daily_stats_at(vault_path) if vault_path.exists() else (0, []))
     owner = owner or existing_owner
     vault_path.parent.mkdir(parents=True, exist_ok=True)
     fd, staging_name = tempfile.mkstemp(
@@ -1815,6 +1837,14 @@ def build_vault(
                 "(metric, local_date, value, unit, interval, state, device_id, "
                 "queried_at, first_seen_at, settled_at, migration_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", existing_total_rows)
+        if existing_stat_rows:
+            # #696 E3: Apple's daily statistics are INSERT-only and immutable, so
+            # they are copied verbatim and never re-derived from the source.
+            target.executemany(
+                "INSERT INTO hk_daily_stats "
+                "(metric, local_date, value, unit, statistic, device_id, "
+                "queried_at, batch_id, first_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", existing_stat_rows)
         if existing_revision_rows:
             # prior_sum/prior_source_kind (consumer #430) likewise -- dropping
             # them here is what would make a migrated day's revert silently
@@ -1834,6 +1864,8 @@ def build_vault(
         # consolidated totals are live-acquired and were just restored above,
         # so apply Apple's figures again before the rebuilt vault is committed.
         db.apply_consolidated_totals(target)
+        # #696 E3: fill-only, so a day with a raw sample keeps its records row.
+        db.apply_daily_stats(target)
 
         # An affirmative expectation. A rebuild may ADD consolidated totals; it may
         # never lose them. Checked here rather than by a later verify because here is
@@ -1847,6 +1879,13 @@ def build_vault(
                 f"total(s) ({existing_totals} in the vault being replaced, {kept} in "
                 "the staging database) — these are live-acquired and have no source; "
                 "see D19 §Q3")
+        kept_stats = target.execute(
+            "SELECT COUNT(*) FROM hk_daily_stats").fetchone()[0]
+        if kept_stats != existing_stats:
+            raise ValueError(
+                f"rebuild would change the Apple daily statistic count from "
+                f"{existing_stats} to {kept_stats}; these are immutable and have "
+                "no source (#696 E3)")
         target.commit()
         target.close()
         target = None

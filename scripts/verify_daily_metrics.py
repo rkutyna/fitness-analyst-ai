@@ -85,6 +85,12 @@ _DERIVED_COVERED = set(DERIVED_METRICS)
 # `daily_metrics.source_kind`).
 CONSOLIDATED = "apple_consolidated"
 
+# #696 E3: a row labelled `apple_statistics` is Apple's daily statistic for a
+# history day with NO raw samples (db.apply_daily_stats). It has no `records`
+# to rebuild from by design, so the records comparison excludes it entirely
+# rather than reporting it as missing. Counted and printed on its own line.
+STATISTICS = "apple_statistics"
+
 # The metrics D19 pulls from Apple as consolidated daily totals (#218 top
 # banner). This is imported from the parser, the wire's single metric catalog,
 # rather than duplicated here. It is deliberately not read out of
@@ -120,6 +126,7 @@ def _comparison_rows(conn, holes: str, kind: str) -> list[dict]:
           ON d.metric = r.metric AND d.date = r.date
         WHERE COALESCE(r.metric, d.metric) NOT IN ({holes})
           AND NOT (r.metric IS NULL AND {kind} = '{CONSOLIDATED}')
+          AND {kind} <> '{STATISTICS}'
         """,
         tuple(DERIVED_METRICS),
     )]
@@ -150,6 +157,7 @@ def historical_minmax_count(conn, minmax_from: str | None) -> int:
               ON d.metric = r.metric AND d.date = r.date
             WHERE COALESCE(r.metric, d.metric) NOT IN ({holes})
               AND NOT (r.metric IS NULL AND {kind} = '{CONSOLIDATED}')
+              AND {kind} <> '{STATISTICS}'
             """,
             tuple(DERIVED_METRICS),
         ))
@@ -222,6 +230,8 @@ def diffs(conn, minmax_from: str | None = None) -> list[dict]:
           -- rebuild at all, so that pair is handed over whole rather than
           -- reported as a row missing from `records`.
           AND NOT (r.metric IS NULL AND {kind} = '{CONSOLIDATED}')
+          -- #696 E3: apple_statistics rows have no records by design.
+          AND {kind} <> '{STATISTICS}'
           AND (r.metric IS NULL OR d.metric IS NULL
            OR d.count <> r.count
            OR ({kind} <> '{CONSOLIDATED}'
@@ -346,6 +356,18 @@ def classify_diffs(conn, rows: list[dict]) -> tuple[list[dict], list[dict]]:
 def _finding(metric, day, check: int, fatal: bool, detail: str) -> dict:
     return {"metric": metric, "date": day, "check": check, "fatal": fatal,
             "detail": detail}
+
+
+def statistics_rows_excluded(conn) -> int:
+    """How many daily_metrics rows the records comparison excluded (#696 E3).
+
+    Zero on a database without the label, so pre-E3 output is unchanged.
+    """
+    if not d19_storage_present(conn):
+        return 0
+    return conn.execute(
+        "SELECT COUNT(*) FROM daily_metrics WHERE source_kind = ?",
+        (STATISTICS,)).fetchone()[0]
 
 
 def consolidated_pairs_checked(conn) -> int:
@@ -680,6 +702,11 @@ def main() -> int:
               f"daily_metrics.sum against the hk_daily_totals row it was copied "
               f"from. This does NOT check that Apple's figure is correct; only "
               f"the Health app can (#218).")
+
+    n_stats = statistics_rows_excluded(conn)
+    if n_stats:
+        print(f"apple statistics rows excluded from the records comparison: "
+              f"{n_stats}")
 
     if bad_consolidated:
         # Truncated like the other two lists. An override that never ran at all

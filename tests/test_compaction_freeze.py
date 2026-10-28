@@ -11,6 +11,7 @@ here states the pre-fix outcome it would have produced.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -469,3 +470,144 @@ def test_compacted_sample_key_is_stable_and_signed_64_bit():
     assert -(2 ** 63) <= key < 2 ** 63
     conn = sqlite3.connect(":memory:")
     assert conn.execute("SELECT ?", (key,)).fetchone()[0] == key
+
+
+# ---- #701: the initial-history hold ------------------------------------
+
+HRV = "HKQuantityTypeIdentifierHeartRateVariabilitySDNN"
+
+
+def _meta(conn, key):
+    row = conn.execute("SELECT value FROM vault_meta WHERE key = ?",
+                       (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _seed_compactable(path, *, started_days_ago=None, complete_days_ago=None):
+    """Two basal rows behind the 30-day window plus a row for the last sync.
+
+    The hold is marked on the still-empty vault, as the receiver does, so the
+    records arrive after it; ``complete_days_ago`` then marks it complete.
+    """
+    conn = db.connect(path)
+    db.init_db(conn)
+    V.declare_vault(conn)
+    if started_days_ago is not None:
+        assert V.mark_initial_history_started(conn, _ago(started_days_ago))
+    db.insert_records(conn, [
+        _raw("basal_energy", "2026-07-10", "s1", 1.0, hk_uuid="u1", hour=8),
+        _raw("basal_energy", "2026-07-10", "s2", 2.0, hk_uuid="u2", hour=9),
+        _raw("basal_energy", "2026-08-21", "last", 3.0, hk_uuid="ul"),
+    ])
+    if complete_days_ago is not None:
+        V.set_initial_history_complete(conn, _ago(complete_days_ago))
+    conn.commit()
+    conn.close()
+
+
+def test_fresh_vault_first_ingest_starts_the_hold_and_a_second_does_not_move_it(
+        vault, monkeypatch):
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "hk-secret")
+    client = TestClient(receiver.create_app(vault))
+    before = datetime.now(timezone.utc)
+    assert client.post("/v1/ingest", headers=H, json=_payload(
+        [_sample("hr-1", HEART, "2026-08-21", "10", 120.0, "count/min")],
+        batch="b1")).status_code == 200
+    after = datetime.now(timezone.utc)
+    conn = vault.connect()
+    first = _meta(conn, "initial_history_started_at")
+    assert first is not None
+    assert before <= datetime.fromisoformat(first) <= after
+    assert client.post("/v1/ingest", headers=H, json=_payload(
+        [_sample("hr-2", HEART, "2026-08-21", "11", 121.0, "count/min")],
+        batch="b2")).status_code == 200
+    assert _meta(conn, "initial_history_started_at") == first
+
+
+def test_vault_with_history_before_this_change_never_gets_the_hold(
+        vault, vault_path, monkeypatch):
+    conn = vault.connect()
+    db.init_db(conn)
+    V.declare_vault(conn)
+    db.insert_records(conn, [
+        _raw("basal_energy", "2026-07-10", "old1", 1.0, hk_uuid="uo1", hour=8),
+        _raw("basal_energy", "2026-07-10", "old2", 2.0, hk_uuid="uo2", hour=9),
+        _raw("basal_energy", "2026-08-21", "old3", 3.0, hk_uuid="uo3"),
+    ])
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "hk-secret")
+    client = TestClient(receiver.create_app(vault))
+    assert client.post("/v1/ingest", headers=H, json=_payload(
+        [_sample("hr-1", HEART, "2026-08-21", "10", 120.0, "count/min")],
+        batch="b1")).status_code == 200
+    conn = vault.connect()
+    assert _meta(conn, "initial_history_started_at") is None
+    conn.close()
+    report = V.run_compaction(vault_path, today="2026-08-25")
+    assert "reason" not in report
+    assert report["through"] == "2026-07-22"
+    assert report["deleted_total"] == 2  # old1 and old2, behind the watermark
+
+
+def test_pending_hold_skips_compaction_and_writes_nothing(tmp_path):
+    path = tmp_path / "v.db"
+    _seed_compactable(path, started_days_ago=3)
+    before = path.read_bytes()
+    report = V.run_compaction(path, today="2026-08-25")
+    assert report["status"] == "skipped"
+    assert report["reason"] == "initial_history_pending"
+    assert report["initial_history_started_at"] is not None
+    assert report["deleted"] == {} and report["vacuumed"] is False
+    conn = db.connect(path, read_only=True)
+    assert V.compaction_status(conn)["compacted_through"] is None
+    assert conn.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 3
+    conn.close()
+    assert path.read_bytes() == before
+
+
+def test_complete_hold_lets_compaction_run(tmp_path):
+    path = tmp_path / "v.db"
+    _seed_compactable(path, started_days_ago=3, complete_days_ago=1)
+    report = V.run_compaction(path, today="2026-08-25")
+    assert "reason" not in report
+    assert report["deleted_total"] == 2
+
+
+def test_hold_expires_after_fourteen_days_without_completion(tmp_path):
+    path = tmp_path / "v.db"
+    _seed_compactable(path, started_days_ago=15)
+    report = V.run_compaction(path, today="2026-08-25")
+    assert "reason" not in report
+    assert report["deleted_total"] == 2
+
+
+def test_set_initial_history_complete_keeps_the_first_value(conn):
+    V.set_initial_history_complete(conn, "2026-08-01T00:00:00+00:00")
+    V.set_initial_history_complete(conn, "2026-08-09T00:00:00+00:00")
+    assert _meta(conn, "initial_history_complete") == "2026-08-01T00:00:00+00:00"
+
+
+def test_history_arriving_after_a_fresh_compaction_is_kept(vault, vault_path,
+                                                          monkeypatch):
+    """End to end: the hold skips the nightly job, so a 200-day-old HRV sample
+    from the still-arriving first sync is stored, not refused."""
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "hk-secret")
+    client = TestClient(receiver.create_app(vault))
+    assert client.post("/v1/ingest", headers=H, json=_payload(
+        [_sample("hr-now", HEART, "2026-08-21", "10", 120.0, "count/min")],
+        batch="b1")).status_code == 200
+    report = V.run_compaction(vault_path, today="2026-08-25")
+    assert report["status"] == "skipped"
+    old_day = "2026-02-10"  # 200 days before the 2026-08-28 test date
+    r = client.post("/v1/ingest", headers=H, json=_payload(
+        [_sample("hrv-old", HRV, old_day, "08", 45.0, "ms")], batch="b2"))
+    assert r.status_code == 200, r.text
+    conn = vault.connect()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM records WHERE hk_uuid = 'hrv-old' "
+        "AND metric = 'heart_rate_variability'").fetchone()[0] == 1

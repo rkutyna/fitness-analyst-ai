@@ -1313,6 +1313,11 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # sample is treated the same way (D2 rules out treating them
             # differently): its tombstone is written, dated from
             # compacted_samples, and the frozen daily row is left as it is.
+            # #701: the first batch with samples starts a fresh vault's initial
+            # history hold. It must run before this batch's inserts, so "zero
+            # records" means before this batch.
+            if parsed["records"]:
+                vault.mark_initial_history_started(conn, db.utcnow_iso())
             compacted_through = vault.frozen_through(conn)
 
             # A tombstone is durable before the add filter is evaluated. A

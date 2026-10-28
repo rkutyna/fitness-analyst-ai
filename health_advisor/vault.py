@@ -448,6 +448,56 @@ def set_first_sync_records(
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (count,))
 
 
+# #701: a fresh vault's first history load can still be arriving when the
+# nightly compaction runs. Compaction then sets the watermark ahead of days the
+# phone has not sent yet, and the receiver refuses those days' governed samples
+# for good. While the hold is pending, run_compaction does nothing.
+INITIAL_HISTORY_HOLD_DAYS = 14
+
+
+def mark_initial_history_started(conn: sqlite3.Connection, now_iso: str) -> bool:
+    """Record when a fresh vault's first history load began; True if written.
+
+    Only a vault with zero ``records`` rows and no existing key gets the mark.
+    A vault that already held history before this change never gets it, so its
+    compaction behaves exactly as before. Caller owns the transaction.
+    """
+    if _vault_meta_value(conn, "initial_history_started_at") is not None:
+        return False
+    if conn.execute("SELECT 1 FROM records LIMIT 1").fetchone() is not None:
+        return False
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) "
+        "VALUES ('initial_history_started_at', ?)", (now_iso,))
+    return True
+
+
+def set_initial_history_complete(conn: sqlite3.Connection, now_iso: str) -> None:
+    """Mark the first history load complete. Idempotent: keeps the first value.
+
+    Caller owns the transaction.
+    """
+    conn.execute(
+        "INSERT INTO vault_meta (key, value) "
+        "VALUES ('initial_history_complete', ?) "
+        "ON CONFLICT(key) DO NOTHING", (now_iso,))
+
+
+def initial_history_pending(conn: sqlite3.Connection, now: datetime) -> bool:
+    """True while a started first history load is neither complete nor expired."""
+    started = _vault_meta_value(conn, "initial_history_started_at")
+    if started is None:
+        return False
+    if _vault_meta_value(conn, "initial_history_complete") is not None:
+        return False
+    started_at = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now - started_at < timedelta(days=INITIAL_HISTORY_HOLD_DAYS)
+
+
 def _vault_meta_value(conn: sqlite3.Connection, key: str) -> str | None:
     """One vault_meta value, or None when unset OR when the table does not exist.
 
@@ -841,6 +891,13 @@ def run_compaction(
     started = time.monotonic()
     conn = db.connect(path, read_only=dry_run)
     try:
+        # #701: a fresh vault's first history load is still arriving. Skip
+        # before any write, so the watermark cannot move past days not yet sent.
+        if initial_history_pending(conn, datetime.now(timezone.utc)):
+            return {"status": "skipped", "reason": "initial_history_pending",
+                    "initial_history_started_at": _vault_meta_value(
+                        conn, "initial_history_started_at"),
+                    "compacted_through": None, "deleted": {}, "vacuumed": False}
         if not dry_run:
             db.init_db(conn)
             conn.commit()

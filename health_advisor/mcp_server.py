@@ -2890,6 +2890,8 @@ NOT_SYNCED_NOTE = ("this session's minute-by-minute distance and step samples "
                    "are not in the vault yet, so its blocks cannot be measured")
 NOT_RECORDED_NOTE = ("an indoor or treadmill session records no per-sample "
                      "distance, so its blocks cannot be measured")
+NOT_SYNCED_HR_NOTE = ("The heart rate for this session has not synced yet, so "
+                      "its blocks cannot be graded.")
 
 
 @tool
@@ -2907,7 +2909,10 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
       qualified_block_min    the same block only if its mean HR is at or below
                              the configured ceiling, else null. Null means
                              "nothing ran easy enough to count
-                             toward the ramp" — it does NOT mean they did not run.
+                             toward the ramp" ONLY when the session has no "hr"
+                             key — it does NOT mean they did not run. With
+                             "hr": "not_synced" the heart rate has not arrived
+                             yet, so null there says nothing about effort.
       unbridged_min          the block without the bridge rule, for comparison
       avg_hr_longest_block   mean HR over the longest block. This is one of
                              THREE different "average heart rates" and they run
@@ -2916,6 +2921,8 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                              whole session including prescribed walk breaks).
                              Always say which you are quoting.
       reps                   every block in the session, longest first
+      hr                     "not_synced" when the session has buckets but none
+                             carries a heart rate yet; absent otherwise.
 
     The bridge rule: up to two consecutive 16-18 min/mi buckets may join two jog
     segments when heart rate confirms the user was still running (>= 130 bpm)
@@ -2975,6 +2982,10 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                              else "not_synced",
                              note=NOT_RECORDED_NOTE if indoor
                              else NOT_SYNCED_NOTE)
+            elif "hr" in block:
+                # Distance and steps synced but no heart rate: qualified_block_min
+                # is null for a reason the model must not read as "too hard".
+                entry.update(hr=block["hr"], note=NOT_SYNCED_HR_NOTE)
             sessions.append(entry)
         hr_ceiling = A.mx.block_qualify_hr_max(conn)
     finally:

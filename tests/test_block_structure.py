@@ -189,3 +189,72 @@ def test_bridge_refuses_a_gap_longer_than_two_buckets():
     block = analysis.longest_block_from_buckets(buckets)
     assert block["bridged_min"] == metrics.r(
         metrics.IMPACT_BUCKET_SECONDS / 60.0, 1)
+
+
+# ---- heart rate not synced: buckets exist, none carries an hr reading ----
+# Six contiguous 20-second buckets are 6 * 20 s = 120 s = 2.0 minutes. Every
+# bucket is a jog bucket by the rule: pace 9.0 is not implausibly fast and
+# cadence 150 is at or above the 140 gait line, so no bridge is needed.
+
+def _six_jog_buckets(hr):
+    return _buckets(*({"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": hr}
+                      for _ in range(6)))
+
+
+def _judged(buckets):
+    """Stamp is_jog with the rule's verdict, as bucket_series does."""
+    for b in buckets:
+        b["is_jog"] = _is_jog(b)
+    return buckets
+
+
+def test_buckets_without_any_hr_report_hr_not_synced():
+    buckets = _judged(_six_jog_buckets(None))
+    block = analysis.longest_block_from_buckets(buckets)
+    assert block["bridged_min"] == 2.0
+    assert block["qualified_min"] is None
+    assert block["avg_hr_longest_block"] is None
+    assert block["hr"] == "not_synced"
+
+
+def test_hr_above_the_ceiling_is_not_hr_not_synced():
+    # Mean HR 170 is above the default 150 ceiling: a measured "too hard".
+    buckets = _judged(_six_jog_buckets(170.0))
+    block = analysis.longest_block_from_buckets(buckets)
+    assert block["bridged_min"] == 2.0
+    assert block["qualified_min"] is None
+    assert block["avg_hr_longest_block"] == 170.0
+    assert "hr" not in block
+
+
+def test_hr_under_the_ceiling_qualifies_and_has_no_hr_key():
+    buckets = _judged(_six_jog_buckets(140.0))
+    block = analysis.longest_block_from_buckets(buckets)
+    assert block["qualified_min"] == 2.0
+    assert "hr" not in block
+
+
+def test_hr_on_some_buckets_only_is_not_hr_not_synced():
+    # Three buckets carry HR 140, three carry none. The block's mean HR is
+    # taken over the three readings (140.0), so it qualifies at 2.0 minutes.
+    buckets = _judged(_buckets(
+        {"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": 140.0},
+        {"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": 140.0},
+        {"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": 140.0},
+        {"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": None},
+        {"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": None},
+        {"pace_min_per_mi": 9.0, "cadence_spm": 150.0, "hr": None},
+    ))
+    block = analysis.longest_block_from_buckets(buckets)
+    assert block["bridged_min"] == 2.0
+    assert block["qualified_min"] == 2.0
+    assert block["avg_hr_longest_block"] == 140.0
+    assert "hr" not in block
+
+
+def test_empty_bucket_list_has_no_hr_key():
+    block = analysis.longest_block_from_buckets([])
+    assert block["bridged_min"] == 0.0
+    assert block["qualified_min"] is None
+    assert block["avg_hr_longest_block"] is None
+    assert "hr" not in block

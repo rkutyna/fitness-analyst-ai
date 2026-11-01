@@ -246,3 +246,41 @@ def test_indoor_day_beside_an_outdoor_unsynced_run_is_not_synced(conn, tools):
     assert out["note"] == NOT_SYNCED_NOTE
     assert out["longest_block_min"] is None
     assert _no_zero_figures(out) == []
+
+
+# ---- heart rate not synced: distance and steps are in, heart rate is not ----
+
+HR_NOT_SYNCED_NOTE = ("The heart rate for this session has not synced yet, so "
+                      "its blocks cannot be graded.")
+NO_HR_DAY = "2026-07-09"
+
+
+def _no_hr_session(conn, base: str, day: str):
+    """12 jog buckets (pace 14, cadence 150, at the gait line so no heart rate
+    is needed to be jog) with distance and steps but no heart-rate rows, then
+    the workout row. Literal 12 * 20 s = 4.0 minutes."""
+    for i in range(12):
+        s = _iso(base, i)
+        _record(conn, "distance_walking_running", s, BUCKET_MIN / 14.0, "mi")
+        _record(conn, "step_count", s, 150.0 / 3.0, "count")
+    _workout(conn, base, _iso(base, 12), day, 12 * BUCKET_MIN, None)
+
+
+def test_session_with_no_hr_carries_hr_not_synced_and_note(conn, tools):
+    _no_hr_session(conn, "2026-07-09T12:00:00Z", NO_HR_DAY)
+    _measured_session(conn, "2026-07-10T12:00:00Z", "2026-07-10")
+    conn.commit()
+
+    out = tools.get_block_structure(day=NO_HR_DAY)
+
+    session = out["sessions"][0]
+    assert session["hr"] == "not_synced"
+    assert session["note"] == HR_NOT_SYNCED_NOTE
+    assert session["longest_block_min"] == 4.0
+    assert session["qualified_block_min"] is None
+    assert session["avg_hr_longest_block"] is None
+    assert "samples" not in session
+
+    measured = tools.get_block_structure(day="2026-07-10")["sessions"][0]
+    assert "hr" not in measured
+    assert measured.get("note") is None

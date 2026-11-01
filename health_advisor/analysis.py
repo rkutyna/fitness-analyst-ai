@@ -230,6 +230,8 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
                              THIS is the dial P2-1 made governing.
       avg_hr_longest_block   mean HR over the longest bridged block
       reps                   every block, longest first
+      hr                     "not_synced" only when there are buckets and none
+                             carries a heart rate; absent otherwise.
     """
     bm = mx.IMPACT_BUCKET_SECONDS / 60.0
     bk = sorted(({**b, "_i": _bucket_index(b["bucket_start_utc"])} for b in buckets),
@@ -288,7 +290,7 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
         hr_ceiling = 150.0  # legacy default for direct pure-function callers
     qualified = [r for r in reps
                  if r["mean_hr"] is not None and r["mean_hr"] <= hr_ceiling]
-    return {
+    out = {
         "unbridged_min": mx.r(plain_len * bm, 1),
         "bridged_min": best["minutes"] if best else 0.0,
         # None, not 0.0: "no block qualified" and "a user ran for zero minutes" are
@@ -297,6 +299,11 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
         "avg_hr_longest_block": best["mean_hr"] if best else None,
         "reps": reps,
     }
+    if bk and all(b.get("hr") is None for b in bk):
+        # Buckets exist but none carries a heart-rate reading: the HR has not
+        # synced, so a None qualified_min here does not mean "too hard".
+        out["hr"] = "not_synced"
+    return out
 
 
 def longest_block(conn, start_utc: str, end_utc: str, bridge: bool = True) -> dict:

@@ -379,6 +379,7 @@ def _host_targets(vault_real: str) -> dict[tuple[str, str], str]:
         ("binaries", "setuid_ping_raw_socket"): "/sbin/ping",
         ("binaries", "dyld_insert_libraries_injection"): "/usr/lib/libgmalloc.dylib",
         ("binaries", "system_binary_reads_forbidden_path"): HOME_READ_PROBE,
+        ("toctou", "home_tmpdir_env_remap_has_no_effect"): HOME_READ_PROBE,
         ("paths", "users_shared_dir_readable"): "/Users/Shared",
         ("paths", "another_users_home_var_root"): "/var/root/.bash_history",
         ("paths", "device_file_read"): "/dev/rdisk0",
@@ -1613,10 +1614,12 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
         case for case in cases
         if case["class"] == "toctou" and _case_applies(case, executor)
     ]
-    in_scope["toctou"] += len(toctou_cases)
-    applicable["toctou"] += len(toctou_cases)
-    blocked["toctou"] += _toctou_score(
+    toctou_blocked, toctou_not_applicable = _toctou_score(
         executor, vault_path, tmp_path, toctou_cases)
+    in_scope["toctou"] += len(toctou_cases)
+    applicable["toctou"] += len(toctou_cases) - len(toctou_not_applicable)
+    blocked["toctou"] += toctou_blocked
+    not_applicable.extend(toctou_not_applicable)
 
     # fd3_abuse class, scored on the *parent's* refusal per the note above.
     fd3_cases = [
@@ -1766,7 +1769,10 @@ def _toctou_vault_symlink_consistency(executor, tmp_root: Path) -> bool:
             and count_a != count_b and unaltered)
 
 
-def _toctou_home_tmpdir_remap_ignored(executor, vault_path, run_dir: Path) -> bool:
+def _toctou_home_tmpdir_remap_verdict(executor, vault_path, run_dir: Path) -> str:
+    """The remapped-$HOME read, scored like a corpus row. Its target is a real
+    file under the invoking user's home; where that file does not exist the
+    read fails whatever the sandbox does, so the row is NOT APPLICABLE."""
     code = f"""
 import os
 os.environ["HOME"] = "/"
@@ -1779,12 +1785,16 @@ except Exception as e:
 """
     res = _run(executor, code, vault_path, run_dir)
     evidence = _denial_evidence("toctou", "home_tmpdir_env_remap_has_no_effect", _executor_kind(executor))
-    return _score_case(res, cls="toctou", evidence=evidence) == BLOCKED
+    return _score_case(res, cls="toctou", evidence=evidence,
+                       target_present=os.path.lexists(HOME_READ_PROBE))
 
 
 def _toctou_score(
     executor, vault_path, tmp_path: Path, cases: list[dict]
-) -> int:
+) -> tuple[int, list[str]]:
+    """(rows blocked, rows NOT APPLICABLE) for the toctou rows in `cases`."""
+    remap = _toctou_home_tmpdir_remap_verdict(
+        executor, vault_path, tmp_path / "toctou_score_4")
     checks = {
         "preplanted_code_py_is_overwritten":
             lambda: _toctou_preplanted_code_is_overwritten(
@@ -1794,11 +1804,12 @@ def _toctou_score(
                 executor, vault_path, tmp_path / "toctou_score_2"),
         "vault_symlink_resolved_consistently":
             lambda: _toctou_vault_symlink_consistency(executor, tmp_path),
-        "home_tmpdir_env_remap_has_no_effect":
-            lambda: _toctou_home_tmpdir_remap_ignored(
-                executor, vault_path, tmp_path / "toctou_score_4"),
+        "home_tmpdir_env_remap_has_no_effect": lambda: remap == BLOCKED,
     }
-    return sum(1 for case in cases if checks[case["name"]]())
+    not_applicable = [f"toctou/{case['name']}" for case in cases
+                      if case["name"] == "home_tmpdir_env_remap_has_no_effect"
+                      and remap == NOT_APPLICABLE]
+    return sum(1 for case in cases if checks[case["name"]]()), not_applicable
 
 
 def test_toctou_preplanted_code_py_is_overwritten(executor, vault_path, tmp_path):
@@ -1815,7 +1826,9 @@ def test_toctou_vault_symlink_resolved_consistently(executor, tmp_path):
 
 
 def test_toctou_home_tmpdir_env_remap_has_no_effect(executor, vault_path, tmp_path):
-    assert _toctou_home_tmpdir_remap_ignored(executor, vault_path, tmp_path / "run")
+    if not os.path.lexists(HOME_READ_PROBE):
+        pytest.skip(f"{HOME_READ_PROBE} does not exist, so a failed read measures nothing")
+    assert _toctou_home_tmpdir_remap_verdict(executor, vault_path, tmp_path / "run") == BLOCKED
 
 
 # --------------------------------------------------------------------------- #

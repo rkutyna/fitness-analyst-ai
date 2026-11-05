@@ -65,7 +65,11 @@ jobs:
       - name: Run tests
         run: python -m pytest
 
+      # This step and the corpus below run even when the test step fails: the
+      # corpus is the only run of the sandbox executors against a vault here,
+      # and an unrelated test failure must not silently skip it.
       - name: Build a synthetic demo vault
+        if: ${{ !cancelled() }}
         run: python -m health_advisor.demo --out data/demo.db --days 200
 
       # INFORMATIONAL, and deliberately not a gate. The sandbox attack corpus
@@ -81,6 +85,7 @@ jobs:
       # first output line even when the run passes, so each executor's denial
       # lines can be read from the log.
       - name: Sandbox attack corpus (informational — see SECURITY.md)
+        if: ${{ !cancelled() }}
         continue-on-error: true
         env:
           HA_TEST_VAULT: ${{ github.workspace }}/data/demo.db

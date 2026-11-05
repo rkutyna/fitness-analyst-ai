@@ -77,12 +77,14 @@ jobs:
       # deficit is host-dependent and this step's continue-on-error already
       # keeps it from gating unrelated work either way. The corpus's other
       # eight classes, and the Linux (bubblewrap) executor, stay strictly
-      # enforced.
+      # enforced. `-rP` prints the corpus table and every row's verdict and
+      # first output line even when the run passes, so each executor's denial
+      # lines can be read from the log.
       - name: Sandbox attack corpus (informational — see SECURITY.md)
         continue-on-error: true
         env:
           HA_TEST_VAULT: ${{ github.workspace }}/data/demo.db
-        run: python -m pytest tests/test_analyst_sandbox.py -o addopts= -q
+        run: python -m pytest tests/test_analyst_sandbox.py -o addopts= -q -rP
 
   no-personal-data:
     name: no-personal-data

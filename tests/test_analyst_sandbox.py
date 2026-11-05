@@ -25,11 +25,14 @@ end-to-end test also happened to catch, without needing to sleep for it.
 from __future__ import annotations
 
 import os
+import re
+import select
 import sqlite3
 import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -38,6 +41,7 @@ import pytest
 
 from health_advisor import analyst_sandbox as sb
 from health_advisor import analyst_envelope
+from health_advisor import analyst_ledger
 from health_advisor import analyst_runner
 
 # The vault these tests run against. Configurable on purpose: a public engine
@@ -169,7 +173,10 @@ def test_parent_side_host_artifact_scoring_ignores_namespace_local_write(tmp_pat
 # `_is_unsafe` answers "did the attack succeed?" and nothing else, so a probe
 # that never reached its attack (NameError, failed import, missing interpreter)
 # used to be counted BLOCKED. A row is now BLOCKED only on positive evidence
-# that the probe ran inside the sandbox and was stopped there.
+# that the probe ran inside the sandbox and was stopped there BY THE SANDBOX:
+# every probe prints BLOCKED from a bare `except Exception`, so the marker alone
+# proves only that the attack failed. The line must also carry the sandbox's
+# own denial reason for that row and executor (`_DENIAL` below).
 # --------------------------------------------------------------------------- #
 
 
@@ -180,6 +187,7 @@ class _EscapeStillOpen(AssertionError):
 BLOCKED = "BLOCKED"
 UNSAFE = "UNSAFE"
 NOT_CONFIRMED = "NOT CONFIRMED"
+NOT_APPLICABLE = "NOT APPLICABLE"
 
 
 def _score_case(
@@ -189,24 +197,42 @@ def _score_case(
     host_artifact: Path | None = None,
     kill_expected: bool = False,
     network_control_ok: bool = True,
+    evidence: bytes | None = None,
+    target_present: bool = True,
+    control_ok: bool | None = None,
+    control_failure: str = NOT_CONFIRMED,
 ) -> str:
-    """Classify one corpus run as BLOCKED, UNSAFE or NOT CONFIRMED.
+    """Classify one corpus run as BLOCKED, UNSAFE, NOT APPLICABLE or NOT CONFIRMED.
 
-    UNSAFE is whatever `_is_unsafe` says. BLOCKED needs positive evidence that
-    the probe executed inside the sandbox and was stopped there:
+    UNSAFE is whatever `_is_unsafe` says, and is checked first, so nothing
+    below can hide an escape. BLOCKED needs positive evidence that the probe
+    executed inside the sandbox and was stopped there BY THE SANDBOX:
 
-    (i)  the child exited 0 and printed its own BLOCKED marker; for a row with
-         a parent-chosen host artifact the child's UNSAFE line is also proof
-         that it ran (a bubblewrap namespace-local write is not an escape), so
-         either marker counts there as long as the artifact is absent;
+    (i)  the child exited 0, printed its own BLOCKED marker, and the line
+         carries `evidence`, the sandbox's own denial reason for this row and
+         executor (Seatbelt answers EPERM, "Operation not permitted"; the
+         query channel's parent-side authorizer answers "not authorized"). A
+         probe stopped by anything else -- host permissions (EACCES), a
+         missing target (ENOENT, under Seatbelt), a probe bug -- prints
+         BLOCKED from the same bare `except Exception`, and does not count.
+         With no `evidence` nothing counts. For a row with a parent-chosen
+         host artifact the child's UNSAFE line also proves it ran (a
+         bubblewrap namespace-local write is not an escape) as long as the
+         artifact is absent;
     (ii) the row is `kill_expected` (the forked-descendant rows, which spin on
          purpose so the deadline has to do the work): the run timed out, its
          process group was confirmed killed, and nothing printed UNSAFE.
 
+    NOT APPLICABLE is earned too, and means the row measures nothing on this
+    run: the host target does not exist for this user (`target_present`), or
+    the unsandboxed positive control failed for a row whose `control_failure`
+    says that is a property of the host (dyld injection on a host that strips
+    it). The roll-up pins which rows may land here.
+
     Anything else -- a crash, a missing interpreter, a profile that failed to
-    load, a timeout nobody expected -- never reached its attack, and counting
-    it as blocked would be a false green. Network rows additionally need the
-    positive control: on an offline host every connect fails, sandbox or not.
+    load, a timeout nobody expected, a denial with the wrong reason -- is NOT
+    CONFIRMED. Network rows additionally need the positive control: on an
+    offline host every connect fails, sandbox or not.
     """
     if _is_unsafe(res, host_artifact=host_artifact):
         return UNSAFE
@@ -219,11 +245,15 @@ def _score_case(
     if res.timed_out or res.returncode != 0:
         return NOT_CONFIRMED
     haystack = res.stdout + res.fd3_bytes
-    if b"BLOCKED" in haystack:
-        return BLOCKED
+    if not target_present:
+        return NOT_APPLICABLE
+    if control_ok is False:
+        return control_failure
     if host_artifact is not None and b"UNSAFE" in haystack:
         return BLOCKED
-    return NOT_CONFIRMED
+    if b"BLOCKED" not in haystack or evidence is None:
+        return NOT_CONFIRMED
+    return BLOCKED if re.search(evidence, haystack) else NOT_CONFIRMED
 
 
 def _network_control() -> bool:
@@ -251,69 +281,269 @@ def _raw(tmp_path: Path, **overrides) -> sb.RawResult:
     return sb.RawResult(**fields)
 
 
+# --------------------------------------------------------------------------- #
+# The sandbox's own denial, per row and executor
+#
+# SEATBELT: measured by running every corpus row under SeatbeltExecutor on
+# macOS and reading its line. Seatbelt answers a denied file, socket or exec
+# with EPERM ("Operation not permitted"); host permissions answer EACCES and a
+# missing path ENOENT, which is how they are told apart. The row entries are
+# the measured lines of probes that surface no errno.
+#
+# BWRAP: measured by running the corpus under BwrapExecutor in the Linux CI
+# job. A host path that is not bound answers ENOENT, a read-only bind EROFS,
+# the unshared network ENETUNREACH.
+#
+# QUERY CHANNEL: the rows that attack `conn` run through the analyst query
+# channel, where `conn` is a proxy to a parent-owned, ledgered, read-only
+# connection. The denial there is the parent's SQLite authorizer, identical on
+# both executors, and it must also appear in that connection's own record of
+# refused actions (`_QUERY_DENIED_ACTION`).
+# --------------------------------------------------------------------------- #
+
+EPERM = rb"\[Errno 1\] Operation not permitted"
+_NOT_AUTHORIZED = rb"BLOCKED AnalystQueryError DatabaseError: not authorized"
+
+_DENIAL_DEFAULT = {
+    "seatbelt": EPERM,
+    "bwrap": rb"\[Errno (?:1|2|30)\] ",
+}
+
+_DENIAL = {
+    ("network", "dns_resolution"): {
+        "seatbelt": rb"BLOCKED gaierror \[Errno 8\] ", "bwrap": rb"BLOCKED gaierror "},
+    ("network", "curl_child_process"): {
+        "seatbelt": rb"BLOCKED rc= 7 ", "bwrap": rb"BLOCKED rc= (?:6|7) "},
+    ("network", "outbound_tcp_connect"): {"bwrap": rb"\[Errno (?:1|101)\] "},
+    ("network", "udp_sendto"): {"bwrap": rb"\[Errno (?:1|101)\] "},
+    # SQLite's SQLITE_AUTH for an open the profile refused (the vault is under
+    # $HOME). NOT "attempt to write a readonly database": that is what the
+    # same write gets unsandboxed against the 0444 vault, and also what a
+    # sandboxed write to a DAC-writable file outside work/ gets.
+    ("vault_integrity", "writable_open_and_create_table"): {
+        "seatbelt": rb"BLOCKED DatabaseError authorization denied",
+        "bwrap": rb"BLOCKED OperationalError unable to open database file"},
+    ("vault_integrity", "pragma_journal_mode_wal"): {
+        "seatbelt": _NOT_AUTHORIZED, "bwrap": _NOT_AUTHORIZED},
+    ("vault_integrity", "attach_and_write"): {
+        "seatbelt": _NOT_AUTHORIZED, "bwrap": _NOT_AUTHORIZED},
+    # VACUUM INTO attaches its target internally; the authorizer refuses that
+    # ATTACH while the statement runs, which SQLite reports as SQLITE_AUTH.
+    ("vault_integrity", "vacuum_into_exfil"): {
+        "seatbelt": rb"BLOCKED AnalystQueryError DatabaseError: authorization denied",
+        "bwrap": rb"BLOCKED AnalystQueryError DatabaseError: authorization denied"},
+    ("inherited_descriptors", "enumerate_and_read_beyond_known"): {
+        "seatbelt": rb"BLOCKED no unexpected readable fd", "bwrap": rb"BLOCKED no unexpected readable fd"},
+    ("inherited_descriptors", "parent_only_secret_not_leaked"): {
+        "seatbelt": rb"BLOCKED no secret leak", "bwrap": rb"BLOCKED no secret leak"},
+    ("inherited_descriptors", "raw_vault_fd_write_bypassing_conn"): {
+        "seatbelt": rb"BLOCKED no descriptor refers to the vault",
+        "bwrap": rb"BLOCKED no descriptor refers to the vault"},
+    ("binaries", "setuid_sudo"): {
+        "bwrap": rb"effective uid is not 0|nosuid|no new privileges|\[Errno 1\] "},
+    ("binaries", "setuid_ping_raw_socket"): {
+        "seatbelt": rb"sendto: Operation not permitted",
+        "bwrap": rb"Network is unreachable|Operation not permitted"},
+    ("binaries", "dyld_insert_libraries_injection"): {
+        "seatbelt": rb"BLOCKED no injection observed", "bwrap": rb"BLOCKED no injection observed"},
+    ("binaries", "system_binary_reads_forbidden_path"): {
+        "seatbelt": rb"Operation not permitted",
+        "bwrap": rb"No such file or directory|Operation not permitted"},
+}
+
+# The authorizer action each SQL-level query-channel row must have been refused
+# with, as recorded by the parent's ledgered connection.
+_QUERY_DENIED_ACTION = {
+    ("vault_integrity", "pragma_journal_mode_wal"): sqlite3.SQLITE_PRAGMA,
+    ("vault_integrity", "attach_and_write"): sqlite3.SQLITE_ATTACH,
+    ("vault_integrity", "vacuum_into_exfil"): sqlite3.SQLITE_ATTACH,
+}
+
+
+def _denial_evidence(cls: str, name: str, kind: str) -> bytes:
+    """The line a BLOCKED verdict for this row must carry under this executor."""
+    return _DENIAL.get((cls, name), {}).get(kind, _DENIAL_DEFAULT[kind])
+
+
+def _host_targets(vault_real: str) -> dict[tuple[str, str], str]:
+    """What each row attacks on the host. A row whose target this user cannot
+    see (`os.path.lexists` is False) measures nothing: /var/root/.bash_history
+    is invisible to a non-root user, and /Users/Shared or /dev/rdisk0 do not
+    exist on Linux. Such a row is NOT APPLICABLE unless it printed UNSAFE."""
+    return {
+        ("network", "unix_domain_socket"): "/var/run/mDNSResponder",
+        ("network", "curl_child_process"): "/usr/bin/curl",
+        ("filesystem_write", "write_into_repo"): str(sb.REPO_ROOT),
+        ("vault_integrity", "writable_open_and_create_table"): vault_real,
+        ("binaries", "setuid_sudo"): "/usr/bin/sudo",
+        ("binaries", "setuid_ping_raw_socket"): "/sbin/ping",
+        ("binaries", "dyld_insert_libraries_injection"): "/usr/lib/libgmalloc.dylib",
+        ("binaries", "system_binary_reads_forbidden_path"): HOME_READ_PROBE,
+        ("paths", "users_shared_dir_readable"): "/Users/Shared",
+        ("paths", "another_users_home_var_root"): "/var/root/.bash_history",
+        ("paths", "device_file_read"): "/dev/rdisk0",
+        ("paths", "device_file_write"): "/dev/rdisk0",
+    }
+
+
+# Rows whose BLOCKED line reports an ABSENCE (no fd leaked, no library loaded,
+# no descriptor on the vault) prove something only if the same probe, run
+# OUTSIDE the sandbox with the thing it looks for handed to it, finds it.
+# Read-only probes only: no write probe is ever run unsandboxed. The value is
+# the verdict when the control fails: a probe that cannot see a leak that is
+# there is broken (NOT CONFIRMED); a host that strips DYLD_* from the binary
+# itself (SIP) cannot measure the profile at all.
+_CONTROLLED = {
+    ("inherited_descriptors", "enumerate_and_read_beyond_known"): NOT_CONFIRMED,
+    ("inherited_descriptors", "parent_only_secret_not_leaked"): NOT_CONFIRMED,
+    ("inherited_descriptors", "raw_vault_fd_write_bypassing_conn"): NOT_CONFIRMED,
+    ("binaries", "dyld_insert_libraries_injection"): NOT_APPLICABLE,
+}
+
+
+def _unsandboxed_control(code: str, work: Path, readable_fd_path: Path | str) -> bool:
+    """Run a read-only probe with no sandbox, handing it one readable fd above
+    4 (what a leak would look like); True when it reports UNSAFE there."""
+    work.mkdir(parents=True, exist_ok=True)
+    fd = os.open(readable_fd_path, os.O_RDONLY)
+    while fd <= 4:
+        higher = os.dup(fd)
+        os.close(fd)
+        fd = higher
+    try:
+        done = subprocess.run([sys.executable, "-c", "conn = None\n" + code], cwd=work,
+                              pass_fds=(fd,), capture_output=True, timeout=30)
+    finally:
+        os.close(fd)
+    return done.returncode == 0 and b"UNSAFE" in done.stdout
+
+
+def _run_query_channel(
+    executor, code: str, vault: str, run_dir: Path, **limit_kwargs,
+) -> tuple[sb.RawResult, tuple[int, ...]]:
+    """Run `code` through the analyst query channel and return the child's raw
+    result with the authorizer actions the parent's connection refused.
+
+    The same dispatch `analyst_runner.run_analyst_code` uses: the parent opens
+    the vault read-only behind the ledgered wrapper, the child gets the `conn`
+    proxy over a socket, and every request is served by `_service_query`. The
+    envelope step is left out because these rows are scored on the child's
+    own line, which `run_analyst_code` does not return.
+    """
+    limits = analyst_runner.AnalystLimits(**limit_kwargs) if limit_kwargs else None
+    parent_conn = analyst_ledger.open_ledgered(vault)
+    query_parent, query_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    query_child_fd = query_child.detach()
+    outcome: list[sb.RawResult] = []
+    failure: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            outcome.append(analyst_runner._invoke_executor(
+                executor, code, str(run_dir), query_child_fd, limits, vault))
+        except BaseException as exc:      # reported below, never swallowed
+            failure.append(exc)
+        finally:
+            try:
+                os.close(query_child_fd)
+            except OSError:
+                pass
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    query_parent.setblocking(False)
+    pending = bytearray()
+    try:
+        while worker.is_alive():
+            ready, _, _ = select.select([query_parent], [], [], 0.25)
+            if not ready:
+                continue
+            try:
+                more, _reason = analyst_runner._service_query(
+                    query_parent, parent_conn, analyst_runner.DEFAULT_MAX_QUERY_ROWS, pending)
+            except (ConnectionError, analyst_runner._AnalystQueryError, ValueError):
+                break
+            if not more:
+                break
+    finally:
+        query_parent.close()
+        worker.join(timeout=30)
+        denied = tuple(action for action, _arg in parent_conn.denied_events)
+        parent_conn.close()
+    if failure:
+        raise failure[0]
+    assert outcome, "the query-channel executor returned no result"
+    return outcome[0], denied
+
+
 def test_probe_that_crashed_before_its_attack_is_not_confirmed(tmp_path):
     crashed = _raw(tmp_path, returncode=-1, stderr=b"NameError: name 'x'")
-    assert _score_case(crashed, cls="filesystem_write") == "NOT CONFIRMED"
+    assert _score_case(crashed, cls="filesystem_write", evidence=EPERM) == NOT_CONFIRMED
 
 
 def test_probe_that_printed_nothing_is_not_confirmed(tmp_path):
-    assert _score_case(_raw(tmp_path), cls="paths") == "NOT CONFIRMED"
+    assert _score_case(_raw(tmp_path), cls="paths", evidence=EPERM) == NOT_CONFIRMED
 
 
 def test_probe_that_exited_nonzero_after_printing_blocked_is_not_confirmed(tmp_path):
-    odd = _raw(tmp_path, returncode=1, stdout=b"BLOCKED PermissionError")
-    assert _score_case(odd, cls="paths") == "NOT CONFIRMED"
+    odd = _raw(tmp_path, returncode=1,
+               stdout=b"BLOCKED PermissionError [Errno 1] Operation not permitted")
+    assert _score_case(odd, cls="paths", evidence=EPERM) == NOT_CONFIRMED
 
 
-def test_probe_that_reported_blocked_and_exited_cleanly_is_blocked(tmp_path):
-    ok = _raw(tmp_path, stdout=b"BLOCKED PermissionError denied")
-    assert _score_case(ok, cls="paths") == "BLOCKED"
-    via_fd3 = _raw(tmp_path, fd3_bytes=b"BLOCKED")
-    assert _score_case(via_fd3, cls="paths") == "BLOCKED"
+def test_probe_that_reported_the_sandbox_denial_and_exited_cleanly_is_blocked(tmp_path):
+    ok = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 1] Operation not permitted")
+    assert _score_case(ok, cls="paths", evidence=EPERM) == BLOCKED
+    via_fd3 = _raw(tmp_path, fd3_bytes=b"BLOCKED [Errno 1] Operation not permitted")
+    assert _score_case(via_fd3, cls="paths", evidence=EPERM) == BLOCKED
+    # The marker alone is not enough: no evidence, or a different reason.
+    assert _score_case(ok, cls="paths") == NOT_CONFIRMED
+    bare = _raw(tmp_path, stdout=b"BLOCKED PermissionError denied")
+    assert _score_case(bare, cls="paths", evidence=EPERM) == NOT_CONFIRMED
 
 
 def test_an_unsafe_marker_wins_even_on_a_killed_run(tmp_path):
     bad = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=True,
                fd3_bytes=b"UNSAFE descendant survived deadline")
     assert _score_case(bad, cls="forked_descendants",
-                       kill_expected=True) == "UNSAFE"
+                       kill_expected=True) == UNSAFE
 
 
 def test_kill_expected_row_is_blocked_only_by_a_confirmed_group_kill(tmp_path):
     killed = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=True)
     assert _score_case(killed, cls="forked_descendants",
-                       kill_expected=True) == "BLOCKED"
+                       kill_expected=True) == BLOCKED
     # Timed out but no confirmed group kill.
     unkilled = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=False)
     assert _score_case(unkilled, cls="forked_descendants",
-                       kill_expected=True) == "NOT CONFIRMED"
+                       kill_expected=True) == NOT_CONFIRMED
     # Exited by itself: the deadline never did the work this row exists for.
     early = _raw(tmp_path, returncode=0)
     assert _score_case(early, cls="forked_descendants",
-                       kill_expected=True) == "NOT CONFIRMED"
+                       kill_expected=True) == NOT_CONFIRMED
 
 
 def test_a_timeout_is_not_blocked_unless_the_row_expects_a_kill(tmp_path):
     killed = _raw(tmp_path, returncode=-9, timed_out=True, killed_group=True)
-    assert _score_case(killed, cls="paths") == "NOT CONFIRMED"
+    assert _score_case(killed, cls="paths", evidence=EPERM) == NOT_CONFIRMED
 
 
 def test_host_artifact_row_needs_proof_the_probe_ran(tmp_path):
     artifact = tmp_path / "host_artifact.txt"
-    ran = _raw(tmp_path, stdout=b"BLOCKED PermissionError")
-    assert _score_case(ran, cls="filesystem_write",
-                       host_artifact=artifact) == "BLOCKED"
+    ran = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 1] Operation not permitted")
+    assert _score_case(ran, cls="filesystem_write", host_artifact=artifact,
+                       evidence=EPERM) == BLOCKED
     # A bubblewrap namespace-local write prints UNSAFE but leaves the host
     # untouched: the probe demonstrably ran, and nothing escaped.
     local = _raw(tmp_path, stdout=b"UNSAFE wrote a namespace-local file")
-    assert _score_case(local, cls="filesystem_write",
-                       host_artifact=artifact) == "BLOCKED"
+    assert _score_case(local, cls="filesystem_write", host_artifact=artifact,
+                       evidence=EPERM) == BLOCKED
     silent = _raw(tmp_path)
-    assert _score_case(silent, cls="filesystem_write",
-                       host_artifact=artifact) == "NOT CONFIRMED"
+    assert _score_case(silent, cls="filesystem_write", host_artifact=artifact,
+                       evidence=EPERM) == NOT_CONFIRMED
     artifact.write_text("x", encoding="utf-8")
-    assert _score_case(ran, cls="filesystem_write",
-                       host_artifact=artifact) == "UNSAFE"
+    assert _score_case(ran, cls="filesystem_write", host_artifact=artifact,
+                       evidence=EPERM) == UNSAFE
 
 
 NETWORK_ROWS = {"outbound_tcp_connect", "dns_resolution", "curl_child_process",
@@ -325,15 +555,15 @@ def test_network_rows_are_not_confirmed_when_the_positive_control_fails(
     cases = _corpus(tmp_path, vault_path)
     network = [c for c in cases if c["class"] == "network"]
     assert {c["name"] for c in network} == NETWORK_ROWS
-    blocked = _raw(tmp_path, stdout=b"BLOCKED OSError offline")
+    blocked = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 1] Operation not permitted")
     for case in network:
-        assert _score_case(blocked, cls="network",
-                           network_control_ok=True) == "BLOCKED"
-        assert _score_case(blocked, cls="network",
-                           network_control_ok=False) == "NOT CONFIRMED"
+        assert _score_case(blocked, cls="network", evidence=EPERM,
+                           network_control_ok=True) == BLOCKED
+        assert _score_case(blocked, cls="network", evidence=EPERM,
+                           network_control_ok=False) == NOT_CONFIRMED
     # Other classes do not depend on the network control.
-    assert _score_case(blocked, cls="paths",
-                       network_control_ok=False) == "BLOCKED"
+    assert _score_case(blocked, cls="paths", evidence=EPERM,
+                       network_control_ok=False) == BLOCKED
 
 
 def test_network_control_fails_when_the_host_cannot_connect(monkeypatch):
@@ -364,6 +594,114 @@ def test_kill_expected_is_set_on_exactly_the_three_forked_rows(tmp_path, vault_p
     assert flagged == {"descendant_holds_fd3_open",
                        "descendant_holds_vault_conn_open",
                        "three_plain_descendants"}
+
+
+# The read probe every `paths` row uses, run here with NO sandbox at all.
+_UNSANDBOXED_READ_PROBE = """
+try:
+    with open(PATH) as f:
+        print("UNSAFE", f.read()[:20])
+except Exception as e:
+    print("BLOCKED", type(e).__name__, e)
+"""
+
+
+@pytest.mark.parametrize("kind", ["seatbelt", "bwrap"])
+def test_a_probe_stopped_by_host_permissions_is_not_blocked(tmp_path, kind):
+    """An unsandboxed child that gets EACCES on a mode-0 file prints BLOCKED
+    from its bare `except`. Run for real, outside any sandbox: it must not
+    score BLOCKED under either executor's evidence."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-0 file; the case needs an ordinary user")
+    target = tmp_path / "mode0.txt"
+    target.write_text("x")
+    target.chmod(0)
+    done = subprocess.run([sys.executable, "-c", f"PATH = {str(target)!r}\n" + _UNSANDBOXED_READ_PROBE],
+                          capture_output=True, timeout=30)
+    assert done.stdout.startswith(b"BLOCKED PermissionError [Errno 13] Permission denied"), done.stdout
+    res = _raw(tmp_path, stdout=done.stdout)
+    evidence = _denial_evidence("paths", "another_users_home_var_root", kind)
+    assert _score_case(res, cls="paths", evidence=evidence) == NOT_CONFIRMED
+    assert _score_case(res, cls="paths") == NOT_CONFIRMED            # no evidence, no BLOCKED
+
+
+def test_a_missing_target_is_not_a_seatbelt_denial(tmp_path):
+    done = subprocess.run([sys.executable, "-c", f"PATH = {str(tmp_path / 'absent')!r}\n" + _UNSANDBOXED_READ_PROBE],
+                          capture_output=True, timeout=30)
+    assert done.stdout.startswith(b"BLOCKED FileNotFoundError [Errno 2] No such file or directory"), done.stdout
+    res = _raw(tmp_path, stdout=done.stdout)
+    assert _score_case(res, cls="paths", evidence=_denial_evidence("paths", "device_file_read", "seatbelt")) \
+        == NOT_CONFIRMED
+    # A target this user cannot see measures nothing, whatever the line says.
+    assert _score_case(res, cls="paths", evidence=EPERM, target_present=False) == NOT_APPLICABLE
+
+
+def test_the_measured_seatbelt_denial_is_blocked(tmp_path):
+    """The literal line the device-read row printed under Seatbelt."""
+    res = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 1] Operation not permitted: '/dev/rdisk0'\n")
+    assert _score_case(res, cls="paths", evidence=_denial_evidence("paths", "device_file_read", "seatbelt")) \
+        == BLOCKED
+
+
+def test_not_applicable_needs_its_proof_and_never_hides_an_escape(tmp_path):
+    missing = _raw(tmp_path, stdout=b"BLOCKED FileNotFoundError [Errno 2] No such file or directory\n")
+    assert _score_case(missing, cls="paths", evidence=EPERM, target_present=False) == NOT_APPLICABLE
+    assert _score_case(missing, cls="paths", evidence=EPERM, target_present=True) == NOT_CONFIRMED
+    escaped = _raw(tmp_path, stdout=b"UNSAFE listed ['x']\n")
+    assert _score_case(escaped, cls="paths", evidence=EPERM, target_present=False) == UNSAFE
+    assert _score_case(escaped, cls="binaries", evidence=EPERM, control_ok=False,
+                       control_failure=NOT_APPLICABLE) == UNSAFE
+    # A run that did not finish cleanly is never NOT APPLICABLE.
+    crashed = _raw(tmp_path, returncode=1, stdout=missing.stdout)
+    assert _score_case(crashed, cls="paths", evidence=EPERM, target_present=False) == NOT_CONFIRMED
+
+
+def test_an_absence_row_counts_only_with_its_unsandboxed_control(tmp_path):
+    line = _raw(tmp_path, stdout=b"BLOCKED no secret leak\n")
+    evidence = _denial_evidence("inherited_descriptors", "parent_only_secret_not_leaked", "seatbelt")
+    assert _score_case(line, cls="inherited_descriptors", evidence=evidence, control_ok=True) == BLOCKED
+    assert _score_case(line, cls="inherited_descriptors", evidence=evidence, control_ok=False) == NOT_CONFIRMED
+    dyld = _raw(tmp_path, stdout=b"BLOCKED no injection observed 0 b'hi\\n'\n")
+    assert _score_case(dyld, cls="binaries", evidence=rb"BLOCKED no injection observed", control_ok=False,
+                       control_failure=NOT_APPLICABLE) == NOT_APPLICABLE
+
+
+def test_the_fd_probes_see_a_leak_when_there_is_one(tmp_path):
+    """The positive control the `inherited_descriptors` absence rows rest on:
+    outside the sandbox, handed the readable fd each one looks for, each probe
+    reports UNSAFE. The vault-descriptor probe is handed a descriptor on its
+    own target, a stand-in vault that is never written."""
+    secret = tmp_path / "parent_secret.txt"
+    stand_in_vault = tmp_path / "stand_in_vault.db"
+    stand_in_vault.write_bytes(b"not a real vault")
+    cases = {c["name"]: c for c in _corpus(tmp_path, str(stand_in_vault), str(stand_in_vault))}
+    for name in ("enumerate_and_read_beyond_known", "parent_only_secret_not_leaked"):
+        assert _unsandboxed_control(cases[name]["code"], tmp_path / name, secret), name
+    vault_row = cases["raw_vault_fd_write_bypassing_conn"]
+    assert _unsandboxed_control(vault_row["code"], tmp_path / "vault_fd", stand_in_vault)
+    # And it does not cry wolf: a descriptor on some other file is not the vault.
+    assert not _unsandboxed_control(vault_row["code"], tmp_path / "other_fd", secret)
+    assert stand_in_vault.read_bytes() == b"not a real vault"
+
+
+def test_query_channel_rows_are_exactly_the_conn_and_vault_descriptor_rows(tmp_path, vault_path):
+    """The rows that attack `conn` or a vault descriptor run where a `conn`
+    exists. On the plain path the child is handed neither, so there they
+    could only ever fail for want of a target."""
+    cases = _corpus(tmp_path, vault_path)
+    query_rows = {(c["class"], c["name"]) for c in cases if c["channel"] == "query"}
+    assert query_rows == {
+        ("vault_integrity", "pragma_journal_mode_wal"),
+        ("vault_integrity", "attach_and_write"),
+        ("vault_integrity", "vacuum_into_exfil"),
+        ("inherited_descriptors", "raw_vault_fd_write_bypassing_conn"),
+    }
+    assert set(_QUERY_DENIED_ACTION) <= query_rows
+    plain_conn_users = [c["name"] for c in cases
+                        if c["channel"] == "plain" and "conn.execute" in c["code"]
+                        and "if conn is not None" not in c["code"]]
+    # The toctou placeholder is scored by its own query-channel check below.
+    assert plain_conn_users == ["vault_symlink_resolved_consistently"]
 
 
 # =========================================================================== #
@@ -623,7 +961,7 @@ except Exception:
 
 
 # =========================================================================== #
-# Done when 1 — the attack corpus: 9 classes, each applicable -> blocked
+# Done when 1 — the attack corpus: 9 classes, each attempted -> blocked
 # =========================================================================== #
 
 # Two classes, each with one sub-case, this profile — implemented exactly as
@@ -714,7 +1052,7 @@ def _binaries_gap_violations(details: list[str]) -> list[str]:
     return problems
 
 
-def _corpus(tmp_root: Path, vault: str) -> list[dict]:
+def _corpus(tmp_root: Path, vault: str, query_vault: str | None = None) -> list[dict]:
     """Build the attack corpus. Each entry is self-contained: the `code` is
     everything the sandboxed process runs. Namespace-sensitive filesystem
     entries also carry a parent-chosen `host_artifact`; those entries are
@@ -725,7 +1063,10 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
     and only applicable rows enter the roll-up. A row counts as blocked only
     on the evidence `_score_case` requires; anything else is NOT CONFIRMED and
     fails the roll-up (#109). The forked-descendant rows are `kill_expected`:
-    the deadline kill itself is what blocks them."""
+    the deadline kill itself is what blocks them. Rows marked
+    `channel="query"` attack `conn` or a vault descriptor and run through the
+    analyst query channel (`_run_query_channel`) against `query_vault`; the
+    rest run on the plain path, which hands the child neither."""
 
     secret_path = tmp_root / "parent_secret.txt"
     secret_path.write_text("TOP-SECRET-VALUE")
@@ -744,9 +1085,13 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
         parent_fd_path: Path | None = None,
         applies_to: str = "both",
         kill_expected: bool = False,
+        channel: str = "plain",
+        control_fd_path: Path | str | None = None,
     ) -> None:
         if applies_to not in EXECUTOR_SCOPES:
             raise ValueError(f"unknown executor scope: {applies_to!r}")
+        if channel not in ("plain", "query"):
+            raise ValueError(f"unknown channel: {channel!r}")
         cases.append({
             "class": cls,
             "name": name,
@@ -756,6 +1101,8 @@ def _corpus(tmp_root: Path, vault: str) -> list[dict]:
             "parent_fd_path": parent_fd_path,
             "applies_to": applies_to,
             "kill_expected": kill_expected,
+            "channel": channel,
+            "control_fd_path": control_fd_path,
         })
 
     # (i) network -------------------------------------------------------- #
@@ -849,6 +1196,9 @@ except Exception as e:
 """)
 
     # (iii) vault integrity ------------------------------------------------ #
+    # The plain path hands the child no `conn`, so the three rows that attack
+    # `conn` run through the analyst query channel (`channel="query"`), where
+    # `conn` is the proxy to the parent's ledgered, read-only connection.
     add("vault_integrity", "writable_open_and_create_table", f"""
 import sqlite3
 try:
@@ -865,7 +1215,7 @@ try:
     print("UNSAFE set WAL")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""")
+""", channel="query")
     attach_probe = tmp_root / "probe_attach_evil.db"
     add("vault_integrity", "attach_and_write", f"""
 try:
@@ -874,7 +1224,7 @@ try:
     print("UNSAFE attached and wrote")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""", host_artifact=attach_probe)
+""", host_artifact=attach_probe, channel="query")
     vacuum_probe = tmp_root / "probe_vacuum_exfil.db"
     add("vault_integrity", "vacuum_into_exfil", f"""
 try:
@@ -882,7 +1232,7 @@ try:
     print("UNSAFE vacuumed a copy out")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
-""", host_artifact=vacuum_probe)
+""", host_artifact=vacuum_probe, channel="query")
 
     # (iv) inherited descriptors ------------------------------------------- #
     add("inherited_descriptors", "enumerate_and_read_beyond_known", """
@@ -925,14 +1275,31 @@ for name in os.listdir("/dev/fd"):
 if not found:
     print("BLOCKED no secret leak")
 """, parent_fd_path=secret_path)
-    add("inherited_descriptors", "raw_vault_fd_write_bypassing_conn", """
+    # Bypassing `conn` needs a descriptor on the vault file itself. Any such
+    # descriptor in the child is the escape, readable or writable, since reads
+    # through it would skip the parent's ledger and authorizer; the probe
+    # matches every open descriptor against the vault's device and inode.
+    # Run on the query channel, the path that carries vault data to the child,
+    # so the target is the vault that channel serves.
+    query_vault_real = os.path.realpath(query_vault or vault)
+    vault_stat = os.stat(query_vault_real)
+    add("inherited_descriptors", "raw_vault_fd_write_bypassing_conn", f"""
 import os
-try:
-    os.write(4, b"corrupt")
-    print("UNSAFE wrote raw vault fd")
-except Exception as e:
-    print("BLOCKED", type(e).__name__, e)
-""")
+target = ({vault_stat.st_dev!r}, {vault_stat.st_ino!r})
+hits = []
+for name in os.listdir("/dev/fd"):
+    try:
+        fd = int(name)
+        st = os.fstat(fd)
+    except (ValueError, OSError):
+        continue
+    if (st.st_dev, st.st_ino) == target:
+        hits.append(fd)
+if hits:
+    print("UNSAFE holds a vault descriptor", sorted(hits))
+else:
+    print("BLOCKED no descriptor refers to the vault")
+""", channel="query", control_fd_path=query_vault_real)
 
     # (v) forked descendants ------------------------------------------------ #
     # These three share one property: the *direct* process spins (so the
@@ -1141,13 +1508,29 @@ def _skip_if_not_applicable(executor, scope: str) -> None:
 
 
 def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
-    cases = _corpus(tmp_path, vault_path)
+    # The query channel's parent opens its vault through `db.connect`, which
+    # this suite refuses for the production vault (tests/conftest.py), so the
+    # query-channel rows run against a synthetic read-only vault. What they
+    # attack -- the parent's authorizer and the child's descriptors -- does
+    # not depend on the vault's contents.
+    from health_advisor.demo import build_demo_vault
+
+    query_vault = tmp_path / "query_vault.db"
+    build_demo_vault(query_vault, days=2)
+    os.chmod(query_vault, 0o444)
+    cases = _corpus(tmp_path, vault_path, str(query_vault))
     assert len(cases) == 35
     assert all(case["applies_to"] in EXECUTOR_SCOPES for case in cases)
 
+    kind = _executor_kind(executor)
+    targets = _host_targets(os.path.realpath(vault_path))
+    readable_fd_path = next(c["parent_fd_path"] for c in cases if c["parent_fd_path"] is not None)
+    in_scope: Counter[str] = Counter()
     applicable: Counter[str] = Counter()
     blocked: Counter[str] = Counter()
     details: list[str] = []
+    not_applicable: list[str] = []
+    rows: list[str] = []
     network_control_ok = _network_control()
     if not network_control_ok:
         details.append(
@@ -1177,15 +1560,39 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
                 os.close(parent_fd)
                 parent_fd = higher_fd
             os.set_inheritable(parent_fd, True)
+        evidence = _denial_evidence(cls, name, kind)
         try:
-            res = _run(executor, case["code"], vault_path, run_dir, **case["limits"])
+            if case["channel"] == "query":
+                res, refused = _run_query_channel(
+                    executor, case["code"], str(query_vault), run_dir, **case["limits"])
+                expected_refusal = _QUERY_DENIED_ACTION.get((cls, name))
+                if expected_refusal is not None and expected_refusal not in refused:
+                    evidence = None     # the parent's authorizer did not refuse it
+            else:
+                res = _run(executor, case["code"], vault_path, run_dir, **case["limits"])
         finally:
             if parent_fd is not None:
                 os.close(parent_fd)
+        target = targets.get((cls, name))
+        control_ok = None
+        if (cls, name) in _CONTROLLED:
+            control_ok = _unsandboxed_control(
+                case["code"], tmp_path / "control" / cls / name,
+                case["control_fd_path"] or readable_fd_path)
         verdict = _score_case(
             res, cls=cls, host_artifact=host_artifact,
             kill_expected=case["kill_expected"],
-            network_control_ok=network_control_ok)
+            network_control_ok=network_control_ok,
+            evidence=evidence,
+            target_present=target is None or os.path.lexists(target),
+            control_ok=control_ok,
+            control_failure=_CONTROLLED.get((cls, name), NOT_CONFIRMED))
+        first_line = (res.stdout + res.fd3_bytes).strip().split(b"\n")[0][:160]
+        rows.append(f"{cls}/{name} [{case['channel']}]: {verdict} — {first_line!r}")
+        in_scope[cls] += 1
+        if verdict == NOT_APPLICABLE:
+            not_applicable.append(f"{cls}/{name}")
+            continue
         applicable[cls] += 1
         if verdict == BLOCKED:
             blocked[cls] += 1
@@ -1206,6 +1613,7 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
         case for case in cases
         if case["class"] == "toctou" and _case_applies(case, executor)
     ]
+    in_scope["toctou"] += len(toctou_cases)
     applicable["toctou"] += len(toctou_cases)
     blocked["toctou"] += _toctou_score(
         executor, vault_path, tmp_path, toctou_cases)
@@ -1215,6 +1623,7 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
         case for case in cases
         if case["class"] == "fd3_abuse" and _case_applies(case, executor)
     ]
+    in_scope["fd3_abuse"] += len(fd3_cases)
     applicable["fd3_abuse"] += len(fd3_cases)
     if fd3_cases:
         blocked["fd3_abuse"] += _fd3_abuse_score(
@@ -1222,25 +1631,38 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
 
     # binaries/paths/etc. already counted above via the loop.
 
+    total_in_scope = sum(in_scope.values())
     total_applicable = sum(applicable.values())
     total_blocked = sum(blocked.values())
 
-    lines = ["", "class | applicable | blocked | rate"]
-    for cls in sorted(applicable):
-        a, b = applicable[cls], blocked[cls]
-        lines.append(f"{cls:22s} | {a:9d} | {b:7d} | {b/a:.0%}")
-    lines.append(f"{'TOTAL':22s} | {total_applicable:9d} | {total_blocked:7d} | {total_blocked/total_applicable:.0%}")
+    lines = ["", f"executor: {kind}", "class | in scope | measured | blocked | rate"]
+    for cls in sorted(in_scope):
+        i, a, b = in_scope[cls], applicable[cls], blocked[cls]
+        rate = f"{b/a:.0%}" if a else "-"
+        lines.append(f"{cls:22s} | {i:8d} | {a:8d} | {b:7d} | {rate}")
+    lines.append(f"{'TOTAL':22s} | {total_in_scope:8d} | {total_applicable:8d} | {total_blocked:7d} | "
+                 f"{total_blocked/total_applicable:.0%}")
     print("\n".join(lines))
+    print("ROWS (verdict — first output line):\n" + "\n".join(rows))
+    if not_applicable:
+        print("NOT APPLICABLE (measure nothing on this run):\n" + "\n".join(not_applicable))
     if details:
         print("NOT BLOCKED:\n" + "\n".join(details))
 
     assert len(cases) == 35, f"corpus has {len(cases)} cases, need 35"
-    expected_applicable = {"seatbelt": 35, "bwrap": 34}[_executor_kind(executor)]
-    assert total_applicable == expected_applicable, (
-        f"corpus has {total_applicable} applicable cases, "
-        f"need {expected_applicable}"
+    expected_in_scope = {"seatbelt": 35, "bwrap": 34}[kind]
+    assert total_in_scope == expected_in_scope, (
+        f"corpus has {total_in_scope} cases in scope, need {expected_in_scope}"
     )
-    assert len(applicable) == 9, f"corpus spans {len(applicable)} classes, need 9"
+    assert len(in_scope) == 9, f"corpus spans {len(in_scope)} classes, need 9"
+
+    # Which rows may measure nothing is pinned by name, so the category cannot
+    # absorb a row whose sandbox denial went missing: a row lands here only
+    # through a declared host target that this user cannot see, or through a
+    # control whose failure is a property of the host.
+    host_dependent = ({f"{c}/{n}" for c, n in targets}
+                      | {f"{c}/{n}" for (c, n), v in _CONTROLLED.items() if v == NOT_APPLICABLE})
+    assert set(not_applicable) <= host_dependent, sorted(set(not_applicable) - host_dependent)
 
     for cls in applicable:
         expected_full = not _known_gap_applies(cls, executor)
@@ -1356,7 +1778,8 @@ except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """
     res = _run(executor, code, vault_path, run_dir)
-    return _score_case(res, cls="toctou") == BLOCKED
+    evidence = _denial_evidence("toctou", "home_tmpdir_env_remap_has_no_effect", _executor_kind(executor))
+    return _score_case(res, cls="toctou", evidence=evidence) == BLOCKED
 
 
 def _toctou_score(
@@ -1519,36 +1942,52 @@ def test_transient_query_run_rejects_preexisting_parent_artifact_symlinks(
     assert target.read_bytes() == b"sentinel"
 
 
+# The fd-3 clamp, as literals: 0 at the floor, 2 MiB at the ceiling
+# (`_FD3_DRAIN_CEILING`, 32 x the 65,536-byte default). These were compared with
+# `analyst_runner._fd3_limit` alone, which delegates to the same `RunLimits`
+# clamp, so a comparison of the two pins no value at all.
+FD3_CAP_CASES = [            # (configured max_fd3_bytes, effective cap)
+    (-1, 0),
+    (0, 0),
+    (65_535, 65_535),
+    (65_536, 65_536),
+    (65_537, 65_537),
+    (2_097_152, 2_097_152),
+    (2_097_153, 2_097_152),
+    (10**9, 2_097_152),
+]
+
+
 def test_run_limits_canonicalize_fd3_and_wall_clock_limits():
-    ceiling = sb.DEFAULT_MAX_FD3_BYTES * 32
-    for value in (0, -1, 65_535, 65_536, 65_537, ceiling, ceiling + 1):
-        limits = sb.RunLimits(max_fd3_bytes=value)
-        assert limits.max_fd3_bytes == analyst_runner._fd3_limit(value)
+    assert sb.DEFAULT_MAX_FD3_BYTES == 65_536
+    assert sb.RunLimits().max_fd3_bytes == 65_536
+    for configured, cap in FD3_CAP_CASES:
+        assert sb.RunLimits(max_fd3_bytes=configured).max_fd3_bytes == cap, configured
+        assert analyst_runner._fd3_limit(configured) == cap, configured
     assert sb.RunLimits(wall_clock_s=-1).wall_clock_s == 0.0
 
 
 def test_raw_executor_uses_canonical_fd3_cap(executor, vault_path, tmp_path):
-    ceiling = sb.DEFAULT_MAX_FD3_BYTES * 32
+    # (configured limit, bytes the child writes, bytes the parent keeps, oversized)
     cases = [
-        (-1, 0),
-        (0, 0),
-        (65_535, 65_535),
-        (65_536, 65_536),
-        (65_537, 65_537),
-        (ceiling, ceiling),
-        (ceiling + 1, ceiling + 1),
+        (-1, 0, 0, False),
+        (0, 0, 0, False),
+        (65_535, 65_535, 65_535, False),
+        (65_536, 65_536, 65_536, False),
+        (65_537, 65_537, 65_537, False),
+        (2_097_152, 2_097_152, 2_097_152, False),
+        (2_097_153, 2_097_153, 2_097_152, True),       # the ceiling clamps the configured limit
     ]
-    for index, (configured_limit, payload_size) in enumerate(cases):
+    for index, (configured_limit, payload_size, kept, oversized) in enumerate(cases):
         result = executor.run(
             f"import os\nos.write(3, b'x' * {payload_size})\n",
             vault_path,
             str(tmp_path / f"fd3-limit-{index}"),
             limits=sb.RunLimits(max_fd3_bytes=configured_limit),
         )
-        effective_limit = analyst_runner._fd3_limit(configured_limit)
         assert isinstance(result.fd3_bytes, bytes)
-        assert result.fd3_oversized is (payload_size > effective_limit)
-        assert result.fd3_bytes == b"x" * min(payload_size, effective_limit)
+        assert result.fd3_oversized is oversized, configured_limit
+        assert result.fd3_bytes == b"x" * kept, (configured_limit, len(result.fd3_bytes))
 
 
 # --------------------------------------------------------------------------- #

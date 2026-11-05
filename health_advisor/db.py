@@ -538,7 +538,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _apply_column_migrations(conn)
     _apply_table_migrations(conn)
 
-    # A vault migrated in place gets this table EMPTY while its `records` already span years, so the one-time full rebuild fills it, except on a compacted vault whose raw rows for frozen pairs are gone.
+    # A vault migrated in place gets this table EMPTY while its `records`
+    # already span years, so a one-time full rebuild fills it. Not on a
+    # compacted vault: its raw rows for frozen pairs are gone.
     from . import vault
     if (not msm_existed
             and vault.compacted_through(conn) is None

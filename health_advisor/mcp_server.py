@@ -2906,13 +2906,20 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
 
     Returns per running session and for the day:
       longest_block_min      longest continuous block, bridge rule applied
-      qualified_block_min    the same block only if its mean HR is at or below
-                             the configured ceiling, else null. Null means
-                             "nothing ran easy enough to count
+      qualified_block_min    the longest block whose own mean HR is at or below
+                             the configured ceiling; it can be a different, shorter block
+                             than longest_block_min — check qualified_is_longest.
+                             Null means "nothing ran easy enough to count
                              toward the ramp" ONLY when the session has no "hr"
                              key — it does NOT mean they did not run. With
                              "hr": "not_synced" the heart rate has not arrived
                              yet, so null there says nothing about effort.
+      qualified_is_longest   true when the qualifying block IS the longest block
+                             (same start and end); false when it is a shorter
+                             block; null when qualified_block_min is null. On the
+                             day it is true only when the qualified and longest
+                             figures are equal and the session that carries the
+                             qualified figure has this flag true.
       unbridged_min          the block without the bridge rule, for comparison
       avg_hr_longest_block   mean HR over the longest block. This is one of
                              THREE different "average heart rates" and they run
@@ -2966,6 +2973,7 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 "duration_min": A.mx.r(w["duration_min"], 1),
                 "longest_block_min": block["bridged_min"],
                 "qualified_block_min": block["qualified_min"],
+                "qualified_is_longest": block["qualified_is_longest"],
                 "unbridged_min": block["unbridged_min"],
                 "avg_hr_longest_block": block["avg_hr_longest_block"],
                 "avg_hr_all_jog": hr["avg_hr_all_jog"],
@@ -2977,6 +2985,7 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
                 # machine sessions never record distance; the rest may sync.
                 indoor = A.recorded_indoors(w)
                 entry.update(longest_block_min=None, qualified_block_min=None,
+                             qualified_is_longest=None,
                              unbridged_min=None, avg_hr_longest_block=None,
                              reps=[], samples="not_recorded" if indoor
                              else "not_synced",
@@ -2994,6 +3003,7 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         return {"day": day, "sessions": [], "longest_block_min": 0.0,
                 "excluded_count": excluded,
                 "qualified_block_min": None,
+                "qualified_is_longest": None,
                 "note": "no session with measurable block structure on this day"}
     measured = [s for s in sessions if s["longest_block_min"] is not None]
     if not measured:
@@ -3001,18 +3011,31 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         unsynced = any(s["samples"] == "not_synced" for s in sessions)
         return {"day": day, "sessions": sessions, "excluded_count": excluded,
                 "longest_block_min": None, "qualified_block_min": None,
+                "qualified_is_longest": None,
                 "samples": "not_synced" if unsynced else "not_recorded",
                 "note": NOT_SYNCED_NOTE if unsynced else NOT_RECORDED_NOTE,
                 "hr_ceiling_for_qualifying": hr_ceiling}
     best = max(measured, key=lambda s: s["longest_block_min"])
     qualified = [s["qualified_block_min"] for s in measured
                  if s["qualified_block_min"] is not None]
+    day_qualified = max(qualified) if qualified else None
+    # The day's qualifying figure comes from the session(s) carrying it. The
+    # flag is true only if that figure equals the day's longest AND such a
+    # session's own identity check says its qualifying block is its longest.
+    day_is_longest = None
+    if day_qualified is not None:
+        carriers = [s for s in measured
+                    if s["qualified_block_min"] == day_qualified]
+        day_is_longest = (day_qualified == best["longest_block_min"]
+                          and any(s["qualified_is_longest"] is True
+                                  for s in carriers))
     return {
         "day": day, "sessions": sessions, "excluded_count": excluded,
         # Across a multi-session day the dial is the LONGEST block, not the sum:
         # the question it answers is "how long can they run continuously".
         "longest_block_min": best["longest_block_min"],
-        "qualified_block_min": max(qualified) if qualified else None,
+        "qualified_block_min": day_qualified,
+        "qualified_is_longest": day_is_longest,
         "hr_ceiling_for_qualifying": hr_ceiling,
     }
 

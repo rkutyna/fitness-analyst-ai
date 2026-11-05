@@ -966,8 +966,8 @@ def last_complete_status() -> dict:
     Outcomes include ``success``, ``empty_response``, ``timeout``,
     ``backend_error``, ``no_api_key``, ``not_called``, and
     ``provider_key_refused`` (HTTP 401/402/403 from OpenRouter: the key is
-    expired, revoked, or out of credit). Its ``detail`` carries the status
-    code only, never a response body.
+    expired, revoked, or out of credit), and ``rate_limited`` (HTTP 429). Its
+    ``detail`` carries the status code only, never a response body.
 
     The return value of :func:`complete` deliberately stays a string.  A
     non-empty answer has ``outcome == "success"`` and
@@ -1162,6 +1162,23 @@ def _announce(event: str, detail: str = "", *, on_log=None, turn: int = 0) -> No
         print(f"[llm.{event}] backend={BACKEND} {detail}", file=sys.stderr, flush=True)
     except Exception:
         pass
+
+
+def _provider_http_outcome(exc) -> tuple[str, str] | None:
+    """Typed outcome for a provider HTTP refusal, or None for any other error.
+
+    401/402/403 (expired, revoked, out of credit) are ``provider_key_refused``;
+    429 is ``rate_limited``. The detail is the status code only: a response body
+    or URL can echo account details and never reaches a status or a log line.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    code = exc.response.status_code
+    if code in (401, 402, 403):
+        return ("provider_key_refused", f"HTTP {code}")
+    if code == 429:
+        return ("rate_limited", "HTTP 429")
+    return None
 
 
 def _stderr_text(value) -> str:
@@ -1701,11 +1718,15 @@ def complete(prompt: str, *, think: bool = False, timeout: int | None = None,
             # A refused key (expired, revoked, out of credit) is a distinct
             # outcome, not a generic backend failure. Only the status code goes
             # into the detail: a body can echo account details.
-            code = exc.response.status_code
-            outcome = ("provider_key_refused" if code in (401, 402, 403)
-                       else "backend_error")
+            # A 429 is a rate limit, not a dead backend: its own outcome.
+            typed = _provider_http_outcome(exc)
+            if typed is not None:
+                outcome, detail = typed
+            else:
+                outcome = "backend_error"
+                detail = f"HTTP {exc.response.status_code}"
             _set_complete_status(outcome=outcome, response_received=False,
-                                 request_made=True, detail=f"HTTP {code}")
+                                 request_made=True, detail=detail)
             return ""
         except httpx.TimeoutException as exc:
             # A timeout is NOT a dead backend. The sweep aborts on the first
@@ -3006,7 +3027,11 @@ def tool_loop(prompt: str, *, ctx, tools: list[dict], think: bool = True,
         _announce("tool_loop_turns_exhausted", f"max_turns={max_turns}")
         return ResearchResponse()
     except Exception as exc:
-        _announce("tool_loop_error", f"{type(exc).__name__}: {exc}")
+        typed = _provider_http_outcome(exc)
+        if typed is not None:
+            _announce(typed[0], typed[1])
+        else:
+            _announce("tool_loop_error", f"{type(exc).__name__}: {exc}")
         return ResearchResponse()
 
 
@@ -3182,6 +3207,7 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
     recent: list = []
     stalls = 0
     turn_errors = 0
+    last_typed = None  # the provider outcome of the latest failed turn, if any
     finalized = False
 
     def _log(turn, event, detail=""):
@@ -3221,9 +3247,21 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
             try:
                 msg, pec = _post()
             except Exception as e:
+                typed = _provider_http_outcome(e)
+                if typed is not None and typed[0] == "provider_key_refused":
+                    # A refused key does not heal between turns: stop now
+                    # rather than spend the retry budget on the same 401.
+                    _announce("provider_key_refused", typed[1],
+                              on_log=on_log, turn=turn)
+                    return _research_response(last_content)
                 turn_errors += 1
+                last_typed = typed
                 _log(turn, "turn_error", type(e).__name__)
                 if turn_errors > TURN_ERROR_BUDGET:
+                    if last_typed is not None and last_typed[0] == "rate_limited":
+                        _announce("rate_limited", "HTTP 429",
+                                  on_log=on_log, turn=turn)
+                        return _research_response(last_content)
                     _announce("research_loop_turn_error_budget",
                               f"{turn_errors} failed turns; last {type(e).__name__}: {e}",
                               on_log=on_log, turn=turn)

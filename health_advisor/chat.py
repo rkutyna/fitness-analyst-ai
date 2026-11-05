@@ -454,6 +454,10 @@ _FALLBACK_CAUSE_SENTENCES = {
     "restated_unit": (
         "My wording repeated a unit that was already shown with the figure."),
     "conversational_refused": _FALLBACK_CLAIM,
+    "provider_key_refused": (
+        "The coach's AI service refused this server's access key, so no "
+        "answer could be written just now. The person who runs your server "
+        "needs to renew the key."),
 }
 
 
@@ -472,7 +476,11 @@ def _fallback_answer(verification: dict | None = None) -> str:
     middle = ""
     if isinstance(verification, dict):
         reason = str(verification.get("reason") or "").strip()
-        middle = _fallback_reason_sentences().get(reason, "")
+        # A refused key is the real cause. The reason it leaves behind ("no
+        # tool-call ledger") would tell the owner that nothing was looked up,
+        # which is the symptom, so the cause sentence wins over it.
+        if verification.get("cause") != "provider_key_refused":
+            middle = _fallback_reason_sentences().get(reason, "")
         if not middle and reason.startswith("conversational answer "):
             middle = _FALLBACK_CLAIM
         if not middle:
@@ -534,6 +542,7 @@ def _verify_ask_answer(conn, prose: str, claims, ledger: list[dict],
 _BACKEND_UNAVAILABLE_OUTCOMES = frozenset({
     "openrouter_not_approved", "openrouter_provider_mismatch",
     "openrouter_no_api_key", "binary_missing", "auth_failure", "no_api_key",
+    "provider_key_refused",
 })
 _TRANSPORT_FAILURE_OUTCOMES = frozenset({
     "tool_loop_error", "tool_loop_deadline", "tool_loop_turns_exhausted",
@@ -656,7 +665,8 @@ _ASK_CAUSES = frozenset({
     "conversational_scripted", "no_gather_needed", "empty_gather",
     "withheld_available_figure", "denied_available_figure",
     "contradicted_day_count", "restated_unit", "unsupported_period_phrase",
-    "stale_window", "gate_refused", "judge_refused", "ok",
+    "stale_window", "gate_refused", "judge_refused", "provider_key_refused",
+    "ok",
 })
 
 
@@ -705,6 +715,11 @@ def _ask_cause(verification: dict, *, ledger: list[dict],
     """
     if no_data_yet:
         return "no_data_yet"
+    # Read the raw outcome: the family folds a refused key into
+    # backend_unavailable, and the owner must be told to renew the key.
+    if any(status.get("outcome") == "provider_key_refused"
+           for status in loop_outcomes):
+        return "provider_key_refused"
     families = [_status_outcome_family(status) for status in loop_outcomes]
     if "backend_unavailable" in families:
         return "backend_unavailable"

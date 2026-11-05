@@ -721,7 +721,9 @@ def test_tool_loop_non_200_returns_empty_and_announces(openrouter):
 
     openrouter(handler)
     assert llm.tool_loop("q", ctx=None, tools=[], max_turns=3) == ""
-    assert llm.last_loop_status()["outcome"] == "tool_loop_error"
+    # #697: a 429 is typed as a rate limit; other non-200s stay tool_loop_error
+    # (tests/test_llm_loop_provider_status.py covers 500).
+    assert llm.last_loop_status()["outcome"] == "rate_limited"
 
 
 # --------------------------------------------------------------------------

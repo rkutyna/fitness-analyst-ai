@@ -3344,5 +3344,12 @@ def research_loop(prompt, *, ctx, extra_tools, compact_state, think=True, num_ct
                       on_log=on_log, turn=max_turns)
         return _research_response(last_content)
     except Exception as exc:
-        _announce("research_loop_error", f"{type(exc).__name__}: {exc}", on_log=on_log)
+        # The finalize call above is outside the per-turn retry, so a refused
+        # or rate-limited key surfaces here; type it like the turn path does.
+        typed = _provider_http_outcome(exc)
+        if typed is not None:
+            _announce(typed[0], typed[1], on_log=on_log)
+        else:
+            _announce("research_loop_error", f"{type(exc).__name__}: {exc}",
+                      on_log=on_log)
         return ResearchResponse()

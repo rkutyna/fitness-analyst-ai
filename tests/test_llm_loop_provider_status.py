@@ -127,3 +127,34 @@ def test_ask_with_rate_limit_is_transport_failed(openrouter, vault, seeded_vault
     assert result["mode"] == "fallback"
     assert result["verification"]["cause"] == "transport_failed"
     assert "refused this server's access key" not in result["text"]
+
+
+def test_research_loop_refused_key_on_the_finalize_call(openrouter, vault,
+                                                         monkeypatch):
+    """The wrap-up request after the last turn sits outside the per-turn retry;
+    a refused key there is still typed, not a generic research_loop_error."""
+    openrouter(401)
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            # Turn 1: the model asks for a tool, so the loop runs out of turns
+            # unfinalized and makes the separate finalize request.
+            return httpx.Response(200, json={
+                "choices": [{"finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": "c1", "type": "function", "function": {
+                        "name": "no_such_tool", "arguments": "{}"}}]}}],
+                "usage": {"prompt_tokens": 10}})
+        return httpx.Response(401, json={"error": {"message": SECRET_MARKER}})
+
+    monkeypatch.setattr(llm, "_TRANSPORT", httpx.MockTransport(handler))
+    out = llm.research_loop("investigate", ctx=vault, extra_tools={},
+                            compact_state=lambda: "S", max_turns=1)
+    assert out == ""
+    status = llm.last_loop_status()
+    assert status["outcome"] == "provider_key_refused"
+    assert status["detail"] == "HTTP 401"
+    assert SECRET_MARKER not in repr(status)
+    assert len(seen) == 2

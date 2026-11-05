@@ -112,3 +112,36 @@ def test_compacted_vault_is_not_rebuilt_by_init_db(conn, monkeypatch):
 
     assert conn.execute(
         "SELECT COUNT(*) FROM metric_source_months").fetchone()[0] == 0
+
+
+def test_old_vault_with_unnamed_source_rows_migrates_without_error(tmp_path):
+    """A records row with no source must not stop init_db: the rebuild counts
+    it under the empty source name, the convention `NULLIF(source, '')` uses
+    for "no source" elsewhere in the schema."""
+    path = tmp_path / "old.db"
+    conn = dbmod.connect(path)
+    conn.executescript("""
+        CREATE TABLE records (
+            id INTEGER PRIMARY KEY, metric TEXT NOT NULL, value REAL,
+            unit TEXT, start_utc TEXT NOT NULL, end_utc TEXT NOT NULL,
+            start_local TEXT, local_date TEXT NOT NULL, source TEXT,
+            origin TEXT NOT NULL DEFAULT 'backfill',
+            dedupe_key TEXT NOT NULL UNIQUE
+        );
+    """)
+    conn.executemany(
+        "INSERT INTO records (metric, value, start_utc, end_utc, local_date, "
+        "source, dedupe_key) VALUES (?, 1, ?, ?, ?, ?, ?)",
+        [("step_count", "2026-08-20T00:00:00Z", "2026-08-20T00:01:00Z",
+          "2026-08-20", None, "a"),
+         ("step_count", "2026-08-21T00:00:00Z", "2026-08-21T00:01:00Z",
+          "2026-08-21", None, "b"),
+         ("step_count", "2026-08-21T00:02:00Z", "2026-08-21T00:03:00Z",
+          "2026-08-21", "Watch", "c")])
+    conn.commit()
+    dbmod.init_db(conn)
+    rows = sorted(tuple(r) for r in conn.execute(
+        "SELECT metric, month, source, n FROM metric_source_months"))
+    assert rows == [("step_count", "2026-08", "", 2),
+                    ("step_count", "2026-08", "Watch", 1)]
+    conn.close()

@@ -1963,8 +1963,8 @@ def rebuild_metric_source_months(
         conn.execute("DELETE FROM metric_source_months")
         conn.execute(
             "INSERT INTO metric_source_months (metric, month, source, n) "
-            "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
-            "FROM records GROUP BY metric, substr(local_date, 1, 7), source"
+            "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
+            "FROM records GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '')"
         )
         if not outer:
             conn.commit()
@@ -1986,9 +1986,9 @@ def rebuild_metric_source_months(
         )
         cur = conn.execute(
             "INSERT INTO metric_source_months (metric, month, source, n) "
-            "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
+            "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
             "FROM records WHERE metric = ? AND substr(local_date, 1, 7) = ? "
-            "GROUP BY metric, substr(local_date, 1, 7), source",
+            "GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '')",
             (metric, month),
         )
         written += cur.rowcount if cur.rowcount > 0 else 0
@@ -2035,8 +2035,8 @@ def _rebuild_source_months_frozen(
                      (*allow, cutoff))
         conn.execute(
             "INSERT INTO metric_source_months (metric, month, source, n) "
-            "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
-            "FROM records WHERE 1 GROUP BY metric, substr(local_date, 1, 7), source "
+            "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
+            "FROM records WHERE 1 GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '') "
             "ON CONFLICT(metric, month, source) DO UPDATE SET "
             "n = MAX(metric_source_months.n, excluded.n)")
         log_ingest(conn, "recompute", "frozen", frozen_months, 0,
@@ -2060,9 +2060,9 @@ def _rebuild_source_months_frozen(
                 (metric, month))
         cur = conn.execute(
             "INSERT INTO metric_source_months (metric, month, source, n) "
-            "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
+            "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
             "FROM records WHERE metric = ? AND substr(local_date, 1, 7) = ? "
-            "GROUP BY metric, substr(local_date, 1, 7), source "
+            "GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '') "
             "ON CONFLICT(metric, month, source) DO UPDATE SET "
             "n = MAX(metric_source_months.n, excluded.n)",
             (metric, month))

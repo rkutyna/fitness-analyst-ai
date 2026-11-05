@@ -1748,6 +1748,10 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     workout whose samples have not synced is different: it is unmeasured, so
     its figures are null with ``samples`` "not_synced", and a week lists such
     days in ``samples_not_synced_days`` with a total over the measured days.
+    A treadmill or other indoor session records no per-sample distance, so a
+    day whose only such workout is indoor is null with ``samples``
+    "not_recorded", and a week lists it in ``samples_not_recorded_days``, never
+    zero.
 
     'jog_threshold_sensitivity' gives jog_minutes recomputed at CADENCE cutoffs
     either side of the live one, and 'jog_near_threshold' the share of eligible
@@ -2962,9 +2966,18 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
             f"AND w.workout_type IN ('running', 'walking', 'hiking') AND {marked}",
             (day,)).fetchone()[0]
         sessions = []
+        # Walks dropped below. A walk with no buckets is unmeasured (unsynced or
+        # indoor), not a measured "no run": tracked so a walk-only day can say so.
+        skipped_walks_unmeasured = []
+        skipped_walks_measured = 0
         for w in rows:
             block = A.longest_block(conn, w["start_utc"], w["end_utc"])
             if not block["reps"] and w["workout_type"] != "running":
+                if A.mx.session_hr_figures(conn, w["start_utc"], w["end_utc"],
+                                           w["avg_heart_rate"])["n_buckets"] == 0:
+                    skipped_walks_unmeasured.append(w)
+                else:
+                    skipped_walks_measured += 1
                 continue          # a walk with no jog block is not a session here
             hr = A.mx.session_hr_figures(conn, w["start_utc"], w["end_utc"],
                                          w["avg_heart_rate"])
@@ -2999,6 +3012,15 @@ def get_block_structure(ctx: VaultContext, day: str) -> dict:
         hr_ceiling = A.mx.block_qualify_hr_max(conn)
     finally:
         conn.close()
+    if not sessions and rows and skipped_walks_measured == 0:
+        # Every workout on the day is a walk with zero buckets: nothing was
+        # measured, so the day is unmeasured, not a measured 0.0.
+        indoor = all(A.recorded_indoors(w) for w in skipped_walks_unmeasured)
+        return {"day": day, "sessions": [], "excluded_count": excluded,
+                "longest_block_min": None, "qualified_block_min": None,
+                "qualified_is_longest": None,
+                "samples": "not_recorded" if indoor else "not_synced",
+                "note": NOT_RECORDED_NOTE if indoor else NOT_SYNCED_NOTE}
     if not sessions:
         return {"day": day, "sessions": [], "longest_block_min": 0.0,
                 "excluded_count": excluded,

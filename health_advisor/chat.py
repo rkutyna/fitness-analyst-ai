@@ -2926,10 +2926,14 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
                                or workout_facts or briefing_facts
                                or declared_facts),
         tool_names=_successful_tool_names(ledger))
+    # consumer #685: a session whose samples are not synced / not recorded
+    # publishes null blocks, so the model needs Python's sentence for it.
+    samples_status_facts = fact_template.build_samples_status_facts(ledger)
     facts = {
         **data_facts,
         **fact_template.build_evidence_status_fact(evidence_status),
         **gathered_data_status_fact,
+        **samples_status_facts,
         # A rating's scale is Python's to state (#558); derived from the
         # figures published above, so it exists only when a rating was read.
         **fact_template.build_rating_scale_facts(data_facts),
@@ -3027,6 +3031,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
 
     cold_start_guidance = fact_template.cold_start_guidance(facts)
     gathered_data_guidance = fact_template.gathered_data_status_guidance(facts)
+    samples_guidance = fact_template.samples_status_guidance(facts)
     declared_guidance = fact_template.declared_facts_guidance(facts)
     rating_scale_guidance = fact_template.rating_scale_guidance(facts)
     # Prompt-cache layout (health_advisor#304). This call is deliberately a
@@ -3047,6 +3052,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
            if citation_fn is not None else "")
         + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
         + (gathered_data_guidance + "\n\n" if gathered_data_guidance else "")
+        + (samples_guidance + "\n\n" if samples_guidance else "")
         + (declared_guidance + "\n\n" if declared_guidance else "")
         + (rating_scale_guidance + "\n\n" if rating_scale_guidance else "")
         + "USER QUESTION:\n" + question.strip() + "\n\n"

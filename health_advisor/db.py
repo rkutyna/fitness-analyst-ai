@@ -503,6 +503,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_conversation_turns_answers_constraint(conn)
     _migrate_review_questions_kind_constraint(conn)
     _migrate_benchmark_stage_constraint(conn)
+    # Whether `metric_source_months` predates this call. CREATE TABLE IF NOT
+    # EXISTS below creates it EMPTY on a vault that already holds raw rows, so
+    # that case needs a one-time full rebuild (see the block after the schema).
+    msm_existed = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'metric_source_months'").fetchone() is not None
     # Recreate the append-only trigger below so existing vaults gain the sole
     # permitted mutation: a one-way delivered_at stamp.
     conn.execute("DROP TRIGGER IF EXISTS conversation_turns_no_update")
@@ -532,10 +538,17 @@ def init_db(conn: sqlite3.Connection) -> None:
     _apply_column_migrations(conn)
     _apply_table_migrations(conn)
 
+    # A vault migrated in place gets this table EMPTY while its `records` already span years, so the one-time full rebuild fills it, except on a compacted vault whose raw rows for frozen pairs are gone.
+    from . import vault
+    if (not msm_existed
+            and vault.compacted_through(conn) is None
+            and conn.execute("SELECT 1 FROM records LIMIT 1").fetchone()
+            is not None):
+        rebuild_metric_source_months(conn, full=True)
+
     # A receiver vault has no build step from which to copy resolution facts.
     # Measure its existing raw rows after the schema is ready; build_vault
     # already writes these keys itself. The marker is additive and idempotent.
-    from . import vault
     vault.mark_receiver_resolutions(conn)
 
     # The declaration is metadata about the shape after the complete

@@ -18,12 +18,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _restore_llm_module():
+def _restore_llm_module(monkeypatch):
     """`importlib.reload` rebinds llm's module-level config, and other test
     modules hold references to it. Reload it back under the ambient environment
     once each test is done, so nothing here depends on or leaks test order.
+
+    The environment is restored FIRST (`monkeypatch.undo()`): conftest's own
+    autouse fixtures request `monkeypatch`, so it is torn down after this
+    fixture, and reloading before that re-read the test's patched variables.
+    The last test of this file on a worker then left llm configured with, for
+    example, a plain-http OpenRouter URL, and every later OpenRouter test on
+    that worker failed as `openrouter_not_approved`.
     """
     yield
+    monkeypatch.undo()
     import health_advisor.llm as llm
     importlib.reload(llm)
 

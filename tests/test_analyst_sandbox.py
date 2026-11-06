@@ -351,6 +351,23 @@ _DENIAL = {
         "bwrap": rb"No such file or directory|Operation not permitted"},
 }
 
+# SQLITE_CANTOPEN ("unable to open database file") for the writable vault
+# open. Measured on a GitHub macOS runner, where the row printed it under
+# Seatbelt instead of SQLITE_AUTH. Host permissions produce it too, but only
+# when the vault's DIRECTORY is not writable (SQLite cannot create the
+# journal), so under Seatbelt it counts only where this user can write that
+# directory: there, an unsandboxed open would have succeeded.
+_CANTOPEN = rb"BLOCKED OperationalError unable to open database file"
+
+
+def _writable_open_evidence(kind: str, vault_real: str) -> bytes:
+    """The denial line the writable-open row must carry on this host."""
+    base = _denial_evidence("vault_integrity", "writable_open_and_create_table", kind)
+    if kind == "seatbelt" and os.access(os.path.dirname(vault_real) or ".", os.W_OK):
+        return base + b"|" + _CANTOPEN
+    return base
+
+
 # The authorizer action each SQL-level query-channel row must have been refused
 # with, as recorded by the parent's ledgered connection.
 _QUERY_DENIED_ACTION = {
@@ -635,6 +652,34 @@ def test_a_missing_target_is_not_a_seatbelt_denial(tmp_path):
         == NOT_CONFIRMED
     # A target this user cannot see measures nothing, whatever the line says.
     assert _score_case(res, cls="paths", evidence=EPERM, target_present=False) == NOT_APPLICABLE
+
+
+def test_cantopen_counts_under_seatbelt_only_where_the_vault_directory_is_writable(tmp_path):
+    """SQLITE_CANTOPEN is the sandbox's answer only where host permissions
+    could not have produced it: a writable vault directory. Mutation: drop the
+    os.access check and the read-only directory case scores BLOCKED."""
+    line = _raw(tmp_path, stdout=b"BLOCKED OperationalError unable to open database file\n")
+    open_dir = tmp_path / "open"
+    open_dir.mkdir()
+    ev = _writable_open_evidence("seatbelt", str(open_dir / "vault.db"))
+    assert _score_case(line, cls="vault_integrity", evidence=ev) == BLOCKED
+    auth = _raw(tmp_path, stdout=b"BLOCKED DatabaseError authorization denied\n")
+    assert _score_case(auth, cls="vault_integrity", evidence=ev) == BLOCKED
+    if os.geteuid() == 0:
+        pytest.skip("root writes a read-only directory")
+    closed = tmp_path / "closed"
+    closed.mkdir()
+    closed.chmod(0o555)
+    try:
+        ev = _writable_open_evidence("seatbelt", str(closed / "vault.db"))
+        assert _score_case(line, cls="vault_integrity", evidence=ev) == NOT_CONFIRMED
+        assert _score_case(auth, cls="vault_integrity", evidence=ev) == BLOCKED
+    finally:
+        closed.chmod(0o755)
+    # The readonly-database answer is never a denial, whatever the directory.
+    ro = _raw(tmp_path, stdout=b"BLOCKED OperationalError attempt to write a readonly database\n")
+    assert _score_case(ro, cls="vault_integrity",
+                       evidence=_writable_open_evidence("seatbelt", str(open_dir / "v.db"))) == NOT_CONFIRMED
 
 
 def test_the_measured_seatbelt_denial_is_blocked(tmp_path):
@@ -1562,6 +1607,8 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
                 parent_fd = higher_fd
             os.set_inheritable(parent_fd, True)
         evidence = _denial_evidence(cls, name, kind)
+        if (cls, name) == ("vault_integrity", "writable_open_and_create_table"):
+            evidence = _writable_open_evidence(kind, os.path.realpath(vault_path))
         try:
             if case["channel"] == "query":
                 res, refused = _run_query_channel(

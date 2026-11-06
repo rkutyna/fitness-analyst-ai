@@ -61,9 +61,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "get_weekly_series": {
-        "UM": """
-            .total
-        """,
         "AMB": """
             .expected_training_effect_bpm.max .expected_training_effect_bpm.min .noise_floor.rho
             .noise_floor.sd_day .weeks[].mdc95 .weeks[].rho .weeks[].sd_day
@@ -74,7 +71,10 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "get_block_comparison": {
-        "UM": """
+        # .diff publishes only when it exceeds mdc95 (the tool's own rule: a
+        # change under the noise floor is not reported as a change); on this
+        # vault no block diff does, so every sweep call withholds it.
+        "DW": """
             .diff
         """,
         "AMB": """
@@ -86,9 +86,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "compare_periods": {
-        "UM": """
-            .mean_delta .mean_delta_pct
-        """,
         "ST": """
             .period_a.n_days .period_b.n_days
         """,

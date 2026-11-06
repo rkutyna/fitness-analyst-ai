@@ -1866,6 +1866,11 @@ def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
 # malformed entry is skipped, never repaired, and an oversized string is
 # skipped rather than truncated: a clipped title would be a wrong fact.
 #
+# A numeric entry may also carry ``"display"``: the tool's own rendering of
+# the number (a metric's change as "-18 min" rather than "-0.3" hours). It
+# must be a non-empty string under the label limit; any other display makes
+# the entry malformed. Without it the engine renders the number from its unit.
+#
 # An entry may also name ``"restates": "$.result.<path>"``: the leaf of the
 # SAME result whose figure it publishes (a tool states a count once in its
 # rows and once here). The builder resolves that path itself and keeps the
@@ -1948,6 +1953,13 @@ def _declared_candidate(item, *, index: int, sequence,
         display = (_pace_display(value, unit)
                    if unit in _DECLARED_PACE_UNITS and value > 0
                    else _display_value(value, unit=unit))
+        given = item.get("display")
+        if given is not None:
+            if (not isinstance(given, str) or not given.strip()
+                    or len(given) > _DECLARED_MAX_TEXT
+                    or any(ord(char) < 32 for char in given)):
+                return None
+            display = given
     else:
         return None
     restated = _declared_restated_path(item, result)

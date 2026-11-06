@@ -310,3 +310,82 @@ def test_a_period_with_no_samples_publishes_no_zero():
          "jog_miles": 0.0, "walk_miles": 0.0, "walk_minutes": 0.0,
          "jog_pace_min_per_mi": None, "jog_change_pct": None}]}
     assert mcp_server._impact_facts(out, metric_units=False) == []
+
+
+# --- item 6: two-period changes and the weekly range total --------------------
+
+def test_compare_periods_publishes_the_change_named_by_both_windows(vault):
+    ledger = _ledger(vault, "compare_periods", {
+        "metric": "step_count", "period_a": "14d",
+        "period_b": "2026-08-01:2026-08-14"})
+    facts = fact_template.build_declared_facts(ledger)
+    base = "compare/step_count/2026-08-18:2026-08-31/vs/2026-08-01:2026-08-14"
+    got = {key: (fact["value"], fact["unit"], fact["display"],
+                 fact["source"]["paths"]) for key, fact in facts.items()}
+    assert got == {
+        PUB(f"{base}/mean_delta"):
+            (1347.5, "count", "+1,348", ["$.result.mean_delta"]),
+        PUB(f"{base}/mean_delta_pct"):
+            (11.56, "%", "11.6", ["$.result.mean_delta_pct"]),
+    }
+    assert facts[PUB(f"{base}/mean_delta")]["label"] == (
+        "Difference in average daily step count between Tue Aug 18 to Mon "
+        "Aug 31 and Sat Aug 1 to Fri Aug 14 (the first window minus the "
+        "second)")
+    # The metric facts are untouched: each window's own stats, nothing else.
+    assert {f["field"] for f in fact_template.build_fact_set(ledger).values()
+            if f.get("field") != "period_label"} == {
+        "mean", "median", "min", "max", "std"}
+
+
+def test_a_clock_time_change_publishes_as_a_duration_and_no_percentage():
+    from health_advisor import mcp_server
+    out = {"metric": "sleep_bedtime", "unit": "hr", "mean_delta": -0.3,
+           "mean_delta_pct": -1.2,
+           "period_a": {"range": ["2026-08-18", "2026-08-31"]},
+           "period_b": {"range": ["2026-08-01", "2026-08-14"]}}
+    facts = mcp_server._compare_periods_facts(out)
+    assert [(f["id"].rsplit("/", 1)[-1], f["value"], f["display"])
+            for f in facts] == [("mean_delta", -0.3, "-18 min")]
+
+
+def test_weekly_series_total_is_named_by_the_weeks_span(vault):
+    ledger = _ledger(vault, "get_weekly_series", {
+        "metric": "step_count", "start": "2026-07-27", "end": "2026-08-30"})
+    facts = fact_template.build_declared_facts(ledger)
+    # 73,625.03 + 82,341.47 + 85,185.32 + 93,632.04 + 85,640.20
+    assert {k: (f["value"], f["display"], f["source"]["paths"])
+            for k, f in facts.items()} == {
+        PUB("weekly/step_count/2026-07-27:2026-08-30/total"):
+            (420424.1, "420,424", ["$.result.total"])}
+    assert facts[PUB("weekly/step_count/2026-07-27:2026-08-30/total")][
+        "label"] == ("Total step count summed over the 5 weeks from Mon Jul "
+                     "27 to Sun Aug 30")
+
+
+def test_block_diff_publishes_only_when_it_exceeds_mdc95(vault):
+    from health_advisor import mcp_server
+    ledger = _ledger(vault, "get_block_comparison", {
+        "metric": "step_count", "block_weeks": 2, "as_of": "2026-08-30"})
+    result = ledger[0]["result"]
+    assert (result["diff"], result["exceeds_mdc95"]) == (838.96, False)
+    assert fact_template.build_declared_facts(ledger) == {}
+    exceeding = {**result, "exceeds_mdc95": True}
+    (fact,) = mcp_server._block_diff_facts(exceeding)
+    assert (fact["id"], fact["value"], fact["display"], fact["restates"]) == (
+        "blocks/step_count/2026-08-03:2026-08-16/vs/2026-08-17:2026-08-30/"
+        "diff", 838.96, "+839", "$.result.diff")
+    assert mcp_server._block_diff_facts({**result, "exceeds_mdc95": None}) == []
+
+
+@pytest.mark.parametrize("display", ["", "   ", 5, "x" * 321, "a\nb"])
+def test_a_malformed_display_drops_the_entry(display):
+    record = {"sequence": 1, "tool_name": "host_tool", "result_elided": False,
+              "result": {fact_template.DECLARED_FACTS_RESULT_KEY: [
+                  {"id": "x", "label": "A change", "value": -0.3,
+                   "display": display},
+                  {"id": "y", "label": "A change", "value": -0.3,
+                   "display": "-18 min"}]}}
+    facts = fact_template.build_declared_facts([record])
+    assert set(facts) == {PUB("y")}
+    assert facts[PUB("y")]["display"] == "-18 min"

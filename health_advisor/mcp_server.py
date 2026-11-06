@@ -443,6 +443,68 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     return out
 
 
+def _metric_words(metric: str) -> str:
+    return metric.replace("_", " ")
+
+
+def _range_text(start: str, end: str) -> str:
+    return f"{_day_text(start)} to {_day_text(end)}"
+
+
+def _metric_figure_fact(fid: str, metric: str, value, unit, path: str,
+                        label: str, *, field: str) -> dict | None:
+    """One declared fact for a metric-valued figure that has no single
+    (metric, period) identity, rendered by the metric's own presenter (a
+    bedtime's change is "-18 min", not "-0.3"). ``None`` for a missing or
+    non-finite value."""
+    if (value is None or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or not np.isfinite(value)):
+        return None
+    fact = {"id": fid, "value": value, "restates": path, "label": label}
+    if isinstance(unit, str) and unit.strip():
+        fact["unit"] = unit
+    display = mx.format_presentation(metric, value, field=field)
+    if display is not None:
+        fact["display"] = display
+    return fact
+
+
+def _clock_time_metric(metric: str) -> bool:
+    """A time-of-day metric, whose percentage change is meaningless (the
+    fact builder withholds the same for metric facts)."""
+    return metric in (mx._PREVIOUS_NOON_CLOCK_METRICS
+                      | mx._MIDNIGHT_CLOCK_METRICS)
+
+
+def _compare_periods_facts(out: dict) -> list[dict]:
+    """compare_periods' two-window changes as declared facts (downstream
+    issue #578). A change belongs to BOTH windows, and a metric fact names
+    one period, so the fact set had no slot for it; the id carries both
+    resolved ranges instead."""
+    metric = out["metric"]
+    a0, a1 = out["period_a"]["range"]
+    b0, b1 = out["period_b"]["range"]
+    base = f"compare/{metric}/{a0}:{a1}/vs/{b0}:{b1}"
+    span = (f"between {_range_text(a0, a1)} and {_range_text(b0, b1)} "
+            f"(the first window minus the second)")
+    facts = [_metric_figure_fact(
+        f"{base}/mean_delta", metric, out.get("mean_delta"), out.get("unit"),
+        "$.result.mean_delta",
+        f"Difference in average daily {_metric_words(metric)} {span}",
+        field="mean_delta")]
+    if not _clock_time_metric(metric):
+        pct = out.get("mean_delta_pct")
+        if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
+                and np.isfinite(pct)):
+            facts.append({
+                "id": f"{base}/mean_delta_pct", "value": pct, "unit": "%",
+                "restates": "$.result.mean_delta_pct",
+                "label": f"Percentage difference in average daily "
+                         f"{_metric_words(metric)} {span}, relative to the "
+                         f"second window"})
+    return [fact for fact in facts if fact is not None]
+
+
 @tool
 def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str) -> dict:
     """Compare a metric across two windows. Each window is either an explicit
@@ -451,7 +513,8 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
 
     An unparseable window is an 'error', never a default. If either window has
     no data the deltas come back null with a 'note' — an empty window is not a
-    change of the other window's whole size."""
+    change of the other window's whole size. `publishable_facts` carries the
+    mean change and its percentage, named by both windows."""
     unit_system = _unit_system(ctx.settings())
     conn = ctx.read_only()
     try:
@@ -484,6 +547,7 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     out["mean_delta"] = _r(sa["mean"] - sb["mean"])
     out["mean_delta_pct"] = _r((sa["mean"] - sb["mean"]) / sb["mean"] * 100) \
         if sb["mean"] else None
+    out[_PUBLISHABLE_FACTS_KEY] = _compare_periods_facts(out)
     return out
 
 
@@ -3143,7 +3207,51 @@ def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> d
     _add_caveat(result, metric)
     if A.mx.agg(metric) == "sum" or metric in {"jog_minutes", "longest_block_min"}:
         result["total"] = A.mx.r(sum(row["total"] for row in weeks), 1)
+        # The sum over every returned week. It is published as a declared
+        # fact named by the weeks' own span, never as a metric fact for the
+        # requested range: a summarize_metric total of that range at another
+        # rounding would collide with it and withhold both (downstream issue
+        # #578).
+        first, last = weeks[0].get("period"), weeks[-1].get("period")
+        if isinstance(first, str) and isinstance(last, str):
+            span_start, span_end = first.split(":")[0], last.split(":")[-1]
+            fact = _metric_figure_fact(
+                f"weekly/{metric}/{span_start}:{span_end}/total", metric,
+                result["total"], weeks[0].get("unit"), "$.result.total",
+                f"Total {_metric_words(metric)} summed over the {len(weeks)} "
+                f"weeks from {_range_text(span_start, span_end)}"
+                + (" (the last week is partial)" if weeks[-1].get("partial")
+                   else ""),
+                field="total")
+            if fact is not None:
+                result[_PUBLISHABLE_FACTS_KEY] = [fact]
     return result
+
+
+def _block_diff_facts(result: dict) -> list[dict]:
+    """The recent-minus-previous block ``diff`` as a declared fact, named by
+    both blocks (downstream issue #578), ONLY when it exceeds mdc95. The
+    tool's own rule is that a change under the noise floor is not to be
+    reported as a change, so a slot for it would invite exactly that."""
+    if result.get("exceeds_mdc95") is not True:
+        return []
+    blocks = result.get("blocks") or {}
+    recent = (blocks.get("recent") or {}).get("period")
+    previous = (blocks.get("previous") or {}).get("period")
+    metric = result.get("metric")
+    if not (isinstance(recent, str) and isinstance(previous, str)
+            and isinstance(metric, str)):
+        return []
+    p0, p1 = previous.split(":")
+    r0, r1 = recent.split(":")
+    fact = _metric_figure_fact(
+        f"blocks/{metric}/{previous}/vs/{recent}/diff", metric,
+        result.get("diff"), None, "$.result.diff",
+        f"Change in average daily {_metric_words(metric)} from "
+        f"{_range_text(p0, p1)} to {_range_text(r0, r1)} (recent block minus "
+        f"previous block; larger than the minimum detectable change)",
+        field="mean_delta")
+    return [fact] if fact is not None else []
 
 
 @tool
@@ -3176,6 +3284,9 @@ def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
             return {"error": f"no data for metric {metric!r}"}
         result = A.block_comparison(conn, metric, block_weeks, as_of)
         _add_caveat(result, metric)
+        facts = _block_diff_facts(result)
+        if facts:
+            result[_PUBLISHABLE_FACTS_KEY] = facts
         return result
     finally:
         conn.close()

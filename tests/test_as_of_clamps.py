@@ -101,6 +101,28 @@ CASES = [
     ("get_briefing", {"day": LATE}, {"day": AS_OF}, {"day"}, set()),
     ("get_weekly_readiness", {"as_of": LATE}, {"as_of": AS_OF}, {"as_of"},
      set()),
+    # The rest of the date-taking read tools (clamped by ``_clamps_dates``).
+    ("get_intraday", {"metric": "heart_rate", "day": LATE},
+     {"metric": "heart_rate", "day": AS_OF}, {"day"}, set()),
+    ("get_hr_zones", {"day": LATE}, {"day": AS_OF}, {"day"}, set()),
+    ("get_workout_segments", {"day": LATE}, {"day": AS_OF}, {"day"}, set()),
+    ("get_block_structure", {"day": LATE}, {"day": AS_OF}, {"day"}, set()),
+    ("get_workout_coverage", {"start": "2026-07-20", "end": LATE},
+     {"start": "2026-07-20", "end": AS_OF}, {"end"}, set()),
+    ("get_subjective", {"start_date": "2026-07-20", "end_date": LATE},
+     {"start_date": "2026-07-20", "end_date": AS_OF}, {"end_date"}, set()),
+    ("get_ingest_diagnostics", {"metric": METRIC, "start": "2026-07-20",
+                                "end": LATE},
+     {"metric": METRIC, "start": "2026-07-20", "end": AS_OF}, {"end"}, set()),
+    ("get_weekly_series", {"metric": METRIC, "start": "2026-07-06",
+                           "end": LATE},
+     {"metric": METRIC, "start": "2026-07-06", "end": AS_OF}, {"end"}, set()),
+    ("get_weekly_series", {"metric": METRIC, "start": LATE, "end": END},
+     {"metric": METRIC, "start": AS_OF, "end": AS_OF}, {"start", "end"},
+     set()),
+    ("get_block_comparison", {"metric": METRIC, "block_weeks": 2,
+                              "as_of": LATE},
+     {"metric": METRIC, "block_weeks": 2, "as_of": AS_OF}, {"as_of"}, set()),
 ]
 _ISO_DAY = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 
@@ -168,3 +190,22 @@ def test_the_ask_binds_what_its_calendar_block_reads(tmp_path, given, bound):
     from health_advisor import chat
     ctx = VaultContext.local(tmp_path / "v.db")
     assert chat._ctx_at_ask_as_of(ctx, given).as_of == bound
+
+
+@pytest.mark.parametrize("name,kwargs", [
+    # start after end, both after the as-of: clamping both to the as-of would
+    # turn a refused window into an answered one.
+    ("get_weekly_series", {"metric": METRIC, "start": END, "end": LATE}),
+    ("get_workout_coverage", {"start": END, "end": LATE}),
+    ("get_subjective", {"start_date": END, "end_date": LATE}),
+    # not a day at all
+    ("get_intraday", {"metric": "heart_rate", "day": "yesterday"}),
+    ("get_block_comparison", {"metric": METRIC, "block_weeks": 2,
+                              "as_of": "2026-13-01"}),
+])
+def test_a_refused_date_is_refused_the_same_way_under_an_as_of(session, name,
+                                                               kwargs):
+    unpinned = S.build_tools(session)[name](**kwargs)
+    pinned = S.build_tools(session.at(AS_OF))[name](**kwargs)
+    assert "error" in pinned
+    assert pinned == unpinned

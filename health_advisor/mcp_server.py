@@ -310,6 +310,45 @@ def _mark_clamped(out: dict, requested: dict[str, str]) -> dict:
     return out
 
 
+def _clamps_dates(*names: str, pairs: tuple[tuple[str, str], ...] = ()):
+    """Clamp a tool's named date arguments to the session's as-of.
+
+    For tools whose dates are plain YYYY-MM-DD arguments and that read nothing
+    after them: the arguments are clamped with ``_clamp_to_as_of`` before the
+    tool runs and the result is marked with ``_mark_clamped``. A value that is
+    not a real day, or a ``(start, end)`` pair in ``pairs`` given in the wrong
+    order, leaves the call untouched so the tool's own validation reports it
+    exactly as before. Without an as-of the tool is called unchanged.
+    ``functools.wraps`` keeps the name, docstring and signature the schema is
+    built from."""
+    def wrap(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def clamped(ctx, *args, **kwargs):
+            if _session_as_of(ctx) is None:
+                return fn(ctx, *args, **kwargs)
+            try:
+                call = sig.bind(ctx, *args, **kwargs)
+            except TypeError:
+                return fn(ctx, *args, **kwargs)
+            given = {n: call.arguments.get(n) for n in names}
+            if any(v is not None and _bad_dates(**{n: v})
+                   for n, v in given.items()):
+                return fn(ctx, *args, **kwargs)
+            if any(isinstance(given.get(a), str) and isinstance(given.get(b), str)
+                   and given[a] > given[b] for a, b in pairs):
+                return fn(ctx, *args, **kwargs)
+            values, requested = _clamp_to_as_of(ctx, **given)
+            if not requested:
+                return fn(ctx, *args, **kwargs)
+            for n in requested:
+                call.arguments[n] = values[n]
+            return _mark_clamped(fn(*call.args, **call.kwargs), requested)
+        return clamped
+    return wrap
+
+
 def _clamp_range_spec(ctx: VaultContext, spec: str, name: str = "period"
                       ) -> tuple[str, dict[str, str]]:
     """An explicit 'YYYY-MM-DD:YYYY-MM-DD' window spec, clamped to the as-of.
@@ -722,6 +761,7 @@ def _intraday_facts(metric: str, day: str, unit, agg: str,
 
 
 @tool
+@_clamps_dates("day")
 def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1) -> dict:
     """Intraday pattern for a metric on a single LOCAL day (YYYY-MM-DD), bucketed
     by local hour. Uses sum for cumulative metrics, average for rates. Returns up
@@ -950,6 +990,7 @@ def _hr_zone_facts(day: str, windows: list[dict]) -> list[dict]:
 
 
 @tool
+@_clamps_dates("day")
 def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
                  start_time: str | None = None, end_time: str | None = None,
                  thresholds: str = HR_ZONE_DEFAULT_THRESHOLDS) -> dict:
@@ -1341,6 +1382,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
 
 
 @tool
+@_clamps_dates("start", "end", pairs=(("start", "end"),))
 def get_workout_coverage(ctx: VaultContext, start: str, end: str) -> dict:
     """Reconcile route and weather coverage for an inclusive local-date window.
 
@@ -1490,6 +1532,7 @@ def _covered_min(splits) -> float | None:
 
 
 @tool
+@_clamps_dates("day")
 def get_workout_segments(ctx: VaultContext, day: str, workout_type: str | None = None) -> dict:
     """Segment/lap breakdown of each workout on a LOCAL day (YYYY-MM-DD) —
     the watch's splits and intervals. Per split: local start and end time,
@@ -2964,6 +3007,8 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
 
 
 @tool
+@_clamps_dates("start_date", "end_date",
+               pairs=(("start_date", "end_date"),))
 def get_subjective(ctx: VaultContext, start_date: str, end_date: str) -> dict:
     """Subjective check-in rows (stress/soreness/energy/sleep_quality 1-5,
     caffeine/alcohol drink counts, free-text notes) for a date range,
@@ -3255,6 +3300,7 @@ def food_meal_total(ctx: VaultContext, items: list[dict]) -> dict:
 
 
 @tool
+@_clamps_dates("start", "end", pairs=(("start", "end"),))
 def get_ingest_diagnostics(ctx: VaultContext, metric: str, start: str,
                            end: str) -> dict:
     """Explain HealthKit ingest coverage for one metric and local date range.
@@ -3349,6 +3395,7 @@ def _convert_spread(value, unit, unit_system):
 
 
 @tool
+@_clamps_dates("start", "end", pairs=(("start", "end"),))
 def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> dict:
     """Weekly means of a metric, each with its day count and its noise floor.
 
@@ -3500,6 +3547,7 @@ def _block_diff_facts(result: dict) -> list[dict]:
 
 
 @tool
+@_clamps_dates("as_of")
 def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
                          as_of: str) -> dict:
     """Compare the last two fixed-length blocks of a metric, gated by MDC95.
@@ -3546,6 +3594,7 @@ NOT_SYNCED_HR_NOTE = ("The heart rate for this session has not synced yet, so "
 
 
 @tool
+@_clamps_dates("day")
 def get_block_structure(ctx: VaultContext, day: str) -> dict:
     """How long the user ran CONTINUOUSLY, and whether it was easy enough to count.
 
@@ -3872,15 +3921,33 @@ def get_monthly_running_power(ctx: VaultContext, month: str) -> dict:
     Returns null when the month holds fewer than two qualifying outdoor runs.
     That is a refusal, not a gap: one run is a session, not a month.
     """
+    # Downstream #596: a month after the session's as-of is clamped to the
+    # as-of's month, and the as-of's own month is read only through the as-of
+    # (unflagged, like every default window the as-of bounds, so an as-of on
+    # the last data day answers byte for byte as no as-of does). Without an
+    # as-of the month is read whole, exactly as before.
+    as_of, requested, through = _session_as_of(ctx), {}, None
+    if as_of is not None and isinstance(month, str):
+        try:
+            date.fromisoformat(f"{month}-01")
+        except ValueError:
+            pass                    # the tool's own read reports it
+        else:
+            if month > as_of[:7]:
+                requested = {"month": month}
+                month = as_of[:7]
+            if month == as_of[:7]:
+                through = as_of
     conn = ctx.read_only()
     try:
-        watts = RF.monthly_running_power(conn, month)
+        watts = RF.monthly_running_power(conn, month, through=through)
     finally:
         conn.close()
-    return {"month": month, "mean_power_w": watts,
-            "pace_band_min_per_mi": list(RF.REFERENCE_PACE_BAND),
-            "note": (None if watts is not None else
-                     "fewer than two qualifying outdoor runs this month")}
+    out = {"month": month, "mean_power_w": watts,
+           "pace_band_min_per_mi": list(RF.REFERENCE_PACE_BAND),
+           "note": (None if watts is not None else
+                    "fewer than two qualifying outdoor runs this month")}
+    return _mark_clamped(out, requested)
 
 
 @tool

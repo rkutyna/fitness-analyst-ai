@@ -481,3 +481,47 @@ def test_collapse_reads_the_canonical_is_jog_it_is_given():
         [_bucket(False, 60.0 / 14.0, 140.0, is_walk=True)])
     assert collapsed[0]["is_jog"] is False
     assert collapsed[0]["is_walk"] is True
+
+
+# Downstream issue #596: a session pinned to an as-of inside the month reads
+# the month only through the as-of. Three runs at 200, 220 and 300 W: the
+# whole month is (200 + 220 + 300) / 3 = 240.0, through the 25th it is
+# (200 + 220) / 2 = 210.0 (hand-computed).
+def _three_power_runs(tmp_path):
+    conn = _conn_for(tmp_path)
+    _insert_power_run(conn, "2026-07-14", 8, 200.0, route_ref="run-a.gpx")
+    _insert_power_run(conn, "2026-07-21", 8, 220.0, route_ref="run-b.gpx")
+    _insert_power_run(conn, "2026-07-28", 8, 300.0, route_ref="run-c.gpx")
+    return conn
+
+
+def test_monthly_running_power_through_bounds_the_month(tmp_path):
+    conn = _three_power_runs(tmp_path)
+    assert rf.monthly_running_power(conn, "2026-07") == pytest.approx(240.0)
+    assert rf.monthly_running_power(conn, "2026-07", through="2026-07-25") \
+        == pytest.approx(210.0)
+    assert rf.monthly_running_power(conn, "2026-07", through="2026-07-28") \
+        == pytest.approx(240.0)
+    # One run by the 20th is a session, not a month.
+    assert rf.monthly_running_power(conn, "2026-07", through="2026-07-20") is None
+
+
+def test_the_monthly_power_tool_reads_only_through_the_session_as_of(tmp_path):
+    from health_advisor import mcp_server as S
+    from health_advisor.context import VaultContext
+    _three_power_runs(tmp_path).close()
+    ctx = VaultContext.local(tmp_path / "running_form.db", user_id="test")
+    tool = S.build_tools(ctx)["get_monthly_running_power"]
+    assert tool("2026-07")["mean_power_w"] == pytest.approx(240.0)
+    pinned = S.build_tools(ctx.at("2026-07-25"))["get_monthly_running_power"]
+    got = pinned("2026-07")
+    assert got["mean_power_w"] == pytest.approx(210.0)
+    assert "clamped_to_as_of" not in got
+    # A later month is clamped to the as-of's month, and says so.
+    later = pinned("2026-09")
+    assert later["month"] == "2026-07"
+    assert later["mean_power_w"] == pytest.approx(210.0)
+    assert later["clamped_to_as_of"] is True
+    assert later["requested_dates"] == {"month": "2026-09"}
+    # An earlier month is untouched.
+    assert pinned("2026-06") == tool("2026-06")

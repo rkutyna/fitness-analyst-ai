@@ -18,6 +18,7 @@ to reach the other's vault, which a module global made impossible (T-003).
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import sqlite3
 from collections.abc import Callable
@@ -2530,6 +2531,100 @@ def _empty_catalog(e: sqlite3.OperationalError):
             "note": "the food catalog is empty — nothing has been added yet"}
 
 
+# A food figure has no metric or period identity, so the closed fact set had
+# no slot for it and a narrating model could only omit or deny a catalog's
+# own numbers (consumer #578). The food tools now declare them as
+# ``publishable_facts``, each naming the leaf it restates.
+_FOOD_FIGURES = (("kcal", "Calories", "kcal"),
+                 ("protein_g", "Protein", "g"),
+                 ("carb_g", "Carbohydrate", "g"),
+                 ("fat_g", "Fat", "g"))
+# Mirrors fact_template._DECLARED_MAX_TEXT; a longer label is skipped there,
+# so a fallback that names no catalog text is used instead.
+_FOOD_LABEL_MAX = 320
+
+
+def _food_label(text: str, fallback: str) -> str:
+    """``text`` when the declared-fact builder will accept it, else
+    ``fallback`` (catalog names are user text and may be long)."""
+    if len(text) <= _FOOD_LABEL_MAX and not any(ord(c) < 32 for c in text):
+        return text
+    return fallback
+
+
+def _food_number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and np.isfinite(value))
+
+
+def _food_item_facts(items: list[dict]) -> list[dict]:
+    """One declared fact per stored per-serving figure of each catalog row."""
+    facts = []
+    for index, row in enumerate(items):
+        key = row.get("item_key")
+        if not isinstance(key, str) or not key:
+            continue
+        what = (f"one serving ({row.get('serving_desc')}) of "
+                f"{row.get('display_name')}, from the food catalog "
+                f"(source: {row.get('source')})")
+        fields = _FOOD_FIGURES + (("serving_g", "Weight in grams", "g"),)
+        for field, noun, unit in fields:
+            value = row.get(field)
+            if not _food_number(value):
+                continue
+            facts.append({
+                "id": f"food/{key}/per_serving/{field}", "value": value,
+                "unit": unit, "restates": f"$.result.items[{index}].{field}",
+                "label": _food_label(
+                    f"{noun} in {what}",
+                    f"{noun} in one serving of catalog item {key}")})
+    return facts
+
+
+def _food_meal_facts(out: dict, pairs: list) -> list[dict]:
+    """The meal's summed figures and each item's calories, as declared facts.
+
+    The meal id is a digest of its (item, servings) list, so the same meal
+    totalled twice in one turn publishes once, and two different meals never
+    share an id. A macro that could not be totalled is null and publishes
+    nothing: a partial sum is not a total.
+    """
+    canon = repr([(str(k), float(n)) for k, n in pairs])
+    meal = "food/meal/" + hashlib.sha256(canon.encode()).hexdigest()[:12]
+    items = out.get("items") or []
+    parts = [f"{row['servings']:g} x {row['display_name']} "
+             f"({row['serving_desc']})" for row in items]
+    what = (f"the meal of {' + '.join(parts)}, summed from the food catalog "
+            f"(weakest source: {out.get('weakest_source')})")
+    fallback = (f"the meal of {len(items)} catalog items totalled in this "
+                f"call (weakest source: {out.get('weakest_source')})")
+    facts = []
+    for field, noun, unit in _FOOD_FIGURES:
+        value = out.get(field)
+        if not _food_number(value):
+            continue
+        facts.append({
+            "id": f"{meal}/{field}", "value": value, "unit": unit,
+            "restates": f"$.result.{field}",
+            "label": _food_label(f"Total {noun.lower()} in {what}",
+                                 f"Total {noun.lower()} in {fallback}")})
+    for index, row in enumerate(items):
+        if not _food_number(row.get("kcal")):
+            continue
+        servings = f"{row['servings']:g}"
+        facts.append({
+            "id": f"food/{row['item_key']}/servings/{servings}/kcal",
+            "value": row["kcal"], "unit": "kcal",
+            "restates": f"$.result.items[{index}].kcal",
+            "label": _food_label(
+                f"Calories in {servings} servings ({row['serving_desc']} "
+                f"each) of {row['display_name']}, from the food catalog "
+                f"(source: {row['source']})",
+                f"Calories in {servings} servings of catalog item "
+                f"{row['item_key']}")})
+    return facts
+
+
 @tool
 def food_lookup(ctx: VaultContext, query: str = "") -> dict:
     """Look up food items and their nutrition per serving from the user's catalog.
@@ -2547,6 +2642,8 @@ def food_lookup(ctx: VaultContext, query: str = "") -> dict:
     photo showed, or the reasoning behind an estimate), `confirmed` (1 only if
     the user looked at these numbers and agreed), and `verified_at`. When
     you report a number from here, report where it came from.
+    `publishable_facts` carries each item's per-serving kcal, macros and
+    serving weight, labelled with the item and its source.
     """ % _TIER_HELP
     conn = ctx.read_only()
     try:
@@ -2555,7 +2652,8 @@ def food_lookup(ctx: VaultContext, query: str = "") -> dict:
         return _empty_catalog(e)
     finally:
         conn.close()
-    return {"items": items, "count": len(items)}
+    return {"items": items, "count": len(items),
+            _PUBLISHABLE_FACTS_KEY: _food_item_facts(items)}
 
 
 @tool
@@ -2632,6 +2730,9 @@ def food_meal_total(ctx: VaultContext, items: list[dict]) -> dict:
 
     An unknown item_key is an error, not a skip — a total quietly missing a
     food is worse than no total. Look the item up and add it first.
+
+    `publishable_facts` carries the meal's totals (a null macro publishes
+    nothing) and each item's calories for its servings.
     """
     try:
         pairs = []
@@ -2651,7 +2752,8 @@ def food_meal_total(ctx: VaultContext, items: list[dict]) -> dict:
         return {"ok": False, "error": str(e)}
     finally:
         conn.close()
-    return {"ok": True, **out}
+    return {"ok": True, **out,
+            _PUBLISHABLE_FACTS_KEY: _food_meal_facts(out, pairs)}
 
 
 @tool

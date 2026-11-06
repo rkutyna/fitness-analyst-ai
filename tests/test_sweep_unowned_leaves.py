@@ -274,9 +274,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "food_lookup": {
-        "UM": """
-            .items[].carb_g .items[].fat_g .items[].kcal .items[].protein_g .items[].serving_g
-        """,
         "AMB": """
             .count
         """,
@@ -285,9 +282,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "food_meal_total": {
-        "UM": """
-            .carb_g .fat_g .items[].kcal .kcal .protein_g
-        """,
         "ST": """
             .items[].confirmed .items[].servings
         """,

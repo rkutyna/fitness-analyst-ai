@@ -1860,6 +1860,15 @@ def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
 # agree, like every other builder here (:func:`_publish_unambiguous`). A
 # malformed entry is skipped, never repaired, and an oversized string is
 # skipped rather than truncated: a clipped title would be a wrong fact.
+#
+# An entry may also name ``"restates": "$.result.<path>"``: the leaf of the
+# SAME result whose figure it publishes (a tool states a count once in its
+# rows and once here). The builder resolves that path itself and keeps the
+# entry only when the leaf holds exactly the declared number; the path then
+# joins the fact's ``source.paths``, so provenance names the leaf a reader
+# sees, not only the list entry. A path that does not resolve, or a leaf
+# that disagrees, makes the entry malformed and it is skipped (consumer
+# #578): the engine never trusts a tool's claim about its own result.
 DECLARED_FACTS_RESULT_KEY = "publishable_facts"
 _DECLARED_KEY_PREFIX = "pub:"
 _DECLARED_MAX_PER_RESULT = 400
@@ -1872,7 +1881,40 @@ def declared_fact_key(fact_id: str) -> str:
     return _DECLARED_KEY_PREFIX + quote(str(fact_id), safe="-_.~:/")
 
 
-def _declared_candidate(item, *, index: int, sequence) -> tuple[str, dict] | None:
+def _declared_restated_path(item: dict, result) -> str | None | bool:
+    """The verified ``restates`` path of one entry: ``None`` when the entry
+    names none, the path when it resolves to exactly the declared number, and
+    ``False`` when it is named but malformed, unresolvable or disagreeing."""
+    path = item.get("restates")
+    if path is None:
+        return None
+    value = item.get("value")
+    if (not isinstance(path, str) or len(path) > _DECLARED_MAX_TEXT
+            or isinstance(value, bool) or not isinstance(value, (int, float))):
+        return False
+    parts = _path_parts(path)
+    # The parse must account for every character, or a path such as
+    # "$.result.a b" would resolve to a prefix of what it names.
+    if not parts or _json_path(tuple(parts)) != path:
+        return False
+    node = result
+    try:
+        for part in parts:
+            if isinstance(part, int) and not isinstance(node, list):
+                return False
+            if isinstance(part, str) and not isinstance(node, dict):
+                return False
+            node = node[part]
+    except (KeyError, IndexError, TypeError):
+        return False
+    if (isinstance(node, bool) or not isinstance(node, (int, float))
+            or node != value):
+        return False
+    return path
+
+
+def _declared_candidate(item, *, index: int, sequence,
+                        result=None) -> tuple[str, dict] | None:
     if not isinstance(item, dict):
         return None
     fact_id, label = item.get("id"), item.get("label")
@@ -1898,13 +1940,18 @@ def _declared_candidate(item, *, index: int, sequence) -> tuple[str, dict] | Non
         display = _display_value(value, unit=unit)
     else:
         return None
+    restated = _declared_restated_path(item, result)
+    if restated is False:
+        return None
     key = declared_fact_key(fact_id)
+    source = {"sequence": sequence,
+              "path": f"$.result.{DECLARED_FACTS_RESULT_KEY}[{index}].value"}
+    if restated is not None:
+        source["paths"] = [restated]
     return key, {
         "key": key, "label": label, "value": value, "unit": unit,
         "display": display,
-        "source": {"sequence": sequence,
-                   "path": f"$.result.{DECLARED_FACTS_RESULT_KEY}"
-                           f"[{index}].value"},
+        "source": source,
     }
 
 
@@ -1930,7 +1977,8 @@ def build_declared_facts(ledger: list[dict]) -> dict[str, dict]:
             continue
         for index, item in enumerate(entries[:_DECLARED_MAX_PER_RESULT]):
             candidate = _declared_candidate(
-                item, index=index, sequence=record.get("sequence"))
+                item, index=index, sequence=record.get("sequence"),
+                result=result)
             if candidate is not None:
                 candidates.append(candidate)
     return _publish_unambiguous(candidates)

@@ -1916,6 +1916,59 @@ def require_host_tools(names=HOST_SUPPLIED_TOOLS) -> None:
             + " (call llm.register_tools before serving the coach surface)")
 
 
+# Engine tools a host has explicitly chosen to REPLACE (issue #650): name ->
+# unbound ``fn(ctx, ...)`` with the same name as the engine tool it stands in
+# for. Opt-in and separate from ``_HOST_TOOLS`` on purpose: ``register_tools``
+# keeps refusing engine names, so an engine-tested tool can only change through
+# this explicit call. Like ``_HOST_TOOLS`` it stores the UNBOUND function, so no
+# vault is held process-wide.
+_REPLACEMENT_TOOLS: dict = {}
+
+
+def register_replacement(fn) -> str:
+    """Replace one ENGINE tool on the ask path. Returns the replaced name.
+
+    ``fn`` must carry the name of an engine tool and take the vault context
+    first, like that tool. A host uses this when a tool's fixed default must
+    be overridden by the host's own configuration, without forking the engine.
+    The replacement's schema and description come from its own signature and
+    docstring. It is bound to the session's ``provider_facing()`` context and
+    passes through ``_ledgered`` exactly as any other tool does: it is
+    registered in the same registry dict that ``_registry`` returns, and that
+    dict is what ``_ledgered`` wraps on the ask and research paths.
+
+    Refuses a name that is not an engine tool (use :func:`register_tools` for
+    new tools), and refuses a different function under a name already
+    replaced. Registering the same function again is idempotent.
+    """
+    from . import mcp_server as S
+    name = fn.__name__
+    if name not in {f.__name__ for f in S._TOOLS}:
+        raise ValueError(
+            f"{name!r} is not an engine tool; use register_tools")
+    with _HOST_TOOLS_LOCK:
+        existing = _REPLACEMENT_TOOLS.get(name)
+        if existing is not None and existing is not fn:
+            raise ValueError(
+                f"replacement for {name!r} is already registered by another "
+                "function")
+        _REPLACEMENT_TOOLS[name] = fn
+    return name
+
+
+def unregister_replacements(*names) -> None:
+    """Restore engine tools by name (test isolation). Unknown names are ignored."""
+    with _HOST_TOOLS_LOCK:
+        for name in names:
+            _REPLACEMENT_TOOLS.pop(name, None)
+
+
+def registered_replacements() -> tuple:
+    """The engine tool names currently replaced by a host, sorted."""
+    with _HOST_TOOLS_LOCK:
+        return tuple(sorted(_REPLACEMENT_TOOLS))
+
+
 def _check_include(include, *, engine_names) -> None:
     """Raise for an ``include`` name that nothing could ever register.
 
@@ -2031,11 +2084,19 @@ def _registry(ctx, include=None, *, analyst_query_fn=None,
     selected = frozenset(RESEARCHER_TOOLS if include is None else include)
     _check_include(include, engine_names={fn.__name__ for fn in S._TOOLS})
     host_selected = frozenset(n for n in selected if n in _HOST_TOOLS)
+    with _HOST_TOOLS_LOCK:
+        # A replaced engine tool is built from the host's function, not from
+        # the engine server, so the engine's copy is never constructed for it.
+        replaced_selected = frozenset(
+            n for n in selected if n in _REPLACEMENT_TOOLS)
+        replacement_fns = [_REPLACEMENT_TOOLS[n]
+                           for n in sorted(replaced_selected)]
     # analyst_query is deliberately not an MCP tool. Analyst mode is exempt
     # from the provider-boundary raw-sample guarantee until its service is
     # separately mediated; keeping it out of build_server preserves that
     # boundary's existing scope and keeps the codex subprocess unable to see it.
-    mcp_selected = selected - {ANALYST_QUERY_NAME} - host_selected
+    mcp_selected = (selected - {ANALYST_QUERY_NAME} - host_selected
+                    - replaced_selected)
     provider_ctx = ctx.provider_facing()
     server = S.build_server(provider_ctx, name="health-deepdive",
                             include=mcp_selected)
@@ -2047,15 +2108,16 @@ def _registry(ctx, include=None, *, analyst_query_fn=None,
             "parameters": t.parameters,
         },
     }) for t in server._tool_manager.list_tools()}
-    if host_selected:
+    if host_selected or replacement_fns:
         # Same construction as the engine tools above (a real FastMCP object,
         # so the schema comes from the signature and docstring), bound to the
-        # same provider-facing context.
+        # same provider-facing context. Replacements take the place of the
+        # engine tool of the same name in the registry.
         from mcp.server.fastmcp import FastMCP
         host_server = FastMCP("health-host-tools")
         with _HOST_TOOLS_LOCK:
             host_fns = [_HOST_TOOLS[n] for n in sorted(host_selected)]
-        for fn in host_fns:
+        for fn in host_fns + replacement_fns:
             host_server.tool()(S._bind(fn, provider_ctx))
         registry.update({t.name: (t.fn, {
             "type": "function",

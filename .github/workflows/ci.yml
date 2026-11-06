@@ -84,6 +84,14 @@ jobs:
       # enforced. `-rP` prints the corpus table and every row's verdict and
       # first output line even when the run passes, so each executor's denial
       # lines can be read from the log.
+      # The container's $HOME holds no shell rc file, so the two rows that
+      # read one (system_binary_reads_forbidden_path and the remapped-HOME
+      # toctou row) had no target and measured nothing under bubblewrap.
+      - name: Give the corpus's home-read rows a target (Linux)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: |
+          [ -e "$HOME/.profile" ] || printf '# sandbox corpus home-read target\n' > "$HOME/.profile"
+
       - name: Sandbox attack corpus (informational — see SECURITY.md)
         if: ${{ !cancelled() }}
         continue-on-error: true

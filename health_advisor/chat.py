@@ -3031,9 +3031,13 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             withheld_fact_keys))
         _record_attempt(capture, 1, _RESULT_ELIDED_ANSWER, None,
                         elided_verification, None, ledger)
+        # Mode "status", not "fallback" (Roger, 2026-11-06): this is a
+        # Python-authored answer the user should keep, like the no-data
+        # reply, not a withheld narration. Clients render "status" as a kept
+        # answer; the ask log's fallback rate counts only "fallback".
         return {
             "text": _RESULT_ELIDED_ANSWER,
-            "mode": "fallback",
+            "mode": "status",
             "tool_trace": ledger,
             "verification": elided_verification,
         }
@@ -4261,7 +4265,9 @@ def _narrate_audit(ctx: VaultContext, report: dict) -> dict:
         )
         result = _answer_fact_template(ctx, "run the injury-risk audit", prompt,
                                        [], path)
-        if result.get("mode") == "fallback":
+        # "status" is the elided-result answer (#578): its sentence is about
+        # a chat question, so an audit replaces it exactly like a fallback.
+        if result.get("mode") in ("fallback", "status"):
             result = {**result, "text": _audit_fallback(report)}
         return result
     finally:

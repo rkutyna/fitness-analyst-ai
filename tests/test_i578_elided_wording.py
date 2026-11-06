@@ -19,7 +19,9 @@ import shutil
 
 import pytest
 
-from health_advisor import chat, deepdive_mcp, demo, llm
+from fastapi.testclient import TestClient
+
+from health_advisor import chat, deepdive_mcp, demo, llm, receiver
 from health_advisor.context import VaultContext
 
 QUESTION = "How has my resting heart rate looked over the last 90 days?"
@@ -79,7 +81,8 @@ def test_only_an_elided_result_gets_the_python_sentence(ctx, tmp_path,
     assert [(r["tool_name"], r["result_elided"]) for r in records] == \
         [("get_daily_series", True)]
     assert result["text"] == WANT
-    assert result["mode"] == "fallback"
+    # "status", not "fallback" (Roger, 2026-11-06): a kept Python answer.
+    assert result["mode"] == "status"
     assert result["verification"]["cause"] == "result_elided"
     assert result["verification"]["ok"] is False
     assert posts == 2                      # the narration model was not asked
@@ -103,3 +106,51 @@ def test_nothing_elided_is_untouched(ctx, tmp_path, monkeypatch):
     assert posts >= 3
     assert result["text"] != WANT
     assert result["verification"].get("cause") != "result_elided"
+
+
+def test_the_client_receives_and_stores_status(built_vault, tmp_path,
+                                               monkeypatch):
+    """The HTTP body and the stored turn both say "status" (the phone keys
+    on the body; history and recovery key on the stored turn)."""
+    copy = tmp_path / "vault.db"
+    shutil.copy(built_vault, copy)
+    vault = VaultContext.local(copy, user_id="test", writable=True)
+    posts = []
+
+    def fake_post(payload, timeout):
+        posts.append(payload)
+        if len(posts) == 1:
+            return {"message": {"role": "assistant", "content": "",
+                                "tool_calls": [{"function": SERIES}]}}
+        return {"message": {"role": "assistant",
+                            "content": "Your resting heart rate is 58 bpm."}}
+
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "ask-secret")
+    monkeypatch.setattr(deepdive_mcp, "LEDGER_RESULT_MAX_BYTES", LIMIT)
+    monkeypatch.setattr(llm, "_ollama_chat_post", fake_post)
+    headers = {"x-health-secret": "ask-secret"}
+    with TestClient(receiver.create_app(vault)) as client:
+        body = client.post("/v1/ask", json={"question": QUESTION},
+                           headers=headers).json()
+        turns = client.get("/v1/conversation", headers=headers).json()["turns"]
+
+    assert body["text"] == WANT
+    assert body["mode"] == "status"
+    assert body["verification"]["cause"] == "result_elided"
+    assert [(t["answer"], t["mode"]) for t in turns
+            if t["question"] == QUESTION] == [(WANT, "status")]
+
+
+def test_an_audit_replaces_the_elided_sentence(vault, monkeypatch):
+    """The elided sentence talks about a chat question; an audit narration
+    that hits it gets the audit's own fallback text, as a fallback does."""
+    monkeypatch.setattr(chat, "_audit_flag_ledger", lambda report: [])
+    monkeypatch.setattr(chat, "_audit_fallback",
+                        lambda report: "the audit's own words")
+    monkeypatch.setattr(
+        chat, "_answer_fact_template",
+        lambda *a, **k: {"text": WANT, "mode": "status", "tool_trace": [],
+                         "verification": {"cause": "result_elided"}})
+    result = chat._narrate_audit(vault, {})
+    assert result["text"] == "the audit's own words"
+    assert result["mode"] == "status"

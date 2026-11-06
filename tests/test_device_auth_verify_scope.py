@@ -335,7 +335,7 @@ def test_a_phone_beside_a_verify_key_is_unchanged(make_app, state, verify_key):
 
 def test_revoking_a_verify_key_refuses_the_probe(make_app, state, verify_key):
     kid = device_auth.kid_for(device_auth._public_point(verify_key))
-    assert _cli(state, "revoke", kid) == 0
+    assert _cli(state, "revoke", "--", kid) == 0
     app = make_app("required")
     with TestClient(app) as client:
         probe = client.get(PROBE, headers=_headers(verify_key, "GET", PROBE))
@@ -472,7 +472,7 @@ def test_verify_probe_reports_an_unenrolled_or_revoked_key_as_device_auth(
         make_app, state, verify_key, serve, capsys):
     base = serve(make_app("required"))
     kid = device_auth.kid_for(device_auth._public_point(verify_key))
-    assert _cli(state, "revoke", kid) == 0
+    assert _cli(state, "revoke", "--", kid) == 0
     capsys.readouterr()
     rc, line, _ = _probe_cli(state, base, TOKEN + "\n", capsys)
     assert (rc, line) == (0, "401 device-auth device_revoked")
@@ -543,11 +543,11 @@ def test_verify_remove_leaves_the_registry_byte_identical_to_phones_only(
     # of revocation: an engine before scopes cannot load either registry.
     with pytest.raises(TypeError, match="scope"):
         _load_like_an_engine_before_scopes(path)
-    assert _cli(state, "revoke", kid) == 0
+    assert _cli(state, "revoke", "--", kid) == 0
     with pytest.raises(TypeError, match="scope"):
         _load_like_an_engine_before_scopes(path)
     capsys.readouterr()
-    assert _cli(state, "verify-remove", "--kid", kid) == 0
+    assert _cli(state, "verify-remove", f"--kid={kid}") == 0
     out = capsys.readouterr()
     assert f"removed {kid}" in out.out
     for line in key_file.read_text().split("-----")[2].strip().splitlines():
@@ -569,12 +569,40 @@ def test_verify_remove_refuses_a_phone_and_an_unknown_kid_leaving_the_file(
     registry.enrol_scoped(Phone().public_x963, scope="verify")
     before = path.read_bytes()
     capsys.readouterr()
-    assert _cli(state, "verify-remove", "--kid", phone.kid) == 1
+    assert _cli(state, "verify-remove", f"--kid={phone.kid}") == 1
     err = capsys.readouterr().err
     assert "full device" in err and "nothing removed" in err
     assert path.read_bytes() == before
     with pytest.raises(device_auth.DeviceAuthError, match="device_not_scoped"):
         registry.remove_scoped(phone.kid)
-    assert _cli(state, "verify-remove", "--kid", Phone().kid) == 1
+    assert _cli(state, "verify-remove", f"--kid={Phone().kid}") == 1
     assert "no enrolled device" in capsys.readouterr().err
     assert path.read_bytes() == before
+
+
+def _dash_leading_phone() -> Phone:
+    """A key whose kid starts with '-' (about one in 64): argparse reads such
+    a word as an option, which made the CLI calls above fail at random."""
+    for _ in range(5000):
+        phone = Phone()
+        if phone.kid.startswith("-"):
+            return phone
+    raise AssertionError("no dash-leading kid in 5000 keys")
+
+
+def test_a_dash_leading_scoped_kid_is_revoked_and_removed_through_the_cli(
+        state, capsys):
+    """The calling forms this file and the consumer's instances.sh use
+    (``revoke -- K``, ``verify-remove --kid=K``) work for the one kid in 64
+    that starts with '-'. Mutation: the separate-word forms (``revoke K``,
+    ``--kid K``) -> argparse exits 2: red."""
+    path = state / "devices.json"
+    registry = device_auth.DeviceRegistry(path)
+    scoped = _dash_leading_phone()
+    registry.enrol_scoped(scoped.public_x963, scope="verify")
+    assert scoped.kid.startswith("-")
+    capsys.readouterr()
+    assert _cli(state, "revoke", "--", scoped.kid) == 0
+    assert _cli(state, "verify-remove", f"--kid={scoped.kid}") == 0
+    assert f"removed {scoped.kid}" in capsys.readouterr().out
+    assert scoped.kid not in path.read_text()

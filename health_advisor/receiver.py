@@ -1985,6 +1985,10 @@ def _enrol_qr(store: "enrol.TokenStore", devices: "device_auth.DeviceAuth",
         raise _enrol_refusal("device_registry_unreadable", 503)
     if existing is not None and not existing.active:
         raise _enrol_refusal("device_revoked", 403)
+    if existing is not None and existing.scope is not None:
+        # A verification key (#652) is never paired: refused before the token
+        # burns, so the QR stays usable by the phone it was minted for.
+        raise _enrol_refusal("device_scope_forbidden", 403)
 
     try:
         store.burn(enrol_id, kid=kid)
@@ -2299,17 +2303,25 @@ class D23BodyAEADApp:
                     return None if value is None else value.decode("latin-1")
 
                 is_upgrade = scope.get("path") == device_auth.ENROL_UPGRADE_PATH
+                # The upgrade route authenticates softly (see above) -- except
+                # that a VERIFIED scoped key (#652) is refused there as
+                # everywhere else, rather than passed on as unsigned. Only a
+                # scope refusal is hard; every other code stays soft, and
+                # without a per-device store the verified kid is still never
+                # used on this route, exactly as before.
+                try:
+                    verified_kid = self.device_auth.authenticate(
+                        _get, method=scope["method"].upper(),
+                        target=target, body=request_body,
+                        path=scope.get("path"))
+                except device_auth.DeviceAuthError as exc:
+                    if is_upgrade and exc.code != "device_scope_forbidden":
+                        verified_kid = None
+                    else:
+                        await self._refusal(send, exc.code, status=exc.status)
+                        return
                 if not is_upgrade or self.device_secrets is not None:
-                    try:
-                        device_kid = self.device_auth.authenticate(
-                            _get, method=scope["method"].upper(),
-                            target=target, body=request_body)
-                    except device_auth.DeviceAuthError as exc:
-                        if is_upgrade:
-                            device_kid = None
-                        else:
-                            await self._refusal(send, exc.code, status=exc.status)
-                            return
+                    device_kid = verified_kid
 
                 # Only the DERIVED auth token in X-Health-Secret -- never a
                 # raw secret -- can move `secret` off the instance value, and
@@ -2557,6 +2569,15 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                           x_health_secret: str | None = Header(default=None)):
             _require_ask_secret(x_health_secret)
             return _enrol_upgrade(devices, request, raw)
+
+        @app.get(device_auth.VERIFY_PROBE_PATH)
+        def verify_probe(x_health_secret: str | None = Header(default=None)):
+            # #652: the one route a verify-scoped device may call. It reads
+            # no vault and no request body, checks the shared secret exactly
+            # as every route above does (after the device layer, never
+            # instead of it), and answers a fixed body.
+            _require_ask_secret(x_health_secret)
+            return dict(device_auth.VERIFY_PROBE_BODY)
 
     if enrol_store is not None:
         @app.post(enrol.ENROL_PATH)

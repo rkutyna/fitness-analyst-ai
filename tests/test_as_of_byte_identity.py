@@ -145,3 +145,33 @@ def test_no_as_of_is_byte_identical_to_the_pre_change_engine(session):
     assert set(got) == set(golden)
     changed = sorted(cid for cid in got if got[cid] != golden[cid])
     assert not changed, f"no-as-of output moved for: {changed}"
+
+
+# The ONLY fields an as-of on the vault's last data day may change, by call id.
+# Production takes each from the wall clock; a pinned as-of takes it from the
+# as-of instead, because a backdated ask has no business knowing today's date.
+#
+# - get_sleep_regularity `end`: the window end defaults to today. The figures
+#   are unchanged, since no night exists between the last data day and today.
+# - get_training_load_detail `end`, `start` (end minus 90 days) and
+#   `live_acwr` (the ACWR computed AT end, whose cold-start status depends on
+#   how many days end lies past the data).
+WALL_CLOCK_FIELDS: dict[str, set[str]] = {
+    "get_sleep_regularity": {"end"},
+    "get_training_load_detail": {"end", "start", "live_acwr"},
+}
+
+
+def test_as_of_on_the_last_data_day_changes_only_wall_clock_fields(session):
+    plain = capture(session)
+    pinned = capture(session.at(END))
+    for cid, _, _ in CALLS:
+        allowed = WALL_CLOCK_FIELDS.get(cid, set())
+        if not allowed:
+            assert pinned[cid] == plain[cid], cid
+            continue
+        a, b = json.loads(plain[cid]), json.loads(pinned[cid])
+        assert {k: v for k, v in a.items() if k not in allowed} == \
+            {k: v for k, v in b.items() if k not in allowed}, cid
+        # The exception is real, and it is the as-of that replaced the clock.
+        assert a["end"] == WALL_CLOCK.isoformat() and b["end"] == END, cid

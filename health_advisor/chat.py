@@ -1551,6 +1551,23 @@ def _no_data_answer(ctx: VaultContext, as_of: str | None) -> dict | None:
         conn.close()
 
 
+def _ctx_at_ask_as_of(ctx: VaultContext, as_of) -> VaultContext:
+    """``ctx`` carrying the ask's as-of, for the tool registry (#596).
+
+    The ask has always read ``as_of`` with ``date.fromisoformat`` (the
+    calendar block), which also takes the basic and week forms
+    ('20260811', '2026-W33-2'); those bind as the canonical day they name.
+    A value it cannot read leaves the context unbound, so the ask fails or
+    answers exactly where it did before rather than earlier."""
+    if as_of is None:
+        return ctx
+    try:
+        day = date.fromisoformat(as_of)
+    except (TypeError, ValueError):
+        return ctx
+    return ctx.at(day.isoformat())
+
+
 def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = None,
                     ledger_path: str | None = None,
                     history: list[dict[str, Any]] | None = None,
@@ -1609,7 +1626,13 @@ def answer_question(ctx: VaultContext, question: str, *, as_of: str | None = Non
                                analyst_query_fn=analyst_query_fn, persist=False,
                                audits=audits)
         else:
-            result = _answer_question_inner(ctx, question, as_of=as_of,
+            # The as-of travels IN the context (downstream issue #596): the
+            # registry, its engine tools, host tools and replacements are all
+            # bound to this context's provider-facing copy, so every tool's
+            # default window and "latest" day answer as of the ask, and an
+            # explicit date after it is clamped.
+            tool_ctx = _ctx_at_ask_as_of(ctx, as_of)
+            result = _answer_question_inner(tool_ctx, question, as_of=as_of,
                                             ledger_path=ledger_path, history=history,
                                             capture=question_capture,
                                             analyst_query_fn=analyst_query_fn,

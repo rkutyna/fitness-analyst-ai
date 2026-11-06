@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone, tzinfo
@@ -443,6 +444,44 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     return out
 
 
+def _fit_declared_facts(out: dict) -> dict:
+    """Keep ``out`` under the ledger's result limit by trimming its declared
+    facts from the END (each builder orders them most useful first).
+
+    A result over ``deepdive_mcp.LEDGER_RESULT_MAX_BYTES`` is elided from the
+    ledger whole, so it publishes nothing at all, not even the figures it
+    carried before it had declared facts. Measured on a live-sized vault:
+    get_impact_volume by day over a year was 197 KB before these facts and
+    484 KB with them, so the facts made the whole answer uncitable. Facts are
+    trimmed (never the tool's own figures) until the result fits; a result
+    whose own figures already exceed the limit gets none, since an elided
+    result publishes nothing anyway. Encoded exactly as the ledger encodes."""
+    facts = out.get(_PUBLISHABLE_FACTS_KEY)
+    if not facts:
+        return out
+    from .deepdive_mcp import LEDGER_RESULT_MAX_BYTES  # deepdive_mcp imports this module
+
+    def fits(n: int) -> bool:
+        trial = {**out, _PUBLISHABLE_FACTS_KEY: facts[:n]}
+        return len(json.dumps(trial, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, default=str).encode("utf-8")) \
+            <= LEDGER_RESULT_MAX_BYTES
+    if fits(len(facts)):
+        return out
+    if not fits(0):
+        out[_PUBLISHABLE_FACTS_KEY] = []
+        return out
+    lo, hi = 0, len(facts)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    out[_PUBLISHABLE_FACTS_KEY] = facts[:lo]
+    return out
+
+
 def _metric_words(metric: str) -> str:
     return metric.replace("_", " ")
 
@@ -662,10 +701,11 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
         _add_presentation(bucket, metric, day, bucket["value"], field="value")
     unit = unit or nz.canonical_unit(metric, None)
     _, unit = V.convert_for_unit_system(None, unit, unit_system)
-    return {"metric": metric, "day": day, "unit": unit,
-            "agg": _agg(metric), "bucket_hours": bucket_hours, "buckets": buckets,
-            _PUBLISHABLE_FACTS_KEY: _intraday_facts(
-                metric, day, unit, _agg(metric), bucket_hours, buckets)}
+    return _fit_declared_facts({
+        "metric": metric, "day": day, "unit": unit,
+        "agg": _agg(metric), "bucket_hours": bucket_hours, "buckets": buckets,
+        _PUBLISHABLE_FACTS_KEY: _intraday_facts(
+            metric, day, unit, _agg(metric), bucket_hours, buckets)})
 
 
 HR_ZONE_DEFAULT_THRESHOLDS = "135,150,155,170"
@@ -2169,7 +2209,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                                             block.get("period"))
                 out["block_comparison"] = comparison
     out[_PUBLISHABLE_FACTS_KEY] = _impact_facts(out, metric_units)
-    return out
+    return _fit_declared_facts(out)
 
 
 @tool
@@ -2952,8 +2992,8 @@ def food_lookup(ctx: VaultContext, query: str = "") -> dict:
         return _empty_catalog(e)
     finally:
         conn.close()
-    return {"items": items, "count": len(items),
-            _PUBLISHABLE_FACTS_KEY: _food_item_facts(items)}
+    return _fit_declared_facts({"items": items, "count": len(items),
+                                _PUBLISHABLE_FACTS_KEY: _food_item_facts(items)})
 
 
 @tool

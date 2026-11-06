@@ -108,8 +108,20 @@ def test_same_metric_and_hk_uuid_is_rejected(conn):
 def test_workout_hk_uuid_is_unique_when_present(conn):
     db.insert_workouts(conn, [_workout(dedupe_key="workout-1", hk_uuid="w-1")])
 
+    # The index itself still refuses a second row for one UUID ...
     with pytest.raises(sqlite3.IntegrityError):
-        db.insert_workouts(conn, [_workout(dedupe_key="workout-2", hk_uuid="w-1")])
+        conn.execute(
+            "INSERT INTO workouts (workout_type, start_utc, end_utc, local_date, "
+            "dedupe_key, hk_uuid) VALUES ('running', '2026-08-20T12:00:00+00:00', "
+            "'2026-08-20T13:00:00+00:00', '2026-08-20', 'workout-2', 'w-1')")
+
+    # ... and insert_workouts never reaches it: a second sighting of the UUID
+    # under another key merges into the stored row (consumer #713), so one
+    # re-sent workout cannot roll back the whole batch.
+    assert db.insert_workouts(
+        conn, [_workout(dedupe_key="workout-2", hk_uuid="w-1")]) == 0
+    assert [tuple(r) for r in conn.execute(
+        "SELECT dedupe_key, hk_uuid FROM workouts")] == [("workout-1", "w-1")]
 
 
 def test_sync_state_is_scoped_by_device_and_type_and_deletions_round_trip(conn):

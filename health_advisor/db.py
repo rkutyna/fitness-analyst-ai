@@ -877,7 +877,9 @@ def workout_key(workout_type: str, start_utc: str, end_utc: str) -> str:
     # Watch", HAE says "GymKit", "GymKit|<name>'s Apple Watch", "<name>'s
     # iPhone "), so including it made every fresh export.zip re-add workouts
     # the receiver had already stored. Type + exact start + exact end
-    # identifies the session.
+    # identifies the session. A stored row's key is fixed at first sighting; a
+    # later sighting of the same hk_uuid under another type merges into it
+    # (consumer #713).
     raw = f"{workout_type}|{start_utc}|{end_utc}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -1138,6 +1140,16 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
     count one session as two or three. `report(row, container)` is called once
     per refusal so the ingest can name what it dropped instead of dropping it
     silently, which is the half of #150 that let this run for two months.
+
+    HealthKit UUID identity (consumer #713). A row whose `hk_uuid` is already
+    stored is the same HealthKit object, whatever type it now carries:
+    - The stored dedupe_key NEVER changes. It is the stable `workout_key` that
+      workout_session_marks, workout_events and consumer code hold, so a
+      renamed session keeps the key of its first sighting.
+    - A named type replaces the stored one; `other` never replaces a name.
+    - When the incoming key matches a DIFFERENT stored row (an export-era row
+      with no UUID) but the UUID matches another row, the UUID wins and the
+      UUID-less row is left exactly as it was.
     """
     sets = ", ".join(f"{c} = COALESCE({c}, excluded.{c})" for c in _WORKOUT_MERGE)
     sql = (
@@ -1204,6 +1216,30 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
                      or merged["elevation_descended_m"] is not None)):
             merged["elevation_source"] = "device_metadata"
         rows.append(merged)
+    # consumer #713: a HealthKit UUID names one immutable HealthKit object, so
+    # it outranks the type-derived key. The phone once sent 71 activity types
+    # as HKWorkoutActivityTypeOther and now names them; a re-sent session then
+    # hashes to a different dedupe_key, and the INSERT hit the hk_uuid unique
+    # index instead of merging, which rolled back the whole batch forever.
+    # Adopting the STORED key sends the row down the ordinary ON CONFLICT
+    # merge (fill holes, never clobber). A named type that differs from the
+    # stored one is remembered and applied after the insert; `other` never
+    # replaces a name, because an old build re-sending must not erase it.
+    renamed: list[tuple[int, str]] = []
+    for r in rows:
+        if not r.get("hk_uuid"):
+            continue
+        stored = conn.execute(
+            "SELECT id, dedupe_key, workout_type FROM workouts WHERE hk_uuid = ?",
+            (r["hk_uuid"],),
+        ).fetchone()
+        if stored is None:
+            continue
+        if stored["dedupe_key"] != r["dedupe_key"]:
+            r["dedupe_key"] = stored["dedupe_key"]
+        if (r["workout_type"] != stored["workout_type"]
+                and r["workout_type"] != "other"):
+            renamed.append((stored["id"], r["workout_type"]))
     # Longest span first so one batch carrying a session and its fragments
     # resolves the same way whatever order they arrive in. list.sort is stable,
     # so equal spans keep the caller's order — and two rows of one type with
@@ -1223,6 +1259,10 @@ def insert_workouts(conn: sqlite3.Connection, rows: Iterable[dict],
     # asserted on by the cross-source dedupe tests.
     before = conn.execute("SELECT COALESCE(MAX(id), 0) FROM workouts").fetchone()[0]
     conn.executemany(sql, rows)
+    for stored_id, named_type in renamed:
+        conn.execute(
+            "UPDATE workouts SET workout_type = ? WHERE id = ?",
+            (named_type, stored_id))
     after = conn.execute("SELECT COALESCE(MAX(id), 0) FROM workouts").fetchone()[0]
     return after - before
 

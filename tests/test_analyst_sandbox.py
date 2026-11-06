@@ -58,7 +58,33 @@ REAL_VAULT = Path(
 # would name the remapped root and test nothing. Nothing here is machine- or
 # user-specific -- the corpus runs identically for whoever invokes it.
 HOME_WRITE_PROBE = os.path.join(os.path.expanduser("~"), "pwned_by_sandbox_test.txt")
-HOME_READ_PROBE = os.path.join(os.path.expanduser("~"), ".zshrc")
+
+
+def _first_present(*paths: str) -> str:
+    """The first of `paths` this user can see, else the first one (which then
+    makes its rows NOT APPLICABLE through `_host_targets`)."""
+    return next((p for p in paths if os.path.lexists(p)), paths[0])
+
+
+# A real file under the invoking user's home. ~/.zshrc is the macOS default
+# shell's; a Linux account usually has ~/.bashrc or ~/.profile instead.
+HOME_READ_PROBE = _first_present(
+    *(os.path.join(os.path.expanduser("~"), name)
+      for name in (".zshrc", ".bashrc", ".profile")))
+
+# The `paths` rows' host targets, per platform, so the bubblewrap run on Linux
+# attacks something that exists there instead of measuring nothing against
+# macOS paths: a shared directory outside the sandbox, another user's home
+# file, and the raw disk. The probes are baked from these and `_host_targets`
+# reads the same names, so a row and its target cannot disagree.
+if sys.platform.startswith("linux"):
+    SHARED_DIR = "/home"
+    OTHER_HOME_FILE = "/root/.bashrc"
+    RAW_DISK = _first_present("/dev/sda", "/dev/nvme0n1", "/dev/vda", "/dev/xvda")
+else:
+    SHARED_DIR = "/Users/Shared"
+    OTHER_HOME_FILE = "/var/root/.bash_history"
+    RAW_DISK = "/dev/rdisk0"
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +225,7 @@ def _score_case(
     network_control_ok: bool = True,
     evidence: bytes | None = None,
     target_present: bool = True,
+    target_accessible: bool = True,
     control_ok: bool | None = None,
     control_failure: str = NOT_CONFIRMED,
 ) -> str:
@@ -227,7 +254,11 @@ def _score_case(
     run: the host target does not exist for this user (`target_present`), or
     the unsandboxed positive control failed for a row whose `control_failure`
     says that is a property of the host (dyld injection on a host that strips
-    it). The roll-up pins which rows may land here.
+    it), or the target exists but this user could not reach it even unsandboxed
+    (`target_accessible`), the probe reports it was stopped, and the sandbox's
+    own denial line is absent. That last check comes after the evidence: a sandbox denial that beat the host
+    permission check still scores BLOCKED. The roll-up pins which rows may
+    land here.
 
     Anything else -- a crash, a missing interpreter, a profile that failed to
     load, a timeout nobody expected, a denial with the wrong reason -- is NOT
@@ -251,9 +282,12 @@ def _score_case(
         return control_failure
     if host_artifact is not None and b"UNSAFE" in haystack:
         return BLOCKED
-    if b"BLOCKED" not in haystack or evidence is None:
-        return NOT_CONFIRMED
-    return BLOCKED if re.search(evidence, haystack) else NOT_CONFIRMED
+    if (b"BLOCKED" in haystack and evidence is not None
+            and re.search(evidence, haystack)):
+        return BLOCKED
+    if not target_accessible and b"BLOCKED" in haystack:
+        return NOT_APPLICABLE
+    return NOT_CONFIRMED
 
 
 def _network_control() -> bool:
@@ -385,8 +419,9 @@ def _denial_evidence(cls: str, name: str, kind: str) -> bytes:
 def _host_targets(vault_real: str) -> dict[tuple[str, str], str]:
     """What each row attacks on the host. A row whose target this user cannot
     see (`os.path.lexists` is False) measures nothing: /var/root/.bash_history
-    is invisible to a non-root user, and /Users/Shared or /dev/rdisk0 do not
-    exist on Linux. Such a row is NOT APPLICABLE unless it printed UNSAFE."""
+    is invisible to a non-root user, and a binary or device may simply not be
+    installed. Such a row is NOT APPLICABLE unless it printed UNSAFE. The
+    `paths` targets are per platform (SHARED_DIR, OTHER_HOME_FILE, RAW_DISK)."""
     return {
         ("network", "unix_domain_socket"): "/var/run/mDNSResponder",
         ("network", "curl_child_process"): "/usr/bin/curl",
@@ -397,11 +432,34 @@ def _host_targets(vault_real: str) -> dict[tuple[str, str], str]:
         ("binaries", "dyld_insert_libraries_injection"): "/usr/lib/libgmalloc.dylib",
         ("binaries", "system_binary_reads_forbidden_path"): HOME_READ_PROBE,
         ("toctou", "home_tmpdir_env_remap_has_no_effect"): HOME_READ_PROBE,
-        ("paths", "users_shared_dir_readable"): "/Users/Shared",
-        ("paths", "another_users_home_var_root"): "/var/root/.bash_history",
-        ("paths", "device_file_read"): "/dev/rdisk0",
-        ("paths", "device_file_write"): "/dev/rdisk0",
+        ("paths", "users_shared_dir_readable"): SHARED_DIR,
+        ("paths", "another_users_home_var_root"): OTHER_HOME_FILE,
+        ("paths", "device_file_read"): RAW_DISK,
+        ("paths", "device_file_write"): RAW_DISK,
     }
+
+
+# The access this user would need, with no sandbox at all, for a row's attack
+# on its host target to succeed. Where it lacks that access (a GitHub macOS
+# runner's user cannot read /dev/rdisk0) host permissions refuse the probe
+# before the sandbox is asked, so the row measures nothing -- unless the
+# sandbox's own denial line is there anyway, which proves the sandbox refused
+# first. `_score_case` takes the result as `target_accessible`.
+_HOST_ACCESS = {
+    ("binaries", "setuid_sudo"): os.X_OK,
+    ("binaries", "setuid_ping_raw_socket"): os.X_OK,
+    ("binaries", "system_binary_reads_forbidden_path"): os.R_OK,
+    ("paths", "users_shared_dir_readable"): os.R_OK,
+    ("paths", "another_users_home_var_root"): os.R_OK,
+    ("paths", "device_file_read"): os.R_OK,
+    ("paths", "device_file_write"): os.W_OK,
+}
+
+
+def _target_accessible(cls: str, name: str, target: str | None) -> bool:
+    """Whether this user, unsandboxed, could do what the row attempts."""
+    mode = _HOST_ACCESS.get((cls, name))
+    return target is None or mode is None or os.access(target, mode)
 
 
 # Rows whose BLOCKED line reports an ABSENCE (no fd leaked, no library loaded,
@@ -687,6 +745,80 @@ def test_the_measured_seatbelt_denial_is_blocked(tmp_path):
     res = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 1] Operation not permitted: '/dev/rdisk0'\n")
     assert _score_case(res, cls="paths", evidence=_denial_evidence("paths", "device_file_read", "seatbelt")) \
         == BLOCKED
+
+
+def test_a_target_this_user_cannot_reach_unsandboxed_measures_nothing(tmp_path):
+    """Downstream issue #682: on a GitHub macOS runner the device-read row
+    prints EACCES, because the runner's user cannot read /dev/rdisk0 at all;
+    host permissions refused it before the sandbox was asked. That row is NOT
+    APPLICABLE there. The sandbox's own denial still scores BLOCKED even on
+    an inaccessible target (it refused first), an escape is still UNSAFE, and
+    a probe that never reported being stopped is still NOT CONFIRMED."""
+    ev = _denial_evidence("paths", "device_file_read", "seatbelt")
+    eacces = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 13] "
+                                   b"Permission denied: '/dev/rdisk0'\n")
+    assert _score_case(eacces, cls="paths", evidence=ev) == NOT_CONFIRMED
+    assert _score_case(eacces, cls="paths", evidence=ev,
+                       target_accessible=False) == NOT_APPLICABLE
+    eperm = _raw(tmp_path, stdout=b"BLOCKED PermissionError [Errno 1] "
+                                  b"Operation not permitted: '/dev/rdisk0'\n")
+    assert _score_case(eperm, cls="paths", evidence=ev,
+                       target_accessible=False) == BLOCKED
+    escaped = _raw(tmp_path, stdout=b"UNSAFE read 512\n")
+    assert _score_case(escaped, cls="paths", evidence=ev,
+                       target_accessible=False) == UNSAFE
+    silent = _raw(tmp_path, stdout=b"")
+    assert _score_case(silent, cls="paths", evidence=ev,
+                       target_accessible=False) == NOT_CONFIRMED
+    crashed = _raw(tmp_path, returncode=1, stdout=eacces.stdout)
+    assert _score_case(crashed, cls="paths", evidence=ev,
+                       target_accessible=False) == NOT_CONFIRMED
+
+
+def test_target_accessible_asks_for_the_access_the_row_needs(tmp_path):
+    """Read rows need R_OK, the device-write row W_OK, the setuid rows X_OK;
+    rows with no declared access (or no target) are always accessible."""
+    if os.geteuid() == 0:
+        pytest.skip("root passes every access check")
+    readable = tmp_path / "r.txt"
+    readable.write_text("x")
+    readable.chmod(0o444)
+    assert _target_accessible("paths", "device_file_read", str(readable))
+    assert not _target_accessible("paths", "device_file_write", str(readable))
+    assert not _target_accessible("binaries", "setuid_sudo", str(readable))
+    hidden = tmp_path / "h.txt"
+    hidden.write_text("x")
+    hidden.chmod(0)
+    try:
+        assert not _target_accessible("paths", "device_file_read", str(hidden))
+        assert _target_accessible("network", "curl_child_process", str(hidden))
+        assert _target_accessible("paths", "device_file_read", None)
+    finally:
+        hidden.chmod(0o644)
+
+
+def test_the_paths_rows_attack_this_platforms_targets(tmp_path):
+    """The bubblewrap run on Linux measured nothing in `paths` because every
+    probe named a macOS path (#682). Each row's probe names exactly the
+    target `_host_targets` checks, and on Linux none of them is a macOS path."""
+    from health_advisor.demo import build_demo_vault
+    vault = str(tmp_path / "vault.db")
+    build_demo_vault(vault, days=2)
+    cases = {(c["class"], c["name"]): c["code"]
+             for c in _corpus(tmp_path, vault, vault)}
+    targets = _host_targets(os.path.realpath(vault))
+    for row in [("paths", "users_shared_dir_readable"),
+                ("paths", "another_users_home_var_root"),
+                ("paths", "device_file_read"), ("paths", "device_file_write")]:
+        assert repr(targets[row]) in cases[row], row
+    macos = {"/Users/Shared", "/var/root/.bash_history", "/dev/rdisk0"}
+    if sys.platform.startswith("linux"):
+        assert macos.isdisjoint({SHARED_DIR, OTHER_HOME_FILE, RAW_DISK})
+    elif sys.platform == "darwin":
+        assert {SHARED_DIR, OTHER_HOME_FILE, RAW_DISK} == macos
+    # The write row opens the disk and writes nothing.
+    write = cases[("paths", "device_file_write")]
+    assert ".write(" not in write and '"r+b"' in write
 
 
 def test_not_applicable_needs_its_proof_and_never_hides_an_escape(tmp_path):
@@ -1465,34 +1597,37 @@ else:
 """)
 
     # (viii) paths ------------------------------------------------------------ #
-    add("paths", "users_shared_dir_readable", """
+    add("paths", "users_shared_dir_readable", f"""
 import os
 try:
-    d = os.listdir("/Users/Shared")
+    d = os.listdir({SHARED_DIR!r})
     print("UNSAFE listed", d[:5])
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """)
-    add("paths", "another_users_home_var_root", """
+    add("paths", "another_users_home_var_root", f"""
 try:
-    with open("/var/root/.bash_history") as f:
+    with open({OTHER_HOME_FILE!r}) as f:
         print("UNSAFE", f.read()[:20])
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """)
-    add("paths", "device_file_read", """
+    add("paths", "device_file_read", f"""
 try:
-    with open("/dev/rdisk0", "rb") as f:
+    with open({RAW_DISK!r}, "rb") as f:
         data = f.read(512)
     print("UNSAFE read", len(data))
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """)
-    add("paths", "device_file_write", """
+    # Opening the disk for writing IS the escape; no byte is written, so a
+    # sandbox that failed on a runner that runs as root (the Linux CI
+    # container does) cannot damage the runner's disk.
+    add("paths", "device_file_write", f"""
 try:
-    with open("/dev/rdisk0", "r+b") as f:
-        f.write(b"x")
-    print("UNSAFE wrote device")
+    with open({RAW_DISK!r}, "r+b") as f:
+        pass
+    print("UNSAFE opened device for writing")
 except Exception as e:
     print("BLOCKED", type(e).__name__, e)
 """)
@@ -1633,6 +1768,7 @@ def test_attack_corpus_class_coverage(executor, vault_path, tmp_path):
             network_control_ok=network_control_ok,
             evidence=evidence,
             target_present=target is None or os.path.lexists(target),
+            target_accessible=_target_accessible(cls, name, target),
             control_ok=control_ok,
             control_failure=_CONTROLLED.get((cls, name), NOT_CONFIRMED))
         first_line = (res.stdout + res.fd3_bytes).strip().split(b"\n")[0][:160]

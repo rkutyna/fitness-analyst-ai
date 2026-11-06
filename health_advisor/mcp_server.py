@@ -798,7 +798,10 @@ def _workout_window_facts(conn, active: str, start: str, end: str, *,
     """
     window = f"workouts/{start}:{end}"
     scope = f"from {start} to {end}"
+    # ``restates`` names the result leaf each count repeats, so the fact's
+    # provenance includes the figure a reader of the result sees.
     facts = [{"id": f"{window}/all/count", "value": total,
+              "restates": "$.result.total_in_range",
               "label": f"Number of workouts of every type recorded {scope}"}]
     dist_unit = "km" if metric_units else "mi"
     # A question about "strength sessions" spans every strength type the vault
@@ -811,10 +814,11 @@ def _workout_window_facts(conn, active: str, start: str, end: str, *,
             "value": sum(row["n"] for row in strength),
             "label": f"Number of strength workouts of any strength type "
                      f"recorded {scope}"})
-    for row in type_counts:
+    for index, row in enumerate(type_counts):
         kind = row["workout_type"]
         base = f"{window}/{kind}"
         facts.append({"id": f"{base}/count", "value": row["n"],
+                      "restates": f"$.result.workout_counts[{index}].count",
                       "label": f"Number of {kind} workouts recorded {scope}"})
         for name, column, unit in (("duration", "duration_min", "min"),
                                    ("distance", "distance_mi", dist_unit)):

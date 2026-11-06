@@ -118,11 +118,11 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "list_workouts": {
-        "UM": """
-            .count .total_in_range .workout_counts[].count .workouts[].energy_kcal
-        """,
+        # .count is how many rows came back, truncated by ``limit``; the
+        # range's count is total_in_range (published), so .count is withheld
+        # on purpose: citing it would answer "how many" with the page size.
         "DW": """
-            .workouts[].avg_heart_rate
+            .count .workouts[].avg_heart_rate
         """,
         "ST": """
             .excluded_count .limit .workouts[].n_segments

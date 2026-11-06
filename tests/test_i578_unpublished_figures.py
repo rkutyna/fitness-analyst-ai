@@ -130,3 +130,54 @@ def test_a_restated_path_that_does_not_hold_the_figure_drops_the_entry(
     assert set(facts) == {PUB("meal/plain")}
     assert facts[PUB("meal/plain")]["source"] == {
         "sequence": 1, "path": "$.result.publishable_facts[1].value"}
+
+
+# --- item 5: list_workouts counts and energy ----------------------------------
+
+WINDOW = "workouts/2026-06-03:2026-08-31"
+
+
+def test_list_workouts_counts_name_the_leaves_they_restate(vault):
+    ledger = _ledger(vault, "list_workouts", {"limit": 3})
+    facts = fact_template.build_declared_facts(ledger)
+    counts = {key: (fact["value"], fact["source"].get("paths"))
+              for key, fact in facts.items() if key.endswith("/count")}
+    assert counts == {
+        PUB(f"{WINDOW}/all/count"): (65, ["$.result.total_in_range"]),
+        PUB(f"{WINDOW}/cycling/count"):
+            (12, ["$.result.workout_counts[0].count"]),
+        PUB(f"{WINDOW}/running/count"):
+            (31, ["$.result.workout_counts[1].count"]),
+        PUB(f"{WINDOW}/traditional_strength_training/count"):
+            (11, ["$.result.workout_counts[2].count"]),
+        PUB(f"{WINDOW}/walking/count"):
+            (11, ["$.result.workout_counts[3].count"]),
+    }
+
+
+def test_list_workouts_rows_publish_their_energy(vault):
+    ledger = _ledger(vault, "list_workouts", {"limit": 3})
+    facts = fact_template.build_workout_facts(ledger)
+    energy = {key: (fact["value"], fact["unit"], fact["source"]["path"])
+              for key, fact in facts.items() if key.endswith("energy_kcal")}
+    assert energy == {
+        fact_template.workout_fact_key(
+            "2026-08-31|traditional_strength_training", "energy_kcal"):
+            (117.9, "kcal", "$.result.workouts[0].energy_kcal"),
+        fact_template.workout_fact_key("2026-08-27|running", "energy_kcal"):
+            (397.7, "kcal", "$.result.workouts[1].energy_kcal"),
+        fact_template.workout_fact_key("2026-08-25|running", "energy_kcal"):
+            (334.4, "kcal", "$.result.workouts[2].energy_kcal"),
+    }
+
+
+def test_list_workouts_page_size_stays_unpublished(vault):
+    """``count`` is the number of rows ``limit`` let through (3 here), not the
+    range's 65: it must never be citable as "how many workouts"."""
+    ledger = _ledger(vault, "list_workouts", {"limit": 3})
+    assert ledger[0]["result"]["count"] == 3
+    unpublished = _unpublished_paths(ledger)
+    assert unpublished == {
+        "$.result.count", "$.result.limit", "$.result.excluded_count",
+        *(f"$.result.workouts[{i}].{field}" for i in range(3)
+          for field in ("avg_heart_rate", "n_segments"))}

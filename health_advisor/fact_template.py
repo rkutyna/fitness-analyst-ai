@@ -1319,6 +1319,11 @@ _WORKOUT_ROW_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("max_heart_rate", "max_heart_rate", "bpm"),
     ("distance_mi", "distance_mi", "mi"),
     ("distance_km", "distance_km", "km"),
+    # Only list_workouts rows carry energy, in the vault's declared unit; no
+    # other workout tool restates it, so no rounding conflict can withhold it
+    # (downstream issue #578).
+    ("energy_kcal", "energy_kcal", "kcal"),
+    ("energy_kj", "energy_kj", "kJ"),
 )
 # A row's pace is computed by ``list_workouts`` from the stored duration and
 # distance (never from the rounded ones the row shows) and published here as
@@ -1521,7 +1526,7 @@ def build_workout_facts(ledger: list[dict]) -> dict[str, dict]:
     publishes an allowlisted set of their fields instead, keyed by the
     workout's own identity (:func:`_workout_identity` --
     date, type, and a start time only where two sessions of one type share a
-    date) -- duration, distance, max heart rate, the session's own
+    date) -- duration, distance, energy, max heart rate, the session's own
     jog-minute count, and the longest continuous running block, wherever a
     call actually returned one. A field a tool did not return for a session
     is simply absent, never invented. Duplicate reports of the same

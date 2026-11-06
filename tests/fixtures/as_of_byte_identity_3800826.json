@@ -37,7 +37,7 @@
  },
  "get_briefing/window": {
   "bytes": 6306,
-  "sha256": "2da1bad82e4047a691ee5d244299076516404d48c3131c7d3de088590c2c75ac"
+  "sha256": "baabd655fcf4c7bd0fa3f2587c3f28b9fc27bd87f63bf36f3aab1dce5b86e1c5"
  },
  "get_daily_series": {
   "bytes": 7771,

@@ -86,6 +86,7 @@ MEASURED_BASE = {
     "hr_ceiling_for_qualifying": 150.0,
     "longest_block_min": 4.0,
     "qualified_block_min": 4.0,
+    "qualified_is_longest": True,
     "sessions": [{
         "avg_hr_all_jog": 140.0,
         "avg_hr_longest_block": 140.0,
@@ -93,6 +94,7 @@ MEASURED_BASE = {
         "duration_min": 4.0,
         "longest_block_min": 4.0,
         "qualified_block_min": 4.0,
+        "qualified_is_longest": True,
         "reps": [{
             "bridged": False,
             "end_utc": "2026-07-02T12:03:40Z",
@@ -118,6 +120,7 @@ def test_unsynced_running_session_publishes_none_not_zero(conn, tools):
         "duration_min": 40.0,
         "longest_block_min": None,
         "qualified_block_min": None,
+        "qualified_is_longest": None,
         "unbridged_min": None,
         "avg_hr_longest_block": None,
         "avg_hr_all_jog": None,
@@ -198,6 +201,7 @@ def test_indoor_running_session_publishes_none_as_not_recorded(conn, tools):
         "duration_min": 40.0,
         "longest_block_min": None,
         "qualified_block_min": None,
+        "qualified_is_longest": None,
         "unbridged_min": None,
         "avg_hr_longest_block": None,
         "avg_hr_all_jog": None,

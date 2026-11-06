@@ -2029,6 +2029,89 @@ def gathered_data_status_guidance(facts: dict[str, dict]) -> str:
     return _GATHERED_DATA_GUIDANCE_TEMPLATE % _GATHERED_DATA_STATUS_KEY
 
 
+# consumer #685 (last Done-when line). get_block_structure, get_impact_volume
+# and get_run_form publish null plus a leaf ``samples`` for a session or day
+# whose minute-by-minute data is not measurable: "not_synced" (watch data not
+# in the vault yet) or "not_recorded" (indoor or machine session, never
+# recorded). Under the closed fact set nothing carries that state, so the model
+# could only say "0 min" or "no data". These two status facts carry it, with
+# the same shape and steering as the gathered-data status above.
+_SAMPLES_STATUS_KEY = "status:samples_not_synced"
+_SAMPLES_NOT_RECORDED_KEY = "status:samples_not_recorded"
+
+_SAMPLES_NOT_SYNCED_SENTENCE = (
+    "That session's minute-by-minute data hasn't synced to your vault yet, so "
+    "its continuous blocks and jog minutes can't be measured. They'll be "
+    "measured once your watch finishes syncing."
+)
+_SAMPLES_NOT_RECORDED_SENTENCE = (
+    "That session was recorded indoors or on a machine, which records no "
+    "minute-by-minute distance, so its continuous blocks and jog minutes can't "
+    "be measured."
+)
+# Ledger ``samples`` value -> (fact key, user-facing sentence).
+_SAMPLES_STATUSES = (
+    ("not_synced", _SAMPLES_STATUS_KEY, _SAMPLES_NOT_SYNCED_SENTENCE),
+    ("not_recorded", _SAMPLES_NOT_RECORDED_KEY,
+     _SAMPLES_NOT_RECORDED_SENTENCE),
+)
+
+
+def _leaf_samples_values(value, found: set) -> None:
+    """Collect every leaf ``samples`` string under ``value``, at any depth."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "samples" and isinstance(child, str):
+                found.add(child)
+            else:
+                _leaf_samples_values(child, found)
+    elif isinstance(value, list):
+        for child in value:
+            _leaf_samples_values(child, found)
+
+
+def build_samples_status_facts(ledger) -> dict[str, dict]:
+    """Publish each samples status fact iff some result carries that value.
+
+    Walks every non-elided ledger record's ``result`` at any depth (dicts and
+    lists), so a session nested in ``sessions[0]`` is found as readily as one at
+    the top level. A status is published once, whatever the number of sessions
+    carrying it: the sentence describes the state, not a count.
+    """
+    if not isinstance(ledger, list):
+        return {}
+    seen: set = set()
+    for record in ledger:
+        if not isinstance(record, dict) or record.get("result_elided"):
+            continue
+        _leaf_samples_values(record.get("result"), seen)
+    out: dict[str, dict] = {}
+    for value, key, sentence in _SAMPLES_STATUSES:
+        if value in seen:
+            out[key] = {"key": key, "display": sentence, "value": value}
+    return out
+
+
+_SAMPLES_GUIDANCE_TEMPLATE = (
+    "SAMPLES STATUS: one of this turn's sessions has minute-by-minute data "
+    "that is not measurable yet. Use {%s} as the sentence saying so; never "
+    "state a 0 for that session's blocks or jog minutes."
+)
+
+
+def samples_status_guidance(facts: dict[str, dict]) -> str:
+    """Instruct the model to narrate a samples status verbatim, per key.
+
+    Registered in :data:`STEERING_TEXTS` alongside the gathered-data guidance.
+    Returns one line per samples status fact present, or "" when there is none.
+    """
+    if not isinstance(facts, dict):
+        return ""
+    lines = [_SAMPLES_GUIDANCE_TEMPLATE % key
+             for _, key, _ in _SAMPLES_STATUSES if key in facts]
+    return "\n".join(lines)
+
+
 def citation_fact_key(sequence, doc_id: str, chunk_ix) -> str:
     """Return the exact slot key for one Python-retrieved passage."""
     enc = lambda value: quote(str(value), safe="-_.~:")
@@ -2829,7 +2912,10 @@ def fit_sentence_edge(display: str, following: str, *,
 # defect with one right answer, so the renderer drops the slot and the prose
 # copy stays. The scan is untouched: the slot is still in ``placeholders``, so
 # whatever verifies the status (``gathered_data_uncited``) still sees it used.
-_STATUS_FACT_KEYS = frozenset({_GATHERED_DATA_STATUS_KEY, _EVIDENCE_STATUS_KEY})
+_STATUS_FACT_KEYS = frozenset({
+    _GATHERED_DATA_STATUS_KEY, _EVIDENCE_STATUS_KEY,
+    _SAMPLES_STATUS_KEY, _SAMPLES_NOT_RECORDED_KEY,
+})
 _ABSENT = "\x00"
 
 
@@ -2979,6 +3065,8 @@ refuse_template = template_refused
 # without listing it here leaves it unguarded: keep the two together.
 STEERING_TEXTS: tuple[str, ...] = (
     _GATHERED_DATA_GUIDANCE_TEMPLATE % _GATHERED_DATA_STATUS_KEY,
+    _SAMPLES_GUIDANCE_TEMPLATE % _SAMPLES_STATUS_KEY,
+    _SAMPLES_GUIDANCE_TEMPLATE % _SAMPLES_NOT_RECORDED_KEY,
     _DECLARED_GUIDANCE_TEMPLATE % (_DECLARED_KEY_PREFIX + "..."),
     _COLD_START_GUIDANCE_HEAD,
     _COLD_START_GUIDANCE_LINE % ("...", "..."),

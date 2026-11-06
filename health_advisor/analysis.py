@@ -226,8 +226,14 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
       unbridged_min          longest chain of jog buckets, bridge rule NOT applied
       bridged_min            longest chain with the bridge rule applied
       qualified_min          longest bridged block whose mean HR is at or below
-                             the vault-configured ceiling, else None.
+                             the vault-configured ceiling, else None. It can be
+                             a different, shorter block than bridged_min when
+                             the longest one runs over the ceiling.
                              THIS is the dial P2-1 made governing.
+      qualified_is_longest   True when the qualifying block IS the longest block
+                             (same start and end), False when it is a different
+                             block, None when qualified_min is None. Identity,
+                             not minutes: two blocks can tie in minutes.
       avg_hr_longest_block   mean HR over the longest bridged block
       reps                   every block, longest first
       hr                     "not_synced" only when there are buckets and none
@@ -290,12 +296,18 @@ def longest_block_from_buckets(buckets: list[dict], bridge: bool = True,
         hr_ceiling = 150.0  # legacy default for direct pure-function callers
     qualified = [r for r in reps
                  if r["mean_hr"] is not None and r["mean_hr"] <= hr_ceiling]
+    qualifying = qualified[0] if qualified else None
     out = {
         "unbridged_min": mx.r(plain_len * bm, 1),
         "bridged_min": best["minutes"] if best else 0.0,
         # None, not 0.0: "no block qualified" and "a user ran for zero minutes" are
         # different facts and the ramp treats them differently.
-        "qualified_min": qualified[0]["minutes"] if qualified else None,
+        "qualified_min": qualifying["minutes"] if qualifying else None,
+        # Identity of the block, not its minutes: two different blocks can tie.
+        "qualified_is_longest": (
+            None if qualifying is None else
+            (qualifying["start_utc"], qualifying["end_utc"])
+            == (best["start_utc"], best["end_utc"])),
         "avg_hr_longest_block": best["mean_hr"] if best else None,
         "reps": reps,
     }

@@ -81,7 +81,7 @@ def test_only_an_elided_result_gets_the_python_sentence(ctx, tmp_path,
     assert [(r["tool_name"], r["result_elided"]) for r in records] == \
         [("get_daily_series", True)]
     assert result["text"] == WANT
-    # "status", not "fallback" (Roger, 2026-11-06): a kept Python answer.
+    # "status", not "fallback" (downstream #578 decision, 2026-11-06): a kept answer.
     assert result["mode"] == "status"
     assert result["verification"]["cause"] == "result_elided"
     assert result["verification"]["ok"] is False

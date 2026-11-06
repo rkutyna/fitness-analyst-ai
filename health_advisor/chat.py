@@ -3031,7 +3031,7 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
             withheld_fact_keys))
         _record_attempt(capture, 1, _RESULT_ELIDED_ANSWER, None,
                         elided_verification, None, ledger)
-        # Mode "status", not "fallback" (Roger, 2026-11-06): this is a
+        # Mode "status", not "fallback" (downstream #578, 2026-11-06): this is a
         # Python-authored answer the user should keep, like the no-data
         # reply, not a withheld narration. Clients render "status" as a kept
         # answer; the ask log's fallback rate counts only "fallback".

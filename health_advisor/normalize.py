@@ -29,6 +29,8 @@ import re
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
+from . import unit_factors as _uf
+
 # --------------------------------------------------------------------------- #
 # Datetime parsing — Apple export format: '2024-01-15 08:30:00 -0400'
 # --------------------------------------------------------------------------- #
@@ -620,12 +622,12 @@ class UnitError(ValueError):
 UNIT_FAMILIES: dict[str, dict[str, tuple[float, float]]] = {
     "length": {                                    # base: metre
         "m": (1.0, 0.0), "km": (1000.0, 0.0), "cm": (0.01, 0.0), "mm": (0.001, 0.0),
-        "in": (0.0254, 0.0), "ft": (0.3048, 0.0), "yd": (0.9144, 0.0),
+        "in": (0.0254, 0.0), "ft": (_uf.FT_TO_M, 0.0), "yd": (0.9144, 0.0),
         "mi": (1609.344, 0.0),
     },
     "mass": {                                      # base: kilogram
         "kg": (1.0, 0.0), "g": (0.001, 0.0), "mg": (1e-6, 0.0),
-        "lb": (0.45359237, 0.0), "oz": (0.028349523125, 0.0),
+        "lb": (_uf.LB_TO_KG, 0.0), "oz": (0.028349523125, 0.0),
         "st": (6.35029318, 0.0),
     },
     "energy": {                                    # base: kilocalorie
@@ -640,7 +642,8 @@ UNIT_FAMILIES: dict[str, dict[str, tuple[float, float]]] = {
     },
     "speed": {                                     # base: metre/second
         "m/s": (1.0, 0.0), "km/hr": (1000.0 / 3600.0, 0.0), "kph": (1000.0 / 3600.0, 0.0),
-        "mi/hr": (0.44704, 0.0), "mph": (0.44704, 0.0), "ft/s": (0.3048, 0.0),
+        "mi/hr": (_uf.MPH_TO_M_PER_S, 0.0), "mph": (_uf.MPH_TO_M_PER_S, 0.0),
+        "ft/s": (_uf.FT_TO_M, 0.0),
     },
     "time": {                                      # base: minute
         "min": (1.0, 0.0), "s": (1.0 / 60.0, 0.0), "sec": (1.0 / 60.0, 0.0),

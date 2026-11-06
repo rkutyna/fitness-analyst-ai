@@ -27,6 +27,7 @@ from typing import Any, Iterable, Sequence
 from . import db
 from . import hr_zones
 from . import metrics
+from . import unit_factors as _uf
 
 
 # D3 raw-series contract.  Keep the reason beside each entry so adding a
@@ -259,12 +260,12 @@ UNIT_CONVERSION_FACTORS: dict[str, float] = {
     "energy_kcal_to_kj": 4.184,
     "pace_min_per_mi_to_min_per_km": 1.0 / 1.609344,
     "speed_mi_per_hr_to_km_per_hr": 1.609344,
-    "mass_lb_to_kg": 0.45359237,
+    "mass_lb_to_kg": _uf.LB_TO_KG,
     "temperature_degF_to_degC": 5.0 / 9.0,
     "temperature_degF_to_degC_offset": -32.0,
-    "length_ft_to_m": 0.3048,
+    "length_ft_to_m": _uf.FT_TO_M,
     "length_in_to_cm": 2.54,
-    "speed_ft_per_s_to_m_per_s": 0.3048,
+    "speed_ft_per_s_to_m_per_s": _uf.FT_TO_M,
 }
 
 # Canonical imperial spellings that have a metric presentation twin. The

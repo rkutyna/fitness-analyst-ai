@@ -1832,9 +1832,9 @@ def build_vault(
                 "INSERT INTO metric_source_months (metric, month, source, n) "
                 "VALUES (?, ?, ?, ?)",
                 source.execute(
-                    "SELECT metric, substr(local_date, 1, 7), source, COUNT(*) "
+                    "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
                     "FROM records "
-                    "GROUP BY metric, substr(local_date, 1, 7), source"),
+                    "GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '')"),
             )
         table_counts["metric_source_months"] = target.execute(
             "SELECT COUNT(*) FROM metric_source_months").fetchone()[0]

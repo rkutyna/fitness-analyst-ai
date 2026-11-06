@@ -84,9 +84,11 @@ engine that predates scopes refuses to load a registry holding one
 (``Device(**raw)`` is strict): it fails closed instead of treating a verify
 key as a phone. Revocation (``revoke``) and the timestamp window apply to a
 scoped key exactly as to a phone's. Because ``revoke`` keeps the entry, rolling
-an instance back past scopes first needs ``verify-remove --kid K``, which
+an instance back past scopes first needs ``verify-remove --kid=K``, which
 deletes a scoped entry outright (and refuses a phone's), leaving the registry
-byte-identical to one that never held it.
+byte-identical to one that never held it. A kid is base64url and about one
+in 64 starts with ``-``, which argparse reads as an option: pass it as
+``--kid=K`` (and ``revoke -- K``), never as a separate word.
 
 Seams left for later items: the enrolment route's body carries a version so a
 QR-token enrolment can share this registry; ``Device.via`` records which
@@ -854,7 +856,8 @@ def main(argv: list[str] | None = None) -> int:
         help="delete one verify-scoped entry from the registry outright (run "
              "before rolling an instance back to an engine older than #652, "
              "which cannot load a scoped entry); refuses a phone's key")
-    vremove.add_argument("--kid", required=True)
+    vremove.add_argument("--kid", required=True,
+                         help="pass as --kid=K: a kid can start with '-'")
     args = parser.parse_args(argv)
     if args.command == "verify-probe":
         return _verify_probe(args.key_file, args.base_url, sys.stdin)

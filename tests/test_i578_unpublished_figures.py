@@ -471,3 +471,20 @@ def test_a_long_by_day_range_keeps_its_most_recent_days():
         "result_elided": False, "result": result}])
     assert PUB("impact/2026-05-30/walk_minutes") in facts      # the last day
     assert PUB("impact/2026-01-01/walk_minutes") not in facts  # beyond 400
+
+
+def test_compare_periods_with_an_open_window_answers_and_declares_nothing(tmp_path):
+    """period 'all' has no start or end: the tool still answers (it raised a
+    TypeError in the fact builder) and publishes no two-window fact."""
+    from health_advisor.demo import build_demo_vault
+    from health_advisor.context import VaultContext
+    from health_advisor import mcp_server as S
+    path = tmp_path / "v.db"
+    build_demo_vault(path, days=60)
+    ctx = VaultContext.local(path, user_id="local")
+    for a, b in (("30d", "all"), ("all", "30d")):
+        out = S.compare_periods(ctx, "resting_heart_rate", a, b)
+        assert "mean_delta" in out
+        assert out["publishable_facts"] == []
+    closed = S.compare_periods(ctx, "resting_heart_rate", "7d", "30d")
+    assert len(closed["publishable_facts"]) == 2

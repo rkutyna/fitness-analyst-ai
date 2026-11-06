@@ -450,3 +450,24 @@ def test_a_restated_presentation_must_equal_the_display(restates):
         return fact_template.build_declared_facts([record])
     assert set(facts("335 kcal")) == {PUB("k")}
     assert facts("336 kcal") == {}
+
+
+def test_a_long_by_day_range_keeps_its_most_recent_days():
+    """The declared-fact builder keeps the first 400 entries of a result;
+    impact facts come newest first so a long range drops the oldest days."""
+    from datetime import date, timedelta
+    from health_advisor import mcp_server
+    first = date(2026, 1, 1)
+    periods = [{"period": (first + timedelta(days=i)).isoformat(),
+                "no_data": False, "partial": False, "jog_miles": 1.0,
+                "jog_pace_min_per_mi": 10.0, "walk_miles": 1.0,
+                "walk_minutes": 20.0, "jog_change_pct": None}
+               for i in range(150)]
+    result = {"by": "day", "periods": periods}
+    result[fact_template.DECLARED_FACTS_RESULT_KEY] = mcp_server._impact_facts(
+        result, metric_units=False)
+    facts = fact_template.build_declared_facts([{
+        "sequence": 1, "tool_name": "get_impact_volume",
+        "result_elided": False, "result": result}])
+    assert PUB("impact/2026-05-30/walk_minutes") in facts      # the last day
+    assert PUB("impact/2026-01-01/walk_minutes") not in facts  # beyond 400

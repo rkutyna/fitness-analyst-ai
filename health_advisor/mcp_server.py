@@ -1941,7 +1941,11 @@ def _impact_facts(out: dict, metric_units: bool) -> list[dict]:
         facts.append({"id": fid, "value": value, "unit": unit,
                       "restates": path, "label": text})
 
-    for index, row in enumerate(out.get("periods") or []):
+    # Newest period first: the declared-fact builder keeps at most its first
+    # 400 entries per result, and a long by-day range would otherwise lose
+    # the recent days a question is most likely about.
+    rows = list(enumerate(out.get("periods") or []))
+    for index, row in reversed(rows):
         period = row.get("period")
         if not isinstance(period, str) or row.get("no_data"):
             continue

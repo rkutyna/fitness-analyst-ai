@@ -181,3 +181,62 @@ def test_list_workouts_page_size_stays_unpublished(vault):
         "$.result.count", "$.result.limit", "$.result.excluded_count",
         *(f"$.result.workouts[{i}].{field}" for i in range(3)
           for field in ("avg_heart_rate", "n_segments"))}
+
+
+# --- item 8: heart-rate zones -------------------------------------------------
+
+def test_hr_zones_publish_time_above_and_in_band_per_window(vault):
+    run_day, _ = vault["days"]
+    assert run_day == "2026-08-27"
+    ledger = _ledger(vault, "get_hr_zones", {"day": run_day})
+    facts = fact_template.build_declared_facts(ledger)
+    day = "hr_zones/2026-08-27/day"
+    run = "hr_zones/2026-08-27/workout/running/17:38:00"
+    got = {key: (fact["value"], fact["unit"], fact["source"]["paths"])
+           for key, fact in facts.items()}
+    expected = {
+        PUB(f"{day}/above/150/minutes"):
+            (3.0, "min", ["$.result.windows[0].above[1].minutes"]),
+        PUB(f"{day}/above/150/pct_samples"):
+            (5.1, "%", ["$.result.windows[0].above[1].pct_samples"]),
+        PUB(f"{day}/band/min-135/minutes"):
+            (28.0, "min", ["$.result.windows[0].bands[0].minutes"]),
+        PUB(f"{day}/avg_heart_rate"):
+            (132.0, "bpm", ["$.result.windows[0].avg_heart_rate"]),
+        PUB(f"{run}/above/150/minutes"):
+            (3.0, "min", ["$.result.windows[1].above[1].minutes"]),
+        PUB(f"{run}/above/150/pct_samples"):
+            (5.7, "%", ["$.result.windows[1].above[1].pct_samples"]),
+        PUB(f"{run}/band/135-150/minutes"):
+            (42.0, "min", ["$.result.windows[1].bands[1].minutes"]),
+        PUB(f"{run}/band/170-max/minutes"):
+            (0.0, "min", ["$.result.windows[1].bands[4].minutes"]),
+        PUB(f"{run}/avg_heart_rate"):
+            (141.0, "bpm", ["$.result.windows[1].avg_heart_rate"]),
+        PUB(f"{run}/max_heart_rate"):
+            (153.0, "bpm", ["$.result.windows[1].max_heart_rate"]),
+    }
+    assert {k: got.get(k) for k in expected} == expected
+    # 2 windows x (avg, max, 4 thresholds x 2, 5 bands x 2)
+    assert len(facts) == 40
+    assert facts[PUB(f"{run}/above/150/minutes")]["label"] == (
+        "Minutes with heart rate above 150 bpm during the running workout "
+        "starting 17:38:00 on Thu Aug 27")
+    # The day window's samples cover 73 of 1380 minutes: its minutes say so.
+    assert facts[PUB(f"{day}/above/150/minutes")]["label"].endswith(
+        "(counted only where heart-rate samples exist; they do not cover the "
+        "whole window)")
+    assert not any(path.endswith(("minutes", "pct_samples", "heart_rate"))
+                   and not path.endswith("min_heart_rate")
+                   for path in _unpublished_paths(ledger))
+
+
+def test_hr_zones_custom_thresholds_publish_under_their_own_edges(vault):
+    ledger = _ledger(vault, "get_hr_zones", {
+        "day": "2026-08-27", "workout_type": "running",
+        "thresholds": "120,140,160"})
+    facts = fact_template.build_declared_facts(ledger)
+    run = "hr_zones/2026-08-27/workout/running/17:38:00"
+    assert facts[PUB(f"{run}/above/140/minutes")]["value"] == 41.33
+    assert facts[PUB(f"{run}/band/120-140/minutes")]["value"] == 6.67
+    assert PUB(f"{run}/above/150/minutes") not in facts

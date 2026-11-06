@@ -634,6 +634,83 @@ def _hr_zone_window(conn, source: str, label: str | None, start_utc: str,
     return out
 
 
+def _bpm(edge) -> str:
+    return f"{edge:g}"
+
+
+def _hr_zone_facts(day: str, windows: list[dict]) -> list[dict]:
+    """Each window's time in band, time above each threshold, and its average
+    and peak heart rate, as declared facts (downstream issue #578).
+
+    A heart-rate zone figure belongs to a window (the day, one workout, or an
+    explicit span), not to a metric series, so the fact set had no slot for
+    "how long was I above 150?" -- the question this tool exists to answer.
+    Every value is the window's own computed figure, named by its window and
+    its threshold or band edges; ``restates`` names the leaf it repeats.
+    """
+    day_text = _day_text(day)
+    facts: list[dict] = []
+    for w_index, window in enumerate(windows):
+        source, label = window.get("source"), window.get("label")
+        start = window.get("start_time_local")
+        if source == "day":
+            wid, scope = "day", f"on {day_text}"
+        elif source == "workout":
+            wid = f"workout/{label}/{start}"
+            scope = f"during the {label} workout starting {start} on {day_text}"
+        else:
+            wid = f"window/{label}"
+            scope = f"between {start} and {window.get('end_time_local')} on {day_text}"
+        base = f"hr_zones/{day}/{wid}"
+        prefix = f"$.result.windows[{w_index}]"
+        floor = (" (counted only where heart-rate samples exist; they do not "
+                 "cover the whole window)" if window.get("note") else "")
+
+        def add(fid, value, unit, path, text):
+            if (value is None or isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not np.isfinite(value)):
+                return
+            facts.append({"id": f"{base}/{fid}", "value": value, "unit": unit,
+                          "restates": f"{prefix}{path}", "label": text})
+
+        add("avg_heart_rate", window.get("avg_heart_rate"), "bpm",
+            ".avg_heart_rate",
+            f"Average of the heart-rate samples recorded {scope}")
+        add("max_heart_rate", window.get("max_heart_rate"), "bpm",
+            ".max_heart_rate",
+            f"Highest heart-rate sample recorded {scope}")
+        for i, row in enumerate(window.get("above") or []):
+            edge = row.get("threshold")
+            if edge is None:
+                continue
+            add(f"above/{_bpm(edge)}/minutes", row.get("minutes"), "min",
+                f".above[{i}].minutes",
+                f"Minutes with heart rate above {_bpm(edge)} bpm {scope}{floor}")
+            add(f"above/{_bpm(edge)}/pct_samples", row.get("pct_samples"), "%",
+                f".above[{i}].pct_samples",
+                f"Percentage of heart-rate samples above {_bpm(edge)} bpm "
+                f"{scope}")
+        for i, band in enumerate(window.get("bands") or []):
+            lo, hi = band.get("lower_exclusive"), band.get("upper_inclusive")
+            if lo is None and hi is None:
+                continue
+            if lo is None:
+                edges, words = f"min-{_bpm(hi)}", f"at or under {_bpm(hi)} bpm"
+            elif hi is None:
+                edges, words = f"{_bpm(lo)}-max", f"above {_bpm(lo)} bpm"
+            else:
+                edges = f"{_bpm(lo)}-{_bpm(hi)}"
+                words = f"above {_bpm(lo)} and at or under {_bpm(hi)} bpm"
+            add(f"band/{edges}/minutes", band.get("minutes"), "min",
+                f".bands[{i}].minutes",
+                f"Minutes with heart rate {words} {scope}{floor}")
+            add(f"band/{edges}/pct_samples", band.get("pct_samples"), "%",
+                f".bands[{i}].pct_samples",
+                f"Percentage of heart-rate samples {words} {scope}")
+    return facts
+
+
 @tool
 def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
                  start_time: str | None = None, end_time: str | None = None,
@@ -659,7 +736,9 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
     workout on it. Minutes are duration-weighted per sample and clipped at
     60 s, so a gap in the samples shows up as 'uncovered_min' instead of being
     charged to the last band seen — check it before quoting band minutes as the
-    whole window."""
+    whole window. `publishable_facts` carries each window's band and
+    above-threshold minutes and percentages, and its average and peak heart
+    rate, each labelled with its window and edges."""
     if err := _bad_dates(day=day):
         return {"error": err}
     try:
@@ -689,7 +768,8 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
                 conn, "explicit", f"{start_time}-{end_time}", s_utc, e_utc,
                 edges, local_timezone=local_timezone)]
             return {"day": day, "thresholds": [mx.r(e, 0) for e in edges],
-                    "count": len(windows), "windows": windows}
+                    "count": len(windows), "windows": windows,
+                    _PUBLISHABLE_FACTS_KEY: _hr_zone_facts(day, windows)}
 
         marked = db.workout_mark_condition(conn, "w", marked=True)
         sql = ("SELECT w.workout_type, w.start_utc, w.end_utc FROM workouts AS w "
@@ -728,7 +808,8 @@ def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
 
     out = {"day": day, "thresholds": [mx.r(e, 0) for e in edges],
            "count": len(windows), "excluded_count": excluded,
-           "windows": windows}
+           "windows": windows,
+           _PUBLISHABLE_FACTS_KEY: _hr_zone_facts(day, windows)}
     if not windows:
         out["note"] = (
             f"no workout of type {workout_type!r} on {day}" if workout_type else

@@ -102,10 +102,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "get_hr_zones": {
-        "UM": """
-            .windows[].above[].minutes .windows[].above[].pct_samples .windows[].avg_heart_rate
-            .windows[].bands[].minutes .windows[].bands[].pct_samples .windows[].max_heart_rate
-        """,
         "AMB": """
             .windows[].covered_min .windows[].min_heart_rate .windows[].uncovered_min
             .windows[].window_min

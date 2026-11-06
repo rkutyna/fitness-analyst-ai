@@ -211,7 +211,27 @@ CREATE TABLE IF NOT EXISTS records (
     hk_uuid              TEXT,
     hk_type_identifier   TEXT,
     source_revision_json TEXT,
-    hk_device_id         TEXT
+    hk_device_id         TEXT,
+    -- Interned source revision: an id into source_revisions below. Written by
+    -- db.insert_records, which leaves source_revision_json NULL on new rows.
+    -- Older rows keep their JSON in source_revision_json until
+    -- db.intern_source_revisions moves it; db.source_revision_json reads
+    -- either form. Declared last so a migrated vault's ALTER-added column and
+    -- a fresh vault's column sit at the same position.
+    source_revision_id   INTEGER
+);
+
+-- ---------------------------------------------------------------------------
+-- source_revisions: each distinct HealthKit source-revision object, as the
+-- canonical JSON text hk_parse produced, stored once. A per-sample copy in
+-- records.source_revision_json was a fifth of a synthetic one-year vault
+-- while holding a handful of distinct values. No foreign key, the same as
+-- compacted_sample_metrics: build_vault copies records before any lookup
+-- table it would reference, and nothing deletes from this table.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS source_revisions (
+    id   INTEGER PRIMARY KEY,
+    json TEXT NOT NULL UNIQUE
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_metric_localdate ON records (metric, local_date);

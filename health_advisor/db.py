@@ -105,6 +105,11 @@ _ADDED_COLUMNS = {
         "hk_type_identifier": "TEXT",
         "source_revision_json": "TEXT",
         "hk_device_id": "TEXT",
+        # downstream issue #702: the interned revision, an id into
+        # source_revisions (declared in schema.sql). Nullable and added with
+        # no backfill: existing rows keep their JSON until an explicit
+        # intern_source_revisions run, so init_db never rewrites records.
+        "source_revision_id": "INTEGER",
     },
     "workouts": {
         "avg_heart_rate": "REAL",
@@ -953,6 +958,9 @@ RECORD_COLS = (
     "local_date", "source", "origin", "dedupe_key", "hk_uuid",
     "hk_type_identifier", "source_revision_json", "hk_device_id",
 )
+# RECORD_COLS is the caller-facing row shape: a row dict still carries
+# `source_revision_json`, and insert_records stores it interned as
+# `source_revision_id` (downstream issue #702).
 WORKOUT_COLS = (
     "workout_type", "start_utc", "end_utc", "local_date", "duration_min",
     "energy_kcal", "distance_mi", "unit_distance", "source", "route_ref",
@@ -982,17 +990,27 @@ def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
     Added rows are counted from the rowid high-water mark rather than
     total_changes, which would also count those updates.
     """
+    # A row's source revision is stored interned (downstream issue #702):
+    # `source_revision_id` points into source_revisions and the per-row JSON
+    # column is written NULL. The conflict clause is unchanged and touches
+    # neither revision column, so a re-sent sample keeps its first revision
+    # exactly as it kept its first JSON before.
     sql = (
         "INSERT INTO records (metric, value, unit, start_utc, end_utc, "
         "start_local, local_date, source, origin, dedupe_key, hk_uuid, "
-        "hk_type_identifier, source_revision_json, hk_device_id) "
+        "hk_type_identifier, source_revision_json, source_revision_id, "
+        "hk_device_id) "
         "VALUES (:metric, :value, :unit, :start_utc, :end_utc, :start_local, "
         ":local_date, :source, :origin, :dedupe_key, :hk_uuid, "
-        ":hk_type_identifier, :source_revision_json, :hk_device_id) "
+        ":hk_type_identifier, NULL, :source_revision_id, :hk_device_id) "
         "ON CONFLICT(dedupe_key) DO UPDATE SET "
         "value = excluded.value, unit = excluded.unit, origin = excluded.origin"
     )
     rows = [{**{k: None for k in _RECORD_OPTIONAL}, **r} for r in rows]
+    revision_ids: dict[str, int] = {}
+    for row in rows:
+        row["source_revision_id"] = _intern_source_revision(
+            conn, row["source_revision_json"], revision_ids)
     mapped_metrics = set()
     if rows:
         # Import lazily: vault.py imports db for its copy/upsert helpers. The
@@ -1026,6 +1044,127 @@ def insert_records(conn: sqlite3.Connection, rows: Iterable[dict]) -> int:
     if mapped_metrics:
         vault.mark_receiver_resolutions(conn, mapped_metrics=mapped_metrics)
     return after - before
+
+
+def _intern_source_revision(conn: sqlite3.Connection, revision_json: str | None,
+                            cache: dict[str, int]) -> int | None:
+    """The source_revisions id for ``revision_json``, inserting it if new.
+
+    ``cache`` is the caller's per-call memo; a vault holds a handful of
+    distinct revisions, so a batch costs one lookup per distinct value. The
+    memo deliberately does not outlive the call: an id cached across a rolled
+    back transaction could name a row that no longer exists.
+    """
+    if revision_json is None:
+        return None
+    if revision_json not in cache:
+        conn.execute("INSERT OR IGNORE INTO source_revisions (json) VALUES (?)",
+                     (revision_json,))
+        cache[revision_json] = conn.execute(
+            "SELECT id FROM source_revisions WHERE json = ?",
+            (revision_json,)).fetchone()[0]
+    return cache[revision_json]
+
+
+def source_revision_json(conn: sqlite3.Connection, row_or_id) -> str | None:
+    """A record's source-revision JSON, from whichever form stores it.
+
+    ``row_or_id`` is a ``records.id`` or a mapping holding a record's
+    ``source_revision_json`` and/or ``source_revision_id``. A row written
+    before downstream issue #702 (or not yet moved by intern_source_revisions)
+    carries the JSON itself; a row written since carries the id. None means
+    the record has no revision, as for backfill and subjective rows.
+    """
+    if isinstance(row_or_id, int):
+        cols = ["source_revision_json"]
+        if has_column(conn, "records", "source_revision_id"):
+            cols.append("source_revision_id")
+        found = conn.execute(
+            f"SELECT {', '.join(cols)} FROM records WHERE id = ?",
+            (row_or_id,)).fetchone()
+        if found is None:
+            raise KeyError(f"no records row with id {row_or_id}")
+        row = dict(zip(cols, tuple(found)))
+    else:
+        row = row_or_id
+    keys = row.keys()
+    text = row["source_revision_json"] if "source_revision_json" in keys else None
+    if text is not None:
+        return text
+    rev_id = row["source_revision_id"] if "source_revision_id" in keys else None
+    if rev_id is None:
+        return None
+    found = conn.execute("SELECT json FROM source_revisions WHERE id = ?",
+                         (rev_id,)).fetchone()
+    if found is None:
+        raise LookupError(f"records refer to source_revisions id {rev_id}, "
+                          "which does not exist")
+    return found[0]
+
+
+def intern_source_revisions(conn: sqlite3.Connection, *,
+                            batch_rows: int = 10_000) -> dict[str, int]:
+    """Move existing rows' revision JSON into source_revisions, in batches.
+
+    Downstream issue #702. For each records row still holding
+    ``source_revision_json``, set ``source_revision_id`` to the interned id
+    and NULL the JSON, ``batch_rows`` rows per transaction, each committed.
+    Idempotent and resumable: only rows that still hold JSON are selected, so
+    a second run, or a run after one that was interrupted between batches,
+    picks up exactly the rows left. Lossless: ``source_revision_json(conn,
+    id)`` returns the same text before and after.
+
+    NOT called by init_db or the receiver: a vault holds millions of records,
+    and startup must not rewrite them. Run it explicitly, under the same
+    write exclusion as any other bulk write.
+
+    It returns no disk space by itself. The NULLed text goes to SQLite's
+    freelist; the file shrinks only at the next VACUUM, which
+    ``vault.run_compaction`` runs after every compaction (``vacuum=True`` is
+    its default) -- or run VACUUM by hand.
+
+    Returns ``{"rows_interned", "batches", "revisions", "remaining"}``:
+    rows moved by this call, committed batches, distinct revisions now
+    stored, and rows still holding JSON (0 after a completed run).
+    """
+    if batch_rows < 1:
+        raise ValueError("batch_rows must be at least 1")
+    if not (has_column(conn, "records", "source_revision_id")
+            and has_table(conn, "source_revisions")):
+        raise ValueError("vault predates source_revisions; run init_db first")
+    cache: dict[str, int] = {}
+    after_id = 0
+    interned = batches = 0
+    while True:
+        # Keyset by rowid so each batch starts where the last one stopped
+        # instead of rescanning the rows already moved.
+        rows = conn.execute(
+            "SELECT id, source_revision_json FROM records "
+            "WHERE id > ? AND source_revision_json IS NOT NULL "
+            "ORDER BY id LIMIT ?", (after_id, batch_rows)).fetchall()
+        if not rows:
+            break
+        updates = [
+            (_intern_source_revision(conn, row[1], cache), row[0], row[1])
+            for row in rows
+        ]
+        # The JSON guard keeps the move exact even if a writer slipped in
+        # between the SELECT and this UPDATE.
+        cur = conn.executemany(
+            "UPDATE records SET source_revision_id = ?, "
+            "source_revision_json = NULL "
+            "WHERE id = ? AND source_revision_json = ?", updates)
+        interned += cur.rowcount
+        after_id = rows[-1][0]
+        conn.commit()
+        batches += 1
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM records WHERE source_revision_json IS NOT NULL"
+    ).fetchone()[0]
+    revisions = conn.execute(
+        "SELECT COUNT(*) FROM source_revisions").fetchone()[0]
+    return {"rows_interned": interned, "batches": batches,
+            "revisions": revisions, "remaining": remaining}
 
 
 def delete_records_for_pairs(

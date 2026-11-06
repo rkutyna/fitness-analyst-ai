@@ -201,6 +201,19 @@ def _as_of(conn, as_of: str | None) -> str:
     return row[0] if row and row[0] else V.local_today(conn).isoformat()
 
 
+def request_as_of(conn, ctx) -> str:
+    """The day a tool call answers as of: the session's ``ctx.as_of`` when the
+    ask pinned one, else the vault's latest data day (``_as_of(conn, None)``).
+
+    The ONE owner of a tool's default window end and of its "latest"/"today"
+    reference (downstream issue #596). Without it a backdated ask told the
+    model "today is D" while every default-window tool anchored on the
+    vault's latest day and handed the model figures from after D.
+    """
+    as_of = getattr(ctx, "as_of", None)
+    return as_of if as_of else _as_of(conn, None)
+
+
 def _bucket_index(bucket_start_utc: str) -> int:
     """Bucket ordinal, so 'contiguous' means no missing time rather than merely
     adjacent in a list that may have gaps."""
@@ -1853,16 +1866,20 @@ def long_term(conn, as_of: str | None = None) -> list[dict]:
     return out
 
 
-def highlights(conn, as_of: str | None = None) -> list[dict]:
+def highlights(conn, as_of: str | None = None, *,
+               through: str | None = None) -> list[dict]:
     """True positive facts for grounded encouragement: all-time PRs hit recently.
 
     "All-time" is as of ``as_of``: no day after it is read, so a briefing for
     a past day never names a high set after that day (downstream issue #731).
     With no ``as_of`` the day is the vault's latest data day, which bounds
-    nothing, so a briefing for the latest day is unchanged."""
+    nothing, so a briefing for the latest day is unchanged. ``through`` (a
+    session's pinned as-of, downstream issue #596) bounds it further when it
+    is earlier still; the bound is the earlier of the two."""
     as_of = _as_of(conn, as_of)
     out = []
     recent_start = (date.fromisoformat(as_of) - timedelta(days=6)).isoformat()
+    bound = min(as_of, through) if through else as_of
     for m in ["step_count", "active_energy", "distance_walking_running", "vo2_max"]:
         if not mx.metric_exists(conn, m):
             continue
@@ -1870,7 +1887,7 @@ def highlights(conn, as_of: str | None = None) -> list[dict]:
         row = conn.execute(
             f"SELECT date, MAX({col}) v FROM daily_metrics WHERE metric = ? AND "
             + mx.current_daily_metrics_predicate(conn) + " AND date <= ?",
-            (m, as_of)).fetchone()
+            (m, bound)).fetchone()
         if row and row["date"] and row["date"] >= recent_start:
             out.append({"metric": m, "kind": "all_time_high",
                         "value": mx.r(row["v"]), "date": row["date"]})
@@ -2058,7 +2075,8 @@ def talking_points(parts: dict) -> list[dict]:
 
 
 def build_briefing(conn, scope: str = "daily", as_of: str | None = None, *,
-                   metric_units: bool = False) -> dict:
+                   metric_units: bool = False,
+                   through: str | None = None) -> dict:
     as_of = _as_of(conn, as_of)
     rd = readiness(conn, as_of)
     tl = training_load(conn, as_of)
@@ -2077,7 +2095,7 @@ def build_briefing(conn, scope: str = "daily", as_of: str | None = None, *,
         "movers_cold_start": mv["cold_start"],
         "long_term": long_term(conn, as_of) if scope == "deep" else [],
         "suggestions": suggestions(rd, tl, wf),
-        "highlights": highlights(conn, as_of),
+        "highlights": highlights(conn, as_of, through=through),
         "workout_focus": wf,
     }
     parts["talking_points"] = talking_points(parts)

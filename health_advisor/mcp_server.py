@@ -265,6 +265,128 @@ def _today(local_timezone: str | tzinfo | None = None) -> date:
     return datetime.now(local_tz).date() if local_tz is not None else date.today()
 
 
+def _session_as_of(ctx: VaultContext) -> str | None:
+    """The as-of an ask pinned on this session, or None (downstream #596).
+
+    None is production's case, and every branch keyed on it keeps the tool's
+    pre-#596 behaviour exactly, wall clock included."""
+    return getattr(ctx, "as_of", None)
+
+
+def _clamp_to_as_of(ctx: VaultContext, **named: str | None
+                    ) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Clamp each explicit date argument after the session's as-of to it.
+
+    Returns ``(values, requested)``: the arguments to use, and
+    ``{name: the date asked for}`` for each one that was clamped. Only a
+    session with an as-of clamps; without one both come back unchanged and
+    empty. Call after ``_bad_dates``, so every value is a real day."""
+    as_of = _session_as_of(ctx)
+    values, requested = dict(named), {}
+    if as_of is None:
+        return values, requested
+    horizon = date.fromisoformat(as_of)
+    for name, value in named.items():
+        if not isinstance(value, str):
+            continue
+        try:
+            later = date.fromisoformat(value) > horizon
+        except ValueError:
+            continue                # the tool's own validation reports it
+        if later:
+            values[name] = as_of
+            requested[name] = value
+    return values, requested
+
+
+def _mark_clamped(out: dict, requested: dict[str, str]) -> dict:
+    """Say on the result that an explicit date was clamped to the as-of.
+
+    ``requested_dates`` maps each clamped argument to the date asked for. The
+    key name is the same on every tool."""
+    if requested and isinstance(out, dict) and "error" not in out:
+        out["clamped_to_as_of"] = True
+        out["requested_dates"] = dict(requested)
+    return out
+
+
+def _clamps_dates(*names: str, pairs: tuple[tuple[str, str], ...] = ()):
+    """Clamp a tool's named date arguments to the session's as-of.
+
+    For tools whose dates are plain YYYY-MM-DD arguments and that read nothing
+    after them: the arguments are clamped with ``_clamp_to_as_of`` before the
+    tool runs and the result is marked with ``_mark_clamped``. A value that is
+    not a real day, or a ``(start, end)`` pair in ``pairs`` given in the wrong
+    order, leaves the call untouched so the tool's own validation reports it
+    exactly as before. Without an as-of the tool is called unchanged.
+    ``functools.wraps`` keeps the name, docstring and signature the schema is
+    built from."""
+    def wrap(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def clamped(ctx, *args, **kwargs):
+            if _session_as_of(ctx) is None:
+                return fn(ctx, *args, **kwargs)
+            try:
+                call = sig.bind(ctx, *args, **kwargs)
+            except TypeError:
+                return fn(ctx, *args, **kwargs)
+            given = {n: call.arguments.get(n) for n in names}
+            if any(v is not None and _bad_dates(**{n: v})
+                   for n, v in given.items()):
+                return fn(ctx, *args, **kwargs)
+            if any(isinstance(given.get(a), str) and isinstance(given.get(b), str)
+                   and given[a] > given[b] for a, b in pairs):
+                return fn(ctx, *args, **kwargs)
+            values, requested = _clamp_to_as_of(ctx, **given)
+            if not requested:
+                return fn(ctx, *args, **kwargs)
+            for n in requested:
+                call.arguments[n] = values[n]
+            return _mark_clamped(fn(*call.args, **call.kwargs), requested)
+        return clamped
+    return wrap
+
+
+def _clamp_range_spec(ctx: VaultContext, spec: str, name: str = "period"
+                      ) -> tuple[str, dict[str, str]]:
+    """An explicit 'YYYY-MM-DD:YYYY-MM-DD' window spec, clamped to the as-of.
+
+    A relative spec ('30d') is returned as is: it is anchored on a date that
+    already respects the as-of. A malformed spec is also returned as is, so
+    the tool's own parser reports it."""
+    if _session_as_of(ctx) is None or not isinstance(spec, str) or ":" not in spec:
+        return spec, {}
+    a, b = (part.strip() for part in spec.split(":", 1))
+    try:
+        date.fromisoformat(a)
+        date.fromisoformat(b)
+    except ValueError:
+        return spec, {}
+    values, requested = _clamp_to_as_of(ctx, start=a, end=b)
+    if not requested:
+        return spec, {}
+    return f"{values['start']}:{values['end']}", {name: spec}
+
+
+def _metric_anchor(conn, metric: str, ctx: VaultContext) -> str | None:
+    """A metric's most recent data day, as of the session.
+
+    Without an as-of this is exactly ``mx.anchor_end`` (production). With one
+    it is the metric's latest day on or before ``A.request_as_of``, or that
+    day itself when the metric has none by then, so its windows are empty
+    rather than anchored after the as-of."""
+    if _session_as_of(ctx) is None:
+        return _anchor_end(conn, metric)
+    through = A.request_as_of(conn, ctx)
+    row = conn.execute(
+        "SELECT MAX(date) FROM daily_metrics WHERE metric = ? AND date <= ? "
+        "AND " + mx.current_daily_metrics_predicate(conn),
+        (metric, through)).fetchone()
+    return row[0] if row and row[0] else through
+
+
 def _local_hhmm(utc_iso: str | None,
                 local_timezone: str | tzinfo | None = None,
                 seconds: bool = False) -> str | None:
@@ -331,12 +453,14 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
     Dates must be explicit YYYY-MM-DD — an 'error' comes back otherwise."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
+    dates_in, clamped = _clamp_to_as_of(ctx, start=start, end=end)
+    start, end = dates_in["start"], dates_in["end"]
     unit_system = _unit_system(ctx.settings())
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
             return _unknown_metric(metric)
-        anchor = end or _anchor_end(conn, metric)
+        anchor = end or _metric_anchor(conn, metric, ctx)
         if start is None:
             start = (date.fromisoformat(anchor) - timedelta(days=89)).isoformat()
         dates, vals, unit = _series(conn, metric, start, anchor)
@@ -380,7 +504,7 @@ def get_daily_series(ctx: VaultContext, metric: str, start: str | None = None, e
                    "n_days": stats["n_days"], "mean": stats["mean"]}
         _add_stat_presentations(summary, metric, summary["period"])
         result["window_summary"] = summary
-    return result
+    return _mark_clamped(result, clamped)
 
 
 @tool
@@ -390,17 +514,18 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     Anchored to the metric's most recent data. A period the server can't parse
     comes back as an 'error' — it is never silently replaced with a default."""
     unit_system = _unit_system(ctx.settings())
+    window_spec, clamped = _clamp_range_spec(ctx, period)
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
             return _unknown_metric(metric)
-        anchor = _anchor_end(conn, metric)
+        anchor = _metric_anchor(conn, metric, ctx)
         try:
             # parse_range, NOT parse_period: parse_period rejects explicit
             # ranges, yet its own error message tells the caller to "use ... an
             # explicit 'YYYY-MM-DD:YYYY-MM-DD' range". A researcher following
             # that advice got the identical error back and had no way forward.
-            start_iso, end_iso = mx.parse_range(period, anchor)
+            start_iso, end_iso = mx.parse_range(window_spec, anchor)
         except ValueError as e:
             return {"error": str(e)}
         dates, vals, unit = _series(conn, metric, start_iso, end_iso)
@@ -413,7 +538,7 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
         empty_out = {"metric": metric, "period": period, "n_days": 0,
                      "note": "no data in this period"}
         _add_caveat(empty_out, metric)
-        return empty_out
+        return _mark_clamped(empty_out, clamped)
     stats = _stats(dates, vals)
     # `stats` already carries the true start/end of the rows it summarised
     # (the first and last dates actually returned by `_series`, i.e.
@@ -441,7 +566,7 @@ def summarize_metric(ctx: VaultContext, metric: str, period: str = "30d") -> dic
     # linear trend per week
     out["trend_per_week"] = _r(mx.slope_per_week(dates, vals))
     _add_stat_presentations(out, metric, published_period)
-    return out
+    return _mark_clamped(out, clamped)
 
 
 def _fit_declared_facts(out: dict) -> dict:
@@ -559,14 +684,17 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     change of the other window's whole size. `publishable_facts` carries the
     mean change and its percentage, named by both windows."""
     unit_system = _unit_system(ctx.settings())
+    spec_a, clamped = _clamp_range_spec(ctx, period_a, "period_a")
+    spec_b, clamped_b = _clamp_range_spec(ctx, period_b, "period_b")
+    clamped.update(clamped_b)
     conn = ctx.read_only()
     try:
         if not _metric_exists(conn, metric):
             return _unknown_metric(metric)
-        anchor = _anchor_end(conn, metric)
+        anchor = _metric_anchor(conn, metric, ctx)
         try:
-            a0, a1 = _parse_range(period_a, anchor)
-            b0, b1 = _parse_range(period_b, anchor)
+            a0, a1 = _parse_range(spec_a, anchor)
+            b0, b1 = _parse_range(spec_b, anchor)
         except ValueError as e:
             return {"error": str(e)}
         da, va, unit = _series(conn, metric, a0, a1)
@@ -585,13 +713,15 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     _add_stat_presentations(out["period_b"], metric, f"{b0}:{b1}")
     if not va or not vb:
         empty = period_a if not va else period_b
-        return {**out, "mean_delta": None, "mean_delta_pct": None,
-                "note": f"no data in {empty!r}; the two windows cannot be compared"}
+        return _mark_clamped(
+            {**out, "mean_delta": None, "mean_delta_pct": None,
+             "note": f"no data in {empty!r}; the two windows cannot be compared"},
+            clamped)
     out["mean_delta"] = _r(sa["mean"] - sb["mean"])
     out["mean_delta_pct"] = _r((sa["mean"] - sb["mean"]) / sb["mean"] * 100) \
         if sb["mean"] else None
     out[_PUBLISHABLE_FACTS_KEY] = _compare_periods_facts(out)
-    return out
+    return _mark_clamped(out, clamped)
 
 
 def _intraday_facts(metric: str, day: str, unit, agg: str,
@@ -631,6 +761,7 @@ def _intraday_facts(metric: str, day: str, unit, agg: str,
 
 
 @tool
+@_clamps_dates("day")
 def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1) -> dict:
     """Intraday pattern for a metric on a single LOCAL day (YYYY-MM-DD), bucketed
     by local hour. Uses sum for cumulative metrics, average for rates. Returns up
@@ -859,6 +990,7 @@ def _hr_zone_facts(day: str, windows: list[dict]) -> list[dict]:
 
 
 @tool
+@_clamps_dates("day")
 def get_hr_zones(ctx: VaultContext, day: str, workout_type: str | None = None,
                  start_time: str | None = None, end_time: str | None = None,
                  thresholds: str = HR_ZONE_DEFAULT_THRESHOLDS) -> dict:
@@ -1124,6 +1256,8 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     the session's distance, one decimal, a whole-session average."""
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
+    dates_in, clamped = _clamp_to_as_of(ctx, start=start, end=end)
+    start, end = dates_in["start"], dates_in["end"]
     limit = max(1, min(int(limit), MAX_WORKOUTS))
     settings = ctx.settings()
     local_timezone = _as_timezone(settings["local_timezone"])
@@ -1136,11 +1270,19 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     try:
         active = db.workout_mark_condition(conn, "w")
         marked = db.workout_mark_condition(conn, "w", marked=True)
-        if end is None:
+        if end is None and _session_as_of(ctx) is None:
             row = conn.execute(
                 "SELECT MAX(w.local_date) FROM workouts AS w"
             ).fetchone()
             end = row[0] or today
+        elif end is None:
+            # The latest workout day on or before the as-of, as production
+            # takes the latest workout day of the whole vault.
+            through = A.request_as_of(conn, ctx)
+            row = conn.execute(
+                "SELECT MAX(w.local_date) FROM workouts AS w "
+                "WHERE w.local_date <= ?", (through,)).fetchone()
+            end = row[0] or through
         if start is None:
             start = (date.fromisoformat(end) - timedelta(days=89)).isoformat()
         # A read-only connection never migrates, so a vault that predates the
@@ -1236,10 +1378,11 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             f"showing the {len(out)} most recent of {total} workouts in this "
             f"range — this is NOT the whole range. Raise 'limit' (max "
             f"{MAX_WORKOUTS}) or narrow the dates before counting or totalling.")
-    return res
+    return _mark_clamped(res, clamped)
 
 
 @tool
+@_clamps_dates("start", "end", pairs=(("start", "end"),))
 def get_workout_coverage(ctx: VaultContext, start: str, end: str) -> dict:
     """Reconcile route and weather coverage for an inclusive local-date window.
 
@@ -1389,6 +1532,7 @@ def _covered_min(splits) -> float | None:
 
 
 @tool
+@_clamps_dates("day")
 def get_workout_segments(ctx: VaultContext, day: str, workout_type: str | None = None) -> dict:
     """Segment/lap breakdown of each workout on a LOCAL day (YYYY-MM-DD) —
     the watch's splits and intervals. Per split: local start and end time,
@@ -2123,15 +2267,20 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     local_timezone = _as_timezone(settings["local_timezone"])
     declared_unit_system = settings["unit_system"]
     metric_units = declared_unit_system == "metric"
+    clamped: dict[str, str] = {}
     conn = ctx.read_only()
     try:
-        as_of = A._as_of(conn, None)
+        as_of = A.request_as_of(conn, ctx)
         as_of_date = date.fromisoformat(as_of)
         requested_start = date.fromisoformat(start)
         if requested_start > as_of_date:
             return {"start": start, "end": end, "by": by, "as_of": as_of,
                     "count": 0, "periods": [],
                     "reason": "window_after_as_of"}
+        # A pinned as-of clamps the echoed end too, so the window this
+        # result names is the window it read (production keeps its echo).
+        dates_in, clamped = _clamp_to_as_of(ctx, end=end)
+        end = dates_in["end"]
 
         effective_end = min(date.fromisoformat(end), as_of_date).isoformat()
         A.check_impact_volume_by(by)
@@ -2161,14 +2310,15 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
     finally:
         conn.close()
     if not rows:
-        return {"start": start, "end": end, "by": by, "as_of": as_of,
-                "count": 0, "periods": [],
-                # This is an unavailable window, not a measured zero. Keep
-                # the distinction in the Python result so a model cannot turn
-                # an empty list into "you did nothing".
-                "data_status": "unavailable",
-                "reason": (f"vault has no distance samples in {start}..{end}; "
-                           "this is no data, not zero activity")}
+        return _mark_clamped({
+            "start": start, "end": end, "by": by, "as_of": as_of,
+            "count": 0, "periods": [],
+            # This is an unavailable window, not a measured zero. Keep
+            # the distinction in the Python result so a model cannot turn
+            # an empty list into "you did nothing".
+            "data_status": "unavailable",
+            "reason": (f"vault has no distance samples in {start}..{end}; "
+                       "this is no data, not zero activity")}, clamped)
 
     out = {"start": start, "end": end, "by": by, "as_of": as_of,
            "count": len(periods), "periods": periods,
@@ -2209,7 +2359,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                                             block.get("period"))
                 out["block_comparison"] = comparison
     out[_PUBLISHABLE_FACTS_KEY] = _impact_facts(out, metric_units)
-    return _fit_declared_facts(out)
+    return _fit_declared_facts(_mark_clamped(out, clamped))
 
 
 @tool
@@ -2251,7 +2401,16 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
     local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    dates_in, clamped = _clamp_to_as_of(ctx, start=start, end=end)
+    start, end = dates_in["start"], dates_in["end"]
     start = start or "2016-01-01"
+    if end is None and _session_as_of(ctx) is not None:
+        # A pinned as-of replaces the wall clock; production keeps it.
+        conn = ctx.read_only()
+        try:
+            end = A.request_as_of(conn, ctx)
+        finally:
+            conn.close()
     end = end or _today(local_timezone).isoformat()
     if start > end:
         return {"error": "start must be on or before end"}
@@ -2280,7 +2439,7 @@ def get_sleep_regularity(ctx: VaultContext, start: str | None = None, end: str |
             if window.get("start") and window.get("end") else None)
         if leaf is not None:
             midpoint["presentation"] = leaf
-        return out
+        return _mark_clamped(out, clamped)
     finally:
         conn.close()
 
@@ -2331,6 +2490,16 @@ def get_training_load_detail(ctx: VaultContext, start: str | None = None,
     if err := _bad_dates(start=start, end=end):
         return {"error": err}
     local_timezone = _as_timezone(ctx.settings()["local_timezone"])
+    dates_in, clamped = _clamp_to_as_of(ctx, start=start, end=end)
+    start, end = dates_in["start"], dates_in["end"]
+    if end is None and _session_as_of(ctx) is not None:
+        # A pinned as-of replaces the wall clock (the window end and the
+        # day live_acwr is computed at); production keeps it.
+        conn = ctx.read_only()
+        try:
+            end = A.request_as_of(conn, ctx)
+        finally:
+            conn.close()
     end = end or _today(local_timezone).isoformat()
     start = start or (date.fromisoformat(end) - timedelta(days=90)).isoformat()
     if start > end:
@@ -2338,7 +2507,7 @@ def get_training_load_detail(ctx: VaultContext, start: str | None = None,
     conn = ctx.read_only()
     try:
         days = HL.daily_load(conn, start, end)
-        return {
+        return _mark_clamped({
             "start": start, "end": end,
             "days": days,
             "days_unknown": sum(1 for d in days if d["status"] == "unknown"),
@@ -2347,7 +2516,7 @@ def get_training_load_detail(ctx: VaultContext, start: str | None = None,
             "note": ("live_acwr has been computed from hr_load_proxy since "
                      "2026-08-09; before that date it came from active_energy "
                      "and the two are not comparable. Units are arbitrary."),
-        }
+        }, clamped)
     finally:
         conn.close()
 
@@ -2396,6 +2565,10 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
     nothing for the most recent run. Dates are local YYYY-MM-DD."""
     if err := _bad_dates(workout_date=workout_date, start=start, end=end):
         return {"error": err}
+    dates_in, clamped = _clamp_to_as_of(ctx, workout_date=workout_date,
+                                        start=start, end=end)
+    workout_date = dates_in["workout_date"]
+    start, end = dates_in["start"], dates_in["end"]
     settings = ctx.settings()
     declared_unit_system = _unit_system(settings)
     metric_units = declared_unit_system == "metric"
@@ -2404,8 +2577,8 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
         if start and end:
             if start > end:
                 return {"error": "start must be on or before end"}
-            return {"mode": "trend", **RF.banded_weekly(
-                conn, start, end, metric_units=metric_units)}
+            return _mark_clamped({"mode": "trend", **RF.banded_weekly(
+                conn, start, end, metric_units=metric_units)}, clamped)
 
         active = db.workout_mark_condition(conn, "w")
         if workout_date:
@@ -2415,12 +2588,21 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
                 "WHERE w.workout_type = 'running' AND w.local_date = ? "
                 f"AND {active} ORDER BY w.duration_min DESC LIMIT 1",
                 (workout_date,)).fetchone()
-        else:
+        elif _session_as_of(ctx) is None:
             row = conn.execute(
                 "SELECT w.start_utc, w.end_utc, w.local_date, w.is_indoor, "
                 "w.fitness_machine FROM workouts AS w "
                 f"WHERE w.workout_type = 'running' AND {active} "
                 "ORDER BY w.start_utc DESC LIMIT 1").fetchone()
+        else:
+            # The most recent run on or before the as-of.
+            row = conn.execute(
+                "SELECT w.start_utc, w.end_utc, w.local_date, w.is_indoor, "
+                "w.fitness_machine FROM workouts AS w "
+                f"WHERE w.workout_type = 'running' AND {active} "
+                "AND w.local_date <= ? "
+                "ORDER BY w.start_utc DESC LIMIT 1",
+                (A.request_as_of(conn, ctx),)).fetchone()
         if not row:
             return {"found": False,
                     "error": f"no running workout on {workout_date}"
@@ -2441,7 +2623,7 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
                        else NOT_SYNCED_FORM_REFUSAL)
             efficiency = walk = dict(refusal)
 
-        return {
+        return _mark_clamped({
             "mode": "session",
             "found": True,
             "date": row["local_date"],
@@ -2450,7 +2632,7 @@ def get_run_form(ctx: VaultContext, workout_date: str | None = None, start: str 
             "personal_reference": RF.personal_reference(
                 conn, "2026-01-01", row["local_date"],
                 exclude_start_utc=row["start_utc"], metric_units=metric_units),
-        }
+        }, clamped)
     finally:
         conn.close()
 
@@ -2471,13 +2653,21 @@ def get_briefing(ctx: VaultContext, scope: str = "daily", day: str | None = None
     if scope not in BRIEFING_SCOPES:
         return {"error": f"scope={scope!r} is not a briefing scope; use "
                          f"{' or '.join(repr(s) for s in BRIEFING_SCOPES)}"}
+    dates_in, clamped = _clamp_to_as_of(ctx, day=day)
+    day = dates_in["day"]
     settings = ctx.settings()
     declared_unit_system = _unit_system(settings)
     metric_units = declared_unit_system == "metric"
     conn = ctx.read_only()
     try:
-        return A.build_briefing(conn, scope=scope, as_of=day,
-                                metric_units=metric_units)
+        # request_as_of is what build_briefing resolved an unset day to
+        # before #596, so production's briefing is unchanged.
+        return _mark_clamped(
+            A.build_briefing(conn, scope=scope,
+                             as_of=day or A.request_as_of(conn, ctx),
+                             metric_units=metric_units,
+                             through=_session_as_of(ctx)),
+            clamped)
     finally:
         conn.close()
 
@@ -2504,10 +2694,19 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
         if not _metric_exists(conn, metric):
             return _unknown_metric(metric)
         col = _value_col(metric)
-        dm = conn.execute(
-            f"SELECT date, {col} v, unit FROM daily_metrics WHERE metric = ? AND "
-            + mx.current_daily_metrics_predicate(conn) + " "
-            f"ORDER BY date DESC LIMIT 1", (metric,)).fetchone()
+        if _session_as_of(ctx) is None:
+            dm = conn.execute(
+                f"SELECT date, {col} v, unit FROM daily_metrics WHERE metric = ? AND "
+                + mx.current_daily_metrics_predicate(conn) + " "
+                f"ORDER BY date DESC LIMIT 1", (metric,)).fetchone()
+        else:
+            # The latest day on or before the as-of. The raw sample below is
+            # read on that same day, so it cannot come from after it either.
+            dm = conn.execute(
+                f"SELECT date, {col} v, unit FROM daily_metrics WHERE metric = ? "
+                "AND date <= ? AND " + mx.current_daily_metrics_predicate(conn)
+                + " ORDER BY date DESC LIMIT 1",
+                (metric, A.request_as_of(conn, ctx))).fetchone()
         # Keep the raw sample on the same local day and with the same total
         # order as daily_metrics.last. Otherwise a last-valued metric could
         # report two different readings under one label when a malformed
@@ -2582,9 +2781,11 @@ def get_latest(ctx: VaultContext, metric: str) -> dict:
 # --------------------------------------------------------------------------- #
 # correlation tools
 # --------------------------------------------------------------------------- #
-def _corr_window(conn, metric_y: str, period: str) -> tuple[str, str]:
-    """Resolve a period spec to [start, end] anchored on metric_y's latest date."""
-    anchor = _anchor_end(conn, metric_y)
+def _corr_window(conn, metric_y: str, period: str,
+                 ctx: VaultContext) -> tuple[str, str]:
+    """Resolve a period spec to [start, end] anchored on metric_y's latest
+    date (as of the session, when it pins one)."""
+    anchor = _metric_anchor(conn, metric_y, ctx)
     start_iso, end_iso = _parse_period(period, anchor)
     if start_iso is None:  # 'all'
         start_iso = conn.execute(
@@ -2612,7 +2813,7 @@ def correlate_metrics(ctx: VaultContext, metric_x: str, metric_y: str, lag_days:
                 return _unknown_metric(m)
         lag_days = max(0, min(int(lag_days), 7))
         try:
-            start_iso, end_iso = _corr_window(conn, metric_y, period)
+            start_iso, end_iso = _corr_window(conn, metric_y, period, ctx)
         except ValueError as e:
             return {"error": str(e)}
         xs, ys, meta = C.paired_series(conn, metric_x, metric_y, lag_days,
@@ -2685,7 +2886,7 @@ def scan_correlations(ctx: VaultContext, target: str, period: str = "90d", lags:
         except ValueError:
             return {"error": "lags must be comma-separated integers, e.g. '0,1'"}
         try:
-            start_iso, end_iso = _corr_window(conn, target, period)
+            start_iso, end_iso = _corr_window(conn, target, period, ctx)
         except ValueError as e:
             return {"error": str(e)}
         tests = C.scan(conn, target, start_iso, end_iso, lag_list)
@@ -2806,6 +3007,8 @@ def log_subjective(ctx: VaultContext, day: str, stress: int | None = None,
 
 
 @tool
+@_clamps_dates("start_date", "end_date",
+               pairs=(("start_date", "end_date"),))
 def get_subjective(ctx: VaultContext, start_date: str, end_date: str) -> dict:
     """Subjective check-in rows (stress/soreness/energy/sleep_quality 1-5,
     caffeine/alcohol drink counts, free-text notes) for a date range,
@@ -3097,6 +3300,7 @@ def food_meal_total(ctx: VaultContext, items: list[dict]) -> dict:
 
 
 @tool
+@_clamps_dates("start", "end", pairs=(("start", "end"),))
 def get_ingest_diagnostics(ctx: VaultContext, metric: str, start: str,
                            end: str) -> dict:
     """Explain HealthKit ingest coverage for one metric and local date range.
@@ -3191,6 +3395,7 @@ def _convert_spread(value, unit, unit_system):
 
 
 @tool
+@_clamps_dates("start", "end", pairs=(("start", "end"),))
 def get_weekly_series(ctx: VaultContext, metric: str, start: str, end: str) -> dict:
     """Weekly means of a metric, each with its day count and its noise floor.
 
@@ -3342,6 +3547,7 @@ def _block_diff_facts(result: dict) -> list[dict]:
 
 
 @tool
+@_clamps_dates("as_of")
 def get_block_comparison(ctx: VaultContext, metric: str, block_weeks: int,
                          as_of: str) -> dict:
     """Compare the last two fixed-length blocks of a metric, gated by MDC95.
@@ -3388,6 +3594,7 @@ NOT_SYNCED_HR_NOTE = ("The heart rate for this session has not synced yet, so "
 
 
 @tool
+@_clamps_dates("day")
 def get_block_structure(ctx: VaultContext, day: str) -> dict:
     """How long the user ran CONTINUOUSLY, and whether it was easy enough to count.
 
@@ -3583,9 +3790,13 @@ def get_weekly_readiness(ctx: VaultContext, as_of: str = "") -> dict:
     There is no band and no cue on purpose. Re-attaching a label to the weekly
     mean would put back the thing that was removed.
     """
+    if as_of and (err := _bad_dates(as_of=as_of)) and _session_as_of(ctx):
+        return {"error": err}
+    dates_in, clamped = _clamp_to_as_of(ctx, as_of=as_of or None)
+    as_of = dates_in["as_of"] or as_of
     conn = ctx.read_only()
     try:
-        as_of = as_of or A._as_of(conn, None)
+        as_of = as_of or A.request_as_of(conn, ctx)
         out = A.weekly_readiness(conn, as_of)
         out["trend"] = A.weekly_readiness_trend(conn, as_of)
         out["alert"] = A.readiness_alert(conn, as_of)
@@ -3598,7 +3809,7 @@ def get_weekly_readiness(ctx: VaultContext, as_of: str = "") -> dict:
         }
     finally:
         conn.close()
-    return out
+    return _mark_clamped(out, clamped)
 
 
 @tool
@@ -3710,15 +3921,33 @@ def get_monthly_running_power(ctx: VaultContext, month: str) -> dict:
     Returns null when the month holds fewer than two qualifying outdoor runs.
     That is a refusal, not a gap: one run is a session, not a month.
     """
+    # Downstream #596: a month after the session's as-of is clamped to the
+    # as-of's month, and the as-of's own month is read only through the as-of
+    # (unflagged, like every default window the as-of bounds, so an as-of on
+    # the last data day answers byte for byte as no as-of does). Without an
+    # as-of the month is read whole, exactly as before.
+    as_of, requested, through = _session_as_of(ctx), {}, None
+    if as_of is not None and isinstance(month, str):
+        try:
+            date.fromisoformat(f"{month}-01")
+        except ValueError:
+            pass                    # the tool's own read reports it
+        else:
+            if month > as_of[:7]:
+                requested = {"month": month}
+                month = as_of[:7]
+            if month == as_of[:7]:
+                through = as_of
     conn = ctx.read_only()
     try:
-        watts = RF.monthly_running_power(conn, month)
+        watts = RF.monthly_running_power(conn, month, through=through)
     finally:
         conn.close()
-    return {"month": month, "mean_power_w": watts,
-            "pace_band_min_per_mi": list(RF.REFERENCE_PACE_BAND),
-            "note": (None if watts is not None else
-                     "fewer than two qualifying outdoor runs this month")}
+    out = {"month": month, "mean_power_w": watts,
+           "pace_band_min_per_mi": list(RF.REFERENCE_PACE_BAND),
+           "note": (None if watts is not None else
+                    "fewer than two qualifying outdoor runs this month")}
+    return _mark_clamped(out, requested)
 
 
 @tool

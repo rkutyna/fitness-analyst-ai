@@ -1,0 +1,142 @@
+{
+ "compare_periods": {
+  "bytes": 2524,
+  "sha256": "9efb91bb9666c2aee6098d4e04690a4133af0548f943278c603a9bc3e5263098"
+ },
+ "compare_periods/window": {
+  "bytes": 2564,
+  "sha256": "660e03160cd52ec702dfa77bdee6f8796f7f4ae7e5f6d7aea7997cf5b815b4f9"
+ },
+ "correlate_metrics": {
+  "bytes": 656,
+  "sha256": "0a7b9de1f0090551ae84f149c2cbb9b6c335b4091aef384880cb1eb44820c36d"
+ },
+ "food_lookup": {
+  "bytes": 50,
+  "sha256": "8d944707f8899dbe56352d4861ba47a126ad27b07dc9103417a82147a19aa007"
+ },
+ "food_meal_total": {
+  "bytes": 61,
+  "sha256": "a283440df36f3506a5fcf2d3e6375c74a4176e3d27d499314639397156e3df7f"
+ },
+ "get_benchmark_series": {
+  "bytes": 395,
+  "sha256": "3c366b79bb87102e5366c1e322e73698f84f2042ef8cb583ef1a85bd019956eb"
+ },
+ "get_block_comparison": {
+  "bytes": 342,
+  "sha256": "b0d21a3094df9af02a4be4e2ab2c280cbb7c925e44defb2b4472cbacad476525"
+ },
+ "get_block_structure": {
+  "bytes": 209,
+  "sha256": "9066dd7314feb2736ae780120dd59a77e1db0bb482cb6053bacff23cab7310ff"
+ },
+ "get_briefing": {
+  "bytes": 5405,
+  "sha256": "a6c406527c437c4c252cf63990a1f35a649d07c8129c30d81bcb94793b165132"
+ },
+ "get_briefing/window": {
+  "bytes": 6306,
+  "sha256": "2da1bad82e4047a691ee5d244299076516404d48c3131c7d3de088590c2c75ac"
+ },
+ "get_daily_series": {
+  "bytes": 7771,
+  "sha256": "bff45facb0045bf0e04fed82aa76f0cbe399d1aa550f290ab6124139ab60af1f"
+ },
+ "get_daily_series/window": {
+  "bytes": 5324,
+  "sha256": "82f5f8ccef9e02d82e78a1c8ea9d02eedbd8e14eb62658d2286237928c471459"
+ },
+ "get_hr_zones": {
+  "bytes": 14149,
+  "sha256": "5d757a1da8308d8cfeec32715419de0fbb16655f02f7b6ef8a0e034fdd139e12"
+ },
+ "get_impact_volume": {
+  "bytes": 10494,
+  "sha256": "561def3b50c0125c671c392f90fde63da77359c603dd12b5ac932feaed74bec4"
+ },
+ "get_impact_volume/window": {
+  "bytes": 29466,
+  "sha256": "8cb47362b311108af06fe1c139fde5bd069789c95d4164d4be253dae41c71df9"
+ },
+ "get_intraday": {
+  "bytes": 9679,
+  "sha256": "366c53cf70991cdb83b84105b78cf4752d28828445e5ab2d61939dcf3bab8a44"
+ },
+ "get_latest": {
+  "bytes": 881,
+  "sha256": "20fe56f476f2e0c57f54a2d827100a523f2fa320d77d4b58bcf6fe9684fb9b69"
+ },
+ "get_monthly_running_power": {
+  "bytes": 141,
+  "sha256": "e7ebb98ced18defa7208fc588cdf87e01e5f5c5579fb80d66fad9ce7bb2161e8"
+ },
+ "get_run_form": {
+  "bytes": 659,
+  "sha256": "32161799f74ad7cf5adf121e7b1a859268fe09d1511dc151232baf2a4276daf7"
+ },
+ "get_run_form/window": {
+  "bytes": 360,
+  "sha256": "82175b4cdc74b9b240e1c7f74386d051f2bf963af450814832ba0268a5956767"
+ },
+ "get_sleep_regularity": {
+  "bytes": 2267,
+  "sha256": "542b2b780567a5e76ccc09fdf7e8b87e6390f64d5fc86827d3d0b400ccdfe452"
+ },
+ "get_sleep_regularity/window": {
+  "bytes": 1796,
+  "sha256": "cbbb28f66db80ce5c54b3d21021146f27a7a3b9c244799e257bbe59ad0fbcc81"
+ },
+ "get_subjective": {
+  "bytes": 18561,
+  "sha256": "2388ace6c201b06bf076ad6550e49875df1229bd2c9ffd05adc08f5bfbf98778"
+ },
+ "get_training_load_detail": {
+  "bytes": 5865,
+  "sha256": "01025ea1f3df7398c0b4c33d7774d317a91ca732cd004344600832efbd26c804"
+ },
+ "get_training_load_detail/window": {
+  "bytes": 3951,
+  "sha256": "5a9093027f81becbe1bb1713fec01ade076b41ad8649b0df681905cd41c9a448"
+ },
+ "get_weekly_readiness": {
+  "bytes": 327,
+  "sha256": "173d81a837f3056c56edfc534a4164b35323713a9a907499b797c9eb349c3f35"
+ },
+ "get_weekly_readiness/window": {
+  "bytes": 315,
+  "sha256": "acb805bec9029510ce387c727750cb7008e896aa203b9a5c3679d3e3efe49e6d"
+ },
+ "get_weekly_series": {
+  "bytes": 3386,
+  "sha256": "ca56864b5a2573f80197ed85754895fdcae30a00554c8e0e85104853b7179588"
+ },
+ "get_workout_segments": {
+  "bytes": 405,
+  "sha256": "d718ac4c0d2da792e8e6bb1b1876ba85a0f6626480ef39395b3dfbc6940e9285"
+ },
+ "list_available_metrics": {
+  "bytes": 7752,
+  "sha256": "234a395d7cb9d8edb781229a63bf18acc06e640f9a459f25c0c2d0bca63982cc"
+ },
+ "list_workouts": {
+  "bytes": 19096,
+  "sha256": "28abb30d5cb32b018da385bbeb7508fce7bca672b1ffd3d96ffc7afd2b2c4c58"
+ },
+ "list_workouts/window": {
+  "bytes": 13861,
+  "sha256": "add95b461d2cead32b11a1472205deb08a5d96234924a953712f3f02ec8e59ad"
+ },
+ "scan_correlations": {
+  "bytes": 4017,
+  "sha256": "d9baba42f89d00ecb394f180366aab5b685d454477b6a094860d0fd3f25ce0b0"
+ },
+ "summarize_metric": {
+  "bytes": 1575,
+  "sha256": "04dee177066e026a77cea0d51ff9860f3c23c01c94118a4c4234ac6faab89b39"
+ },
+ "summarize_metric/window": {
+  "bytes": 1593,
+  "sha256": "fccacfc50dc82c7c1d914e32c99cb27acc597d18485e8d640a13368acdcf1043"
+ }
+}

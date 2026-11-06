@@ -19,7 +19,7 @@ quality are all absent from the export. Every output here is descriptive.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
@@ -432,7 +432,8 @@ def _matched_power_for_run(conn, start_utc: str, end_utc: str,
 
 def monthly_running_power(conn, month: str,
                            pace_band: tuple[float, float] = REFERENCE_PACE_BAND, *,
-                           metric_units: bool = False) -> float | None:
+                           metric_units: bool = False,
+                           through: str | None = None) -> float | None:
     """Mean matched-pace power for a month, or ``None`` with fewer than two runs.
 
     Only route-backed Apple Watch running workouts are outdoor evidence. Each
@@ -440,6 +441,9 @@ def monthly_running_power(conn, month: str,
     month. The first three minutes of every continuous jog block are excluded
     because HR-lag analysis showed those buckets are not settled-state evidence
     (AUDIT-1 §6).
+
+    ``through`` (YYYY-MM-DD) bounds the month at that day inclusive, for a
+    session pinned to an as-of inside the month; None reads the whole month.
     """
     first = date.fromisoformat(f"{month}-01")
     if first.month == 12:
@@ -447,6 +451,9 @@ def monthly_running_power(conn, month: str,
     else:
         next_month = date(first.year, first.month + 1, 1)
     end_month = next_month.isoformat()
+    if through is not None:
+        end_month = min(end_month,
+                        (date.fromisoformat(through) + timedelta(days=1)).isoformat())
 
     runs = conn.execute(
         "SELECT start_utc, end_utc, local_date FROM workouts "

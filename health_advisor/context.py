@@ -25,8 +25,10 @@ a ``WHERE user_id =`` that one query can forget (D4).
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 
 from . import db as _db
@@ -90,6 +92,13 @@ class VaultContext:
     db_path: Path
     capabilities: frozenset[str] = READ_ONLY
     vault_version: int | None = None
+    #: The day this session is answering AS OF (YYYY-MM-DD), or None for "the
+    #: vault's latest data". Set with :meth:`at`. A tool takes its default
+    #: window end and its "latest"/"today" reference from it (via
+    #: ``analysis.request_as_of``), and reads no row after it. An explicit
+    #: value in the explicit context object, never a context var or a module
+    #: default, for the same reason the vault path is (T-003).
+    as_of: str | None = None
 
     @property
     def vault_id(self) -> str:
@@ -110,6 +119,8 @@ class VaultContext:
     def __post_init__(self) -> None:
         object.__setattr__(self, "db_path", Path(self.db_path))
         object.__setattr__(self, "capabilities", frozenset(self.capabilities))
+        if self.as_of is not None:
+            _check_as_of(self.as_of)
 
     # ----------------------------------------------------------------- #
     # construction
@@ -137,6 +148,16 @@ class VaultContext:
         to check, but because the capability is not there to check against.
         """
         return self.revoking(RAW_SAMPLES, WRITE)
+
+    def at(self, as_of: str) -> "VaultContext":
+        """This session, answering as of ``as_of`` (a YYYY-MM-DD day).
+
+        Returns a copy; every other derivation (:meth:`provider_facing`,
+        :meth:`granting`, :meth:`revoking`, :meth:`pinned`) carries the as-of
+        forward. Anything but a real YYYY-MM-DD day raises ``ValueError``.
+        """
+        _check_as_of(as_of)
+        return replace(self, as_of=as_of)
 
     def granting(self, *caps: str) -> "VaultContext":
         return replace(self, capabilities=self.capabilities | frozenset(caps))
@@ -294,8 +315,22 @@ class VaultContext:
 
     def __repr__(self) -> str:  # never print the path's parent tree in logs
         v = "unpinned" if self.vault_version is None else f"v{self.vault_version}"
+        at = "" if self.as_of is None else f", as_of={self.as_of}"
         return (f"VaultContext(user={self.user_id!r}, vault={self.db_path.name!r}, "
-                f"{v}, caps={','.join(sorted(self.capabilities))})")
+                f"{v}, caps={','.join(sorted(self.capabilities))}{at})")
+
+
+_AS_OF_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _check_as_of(as_of) -> None:
+    """Refuse an as-of that is not a real YYYY-MM-DD day."""
+    if not isinstance(as_of, str) or not _AS_OF_RE.fullmatch(as_of):
+        raise ValueError(f"as_of must be a YYYY-MM-DD day, not {as_of!r}")
+    try:
+        date.fromisoformat(as_of)
+    except ValueError:
+        raise ValueError(f"as_of {as_of!r} is not a real day") from None
 
 
 def _owner_of(conn: sqlite3.Connection) -> str | None:

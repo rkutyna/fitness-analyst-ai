@@ -570,6 +570,10 @@ def _compare_periods_facts(out: dict) -> list[dict]:
     metric = out["metric"]
     a0, a1 = out["period_a"]["range"]
     b0, b1 = out["period_b"]["range"]
+    # An open window ("all") has no start or end to name, so its change has
+    # no identity a fact id could carry: publish nothing rather than crash.
+    if not all(isinstance(edge, str) for edge in (a0, a1, b0, b1)):
+        return []
     base = f"compare/{metric}/{a0}:{a1}/vs/{b0}:{b1}"
     span = (f"between {_range_text(a0, a1)} and {_range_text(b0, b1)} "
             f"(the first window minus the second)")

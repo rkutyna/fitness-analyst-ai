@@ -91,9 +91,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "get_intraday": {
-        "UM": """
-            .buckets[].value
-        """,
         "ST": """
             .bucket_hours .buckets[].hour .buckets[].n
         """,
@@ -332,9 +329,10 @@ KNOWN: dict[str, dict[str, str]] = {
 # Metrics for which the denial gate sees a figure that no published fact cites,
 # per tool. Pinned both ways: a new entry is a new #576-shaped hole, a missing
 # one is a fix that should shrink this table.
-GATE_SEES_WITHOUT_SLOT: dict[str, set[str]] = {
-    "get_intraday": {"heart_rate", "step_count"},
-}
+# get_intraday's buckets were the one entry until downstream issue #578: the
+# gate (unchanged) counts each bucket's presentation as the metric's value,
+# and each bucket now publishes a declared fact restating that presentation.
+GATE_SEES_WITHOUT_SLOT: dict[str, set[str]] = {}
 
 GAP_LABELS = ("UM", "AMB", "DW")
 

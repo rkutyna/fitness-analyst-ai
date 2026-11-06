@@ -551,6 +551,42 @@ def compare_periods(ctx: VaultContext, metric: str, period_a: str, period_b: str
     return out
 
 
+def _intraday_facts(metric: str, day: str, unit, agg: str,
+                   bucket_hours: int, buckets: list[dict]) -> list[dict]:
+    """Each bucket's figure as a declared fact named by its local hours
+    (downstream issue #578).
+
+    A bucket is a sub-day figure. Keyed as a metric fact it could only take
+    the DAY as its period, where 24 buckets disagree with each other (and
+    with the day's own figure), so the publisher withheld all of them while
+    the denial gate still saw a value. The id carries the hour span instead,
+    and each fact restates both the bucket's number and its presentation,
+    the leaf the gate counts.
+    """
+    day_text = _day_text(day)
+    words = _metric_words(metric)
+    facts = []
+    for index, bucket in enumerate(buckets):
+        hour = bucket.get("hour")
+        if isinstance(hour, bool) or not isinstance(hour, int):
+            continue
+        span = f"{hour:02d}:00 to {hour + bucket_hours:02d}:00"
+        what = (f"Total {words} recorded" if agg == "sum"
+                else f"Average {words} over the samples recorded")
+        path = f"$.result.buckets[{index}]"
+        restates = [f"{path}.value"]
+        if isinstance(bucket.get("presentation"), dict):
+            restates.append(f"{path}.presentation.value")
+        fact = _metric_figure_fact(
+            f"intraday/{metric}/{day}/{hour:02d}-{hour + bucket_hours:02d}",
+            metric, bucket.get("value"), unit, f"{path}.value",
+            f"{what} from {span} on {day_text} (local time)", field="value")
+        if fact is not None:
+            fact["restates"] = restates
+            facts.append(fact)
+    return facts
+
+
 @tool
 def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1) -> dict:
     """Intraday pattern for a metric on a single LOCAL day (YYYY-MM-DD), bucketed
@@ -562,7 +598,8 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
     anything else is an 'error'. 'hour' is the bucket's first local hour. Note
     that a wider bucket dilutes an event: an 08:00 hour can average 140.6 bpm
     over a run that spent 14.7 minutes above 150. For anything about
-    an HR cap use get_hr_zones, which scopes to the workout itself."""
+    an HR cap use get_hr_zones, which scopes to the workout itself.
+    `publishable_facts` carries each bucket's figure, named by its hours."""
     if err := _bad_dates(day=day):
         return {"error": err}
     unit_system = _unit_system(ctx.settings())
@@ -622,7 +659,9 @@ def get_intraday(ctx: VaultContext, metric: str, day: str, bucket_hours: int = 1
     unit = unit or nz.canonical_unit(metric, None)
     _, unit = V.convert_for_unit_system(None, unit, unit_system)
     return {"metric": metric, "day": day, "unit": unit,
-            "agg": _agg(metric), "bucket_hours": bucket_hours, "buckets": buckets}
+            "agg": _agg(metric), "bucket_hours": bucket_hours, "buckets": buckets,
+            _PUBLISHABLE_FACTS_KEY: _intraday_facts(
+                metric, day, unit, _agg(metric), bucket_hours, buckets)}
 
 
 HR_ZONE_DEFAULT_THRESHOLDS = "135,150,155,170"

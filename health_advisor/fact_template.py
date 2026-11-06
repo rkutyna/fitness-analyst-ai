@@ -1871,14 +1871,16 @@ def build_briefing_facts(ledger: list[dict]) -> dict[str, dict]:
 # must be a non-empty string under the label limit; any other display makes
 # the entry malformed. Without it the engine renders the number from its unit.
 #
-# An entry may also name ``"restates": "$.result.<path>"``: the leaf of the
-# SAME result whose figure it publishes (a tool states a count once in its
-# rows and once here). The builder resolves that path itself and keeps the
-# entry only when the leaf holds exactly the declared number; the path then
-# joins the fact's ``source.paths``, so provenance names the leaf a reader
-# sees, not only the list entry. A path that does not resolve, or a leaf
-# that disagrees, makes the entry malformed and it is skipped (consumer
-# #578): the engine never trusts a tool's claim about its own result.
+# An entry may also name ``"restates": "$.result.<path>"`` (or a list of up
+# to four): the leaves of the SAME result whose figure it publishes (a tool
+# states a count once in its rows and once here). The builder resolves each
+# path itself and keeps the entry only when a numeric leaf holds exactly the
+# declared number and a string leaf (the tool's presentation of it) equals
+# the fact's display exactly; the paths then join the fact's
+# ``source.paths``, so provenance names the leaves a reader sees, not only
+# the list entry. A path that does not resolve, or a leaf that disagrees,
+# makes the entry malformed and it is skipped (consumer #578): the engine
+# never trusts a tool's claim about its own result.
 DECLARED_FACTS_RESULT_KEY = "publishable_facts"
 _DECLARED_KEY_PREFIX = "pub:"
 _DECLARED_MAX_PER_RESULT = 400
@@ -1892,36 +1894,61 @@ def declared_fact_key(fact_id: str) -> str:
     return _DECLARED_KEY_PREFIX + quote(str(fact_id), safe="-_.~:/")
 
 
-def _declared_restated_path(item: dict, result) -> str | None | bool:
-    """The verified ``restates`` path of one entry: ``None`` when the entry
-    names none, the path when it resolves to exactly the declared number, and
-    ``False`` when it is named but malformed, unresolvable or disagreeing."""
-    path = item.get("restates")
-    if path is None:
-        return None
-    value = item.get("value")
-    if (not isinstance(path, str) or len(path) > _DECLARED_MAX_TEXT
-            or isinstance(value, bool) or not isinstance(value, (int, float))):
-        return False
+_DECLARED_MAX_RESTATES = 4
+_MISSING = object()
+
+
+def _declared_leaf(result, path):
+    """The leaf ``path`` names in ``result``, or ``_MISSING``."""
+    if not isinstance(path, str) or len(path) > _DECLARED_MAX_TEXT:
+        return _MISSING
     parts = _path_parts(path)
     # The parse must account for every character, or a path such as
     # "$.result.a b" would resolve to a prefix of what it names.
     if not parts or _json_path(tuple(parts)) != path:
-        return False
+        return _MISSING
     node = result
-    try:
-        for part in parts:
-            if isinstance(part, int) and not isinstance(node, list):
-                return False
-            if isinstance(part, str) and not isinstance(node, dict):
-                return False
+    for part in parts:
+        if isinstance(part, int) and isinstance(node, list) \
+                and 0 <= part < len(node):
             node = node[part]
-    except (KeyError, IndexError, TypeError):
+        elif isinstance(part, str) and isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return _MISSING
+    return node
+
+
+def _declared_restated_paths(item: dict, result,
+                             display: str) -> list[str] | None | bool:
+    """The verified ``restates`` paths of one numeric entry.
+
+    ``restates`` is one path or a list of up to four. A numeric leaf must hold
+    exactly the declared number; a string leaf (a tool's presentation of that
+    number) must equal the fact's display exactly. Returns ``None`` when the
+    entry names none, the paths when every one verifies, and ``False`` when
+    any is malformed, unresolvable or disagreeing.
+    """
+    named = item.get("restates")
+    if named is None:
+        return None
+    value = item.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    if (isinstance(node, bool) or not isinstance(node, (int, float))
-            or node != value):
+    paths = [named] if isinstance(named, str) else named
+    if (not isinstance(paths, list) or not paths
+            or len(paths) > _DECLARED_MAX_RESTATES
+            or len(set(map(str, paths))) != len(paths)):
         return False
-    return path
+    for path in paths:
+        leaf = _declared_leaf(result, path)
+        if isinstance(leaf, str):
+            if leaf != display:
+                return False
+        elif (isinstance(leaf, bool) or not isinstance(leaf, (int, float))
+                or leaf != value):
+            return False
+    return list(paths)
 
 
 def _declared_candidate(item, *, index: int, sequence,
@@ -1962,14 +1989,14 @@ def _declared_candidate(item, *, index: int, sequence,
             display = given
     else:
         return None
-    restated = _declared_restated_path(item, result)
+    restated = _declared_restated_paths(item, result, display)
     if restated is False:
         return None
     key = declared_fact_key(fact_id)
     source = {"sequence": sequence,
               "path": f"$.result.{DECLARED_FACTS_RESULT_KEY}[{index}].value"}
     if restated is not None:
-        source["paths"] = [restated]
+        source["paths"] = restated
     return key, {
         "key": key, "label": label, "value": value, "unit": unit,
         "display": display,

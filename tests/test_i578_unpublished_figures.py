@@ -389,3 +389,64 @@ def test_a_malformed_display_drops_the_entry(display):
     facts = fact_template.build_declared_facts([record])
     assert set(facts) == {PUB("y")}
     assert facts[PUB("y")]["display"] == "-18 min"
+
+
+# --- item 3: intraday buckets -------------------------------------------------
+
+def test_intraday_buckets_publish_under_their_hour_span(vault):
+    from health_advisor import chat
+    ledger = _ledger(vault, "get_intraday",
+                     {"metric": "step_count", "day": "2026-08-27"})
+    facts = fact_template.build_declared_facts(ledger)
+    base = "intraday/step_count/2026-08-27"
+    got = {k: (f["value"], f["unit"], f["display"], f["source"]["paths"])
+           for k, f in facts.items()}
+    expected = {
+        PUB(f"{base}/07-08"): (365.4, "count", "365", [
+            "$.result.buckets[0].value",
+            "$.result.buckets[0].presentation.value"]),
+        PUB(f"{base}/08-09"): (513.9, "count", "514", [
+            "$.result.buckets[1].value",
+            "$.result.buckets[1].presentation.value"]),
+    }
+    assert {k: got.get(k) for k in expected} == expected
+    assert len(facts) == 16          # one per returned bucket
+    assert facts[PUB(f"{base}/07-08")]["label"] == (
+        "Total step count recorded from 07:00 to 08:00 on Thu Aug 27 "
+        "(local time)")
+    # The gate is unchanged: it still sees a step_count value in this ledger,
+    # and now every leaf it counts is a published source.
+    assert chat._ledger_has_asked_metric_value(ledger, "step_count")
+    assert lib.analyse(ledger)["gate_no_slot"] == []
+
+
+def test_intraday_rate_buckets_say_average(vault):
+    ledger = _ledger(vault, "get_intraday",
+                     {"metric": "heart_rate", "day": "2026-08-27"})
+    facts = fact_template.build_declared_facts(ledger)
+    fact = facts[PUB("intraday/heart_rate/2026-08-27/08-09")]
+    assert fact["label"] == ("Average heart rate over the samples recorded "
+                             "from 08:00 to 09:00 on Thu Aug 27 (local time)")
+    # Buckets never become metric facts for the day: no key collides with
+    # the day's own figure.
+    assert not any(f.get("metric") == "heart_rate" for f in
+                   fact_template.build_fact_set(ledger).values()
+                   if f.get("field") != "period_label")
+
+
+@pytest.mark.parametrize("restates", [
+    ["$.result.kcal", "$.result.shown"],       # number and its rendering
+    "$.result.shown",
+])
+def test_a_restated_presentation_must_equal_the_display(restates):
+    def facts(shown):
+        record = {"sequence": 1, "tool_name": "t", "result_elided": False,
+                  "result": {"kcal": 335.0, "shown": shown,
+                             fact_template.DECLARED_FACTS_RESULT_KEY: [
+                                 {"id": "k", "label": "Meal calories",
+                                  "value": 335.0, "unit": "kcal",
+                                  "display": "335 kcal",
+                                  "restates": restates}]}}
+        return fact_template.build_declared_facts([record])
+    assert set(facts("335 kcal")) == {PUB("k")}
+    assert facts("336 kcal") == {}

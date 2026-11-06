@@ -1270,6 +1270,10 @@ _COPY_ORDER = (
     # workout_routes references workouts.id and must follow its parent; copying
     # the packed BLOB preserves route telemetry without introducing a trace.
     "workout_routes",
+    # records.source_revision_id names a row here (downstream issue #702), and
+    # the target is freshly initialised, so copying ids verbatim keeps every
+    # copied record's revision resolvable.
+    "source_revisions",
     "records",
     "workout_events",
     "daily_metrics",

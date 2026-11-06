@@ -63,6 +63,7 @@ def test_hk_columns_are_nullable_and_indexes_are_partial(conn):
     }
     assert all(record_info[name]["notnull"] == 0 for name in (
         "hk_uuid", "hk_type_identifier", "source_revision_json", "hk_device_id",
+        "source_revision_id",
     ))
     assert workout_info["hk_uuid"]["notnull"] == 0
     assert record_info["dedupe_key"]["notnull"] == 1
@@ -182,6 +183,7 @@ def test_old_vault_keeps_rows_while_migrating_hk_columns_and_indexes(tmp_path):
     assert conn.execute("SELECT value FROM records WHERE dedupe_key = 'old'").fetchone()[0] == 12
     assert {row["name"] for row in conn.execute("PRAGMA table_info(records)")} >= {
         "hk_uuid", "hk_type_identifier", "source_revision_json", "hk_device_id",
+        "source_revision_id",
     }
     assert conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
@@ -208,12 +210,16 @@ def test_build_vault_carries_hk_columns_indexes_and_state(tmp_path):
     vault.build_vault(source, target, measure_gzip=False)
     conn = db.connect(target, read_only=True)
     try:
+        # The revision is stored interned since downstream issue #702, so it
+        # is read through db.source_revision_json; the copy must carry the
+        # source_revisions row its id names, or this lookup raises.
         row = conn.execute(
-            "SELECT hk_uuid, hk_type_identifier, source_revision_json, hk_device_id "
-            "FROM records"
+            "SELECT id, hk_uuid, hk_type_identifier, hk_device_id FROM records"
         ).fetchone()
-        assert tuple(row) == (
-            HK_UUID, "HKCategoryTypeIdentifierSleepAnalysis", '{"version":"1"}', "watch-a",
+        assert (row["hk_uuid"], row["hk_type_identifier"], row["hk_device_id"],
+                db.source_revision_json(conn, row["id"])) == (
+            HK_UUID, "HKCategoryTypeIdentifierSleepAnalysis", "watch-a",
+            '{"version":"1"}',
         )
         assert conn.execute("SELECT hk_uuid FROM workouts").fetchone()[0] == "w-1"
         # The anchor must NOT travel — see the _COPY_ORDER comment. build_vault

@@ -143,12 +143,6 @@ KNOWN: dict[str, dict[str, str]] = {
         """,
     },
     "get_impact_volume": {
-        "UM": """
-            .periods[].jog_miles .periods[].jog_pace_min_per_mi .periods[].walk_miles
-            .periods[].walk_minutes .periods[].jog_change_pct
-            .block_comparison.change.mean_delta .block_comparison.change.total_delta
-            .block_comparison.change.total_delta_pct
-        """,
         "AMB": """
             .jog_threshold_sensitivity[].jog_minutes
         """,

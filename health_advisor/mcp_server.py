@@ -1795,6 +1795,105 @@ def _impact_unsynced_days(conn, start: str, end: str, bucket_rows: list[dict],
     return days, weeks, recorded, recorded_weeks
 
 
+def _impact_period_text(period: str, by: str) -> str:
+    if by == "day":
+        return f"on {_day_text(period)}"
+    first, _, last = period.partition(":")
+    return f"in the week of {_day_text(first)} to {_day_text(last or first)}"
+
+
+def _impact_block_range(block: dict) -> str | None:
+    starts = (block.get("period") or {}).get("period_starts") \
+        if isinstance(block.get("period"), dict) else None
+    if not isinstance(starts, list) or not starts:
+        return None
+    last = date.fromisoformat(str(starts[-1])) + timedelta(days=6)
+    return f"{starts[0]}:{last.isoformat()}"
+
+
+def _impact_facts(out: dict, metric_units: bool) -> list[dict]:
+    """The period rows' jog and walk figures beside ``jog_minutes``, and the
+    block comparison's changes, as declared facts (downstream issue #578).
+
+    Only ``jog_minutes`` is a catalogue metric. Its siblings are other
+    quantities (miles, a pace, walking minutes, a percentage change), so
+    each is published under its OWN id and label, never by inheriting the
+    row's ``jog_minutes`` metric, which would label miles as minutes. A
+    period with no samples at all (``no_data``) is emitted as zeros only to
+    keep the sequence gap-free; none of its figures is published, because a
+    zero there is not a measurement.
+    """
+    by = out.get("by")
+    dist_unit = "km" if metric_units else "mi"
+    dist_key = "jog_km" if metric_units else "jog_miles"
+    walk_key = "walk_km" if metric_units else "walk_miles"
+    pace_key = "jog_pace_min_per_km" if metric_units else "jog_pace_min_per_mi"
+    facts: list[dict] = []
+
+    def add(fid, value, unit, path, text):
+        if (value is None or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(value)):
+            return
+        facts.append({"id": fid, "value": value, "unit": unit,
+                      "restates": path, "label": text})
+
+    for index, row in enumerate(out.get("periods") or []):
+        period = row.get("period")
+        if not isinstance(period, str) or row.get("no_data"):
+            continue
+        when = _impact_period_text(period, by)
+        if row.get("partial"):
+            when += " (a partial period: not all of its days have happened)"
+        base, path = f"impact/{period}", f"$.result.periods[{index}]"
+        add(f"{base}/{dist_key}", row.get(dist_key), dist_unit,
+            f"{path}.{dist_key}",
+            f"Distance covered while jogging (minutes the tool classifies as "
+            f"jogging) {when}")
+        add(f"{base}/{pace_key}", row.get(pace_key), f"min/{dist_unit}",
+            f"{path}.{pace_key}", f"Average jogging pace {when}")
+        add(f"{base}/{walk_key}", row.get(walk_key), dist_unit,
+            f"{path}.{walk_key}",
+            f"Distance covered while walking (all walking movement the watch "
+            f"recorded, not only deliberate walks) {when}")
+        add(f"{base}/walk_minutes", row.get("walk_minutes"), "min",
+            f"{path}.walk_minutes",
+            f"Minutes of walking movement the watch recorded (all walking "
+            f"movement, not only deliberate walks; not exercise volume) {when}")
+        add(f"{base}/jog_change_pct", row.get("jog_change_pct"), "%",
+            f"{path}.jog_change_pct",
+            f"Percentage change in jog minutes {when} versus the preceding "
+            f"{'day' if by == 'day' else 'week'}")
+
+    comparison = out.get("block_comparison")
+    if isinstance(comparison, dict):
+        blocks = comparison.get("blocks") or {}
+        prior = _impact_block_range(blocks.get("prior") or {})
+        recent = _impact_block_range(blocks.get("recent") or {})
+        change = comparison.get("change") or {}
+        if prior and recent:
+            weeks = comparison.get("weeks_per_block")
+            span = (f"from the {weeks} weeks {_day_text(prior.split(':')[0])} "
+                    f"to {_day_text(prior.split(':')[1])} to the {weeks} weeks "
+                    f"{_day_text(recent.split(':')[0])} to "
+                    f"{_day_text(recent.split(':')[1])}")
+            trailing = (comparison.get("completeness") or {}).get(
+                "partial_trailing_week") or {}
+            if trailing.get("included") and trailing.get("partial"):
+                span += " (the recent block includes a partial week)"
+            base = f"impact/blocks/{prior}/{recent}/jog_minutes"
+            path = "$.result.block_comparison.change"
+            add(f"{base}/mean_delta", change.get("mean_delta"), "min",
+                f"{path}.mean_delta",
+                f"Change in average weekly jog minutes {span}")
+            add(f"{base}/total_delta", change.get("total_delta"), "min",
+                f"{path}.total_delta", f"Change in total jog minutes {span}")
+            add(f"{base}/total_delta_pct", change.get("total_delta_pct"), "%",
+                f"{path}.total_delta_pct",
+                f"Percentage change in total jog minutes {span}")
+    return facts
+
+
 @tool
 def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                       weeks_per_block: int | None = None,
@@ -1857,7 +1956,11 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
 
     Note that walk_minutes covers ALL ambulatory movement the watch saw, not
     just deliberate walks, so it runs far higher than session time — don't
-    report it as exercise volume. Dates are local YYYY-MM-DD."""
+    report it as exercise volume. Dates are local YYYY-MM-DD.
+
+    `publishable_facts` carries each measured period's jog distance, jog
+    pace, walk distance, walk minutes and jog_change_pct, and the block
+    comparison's changes, each labelled with what it is and its period."""
     for label, value in (("start", start), ("end", end)):
         try:
             date.fromisoformat(value)
@@ -1954,6 +2057,7 @@ def get_impact_volume(ctx: VaultContext, start: str, end: str, by: str = "week",
                     _add_stat_presentations(block, "jog_minutes",
                                             block.get("period"))
                 out["block_comparison"] = comparison
+    out[_PUBLISHABLE_FACTS_KEY] = _impact_facts(out, metric_units)
     return out
 
 

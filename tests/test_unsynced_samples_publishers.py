@@ -91,6 +91,8 @@ def _period(out: dict, day: str) -> dict:
 
 
 # ---- frozen literals captured from the unmodified code ----
+# (publishable_facts added by downstream issue #578: the period's jog and
+# walk figures as declared facts; the measured figures are unchanged.)
 IMPACT_MEASURED_DAY_BASE = json.loads(r'''
 {
  "as_of": "2026-07-10",
@@ -183,6 +185,20 @@ IMPACT_MEASURED_DAY_BASE = json.loads(r'''
     "value": "13 min"
    }
   }
+ ],
+ "publishable_facts": [
+  {"id": "impact/2026-07-02/jog_miles", "value": 0.95, "unit": "mi",
+   "restates": "$.result.periods[0].jog_miles",
+   "label": "Distance covered while jogging (minutes the tool classifies as jogging) on Thu Jul 2"},
+  {"id": "impact/2026-07-02/jog_pace_min_per_mi", "value": 14.0,
+   "unit": "min/mi", "restates": "$.result.periods[0].jog_pace_min_per_mi",
+   "label": "Average jogging pace on Thu Jul 2"},
+  {"id": "impact/2026-07-02/walk_miles", "value": 0.0, "unit": "mi",
+   "restates": "$.result.periods[0].walk_miles",
+   "label": "Distance covered while walking (all walking movement the watch recorded, not only deliberate walks) on Thu Jul 2"},
+  {"id": "impact/2026-07-02/walk_minutes", "value": 0.0, "unit": "min",
+   "restates": "$.result.periods[0].walk_minutes",
+   "label": "Minutes of walking movement the watch recorded (all walking movement, not only deliberate walks; not exercise volume) on Thu Jul 2"}
  ],
  "periods": [
   {

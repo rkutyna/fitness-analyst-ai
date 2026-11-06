@@ -240,3 +240,73 @@ def test_hr_zones_custom_thresholds_publish_under_their_own_edges(vault):
     assert facts[PUB(f"{run}/above/140/minutes")]["value"] == 41.33
     assert facts[PUB(f"{run}/band/120-140/minutes")]["value"] == 6.67
     assert PUB(f"{run}/above/150/minutes") not in facts
+
+
+# --- item 4: impact volume's sibling figures ----------------------------------
+
+def test_impact_volume_siblings_publish_under_their_own_ids(vault):
+    ledger = _ledger(vault, "get_impact_volume", {
+        "start": "2026-07-27", "end": "2026-08-30", "weeks_per_block": 2})
+    facts = fact_template.build_declared_facts(ledger)
+    week = "impact/2026-08-03:2026-08-09"
+    blocks = "impact/blocks/2026-08-03:2026-08-16/2026-08-17:2026-08-30/jog_minutes"
+    got = {key: (fact["value"], fact["unit"], fact["display"],
+                 fact["source"]["paths"]) for key, fact in facts.items()}
+    expected = {
+        PUB(f"{week}/jog_miles"):
+            (7.65, "mi", "7.65", ["$.result.periods[1].jog_miles"]),
+        PUB(f"{week}/jog_pace_min_per_mi"):
+            (10.4, "min/mi", "10:24 min/mi",
+             ["$.result.periods[1].jog_pace_min_per_mi"]),
+        PUB(f"{week}/walk_miles"):
+            (11.24, "mi", "11.24", ["$.result.periods[1].walk_miles"]),
+        PUB(f"{week}/walk_minutes"):
+            (198.3, "min", "198.3", ["$.result.periods[1].walk_minutes"]),
+        PUB(f"{week}/jog_change_pct"):
+            (0.8, "%", "0.8", ["$.result.periods[1].jog_change_pct"]),
+        PUB(f"{blocks}/mean_delta"):
+            (24.7, "min", "24.7",
+             ["$.result.block_comparison.change.mean_delta"]),
+        PUB(f"{blocks}/total_delta"):
+            (49.4, "min", "49.4",
+             ["$.result.block_comparison.change.total_delta"]),
+        PUB(f"{blocks}/total_delta_pct"):
+            (27.5, "%", "27.5",
+             ["$.result.block_comparison.change.total_delta_pct"]),
+    }
+    assert {k: got.get(k) for k in expected} == expected
+    # The first week has no predecessor in range: its change is null and
+    # publishes nothing.
+    assert PUB("impact/2026-07-27:2026-08-02/jog_change_pct") not in facts
+    assert facts[PUB(f"{week}/jog_miles")]["label"] == (
+        "Distance covered while jogging (minutes the tool classifies as "
+        "jogging) in the week of Mon Aug 3 to Sun Aug 9")
+    assert facts[PUB(f"{blocks}/mean_delta")]["label"] == (
+        "Change in average weekly jog minutes from the 2 weeks Mon Aug 3 to "
+        "Sun Aug 16 to the 2 weeks Mon Aug 17 to Sun Aug 30")
+
+
+def test_impact_volume_siblings_never_inherit_the_jog_minutes_metric(vault):
+    """No sibling leaf becomes a ``jog_minutes`` metric fact (miles labelled as
+    minutes); the metric facts are still exactly the period rows' jog
+    minutes and the block weeks' values."""
+    ledger = _ledger(vault, "get_impact_volume", {
+        "start": "2026-07-27", "end": "2026-08-30", "weeks_per_block": 2})
+    metric_paths = {fact["source"]["path"] for fact in
+                    fact_template.build_fact_set(ledger).values()
+                    if (fact.get("source") or {}).get("path")}
+    assert all(path.endswith((".jog_minutes", ".value", ".mean", ".total"))
+               for path in metric_paths), sorted(metric_paths)
+    assert _unpublished_paths(ledger) & {
+        f"$.result.periods[{i}].{field}" for i in range(5)
+        for field in ("jog_miles", "jog_pace_min_per_mi", "walk_miles",
+                      "walk_minutes", "jog_change_pct")} == set()
+
+
+def test_a_period_with_no_samples_publishes_no_zero():
+    from health_advisor import mcp_server
+    out = {"by": "week", "periods": [
+        {"period": "2026-08-03:2026-08-09", "no_data": True, "partial": False,
+         "jog_miles": 0.0, "walk_miles": 0.0, "walk_minutes": 0.0,
+         "jog_pace_min_per_mi": None, "jog_change_pct": None}]}
+    assert mcp_server._impact_facts(out, metric_units=False) == []

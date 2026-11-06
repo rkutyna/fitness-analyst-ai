@@ -3068,10 +3068,14 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         + (cold_start_guidance + "\n\n" if cold_start_guidance else "")
         + (gathered_data_guidance + "\n\n" if gathered_data_guidance else "")
         + (samples_guidance + "\n\n" if samples_guidance else "")
-        + (declared_guidance + "\n\n" if declared_guidance else "")
         + (rating_scale_guidance + "\n\n" if rating_scale_guidance else "")
         + "USER QUESTION:\n" + question.strip() + "\n\n"
-        "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
+        # The declared-facts note quotes one of THIS turn's keys as its
+        # example, so it is per-turn text and sits in the tail with the fact
+        # set, never in the cacheable head (#304; downstream issue #578 made
+        # most turns carry declared facts).
+        + (declared_guidance + "\n\n" if declared_guidance else "")
+        + "CLOSED FACT SET (Python ledger facts for this answer only):\n" +
         fact_template.render_fact_set(facts))
     final_status_before = llm.last_loop_status()
     raw = llm.tool_loop(

@@ -1879,6 +1879,7 @@ _DECLARED_KEY_PREFIX = "pub:"
 _DECLARED_MAX_PER_RESULT = 400
 _DECLARED_MAX_ID = 200
 _DECLARED_MAX_TEXT = 320
+_DECLARED_PACE_UNITS = frozenset({"min/mi", "min/km"})
 
 
 def declared_fact_key(fact_id: str) -> str:
@@ -1942,7 +1943,11 @@ def _declared_candidate(item, *, index: int, sequence,
     elif isinstance(value, (int, float)):
         if not math.isfinite(value):
             return None
-        display = _display_value(value, unit=unit)
+        # A pace in minutes per distance reads as a clock-style pace
+        # ("10:36 min/mi"); "10.6" would read as ten minutes six seconds.
+        display = (_pace_display(value, unit)
+                   if unit in _DECLARED_PACE_UNITS and value > 0
+                   else _display_value(value, unit=unit))
     else:
         return None
     restated = _declared_restated_path(item, result)

@@ -488,3 +488,34 @@ def test_compare_periods_with_an_open_window_answers_and_declares_nothing(tmp_pa
         assert out["publishable_facts"] == []
     closed = S.compare_periods(ctx, "resting_heart_rate", "7d", "30d")
     assert len(closed["publishable_facts"]) == 2
+
+
+def test_declared_facts_never_push_a_result_over_the_ledger_limit():
+    """A result over the ledger limit is elided whole and publishes nothing.
+    Measured on a live-sized vault: get_impact_volume by day over a year was
+    197 KB before the declared facts and 484 KB with them. The trim keeps the
+    most useful facts (the front of the list) and never touches the figures.
+    Mutation: return `out` untrimmed and the size assertion fails."""
+    import json as _json
+    from health_advisor import mcp_server as S
+    from health_advisor.deepdive_mcp import LEDGER_RESULT_MAX_BYTES as LIMIT
+
+    def size(obj):
+        return len(_json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False).encode("utf-8"))
+
+    figures = {"periods": [{"period": f"2025-01-{i % 28 + 1:02d}", "jog_minutes": i}
+                           for i in range(2000)]}
+    facts = [{"id": f"impact/{i}/jog_miles", "value": i, "label": "x" * 200}
+             for i in range(3000)]
+    out = S._fit_declared_facts({**figures, "publishable_facts": list(facts)})
+    assert size(out) <= LIMIT
+    kept = out["publishable_facts"]
+    assert 0 < len(kept) < len(facts)
+    assert kept == facts[:len(kept)]                       # a prefix: the most useful first
+    assert out["periods"] == figures["periods"]            # the figures are untouched
+    # A result that fits is returned unchanged; one whose figures alone overflow gets none.
+    small = {"a": 1, "publishable_facts": facts[:3]}
+    assert S._fit_declared_facts(dict(small)) == small
+    huge = {"blob": "y" * (LIMIT + 10), "publishable_facts": facts[:3]}
+    assert S._fit_declared_facts(huge)["publishable_facts"] == []

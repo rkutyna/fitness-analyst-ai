@@ -352,5 +352,7 @@ def test_cause_in_the_row_is_a_known_enum_value_for_every_cause_ask_cause_return
                          if isinstance(sub, ast.Constant)
                          and isinstance(sub.value, str)}
     assert returned
-    # The one cause set directly by the scripted conversational reply.
-    assert returned | {"conversational_scripted"} == set(chat._ASK_CAUSES)
+    # The two causes set directly: the scripted conversational reply's and
+    # the elided-result answer's (downstream #578).
+    assert returned | {"conversational_scripted", "result_elided"} == \
+        set(chat._ASK_CAUSES)

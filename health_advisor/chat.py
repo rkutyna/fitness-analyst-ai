@@ -653,8 +653,8 @@ def _refuse_steering_leak(result: dict) -> dict:
 
 
 # The closed set of values a turn's ``cause`` can take: every string
-# ``_ask_cause`` returns, plus the one literal the scripted conversational
-# reply sets directly. The question log copies ``cause`` onto its row only when
+# ``_ask_cause`` returns, plus the two literals set directly: the scripted
+# conversational reply's and the elided-result answer's (#578). The question log copies ``cause`` onto its row only when
 # it is in this set, so an open-ended string can never reach the log through
 # that field. ``tests/test_ask_question_counters.py`` derives the first half
 # of the set from ``_ask_cause``'s own source, so a new cause cannot be added
@@ -666,7 +666,7 @@ _ASK_CAUSES = frozenset({
     "withheld_available_figure", "denied_available_figure",
     "contradicted_day_count", "restated_unit", "unsupported_period_phrase",
     "stale_window", "gate_refused", "judge_refused", "provider_key_refused",
-    "ok",
+    "result_elided", "ok",
 })
 
 
@@ -2494,6 +2494,31 @@ def _window_data_unavailable(ledger: list[dict], resolved_window) -> bool:
     )
 
 
+# Downstream #578, Done-when 4: the Python-owned answer for a turn whose only
+# figure-bearing results were too large for the call ledger. It names no
+# figure and no tool, and says what to ask instead.
+_RESULT_ELIDED_REASON = "every figure-bearing tool result was elided from the ledger"
+_RESULT_ELIDED_ANSWER = (
+    "What I looked up for this question was too large to check figure by "
+    "figure, so I can't quote a number from it. Ask about a shorter period, "
+    "or group it by week or month, and I can give you the figures.")
+
+
+def _figures_lost_to_elision(ledger: list[dict], *,
+                             figures_published: bool) -> bool:
+    """Whether elision alone left this turn without a citable figure.
+
+    True when at least one ledger record's result was elided and no figure
+    fact was published from anything else. A turn that published a figure
+    from another call narrates as usual: the elided call's index line already
+    tells the model nothing in it is citable.
+    """
+    if figures_published or not isinstance(ledger, list):
+        return False
+    return any(isinstance(record, dict) and record.get("result_elided")
+               for record in ledger)
+
+
 def _unavailable_window_answer(resolved_window) -> str:
     """Render the deterministic user-facing refusal for an uncovered window."""
     return (f"I don't have activity data for {resolved_window.start} through "
@@ -2953,6 +2978,42 @@ def _answer_fact_template(ctx: VaultContext, question: str, prompt: str,
         # figures published above, so it exists only when a rating was read.
         **fact_template.build_rating_scale_facts(data_facts),
     }
+
+    # Downstream #578: a result over the ledger's size limit is elided, and
+    # an elided result publishes nothing. When that left the turn with no
+    # figure at all, Python says so in its own words and the narration model
+    # is not asked: there is nothing it could cite, and a figure it wrote
+    # from the gather transcript could not be bound to the vault.
+    if _figures_lost_to_elision(
+            ledger, figures_published=bool(figure_facts)):
+        elided_verification = {
+            "ok": False,
+            "grounded": False,
+            "unsupported": [],
+            "reason": _RESULT_ELIDED_REASON,
+            "figures_verified": 0,
+            "figures_total": 0,
+            "advice_quantities": [],
+            "tier_counts": {"path": 0, "metric": None},
+            "tier1_path_bound": 0,
+            "tier2_metric_recomputed": None,
+            "tool_calls": len(ledger),
+            "judge_score": None,
+            "template_compliant": False,
+            "narration_counts_comparable": False,
+            "cause": "result_elided",
+        }
+        elided_verification.update(_ask_fact_counters(
+            question, facts, figure_facts, {"placeholders": []},
+            withheld_fact_keys))
+        _record_attempt(capture, 1, _RESULT_ELIDED_ANSWER, None,
+                        elided_verification, None, ledger)
+        return {
+            "text": _RESULT_ELIDED_ANSWER,
+            "mode": "fallback",
+            "tool_trace": ledger,
+            "verification": elided_verification,
+        }
 
     # The allowlist above is positive evidence that this turn requested no
     # data. Reuse the gather reply only for that closed class; a data question

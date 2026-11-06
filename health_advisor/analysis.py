@@ -1854,7 +1854,12 @@ def long_term(conn, as_of: str | None = None) -> list[dict]:
 
 
 def highlights(conn, as_of: str | None = None) -> list[dict]:
-    """True positive facts for grounded encouragement: all-time PRs hit recently."""
+    """True positive facts for grounded encouragement: all-time PRs hit recently.
+
+    "All-time" is as of ``as_of``: no day after it is read, so a briefing for
+    a past day never names a high set after that day (downstream issue #731).
+    With no ``as_of`` the day is the vault's latest data day, which bounds
+    nothing, so a briefing for the latest day is unchanged."""
     as_of = _as_of(conn, as_of)
     out = []
     recent_start = (date.fromisoformat(as_of) - timedelta(days=6)).isoformat()
@@ -1864,8 +1869,8 @@ def highlights(conn, as_of: str | None = None) -> list[dict]:
         col = mx.value_col(m)
         row = conn.execute(
             f"SELECT date, MAX({col}) v FROM daily_metrics WHERE metric = ? AND "
-            + mx.current_daily_metrics_predicate(conn),
-            (m,)).fetchone()
+            + mx.current_daily_metrics_predicate(conn) + " AND date <= ?",
+            (m, as_of)).fetchone()
         if row and row["date"] and row["date"] >= recent_start:
             out.append({"metric": m, "kind": "all_time_high",
                         "value": mx.r(row["v"]), "date": row["date"]})

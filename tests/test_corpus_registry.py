@@ -29,6 +29,7 @@ from health_advisor.corpus_build import (
     sha256_text,
     validate_entry,
 )
+from tests.import_guard import VAULT_OPENING_MODULES, banned_after_import, banned_imports
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INGEST_PATH = REPO_ROOT / "scripts" / "corpus_ingest.py"
@@ -238,16 +239,13 @@ def test_ingest_rejects_a_vault_flag_at_the_command_line(tmp_path):
 
 
 def test_ingest_source_contains_no_vault_import():
-    """It must not be able to reach a vault by import either."""
-    src = INGEST_PATH.read_text(encoding="utf-8")
-    code_lines = [
-        ln for ln in src.splitlines()
-        if ln.startswith(("import ", "from ")) or " import " in ln]
-    for line in code_lines:
-        for banned in ("health_advisor.db", "health_advisor.vault",
-                       "health_advisor.context", "health_advisor.receiver",
-                       "health_advisor.normalize"):
-            assert banned not in line, line
+    """It must not be able to reach a vault by import either: every import is
+    resolved with `ast`, function bodies included, and `sys.modules` is read
+    after a fresh import for what they pull in (tests/import_guard.py, shared
+    with tests/test_corpus_fetch.py). Mutation: append `from health_advisor
+    import vault` to scripts/corpus_ingest.py and both checks name it."""
+    assert banned_imports(INGEST_PATH, VAULT_OPENING_MODULES) == []
+    assert banned_after_import(INGEST_PATH, VAULT_OPENING_MODULES) == []
 
 
 def test_ingest_has_no_default_corpus_path_and_no_env_var(monkeypatch):

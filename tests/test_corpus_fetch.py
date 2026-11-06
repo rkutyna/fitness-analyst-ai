@@ -31,6 +31,7 @@ import pytest
 
 from health_advisor import corpus_sources as cs
 from health_advisor.corpus_build import extract_text, sha256_text, validate_entry
+from tests.import_guard import VAULT_OPENING_MODULES, banned_after_import, banned_imports
 
 FETCH_PATH = Path(__file__).resolve().parent.parent / "scripts" / "corpus_fetch.py"
 
@@ -80,12 +81,41 @@ def test_fetch_rejects_a_vault_flag_at_the_command_line(tmp_path):
 
 
 def test_fetch_source_imports_nothing_that_can_open_a_vault():
-    src = FETCH_PATH.read_text(encoding="utf-8")
-    code_lines = [ln for ln in src.splitlines()
-                  if ln.startswith(("import ", "from ")) or " import " in ln]
-    for line in code_lines:
-        for banned in fetch.FORBIDDEN_IMPORTS:
-            assert banned not in line, line
+    """Resolved with `ast`, then checked in `sys.modules` after a fresh import
+    (tests/import_guard.py). A per-line substring match would pass
+    `from health_advisor import vault`. Mutation: append that line to
+    scripts/corpus_fetch.py and both checks name it."""
+    assert fetch.FORBIDDEN_IMPORTS == VAULT_OPENING_MODULES
+    assert banned_imports(FETCH_PATH, VAULT_OPENING_MODULES) == []
+    assert banned_after_import(FETCH_PATH, VAULT_OPENING_MODULES) == []
+
+
+@pytest.mark.parametrize("source, hit", [
+    ("from health_advisor import vault\n", "1: health_advisor.vault"),
+    ("import health_advisor.vault as V\n", "1: health_advisor.vault"),
+    ("from health_advisor.vault import open_vault\n", "1: health_advisor.vault"),
+    ("from health_advisor import *\n", "1: health_advisor.*"),
+    ("def f():\n    from health_advisor import db\n", "2: health_advisor.db"),
+    ("import importlib\nimportlib.import_module('health_advisor.context')\n", "2: health_advisor.context"),
+    ("from health_advisor import receiver as r\n", "1: health_advisor.receiver"),
+    ("from . import vault\n", "1: relative import ."),
+])
+def test_the_import_guard_resolves_every_spelling(tmp_path, source, hit):
+    script = tmp_path / "script.py"
+    script.write_text(source, encoding="utf-8")
+    assert hit in banned_imports(script, VAULT_OPENING_MODULES)
+
+
+def test_the_import_guard_sees_transitive_imports_and_passes_clean_ones(tmp_path):
+    """`sys.modules` sees what an innocent-looking import pulls in; `ast` cannot.
+    `json` loads `json.decoder`, so with that as the banned name the static
+    check passes and the runtime check names it."""
+    script = tmp_path / "script.py"
+    script.write_text("import json\nfrom health_advisor import corpus_sources\n", encoding="utf-8")
+    assert banned_imports(script, ("json.decoder",)) == []
+    assert banned_after_import(script, ("json.decoder",)) == ["json.decoder"]
+    assert banned_imports(script, VAULT_OPENING_MODULES) == []
+    assert banned_after_import(script, VAULT_OPENING_MODULES) == []
 
 
 def test_fetch_requires_an_output_directory(tmp_path):

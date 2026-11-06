@@ -83,7 +83,10 @@ no scoped entry is byte-identical to one written before this existed. An
 engine that predates scopes refuses to load a registry holding one
 (``Device(**raw)`` is strict): it fails closed instead of treating a verify
 key as a phone. Revocation (``revoke``) and the timestamp window apply to a
-scoped key exactly as to a phone's.
+scoped key exactly as to a phone's. Because ``revoke`` keeps the entry, rolling
+an instance back past scopes first needs ``verify-remove --kid K``, which
+deletes a scoped entry outright (and refuses a phone's), leaving the registry
+byte-identical to one that never held it.
 
 Seams left for later items: the enrolment route's body carries a version so a
 QR-token enrolment can share this registry; ``Device.via`` records which
@@ -505,6 +508,29 @@ class DeviceRegistry:
             self._write(devices)
             return revoked, False
 
+    def remove_scoped(self, kid: str) -> Device:
+        """Delete one SCOPED entry outright; return it. Host-side only.
+
+        The rollback path for #652: an engine that predates scopes refuses to
+        load a registry holding any scoped entry, and ``revoke`` keeps the
+        entry, so a revoked verify key would still take every phone offline
+        after a rollback. Deleting it leaves the registry exactly as if the
+        key had never been enrolled. A full device (a phone) is never deleted
+        here -- phones are revoked, so their refusal stays on record -- and an
+        unknown kid is an error, not a silent no-op.
+        """
+        with self._exclusive():
+            devices = self._read_file()
+            existing = devices.get(kid)
+            if existing is None:
+                raise KeyError(kid)
+            if existing.scope is None:
+                raise DeviceAuthError("device_not_scoped", 409)
+            del devices[kid]
+            self._write(devices)
+            return existing
+
+
 
 def registry_from_env() -> DeviceRegistry:
     """The registry named by HA_DEVICE_REGISTRY_FILE, checked at startup."""
@@ -679,6 +705,27 @@ def _verify_enrol(registry: DeviceRegistry, key_file: str) -> int:
     return 0
 
 
+def _verify_remove(registry: DeviceRegistry, kid: str) -> int:
+    try:
+        device = registry.remove_scoped(kid)
+    except KeyError:
+        print(f"refusing: no enrolled device has kid {kid!r}; nothing removed",
+              file=sys.stderr)
+        return 1
+    except DeviceAuthError as exc:
+        print(f"refusing: {kid} is a full device, not a verify-scoped key "
+              f"({exc.code}); revoke a phone instead; nothing removed",
+              file=sys.stderr)
+        return 1
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"refusing: the registry cannot be read or written "
+              f"({type(exc).__name__}); nothing removed", file=sys.stderr)
+        return 1
+    print(f"removed {device.kid} (scope {device.scope}) from the registry; "
+          "other devices unaffected")
+    return 0
+
+
 def _read_token(stream) -> str | None:
     line = stream.readline(1024).strip()
     found = _TOKEN_LINE_RE.fullmatch(line)
@@ -802,6 +849,12 @@ def main(argv: list[str] | None = None) -> int:
              "X-Health-Secret token is read from stdin; prints '<status> <class>'")
     vprobe.add_argument("--key-file", required=True)
     vprobe.add_argument("--base-url", required=True)
+    vremove = sub.add_parser(
+        "verify-remove",
+        help="delete one verify-scoped entry from the registry outright (run "
+             "before rolling an instance back to an engine older than #652, "
+             "which cannot load a scoped entry); refuses a phone's key")
+    vremove.add_argument("--kid", required=True)
     args = parser.parse_args(argv)
     if args.command == "verify-probe":
         return _verify_probe(args.key_file, args.base_url, sys.stdin)
@@ -811,6 +864,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "verify-enrol":
         return _verify_enrol(registry, args.key_file)
+
+    if args.command == "verify-remove":
+        return _verify_remove(registry, args.kid)
 
     if args.command == "list":
         devices = registry.devices()

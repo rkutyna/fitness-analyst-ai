@@ -11,6 +11,7 @@ Every key here is generated per test run.
 """
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -503,3 +504,77 @@ def test_classify_probe_never_echoes_a_body():
     assert device_auth.classify_probe(
         500, b'{"detail": {"error": "LEAK Me"}}') == "error unrecognised"
     assert device_auth.classify_probe(404, b"<html>CANARY</html>") == "unrecognised"
+
+
+# ------------------------------------------------- rollback: verify-remove
+
+
+@dataclasses.dataclass(frozen=True)
+class _DeviceBeforeScopes:
+    """Device as an engine predating #652 defines it: no ``scope`` field."""
+    kid: str
+    public_key: str
+    enrolled_at: str
+    via: str
+    key_storage: str
+    revoked_at: str | None = None
+
+
+def _load_like_an_engine_before_scopes(path) -> int:
+    data = json.loads(path.read_text())
+    return len([_DeviceBeforeScopes(**raw) for raw in data["devices"]])
+
+
+def test_verify_remove_leaves_the_registry_byte_identical_to_phones_only(
+        state, capsys):
+    """Mutation: remove_scoped revokes instead of deleting -> the scoped entry
+    stays, the bytes differ and the pre-scope loader raises: red."""
+    path = state / "devices.json"
+    registry = device_auth.DeviceRegistry(path)
+    for _ in range(2):
+        registry.enrol(Phone().public_x963, via="token", key_storage="keychain",
+                       allow_new=True)
+    phones_only = path.read_bytes()
+    key_file = state / "verify-probe.key"
+    assert _cli(state, "verify-enrol", "--key-file", str(key_file)) == 0
+    kid = device_auth.kid_for(device_auth._public_point(
+        device_auth.load_key_file(str(key_file))))
+    # The availability failure being fixed (#652 review M2), and its survival
+    # of revocation: an engine before scopes cannot load either registry.
+    with pytest.raises(TypeError, match="scope"):
+        _load_like_an_engine_before_scopes(path)
+    assert _cli(state, "revoke", kid) == 0
+    with pytest.raises(TypeError, match="scope"):
+        _load_like_an_engine_before_scopes(path)
+    capsys.readouterr()
+    assert _cli(state, "verify-remove", "--kid", kid) == 0
+    out = capsys.readouterr()
+    assert f"removed {kid}" in out.out
+    for line in key_file.read_text().split("-----")[2].strip().splitlines():
+        assert line not in out.out + out.err
+    assert path.read_bytes() == phones_only
+    assert _load_like_an_engine_before_scopes(path) == 2
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_verify_remove_refuses_a_phone_and_an_unknown_kid_leaving_the_file(
+        state, capsys):
+    """Mutation: drop the scope-is-None refusal -> the phone's entry is deleted
+    and the call exits 0: red."""
+    path = state / "devices.json"
+    registry = device_auth.DeviceRegistry(path)
+    phone = Phone()
+    registry.enrol(phone.public_x963, via="token", key_storage="keychain",
+                   allow_new=True)
+    registry.enrol_scoped(Phone().public_x963, scope="verify")
+    before = path.read_bytes()
+    capsys.readouterr()
+    assert _cli(state, "verify-remove", "--kid", phone.kid) == 1
+    err = capsys.readouterr().err
+    assert "full device" in err and "nothing removed" in err
+    assert path.read_bytes() == before
+    with pytest.raises(device_auth.DeviceAuthError, match="device_not_scoped"):
+        registry.remove_scoped(phone.kid)
+    assert _cli(state, "verify-remove", "--kid", Phone().kid) == 1
+    assert "no enrolled device" in capsys.readouterr().err
+    assert path.read_bytes() == before

@@ -501,6 +501,19 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     if getattr(conn, "_health_advisor_read_only", False):
         return
+    if declared == VAULT_SCHEMA_VERSION and _schema_is_current(conn):
+        # Fast path (downstream #734): the vault was fully migrated by this
+        # exact migration code and its schema has not changed since, so every
+        # statement below would be a no-op -- but the DROP TRIGGERs and the
+        # schema script would still take the write lock, and a request that
+        # only needs a current schema would queue behind any writer (an
+        # ingest) for up to BUSY_TIMEOUT_MS and then fail. Only reads here.
+        # The resolution marks are data, not schema: keep establishing an
+        # absent one, which reads and writes only when a mark is added.
+        from . import vault
+        vault.mark_receiver_resolutions(conn)
+        conn.commit()
+        return
 
     # Constraint changes are table migrations, not column migrations. Do this
     # before schema.sql so its IF NOT EXISTS triggers cannot preserve the old
@@ -578,7 +591,78 @@ def init_db(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO vault_meta (key, value) VALUES (?, ?)",
         ("created_at", utcnow_iso()),
     )
+    # Stamp what this complete run produced, so the next init_db can tell
+    # without DDL that there is nothing left to do (see _schema_is_current).
+    conn.execute(
+        "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",
+        (SCHEMA_FINGERPRINT_KEY, _schema_fingerprint(conn)),
+    )
     conn.commit()
+
+
+# vault_meta key holding the fingerprint init_db stamps after a complete
+# migration run (downstream #734).
+SCHEMA_FINGERPRINT_KEY = "schema_fingerprint"
+_CODE_DIGEST_CACHE: dict[str, str] = {}
+
+
+def _migration_code_digest() -> str:
+    """Digest of everything that decides what init_db's full run does.
+
+    The module source (every migration function, _ADDED_COLUMNS,
+    _ADDED_TABLES, _BENCHMARK_DDL) and schema.sql, plus the live values of the
+    migration tables and the benchmark stage bound, so a changed migration --
+    shipped in code or patched in at runtime -- is never mistaken for a
+    current vault. Any edit to this file makes every vault take the full path
+    once, which is the conservative direction.
+    """
+    from . import benchmark
+    source = _CODE_DIGEST_CACHE.get("source")
+    if source is None:
+        source = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        _CODE_DIGEST_CACHE["source"] = source
+    h = hashlib.sha256()
+    for part in (source, Path(SCHEMA_PATH).read_text(), repr(VAULT_SCHEMA_VERSION),
+                 repr(sorted((t, sorted(c.items()))
+                             for t, c in _ADDED_COLUMNS.items())),
+                 repr(sorted(_ADDED_TABLES.items())), _BENCHMARK_DDL,
+                 repr(benchmark.MAX_STAGE)):
+        h.update(part.encode())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _schema_fingerprint(conn: sqlite3.Connection) -> str:
+    """The migration code's digest bound to this database's actual schema.
+
+    sqlite_master holds the text of every table, index and trigger, so a
+    trigger with an old body (consumer #430's settled-immutability pair, #108's
+    assistant-only trigger), a missing column, or a dropped index changes the
+    fingerprint even though the migration code did not change.
+    """
+    h = hashlib.sha256(_migration_code_digest().encode())
+    for row in conn.execute(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+        "ORDER BY type, name, tbl_name"
+    ):
+        h.update("\0".join(str(v) for v in tuple(row)).encode())
+        h.update(b"\1")
+    return h.hexdigest()
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    """Whether the last complete init_db stamped exactly this code and schema.
+
+    Read-only: a vault that predates the stamp, or has no vault_meta yet,
+    answers False and takes the full migration path.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM vault_meta WHERE key = ?", (SCHEMA_FINGERPRINT_KEY,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None and row[0] == _schema_fingerprint(conn)
 
 
 def utcnow_iso() -> str:
@@ -2108,6 +2192,28 @@ def arbitrated_pairs(
     return sorted(p for p in pairs if nz.agg_for(p[0]) == "sum")
 
 
+# One (metric, month) recount, sargable (downstream #734). The month test is
+# still `substr(local_date, 1, 7) = month`, so the rows counted are exactly the
+# rows the old query counted; the range in front of it is what lets SQLite seek
+# idx_records_metric_localdate instead of walking the metric's whole history.
+# Every string that starts with `month` sorts in [month, month with its last
+# character incremented) under BINARY collation, so the range never excludes a
+# row the substr() test would keep. Measured on a synthetic 13.9M-row vault:
+# one heart_rate month recount went from 12.2 s (a scan of every heart_rate row,
+# held inside the ingest's write transaction) to 0.01 s.
+_MONTH_RECOUNT_WHERE = (
+    "metric = ? AND local_date >= ? AND local_date < ? "
+    "AND substr(local_date, 1, 7) = ?"
+)
+
+
+def _month_recount_params(metric: str, month: str) -> tuple[str, str, str, str]:
+    if not month:  # an empty local_date prefix matches every row
+        return (metric, "", "\U0010ffff", month)
+    upper = month[:-1] + chr(ord(month[-1]) + 1)
+    return (metric, month, upper, month)
+
+
 def rebuild_metric_source_months(
     conn: sqlite3.Connection,
     *,
@@ -2166,9 +2272,9 @@ def rebuild_metric_source_months(
         cur = conn.execute(
             "INSERT INTO metric_source_months (metric, month, source, n) "
             "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
-            "FROM records WHERE metric = ? AND substr(local_date, 1, 7) = ? "
+            f"FROM records WHERE {_MONTH_RECOUNT_WHERE} "
             "GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '')",
-            (metric, month),
+            _month_recount_params(metric, month),
         )
         written += cur.rowcount if cur.rowcount > 0 else 0
     if not outer:
@@ -2240,11 +2346,11 @@ def _rebuild_source_months_frozen(
         cur = conn.execute(
             "INSERT INTO metric_source_months (metric, month, source, n) "
             "SELECT metric, substr(local_date, 1, 7), COALESCE(source, ''), COUNT(*) "
-            "FROM records WHERE metric = ? AND substr(local_date, 1, 7) = ? "
+            f"FROM records WHERE {_MONTH_RECOUNT_WHERE} "
             "GROUP BY metric, substr(local_date, 1, 7), COALESCE(source, '') "
             "ON CONFLICT(metric, month, source) DO UPDATE SET "
             "n = MAX(metric_source_months.n, excluded.n)",
-            (metric, month))
+            _month_recount_params(metric, month))
         written += cur.rowcount if cur.rowcount > 0 else 0
     if merged:
         log_ingest(conn, "recompute", "frozen", merged, 0,

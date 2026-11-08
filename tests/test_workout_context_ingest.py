@@ -261,6 +261,11 @@ def test_a_declared_vault_opens_with_its_declaration_undisturbed(tmp_path):
     assert vault_mod.is_vault(conn)
     assert vault_mod.compacted_through(conn) == through
     after = dict(conn.execute("SELECT key, value FROM vault_meta").fetchall())
+    # The schema fingerprint is init_db's cache key, not part of the
+    # declaration: dropping and re-adding the columns changed the schema, so
+    # init_db is meant to re-stamp it (downstream #734). Every declared key
+    # must survive unchanged.
+    meta.pop(db.SCHEMA_FINGERPRINT_KEY)
     assert {k: after.get(k) for k in meta} == meta
     assert conn.execute(
         "SELECT is_indoor, fitness_machine FROM workouts").fetchone()[:] == (None, None)

@@ -1170,6 +1170,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     lock_wait_ms = None
     clock = None
     try:
+        # This connection alone gets the larger page cache, so the batch's
+        # write transaction does not spill and lock readers out before its
+        # commit (downstream #734); it is released when the connection closes.
+        db.use_ingest_cache(conn)
         db.init_db(conn)
         begin_at = time.perf_counter()
         conn.execute("BEGIN IMMEDIATE")

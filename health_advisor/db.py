@@ -55,18 +55,23 @@ VAULT_SCHEMA_VERSION = 2
 # together they turn "reader errors out" into "reader waits a moment".
 BUSY_TIMEOUT_MS = 30_000
 
-# Page cache for a WRITABLE connection, in KiB (downstream #734). With the
-# library default (2 MiB, ~500 pages) a normal sync batch spills: a 2,000-record
-# heart-rate batch dirties ~4,800 pages (its rollback journal measured 19 MiB on
-# a 14M-row vault), so mid-transaction the writer escalates to EXCLUSIVE and
-# every READER is refused until the commit, not only during it. 64 MiB holds
-# such a batch's dirty pages with room for the pages it reads. The cache is
-# allocated as pages are touched and freed at close, and only writable
-# connections get it (readers keep the default), so a process with a few
-# writable connections open at once stays far under a 2 GB memory cap even
-# when each fills its cache. A batch large enough to exceed it still spills;
-# correctness never depended on this, only how long readers wait.
-WRITABLE_CACHE_KIB = 65_536
+# Page cache for the HealthKit ingest's main write transaction, in KiB
+# (downstream #734). With the library default (a few MiB at most) a normal
+# sync batch spills dirty pages mid-transaction, which escalates the writer to
+# EXCLUSIVE, so every READER is refused until the commit, not only during it.
+# Measured on an invented multi-million-row vault: a 2,000-record batch of new
+# heart-rate rows (random UUIDs, the densest index churn of any sync batch)
+# dirtied up to about 5,300 pages of 4 KiB; other metrics dirtied fewer. 32 MiB
+# (8,192 pages) covers that with about 50% margin. Only clean pages are evicted
+# to make room, so the dirty pages are what has to fit; a batch of twice that
+# size (about 9,000 dirty pages) spills.
+#
+# Opt-in, per connection, through `use_ingest_cache`: every other connection,
+# writable or not, keeps the library default, because a large cache is also
+# filled by plain reads and a process with many connections open would hold
+# one per connection. A batch that dirties more than this still spills, as
+# every batch did before: correct, only readers wait longer.
+INGEST_CACHE_KIB = 32_768
 
 # Per-request lock-wait budget (downstream #734). A user-facing request makes
 # several connections; each waits up to its busy timeout, so a request behind
@@ -161,14 +166,23 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connecti
         # write, so the :ro mount works. Writes here are infrequent (daily).
         conn.execute("PRAGMA journal_mode = DELETE")
         conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute(f"PRAGMA cache_size = -{WRITABLE_CACHE_KIB}")
-        # The spill threshold is a page count and its default varies by
-        # build (2,000 to 20,000 pages seen); pin it to the same budget so
-        # both the no-spill margin and the memory bound are this constant.
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
-        conn.execute(
-            f"PRAGMA cache_spill = {max(1, WRITABLE_CACHE_KIB * 1024 // page_size)}")
     return conn
+
+
+def use_ingest_cache(conn: sqlite3.Connection) -> None:
+    """Give ``conn`` the ingest's page cache (see INGEST_CACHE_KIB).
+
+    For the HealthKit ingest's main write transaction only. The cache is
+    allocated as pages are touched and freed when ``conn`` closes; journal
+    mode and synchronous are untouched.
+    """
+    conn.execute(f"PRAGMA cache_size = -{INGEST_CACHE_KIB}")
+    # The spill threshold is a page count and its default varies by build;
+    # pin it to the same budget so both the no-spill margin and the memory
+    # bound are INGEST_CACHE_KIB.
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
+    conn.execute(
+        f"PRAGMA cache_spill = {max(1, INGEST_CACHE_KIB * 1024 // page_size)}")
 
 
 # Columns added after the initial schema. `CREATE TABLE IF NOT EXISTS` won't add

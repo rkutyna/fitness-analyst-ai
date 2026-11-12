@@ -394,6 +394,12 @@ def update_for_days(conn, days) -> int:
     """
     written = 0
     prepared = []
+    # downstream #734: every long read happens BEFORE the first write. The
+    # caller's transaction is deferred, so the vault's write lock is taken at
+    # the first _upsert and held to the commit; reading 365 days of heart rate
+    # (hr_max_estimate) and the impact digest after that point held it for
+    # ~0.6 s per workout day. None of these reads depends on a row this
+    # function writes: they read records, workouts and non-derived daily rows.
     for day in sorted(set(days)):
         timing = compute_sleep_timing(_sleep_intervals(conn, day), day)
         vals = {k: v for k, v in (timing or {}).items() if k != "status"}
@@ -402,6 +408,8 @@ def update_for_days(conn, days) -> int:
             vals["wear_hours"] = wh
         vals.update(_dial_for_day(conn, day))
         prepared.append((day, vals))
+    loads = {day: _hr_load_for_day(conn, day) for day, _ in prepared}
+    for day, vals in prepared:
         for m, v in vals.items():
             _upsert(conn, m, day, v)
             written += 1
@@ -425,7 +433,7 @@ def update_for_days(conn, days) -> int:
         regularity = _interval_regularity_for_day(conn, day)
         if regularity is not None:
             window[REGULARITY_METRIC] = regularity
-        load = _hr_load_for_day(conn, day)
+        load = loads[day]
         if load is not None:
             window[HR_LOAD_METRIC] = load
         for m in DERIVED_METRICS:

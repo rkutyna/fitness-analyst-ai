@@ -1997,6 +1997,14 @@ def _workout_arbitration(
     return " AND NOT EXISTS (" + query + ")", params
 
 
+# `AS MATERIALIZED` (SQLite >= 3.35) makes an uncorrelated CTE inside a
+# correlated subquery run once per statement rather than be flattened into
+# the per-row subquery. Older libraries reject the keyword, so they get the
+# plain form: the result is identical, only the cost bound is not promised
+# there (downstream #734).
+_MATERIALIZED = "MATERIALIZED " if sqlite3.sqlite_version_info >= (3, 35, 0) else ""
+
+
 def _workout_arbitration_query(
     conn: sqlite3.Connection, metric: str, *, date: str | None = None,
     source_table: str = "records",
@@ -2090,44 +2098,95 @@ def _workout_arbitration_query(
     cutoff = workout_source_arbitration_cutoff(conn).replace("'", "''")
     day_scope, day_scope_args = scoped("day_winner")
     workout_scope, workout_scope_args = workout_scoped("workout")
+    # downstream #734: the per-workout and per-day winner tests used to be
+    # EXISTS subqueries CORRELATED to each candidate row, so every distance
+    # sample re-walked its whole workout window through idx_records_metric_start
+    # (and a role with no labels, e.g. GymKit on most days, walked it to the
+    # end): O(n^2) in a workout's samples, 8.5 s of write-lock hold for one
+    # 1,044-record batch. Each test depends only on the workout (or the day),
+    # never on the candidate row, so it is computed ONCE per workout and per
+    # day in uncorrelated MATERIALIZED CTEs, and the per-row work is a lookup
+    # in those small sets. The truth value of every predicate is unchanged.
+    #
+    # In date mode (a ``date`` and no ``arbitration_window``) the clause has
+    # always been built for rows of that local_date only -- the source labels
+    # above are that date's labels -- so the sets are bounded to that date:
+    # winner days to the date, workouts to those overlapping the date's rows.
+    date_mode = arbitration_window is None and date is not None
+    day_bound, day_bound_args = "", []
+    workout_bound, workout_bound_args = "", []
+    if date_mode:
+        day_bound, day_bound_args = " AND day_winner.local_date = ?", [date]
+        workout_bound = (
+            " AND workout.end_utc > (SELECT MIN(bound.start_utc || '') "
+            f"FROM {source} AS bound "
+            "WHERE bound.metric = 'distance_walking_running' "
+            "AND bound.local_date = ?)"
+            " AND workout.start_utc <= (SELECT MAX(bound.start_utc || '') "
+            f"FROM {source} AS bound "
+            "WHERE bound.metric = 'distance_walking_running' "
+            "AND bound.local_date = ?)")
+        # `|| ''` keeps the planner on (metric, local_date): a bare MIN/MAX
+        # of start_utc is answered from idx_records_metric_start by walking
+        # the metric's whole history until a row of this date turns up.
+        workout_bound_args = [date, date]
     winner_window = (
         "winner.metric = 'distance_walking_running' "
         "AND winner.start_utc >= workout.start_utc "
         "AND winner.start_utc < workout.end_utc"
     )
-    has_gymkit = (
-        f"EXISTS (SELECT 1 FROM {source} AS winner "
-        f"WHERE {winner_window} AND {member('winner.source', 'gymkit')})"
+
+    def has_role(role: str) -> str:
+        # A role with no labels in scope can never match (`x IN (empty)` is
+        # false); say so as a constant instead of walking the window.
+        if not role_labels[role]:
+            return "0"
+        return (f"EXISTS (SELECT 1 FROM {source} AS winner "
+                f"WHERE {winner_window} AND {member('winner.source', role)})")
+
+    materialized = _MATERIALIZED
+    watch_days_cte = (
+        f"watch_days(local_date) AS {materialized}("
+        "SELECT DISTINCT day_winner.local_date "
+        f"FROM {source} AS day_winner "
+        "WHERE day_winner.metric = 'distance_walking_running' "
+        f"AND day_winner.local_date >= '{cutoff}'{day_bound} "
+        f"{day_scope} AND {member('day_winner.source', 'watch')})"
     )
-    has_watch = (
-        f"EXISTS (SELECT 1 FROM {source} AS winner "
-        f"WHERE {winner_window} AND {member('winner.source', 'watch')})"
+    workout_flags_cte = (
+        "workout_flags(start_utc, end_utc, has_gymkit, has_watch) AS "
+        f"{materialized}(SELECT start_utc, end_utc, has_gymkit, has_watch FROM ("
+        "SELECT workout.start_utc AS start_utc, workout.end_utc AS end_utc, "
+        f"{has_role('gymkit')} AS has_gymkit, "
+        f"{has_role('watch')} AS has_watch "
+        "FROM workouts AS workout "
+        f"WHERE workout.local_date >= '{cutoff}' "
+        f"{workout_scope}{workout_bound}) "
+        "WHERE has_gymkit OR has_watch)"
     )
     day_loser = (
         f"({source}.local_date >= '{cutoff}' "
         f"AND {member(f'{source}.source', 'iphone')} "
-        f"AND EXISTS (SELECT 1 FROM {source} AS day_winner "
-        "WHERE day_winner.metric = 'distance_walking_running' "
-        f"AND day_winner.local_date = {source}.local_date "
-        f"{day_scope} AND {member('day_winner.source', 'watch')}))"
+        f"AND {source}.local_date IN (SELECT local_date FROM watch_days))"
     )
     workout_loser = (
-        "EXISTS (SELECT 1 FROM workouts AS workout "
-        f"WHERE workout.local_date >= '{cutoff}' "
-        f"{workout_scope} "
-        f"AND {source}.start_utc >= workout.start_utc "
-        f"AND {source}.start_utc < workout.end_utc "
+        "EXISTS (SELECT 1 FROM workout_flags AS flags "
+        f"WHERE {source}.start_utc >= flags.start_utc "
+        f"AND {source}.start_utc < flags.end_utc "
         "AND (("
-        f"{member(f'{source}.source', 'iphone')} AND ({has_gymkit} OR {has_watch})"
+        f"{member(f'{source}.source', 'iphone')} "
+        "AND (flags.has_gymkit OR flags.has_watch)"
         ") OR ("
-        f"{member(f'{source}.source', 'watch')} AND {has_gymkit}"
+        f"{member(f'{source}.source', 'watch')} AND flags.has_gymkit"
         ")))"
     )
     return (
-        "WITH " + role_ctes + " "
+        "WITH " + role_ctes + ", " + watch_days_cte + ", "
+        + workout_flags_cte + " "
         "SELECT 1 FROM (SELECT 1) AS arbitration WHERE ("
         f"{day_loser} OR {workout_loser})",
-        [*role_args, *day_scope_args, *workout_scope_args],
+        [*role_args, *day_bound_args, *day_scope_args,
+         *workout_scope_args, *workout_bound_args],
     )
 
 

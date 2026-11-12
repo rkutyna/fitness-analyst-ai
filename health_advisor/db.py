@@ -2695,6 +2695,25 @@ def _recompute_core(
     return written
 
 
+def stored_record_metrics(conn: sqlite3.Connection) -> list[str]:
+    """Every distinct `records.metric`, by a loose scan of the metric index.
+
+    One index seek per metric rather than a walk of every row: the receiver
+    uses it to turn a HealthKit deletion's lookup by UUID into a SEARCH of
+    ``idx_records_metric_hk_uuid`` (metric, hk_uuid) over this exact list,
+    instead of a SCAN of that whole index (downstream #734). The list is
+    exact, so the rows found are exactly the rows a lookup by UUID alone
+    finds.
+    """
+    return [r[0] for r in conn.execute(
+        "WITH RECURSIVE m(metric) AS ("
+        "SELECT MIN(metric) FROM records "
+        "UNION ALL "
+        "SELECT (SELECT MIN(metric) FROM records WHERE metric > m.metric) "
+        "FROM m WHERE m.metric IS NOT NULL) "
+        "SELECT metric FROM m WHERE metric IS NOT NULL")]
+
+
 def has_table(conn: sqlite3.Connection, name: str) -> bool:
     """Whether ``name`` exists as a table in this database."""
     return conn.execute(

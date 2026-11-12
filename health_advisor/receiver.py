@@ -1323,6 +1323,15 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # A tombstone is durable before the add filter is evaluated. A
             # deletion for an unknown UUID therefore still protects against a
             # later stale add, while replaying the deletion does no work.
+            # downstream #734: a lookup by UUID alone planned as a SCAN of
+            # idx_records_metric_hk_uuid (~30 ms per deletion on a 14M-row
+            # vault, under the write lock). Constraining metric to the exact
+            # list of stored metrics makes it a SEARCH of (metric, hk_uuid)
+            # and finds the same rows. Deletions only remove rows, so the list
+            # taken here stays exact for the whole loop.
+            uuid_metrics: list[str] = (
+                db.stored_record_metrics(conn) if parsed["deletions"] else [])
+            uuid_in = ",".join("?" * len(uuid_metrics)) or "NULL"
             for deletion in parsed["deletions"]:
                 dtype, uuid = deletion["type_identifier"], deletion["hk_uuid"]
                 tombstone = conn.execute(
@@ -1334,9 +1343,10 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     continue
                 rows = conn.execute(
                     "SELECT metric, local_date FROM records "
-                    "WHERE hk_uuid = ? AND hk_type_identifier = ? "
+                    f"WHERE metric IN ({uuid_in}) "
+                    "AND hk_uuid = ? AND hk_type_identifier = ? "
                     "AND hk_device_id = ?",
-                    (uuid, dtype, parsed["device_id"]),
+                    (*uuid_metrics, uuid, dtype, parsed["device_id"]),
                 ).fetchall()
                 affected.update((row["metric"], row["local_date"]) for row in rows)
                 records_touched.update(
@@ -1364,11 +1374,12 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                             "local_date": gone["local_date"],
                         })
                 cur = conn.execute(
-                    "DELETE FROM records WHERE hk_uuid = ? "
+                    f"DELETE FROM records WHERE metric IN ({uuid_in}) "
+                    "AND hk_uuid = ? "
                     "AND hk_type_identifier = ? AND hk_device_id = ?",
-                    (uuid, dtype, parsed["device_id"]),
-                )
-                deleted += cur.rowcount
+                    (*uuid_metrics, uuid, dtype, parsed["device_id"]),
+                ) if rows else None
+                deleted += cur.rowcount if cur is not None else 0
                 conn.execute(
                     "INSERT INTO hk_deletions "
                     "(device_id, type_identifier, hk_uuid, deleted_at, "

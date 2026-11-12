@@ -303,7 +303,17 @@ def test_followup_prompt_contains_prior_turns_once_and_reads_before_append(
         events.append(("append", args[2], args[3]))
         return original_append(*args, **kwargs)
 
+    original_start = chat.start_question
+
+    def recorded_start(*args, **kwargs):
+        # downstream #734: a new conversation and its first question are one
+        # transaction, so the first ask stores its question here.
+        result = original_start(*args, **kwargs)
+        events.append(("begin", result[0]))
+        return result
+
     monkeypatch.setattr(chat, "append_question_and_history", recorded_begin)
+    monkeypatch.setattr(chat, "start_question", recorded_start)
     monkeypatch.setattr(chat, "append_turn", recorded_append)
     monkeypatch.setattr(llm, "tool_loop", fake_loop)
     monkeypatch.setattr(llm, "complete", lambda *args, **kwargs: '{"score": 95}')

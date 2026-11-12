@@ -2189,9 +2189,9 @@ def _workout_arbitration_query(
     # downstream #734: the per-workout and per-day winner tests used to be
     # EXISTS subqueries CORRELATED to each candidate row, so every distance
     # sample re-walked its whole workout window through idx_records_metric_start
-    # (and a role with no labels, e.g. GymKit on most days, walked it to the
-    # end): O(n^2) in a workout's samples, 8.5 s of write-lock hold for one
-    # 1,044-record batch. Each test depends only on the workout (or the day),
+    # (and a role with no labels in scope walked it to the end): O(n^2) in a
+    # workout's samples, seconds of write-lock hold for a thousand-record
+    # batch on a workout day. Each test depends only on the workout (or the day),
     # never on the candidate row, so it is computed ONCE per workout and per
     # day in uncorrelated MATERIALIZED CTEs, and the per-row work is a lookup
     # in those small sets. The truth value of every predicate is unchanged.

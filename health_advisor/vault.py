@@ -1071,8 +1071,8 @@ def mark_receiver_resolutions(
         # A series already marked as sample resolution (raw_series) has no
         # finer mark to refine toward: the measurement below could only be
         # discarded (resolution >= 0). Skip it. It reads the metric's whole
-        # history under the ingest's write lock, 0.65 s per step or distance
-        # batch on a 14M-row vault (downstream #734).
+        # history under the ingest's write lock, over half a second per step
+        # or distance batch on a multi-million-row vault (downstream #734).
         if metric in known and metric in raw_series:
             continue
         resolution = _recorded_resolution_seconds(conn, metric)

@@ -1,9 +1,9 @@
 """HealthKit deletions find their rows by SEARCH, and find the same rows.
 
 downstream #734: each deletion looked its UUID up with a predicate that planned
-as a SCAN of idx_records_metric_hk_uuid, ~30 ms per deletion on a 14M-row
-vault, all under the ingest's write lock; 200 deletions of UUIDs the vault
-never held held it for 6 s. The cost oracle is SQLite VM steps at two vault
+as a SCAN of idx_records_metric_hk_uuid, tens of milliseconds per deletion on
+a multi-million-row vault, all under the ingest's write lock, so a few hundred
+deletions of UUIDs the vault never held held it for seconds. The cost oracle is SQLite VM steps at two vault
 sizes, never wall-clock.
 """
 from __future__ import annotations

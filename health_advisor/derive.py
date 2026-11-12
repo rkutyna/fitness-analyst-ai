@@ -399,7 +399,8 @@ def update_for_days(conn, days, timings: dict | None = None) -> int:
     # caller's transaction is deferred, so the vault's write lock is taken at
     # the first _upsert and held to the commit; reading 365 days of heart rate
     # (hr_max_estimate) and the impact digest after that point held it for
-    # ~0.6 s per workout day. None of these reads depends on a row this
+    # a large fraction of a second per workout day on a multi-million-row
+    # vault. None of these reads depends on a row this
     # function writes: they read records, workouts and non-derived daily rows.
     for day in sorted(set(days)):
         timing = compute_sleep_timing(_sleep_intervals(conn, day), day)

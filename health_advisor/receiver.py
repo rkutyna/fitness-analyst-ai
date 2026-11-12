@@ -1437,8 +1437,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # deletion for an unknown UUID therefore still protects against a
             # later stale add, while replaying the deletion does no work.
             # downstream #734: a lookup by UUID alone planned as a SCAN of
-            # idx_records_metric_hk_uuid (~30 ms per deletion on a 14M-row
-            # vault, under the write lock). Constraining metric to the exact
+            # idx_records_metric_hk_uuid (tens of milliseconds per deletion on
+            # a multi-million-row vault, under the write lock). Constraining metric to the exact
             # list of stored metrics makes it a SEARCH of (metric, hk_uuid)
             # and finds the same rows. Deletions only remove rows, so the list
             # taken here stays exact for the whole loop.

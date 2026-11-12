@@ -2,7 +2,8 @@
 
 downstream #734: update_for_days wrote a day's rows first and only then read
 365 days of heart rate (hr_max_estimate, via the HR load) and ran the impact
-digest, so the write lock was held through ~0.6 s of reading per workout day.
+digest, so the write lock was held through a large fraction of a second of
+reading per workout day on a multi-million-row vault.
 The caller's transaction is deferred: the lock is taken by the first write.
 """
 from __future__ import annotations

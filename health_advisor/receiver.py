@@ -1823,7 +1823,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
            records_seen=len(parsed["records"]), records_added=rec_added,
            workouts_seen=len(parsed["workouts"]), workouts_added=workouts_added,
            workouts_rejected=len(workout_fragments),
-           deleted=deleted, daily_pairs=dm, derived=derived,
+           deleted=deleted, tombstones=tombstones_added,
+           daily_pairs=dm, derived=derived,
            unhandled=len(parsed["unhandled"]),
            date_min=_dates[0] if _dates else None,
            date_max=_dates[-1] if _dates else None,
@@ -1835,7 +1836,8 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             _trace("ingest-slow-lock", batch_id=parsed["batch_id"],
                    threshold_ms=LOCK_HOLD_WARN_MS,
                    records_seen=len(parsed["records"]),
-                   deleted=deleted, daily_pairs=dm, **timing)
+                   deleted=deleted, tombstones=tombstones_added,
+                   daily_pairs=dm, **timing)
     except Exception:                      # noqa: BLE001 - timing never fails an ingest
         pass
     response = {

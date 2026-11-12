@@ -75,7 +75,7 @@ def test_ingest_ok_trace_carries_lock_timings(app, capfd):
     assert r.status_code == 200, r.text
     line = next(l for l in capfd.readouterr().err.splitlines()
                 if l.startswith("ingest-trace ingest-ok"))
-    for field in ("lock_wait_ms=", "lock_hold_ms=", "derive_hold_ms=",
+    for field in ("tombstones=", "lock_wait_ms=", "lock_hold_ms=", "derive_hold_ms=",
                   "slowest_step=", "slowest_step_ms="):
         assert field in line, (field, line)
     assert "ingest-slow-lock" not in capfd.readouterr().err

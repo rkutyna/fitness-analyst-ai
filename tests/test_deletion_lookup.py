@@ -116,3 +116,56 @@ def test_deletion_cost_does_not_grow_with_the_vault(tmp_path, monkeypatch):
     large = _deletion_steps(tmp_path, monkeypatch, 12_000)
     # A SEARCH is flat in the vault's size; the SCAN it replaced was ~4x here.
     assert large / small < 1.5, (small, large)
+
+
+def test_a_tombstone_still_refuses_the_sample_arriving_in_a_later_batch(
+        conn, vault, monkeypatch):
+    body = _post(vault, monkeypatch, "del-first",
+                 [{"hk_uuid": "late-uuid", "type_identifier": HEART}])
+    assert body["deleted"] == 0 and body["tombstones_added"] == 1
+    sample = {"kind": "quantity", "hk_uuid": "late-uuid", "type_identifier": HEART,
+              "start": "2026-10-21T08:00:00-04:00", "end": "2026-10-21T08:00:00-04:00",
+              "value": 80.0, "unit": "count/min",
+              "source_revision": {"source_name": "Apple Watch", "bundle_id": "x"}}
+    later = {**_payload("add-later", []), "samples": [sample]}
+    monkeypatch.setattr(receiver, "SHARED_SECRET", "s3cret")
+    with TestClient(receiver.create_app(vault)) as client:
+        r = client.post("/v1/ingest", json=later, headers={"x-health-secret": "s3cret"})
+    assert r.status_code == 200 and r.json()["records_added"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM records WHERE hk_uuid = 'late-uuid'"
+                        ).fetchone()[0] == 0
+
+
+def _steps_for_deletions(tmp_path, monkeypatch, n):
+    from health_advisor.context import VaultContext
+    path = tmp_path / f"n{n}.db"
+    seed = db.connect(path)
+    db.init_db(seed)
+    for i in range(2_000):
+        _row(seed, "heart_rate", f"stored-{i:08d}", HEART, "dev-a", i)
+    seed.commit()
+    seed.close()
+    steps = [0]
+    real_connect = db.connect
+
+    def counting_connect(*args, **kwargs):
+        c = real_connect(*args, **kwargs)
+
+        def tick():
+            steps[0] += 1
+            return 0
+        c.set_progress_handler(tick, 100)
+        return c
+
+    monkeypatch.setattr(db, "connect", counting_connect)
+    _post(VaultContext.local(path, user_id="test", writable=True), monkeypatch,
+          f"n-{n}", [{"hk_uuid": f"unknown-{i}", "type_identifier": HEART}
+                     for i in range(n)])
+    monkeypatch.setattr(db, "connect", real_connect)
+    return steps[0]
+
+
+def test_deletion_cost_is_linear_in_the_number_of_deletions(tmp_path, monkeypatch):
+    small = _steps_for_deletions(tmp_path, monkeypatch, 50)
+    large = _steps_for_deletions(tmp_path, monkeypatch, 200)
+    assert large / small < 6, (small, large)

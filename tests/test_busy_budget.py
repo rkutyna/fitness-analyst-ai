@@ -37,7 +37,8 @@ def test_a_writable_connect_waits_the_engine_timeout_not_five_seconds(
     started = time.monotonic()
     with pytest.raises(sqlite3.OperationalError):
         db.connect(vault_path)
-    assert time.monotonic() - started < 2.0
+    # The wait being excluded is Python's default 5 s; 300 ms plus any load.
+    assert time.monotonic() - started < 4.0
 
 
 def test_a_busy_budget_bounds_every_connection_opened_inside_it(
@@ -52,7 +53,8 @@ def test_a_busy_budget_bounds_every_connection_opened_inside_it(
             started = time.monotonic()
             with pytest.raises(sqlite3.OperationalError):
                 c.execute("BEGIN IMMEDIATE")
-            assert time.monotonic() - started < 3.0
+            # Far under the 30 s the budget replaces, whatever the load.
+            assert time.monotonic() - started < 10.0
             c.close()
     finally:
         holder.rollback()

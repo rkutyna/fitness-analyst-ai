@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-import time
 
 import httpx
 import pytest
@@ -146,22 +145,25 @@ def test_other_operational_errors_stay_500(app, monkeypatch):
 
 def test_the_event_loop_keeps_serving_while_ask_waits_for_the_lock(
         app, monkeypatch, hold_lock):
-    monkeypatch.setattr(db, "BUSY_TIMEOUT_MS", 2_000)
+    # Ordering, not a wall-clock threshold: /health must answer while ask is
+    # still waiting out its busy timeout. The timeout is long enough that a
+    # loaded machine cannot let ask finish first by accident.
+    monkeypatch.setattr(db, "BUSY_TIMEOUT_MS", 5_000)
     hold_lock("IMMEDIATE")   # writers wait; readers (/health) are not blocked
 
     async def scenario():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport,
                                      base_url="http://t") as client:
-            started = time.monotonic()
             ask = asyncio.create_task(client.post(
                 "/v1/ask", json={"question": "q?"}, headers=HEADERS))
             await asyncio.sleep(0.2)          # ask is now waiting on the lock
             health = await client.get("/health")
-            health_after = time.monotonic() - started
+            ask_pending_when_health_answered = not ask.done()
             ask_response = await ask
-            return health.status_code, health_after, ask_response.status_code
-    status, health_after, ask_status = asyncio.run(scenario())
+            return (health.status_code, ask_pending_when_health_answered,
+                    ask_response.status_code)
+    status, ask_was_pending, ask_status = asyncio.run(scenario())
     assert status == 200
-    assert health_after < 1.5, health_after   # did not wait out ask's 2 s
+    assert ask_was_pending       # /health did not wait for ask's lock wait
     assert ask_status == 503

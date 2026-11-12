@@ -1068,6 +1068,13 @@ def mark_receiver_resolutions(
         # refine; this keeps build_vault's declaration independent.
         if metric in known and mapped_metrics is None:
             continue
+        # A series already marked as sample resolution (raw_series) has no
+        # finer mark to refine toward: the measurement below could only be
+        # discarded (resolution >= 0). Skip it. It reads the metric's whole
+        # history under the ingest's write lock, 0.65 s per step or distance
+        # batch on a 14M-row vault (downstream #734).
+        if metric in known and metric in raw_series:
+            continue
         resolution = _recorded_resolution_seconds(conn, metric)
         if resolution is None:
             continue

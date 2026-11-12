@@ -5,11 +5,14 @@ here so there is exactly one place that knows the schema and the upsert rules.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import json
 import re
 import sqlite3
 import struct
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -65,6 +68,39 @@ BUSY_TIMEOUT_MS = 30_000
 # correctness never depended on this, only how long readers wait.
 WRITABLE_CACHE_KIB = 65_536
 
+# Per-request lock-wait budget (downstream #734). A user-facing request makes
+# several connections; each waits up to its busy timeout, so a request behind
+# a long sync could wait 30 s several times over and outlive the phone's own
+# timeout. A caller (the consumer, per request) may set a deadline with
+# `busy_budget(ms)`; every `connect` in that context then waits at most the
+# time left, never less than BUSY_BUDGET_FLOOR_MS. Unset, nothing changes.
+# contextvars travel into asyncio.to_thread and Starlette's threadpool.
+# Limitation: the budget is read when a connection OPENS; one connection's
+# busy timeout applies to each of its statements, so a long-lived connection
+# can still wait more than once.
+BUSY_BUDGET_FLOOR_MS = 500
+_busy_deadline: "contextvars.ContextVar[float | None]" = contextvars.ContextVar(
+    "health_advisor_busy_deadline", default=None)
+
+
+@contextlib.contextmanager
+def busy_budget(ms: int):
+    """Bound the lock waits of every connection opened inside this block."""
+    token = _busy_deadline.set(time.monotonic() + ms / 1000)
+    try:
+        yield
+    finally:
+        _busy_deadline.reset(token)
+
+
+def busy_timeout_ms() -> int:
+    """The busy timeout a connection opened now gets."""
+    deadline = _busy_deadline.get()
+    if deadline is None:
+        return BUSY_TIMEOUT_MS
+    left = int((deadline - time.monotonic()) * 1000)
+    return max(BUSY_BUDGET_FLOOR_MS, min(BUSY_TIMEOUT_MS, left))
+
 
 def is_busy_error(exc: BaseException) -> bool:
     """Whether ``exc`` is SQLite refusing a lock (the SQLITE_BUSY family).
@@ -101,13 +137,20 @@ class _VaultConnection(sqlite3.Connection):
 def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
     """Open a connection with sane pragmas. read_only uses a URI immutable mode."""
     db_path = Path(db_path)
+    # The busy timeout is set FIRST, and also as the driver's own timeout:
+    # `PRAGMA journal_mode` below can wait for a lock, and before this it
+    # waited Python's default 5 s rather than this timeout (downstream #734).
+    timeout_ms = busy_timeout_ms()
     if read_only:
         conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, factory=_VaultConnection
+            f"file:{db_path}?mode=ro", uri=True, factory=_VaultConnection,
+            timeout=timeout_ms / 1000,
         )
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path, factory=_VaultConnection)
+        conn = sqlite3.connect(db_path, factory=_VaultConnection,
+                               timeout=timeout_ms / 1000)
+    conn.execute(f"PRAGMA busy_timeout = {timeout_ms}")
     conn._health_advisor_read_only = read_only
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -125,7 +168,6 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connecti
         page_size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
         conn.execute(
             f"PRAGMA cache_spill = {max(1, WRITABLE_CACHE_KIB * 1024 // page_size)}")
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return conn
 
 

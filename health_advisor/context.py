@@ -342,6 +342,11 @@ def _owner_of(conn: sqlite3.Connection) -> str | None:
     try:
         row = conn.execute(
             "SELECT value FROM vault_meta WHERE key = 'owner'").fetchone()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        # A busy vault says nothing about ownership: reading it as
+        # "unclaimed" skipped the check and cost a second full busy wait on
+        # the caller's next statement (downstream #734).
+        if _db.is_busy_error(exc):
+            raise
         return None
     return row[0] if row else None

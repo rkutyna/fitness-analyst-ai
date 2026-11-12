@@ -52,6 +52,19 @@ VAULT_SCHEMA_VERSION = 2
 # together they turn "reader errors out" into "reader waits a moment".
 BUSY_TIMEOUT_MS = 30_000
 
+# Page cache for a WRITABLE connection, in KiB (downstream #734). With the
+# library default (2 MiB, ~500 pages) a normal sync batch spills: a 2,000-record
+# heart-rate batch dirties ~4,800 pages (its rollback journal measured 19 MiB on
+# a 14M-row vault), so mid-transaction the writer escalates to EXCLUSIVE and
+# every READER is refused until the commit, not only during it. 64 MiB holds
+# such a batch's dirty pages with room for the pages it reads. The cache is
+# allocated as pages are touched and freed at close, and only writable
+# connections get it (readers keep the default), so a process with a few
+# writable connections open at once stays far under a 2 GB memory cap even
+# when each fills its cache. A batch large enough to exceed it still spills;
+# correctness never depended on this, only how long readers wait.
+WRITABLE_CACHE_KIB = 65_536
+
 
 def workout_source_arbitration_cutoff(conn: sqlite3.Connection) -> str:
     """Resolve the cutoff from vault metadata at the time of the query.
@@ -93,6 +106,13 @@ def connect(db_path: str | Path, *, read_only: bool = False) -> sqlite3.Connecti
         # write, so the :ro mount works. Writes here are infrequent (daily).
         conn.execute("PRAGMA journal_mode = DELETE")
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute(f"PRAGMA cache_size = -{WRITABLE_CACHE_KIB}")
+        # The spill threshold is a page count and its default varies by
+        # build (2,000 to 20,000 pages seen); pin it to the same budget so
+        # both the no-spill margin and the memory bound are this constant.
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
+        conn.execute(
+            f"PRAGMA cache_spill = {max(1, WRITABLE_CACHE_KIB * 1024 // page_size)}")
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return conn
 

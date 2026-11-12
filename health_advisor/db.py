@@ -66,6 +66,18 @@ BUSY_TIMEOUT_MS = 30_000
 WRITABLE_CACHE_KIB = 65_536
 
 
+def is_busy_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is SQLite refusing a lock (the SQLITE_BUSY family).
+
+    True for a busy timeout ("database is locked"); False for every other
+    OperationalError (no such table, disk I/O, ...), which is a real fault.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    name = getattr(exc, "sqlite_errorname", "") or ""
+    return name.startswith("SQLITE_BUSY") or "database is locked" in str(exc)
+
+
 def workout_source_arbitration_cutoff(conn: sqlite3.Connection) -> str:
     """Resolve the cutoff from vault metadata at the time of the query.
 

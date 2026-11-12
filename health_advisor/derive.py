@@ -12,6 +12,7 @@ CLI:  python -m health_advisor.derive --backfill   (derive all history)
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -379,7 +380,7 @@ def _dial_for_day(conn, day: str) -> dict:
     return out
 
 
-def update_for_days(conn, days) -> int:
+def update_for_days(conn, days, timings: dict | None = None) -> int:
     """Recompute derived rows for the given local days. Caller commits.
 
     A missing source deletes a row stamped with the current formula version:
@@ -409,6 +410,8 @@ def update_for_days(conn, days) -> int:
         vals.update(_dial_for_day(conn, day))
         prepared.append((day, vals))
     loads = {day: _hr_load_for_day(conn, day) for day, _ in prepared}
+    if timings is not None and not conn.in_transaction:
+        timings["writes_started"] = time.perf_counter()
     for day, vals in prepared:
         for m, v in vals.items():
             _upsert(conn, m, day, v)
@@ -567,7 +570,8 @@ def rederive_stale(conn) -> dict[str, object]:
 
 
 def update_after_ingest(conn, days, source: str,
-                        errors: list[str] | None = None) -> int:
+                        errors: list[str] | None = None,
+                        timings: dict | None = None) -> int:
     """Ingest-path wrapper: a derive bug must never fail an ingest request.
     Logs failures to ingest_log and returns 0.
 
@@ -579,8 +583,13 @@ def update_after_ingest(conn, days, source: str,
     `errors` to get the failure back and say so upstream; the receiver does.
     """
     try:
-        n = update_for_days(conn, days)
+        n = update_for_days(conn, days, timings)
         conn.commit()
+        # `timings["hold_ms"]`: how long this held the vault's write lock,
+        # from the first write to the commit (downstream #734).
+        if timings is not None and "writes_started" in timings:
+            timings["hold_ms"] = (
+                time.perf_counter() - timings["writes_started"]) * 1000
         return n
     except Exception as e:  # noqa: BLE001 — deliberate catch-all at the ingest boundary
         conn.rollback()

@@ -3802,12 +3802,42 @@ def append_question_and_history(
     """
     if not conversation_id.strip():
         raise ValueError("conversation_id must be a non-empty string")
+    _, turn, history = _append_question(ctx, conversation_id, content,
+                                        create=False)
+    return turn, history
+
+
+def start_question(
+    ctx: VaultContext, conversation_id: str | None, content: str,
+) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    """Append a question, creating its conversation when none is given.
+
+    The new conversation (if any) and the question are ONE write
+    transaction, so any failure -- a busy vault included -- stores nothing,
+    and the caller may safely re-send the same question (downstream #734).
+    Returns ``(conversation_id, user_turn, history)``; raises KeyError for an
+    unknown conversation_id.
+    """
+    if conversation_id is not None and not conversation_id.strip():
+        raise ValueError("conversation_id must be a non-empty string")
+    return _append_question(ctx, conversation_id or uuid.uuid4().hex,
+                            content, create=conversation_id is None)
+
+
+def _append_question(
+    ctx: VaultContext, conversation_id: str, content: str, *, create: bool,
+) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     if not content.strip():
         raise ValueError("content must be a non-empty string")
     conn = ctx.connect()
     try:
         db.init_db(conn)
         conn.execute("BEGIN IMMEDIATE")
+        if create:
+            now = db.utcnow_iso()
+            conn.execute(
+                "INSERT INTO conversations (id, created_at, updated_at) "
+                "VALUES (?, ?, ?)", (conversation_id, now, now))
         conversation = conn.execute(
             "SELECT id FROM conversations WHERE id = ?", (conversation_id,)
         ).fetchone()
@@ -3846,7 +3876,7 @@ def append_question_and_history(
             (created_at, conversation_id),
         )
         conn.commit()
-        return turn, history
+        return conversation_id, turn, history
     except Exception:
         conn.rollback()
         raise

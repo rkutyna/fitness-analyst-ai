@@ -832,6 +832,67 @@ def _trace(event: str, **fields) -> None:
     print(f"ingest-trace {event} {parts}", file=sys.stderr, flush=True)
 
 
+#: A request that waited out the busy timeout for the vault's lock is answered
+#: 503 with these (downstream #734). The consumer's own routes use the same
+#: status and Retry-After; this wording is the engine's generic one.
+VAULT_BUSY_RETRY_AFTER_SECONDS = "20"
+VAULT_BUSY_DETAIL = ("The vault is busy saving other data, so this request "
+                     "was not saved. Try again in a few seconds.")
+ASK_ANSWER_NOT_STORED_DETAIL = (
+    "The question was saved, but the vault was busy and its answer could not "
+    "be stored. Do not re-send the question; reload the conversation.")
+
+#: An ingest whose main transaction, or whose derive step, holds the vault's
+#: write lock longer than this also emits an `ingest-slow-lock` trace
+#: (downstream #734). Every other request on the vault waits that long; at
+#: 3 s a check-in or an ask visibly stalls, while a healthy sync batch holds
+#: the lock for well under a second on a laptop and a few seconds at most on
+#: a small server.
+LOCK_HOLD_WARN_MS = 3_000
+
+
+class _StepClock:
+    """Lap timer for the ingest's write transaction (downstream #734).
+
+    ``lap(name)`` charges the time since the previous lap to ``name``. It only
+    reads ``time.perf_counter`` and updates a dict, so it cannot fail an
+    ingest; the trace that reports it is formatted defensively as well.
+    """
+
+    def __init__(self) -> None:
+        self.start = self._last = time.perf_counter()
+        self.steps: dict[str, float] = {}
+
+    def lap(self, name: str) -> None:
+        now = time.perf_counter()
+        self.steps[name] = self.steps.get(name, 0.0) + (now - self._last)
+        self._last = now
+
+    def held_ms(self) -> int:
+        return int((self._last - self.start) * 1000)
+
+    def slowest(self) -> tuple[str | None, int | None]:
+        if not self.steps:
+            return None, None
+        name = max(self.steps, key=self.steps.get)
+        return name, int(self.steps[name] * 1000)
+
+
+def _lock_timing_fields(lock_wait_ms, clock, derive_timings) -> dict:
+    """The ingest-ok timing fields; never raises (downstream #734)."""
+    try:
+        slowest, slowest_ms = clock.slowest() if clock else (None, None)
+        derive_hold = (derive_timings or {}).get("hold_ms")
+        return {
+            "lock_wait_ms": lock_wait_ms,
+            "lock_hold_ms": clock.held_ms() if clock else None,
+            "derive_hold_ms": int(derive_hold) if derive_hold is not None else None,
+            "slowest_step": slowest, "slowest_step_ms": slowest_ms,
+        }
+    except Exception:                      # noqa: BLE001 - timing never fails an ingest
+        return {}
+
+
 def _reconcile_dates(affected, workout_dates) -> set[str]:
     """The workout local_dates a batch's heart-rate reconciliation covers.
 
@@ -1106,9 +1167,14 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     backfill_stat_skips = {reason: 0 for reason in BACKFILL_STAT_SKIP_REASONS}
 
     conn = ctx.connect()
+    lock_wait_ms = None
+    clock = None
     try:
         db.init_db(conn)
+        begin_at = time.perf_counter()
         conn.execute("BEGIN IMMEDIATE")
+        clock = _StepClock()
+        lock_wait_ms = int((clock.start - begin_at) * 1000)
 
         # The preflight is useful for the common replay case, but the check
         # inside this write transaction is the race-safe one.
@@ -1329,6 +1395,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # list of stored metrics makes it a SEARCH of (metric, hk_uuid)
             # and finds the same rows. Deletions only remove rows, so the list
             # taken here stays exact for the whole loop.
+            clock.lap("guards")
             uuid_metrics: list[str] = (
                 db.stored_record_metrics(conn) if parsed["deletions"] else [])
             uuid_in = ",".join("?" * len(uuid_metrics)) or "NULL"
@@ -1395,6 +1462,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                     (uuid,),
                 ).rowcount
 
+            clock.lap("deletions")
             # Filter tombstoned adds before constructing pairs. This matters
             # for a deletion of an unknown row followed by the same stale row:
             # it must not create either a raw row or a daily aggregate.
@@ -1477,6 +1545,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 rec_added += db.insert_records(
                     conn, accepted[i:i + INGEST_CHUNK]
                 )
+            clock.lap("records")
             # Workouts have their own session identity and merge point. They
             # are deliberately applied after records land and before the first
             # daily recompute, so a workout-only page still derives its day.
@@ -1525,6 +1594,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 ).fetchone()[0] is None
                 for route in route_rows
             )
+            clock.lap("workouts")
             # A workout changes which already-ingested distance samples survive
             # workout-window arbitration. Re-derive that sole workout-arbitrated
             # metric when a workout arrives after its samples; history before
@@ -1554,6 +1624,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 daily_totals_added = db.insert_daily_totals(
                     conn, writable_totals, batch_id=parsed["batch_id"])
             db.log_ingest_diagnostics(conn, diagnostic_rows)
+            clock.lap("daily_totals")
             dm = db.recompute_daily_metrics(conn, pairs=sorted(affected))
 
             # Session attribution is a records concern, so it runs after the
@@ -1579,6 +1650,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                         conn, pairs=sorted(affected)
                     )
 
+            clock.lap("recompute")
             # Scoped to `records_touched`, not `affected`: `affected` also
             # carries daily-totals and workout-arbitration pairs that never
             # write a `records` row, and rebuilding for those would just
@@ -1638,7 +1710,9 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
                 "VALUES (?, ?, ?, ?)",
                 (key, 0, db.utcnow_iso(), detail),
             )
+            clock.lap("bookkeeping")
             conn.commit()
+            clock.lap("commit")
     except Exception:
         if conn.in_transaction:
             conn.rollback()
@@ -1684,6 +1758,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
     # designed to swallow a derive failure and report it, while the HealthKit
     # batch itself is already durable and its replay key is already recorded.
     derive_errors: list[str] = []
+    derive_timings: dict = {}
     derive_conn = ctx.connect()
     try:
         derive_days = {day for _, day in affected} | parsed["workout_dates"]
@@ -1699,7 +1774,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
             # This positional is derive's `source`, which lands in
             # ingest_log.source — not records.origin either (#133).
             derive_conn, derive_days, "healthkit",
-            errors=derive_errors,
+            errors=derive_errors, timings=derive_timings,
         )
         # Operator evidence for a SUCCESSFUL sync. Until 2026-08-27 only the
         # reject path wrote to ingest_log, so a healthy HealthKit ingest left no
@@ -1742,6 +1817,7 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
         derive_conn.close()
     _dates = sorted({d for _, d in affected} | parsed["workout_dates"]
                     | parsed["route_dates"])
+    timing = _lock_timing_fields(lock_wait_ms, clock, derive_timings)
     _trace("ingest-ok",
            batch_id=parsed["batch_id"], device=parsed.get("device_id"),
            records_seen=len(parsed["records"]), records_added=rec_added,
@@ -1750,7 +1826,18 @@ def _healthkit_ingest(ctx, request: Request, raw: bytes,
            deleted=deleted, daily_pairs=dm, derived=derived,
            unhandled=len(parsed["unhandled"]),
            date_min=_dates[0] if _dates else None,
-           date_max=_dates[-1] if _dates else None)
+           date_max=_dates[-1] if _dates else None,
+           **timing)
+    try:
+        held = max(timing.get("lock_hold_ms") or 0,
+                   timing.get("derive_hold_ms") or 0)
+        if held > LOCK_HOLD_WARN_MS:
+            _trace("ingest-slow-lock", batch_id=parsed["batch_id"],
+                   threshold_ms=LOCK_HOLD_WARN_MS,
+                   records_seen=len(parsed["records"]),
+                   deleted=deleted, daily_pairs=dm, **timing)
+    except Exception:                      # noqa: BLE001 - timing never fails an ingest
+        pass
     response = {
         "ok": True, "applied": True, "batch_id": parsed["batch_id"],
         "records_seen": len(parsed["records"]), "records_added": rec_added,
@@ -2555,6 +2642,25 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
     app.state.apns_sender = apns_sender
     app.state.apns_dispatcher = dispatcher
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def _vault_busy(request: Request, exc: sqlite3.OperationalError):
+        """A vault lock wait that timed out is a retryable 503, not a 500.
+
+        downstream #734: a phone sync holds the write lock in bursts, and a
+        request that waited out the busy timeout used to escape as a bare 500
+        from whichever route it hit. Routes that write do so in one
+        transaction, so a busy refusal means that request stored nothing and
+        the client may re-send it. Every other OperationalError is a real
+        fault and is re-raised to the ordinary 500 path.
+        """
+        if not db.is_busy_error(exc):
+            raise exc
+        print(f"vault-busy {request.method} {request.url.path}: {exc}",
+              file=sys.stderr, flush=True)
+        return JSONResponse(
+            status_code=503, content={"detail": VAULT_BUSY_DETAIL},
+            headers={"Retry-After": VAULT_BUSY_RETRY_AFTER_SECONDS})
+
     @app.on_event("startup")
     def _ensure_db():
         """Create the DB + schema if missing so read-only /health always works."""
@@ -2715,15 +2821,25 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         """
         _require_ask_secret(x_health_secret)
         payload = _ask_payload(raw)
-        conversation_id = payload["conversation_id"]
-        if conversation_id is None:
-            conversation_id = chat.create_conversation(ctx)["id"]
-        elif chat.get_conversation(ctx, conversation_id) is None:
-            raise HTTPException(status_code=404,
-                                detail=f"unknown conversation: {conversation_id}")
+        # downstream #734: the vault writes run OFF the event loop (a lock
+        # wait here used to stall every request in the process), and the new
+        # conversation and the question are one transaction, so a busy vault
+        # (503, see _vault_busy) means nothing was stored for this question.
+        def open_question():
+            if payload["conversation_id"] is None:
+                return chat.start_question(ctx, None, payload["question"])
+            turn, prior = chat.append_question_and_history(
+                ctx, payload["conversation_id"], payload["question"])
+            return payload["conversation_id"], turn, prior
 
-        question_turn, history = chat.append_question_and_history(
-            ctx, conversation_id, payload["question"])
+        try:
+            conversation_id, question_turn, history = await asyncio.to_thread(
+                open_question)
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown conversation: {payload['conversation_id']}"
+            ) from None
         loop = asyncio.get_running_loop()
         attachments: list[dict] = []
 
@@ -2906,17 +3022,28 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             stored_mode = (result["mode"]
                            if result["mode"] in {"narration", "fallback", "status"}
                            else "fallback")
-            chat.append_turn(
-                ctx, conversation_id, "assistant", result["text"],
-                answers_turn_id=question_turn["id"],
-                client_disconnected_at=disconnected_at,
-                progress_id=progress_id,
-                mode=stored_mode,
-                attachments=result.get("attachments", attachments),
-                after_commit=(dispatcher.enqueue
-                              if dispatcher is not None
-                              and result.get("mode") != "fallback" else None),
-            )
+            try:
+                await asyncio.to_thread(
+                    chat.append_turn,
+                    ctx, conversation_id, "assistant", result["text"],
+                    answers_turn_id=question_turn["id"],
+                    client_disconnected_at=disconnected_at,
+                    progress_id=progress_id,
+                    mode=stored_mode,
+                    attachments=result.get("attachments", attachments),
+                    after_commit=(dispatcher.enqueue
+                                  if dispatcher is not None
+                                  and result.get("mode") != "fallback" else None),
+                )
+            except sqlite3.OperationalError as exc:
+                if not db.is_busy_error(exc):
+                    raise
+                # The QUESTION is already stored, so this must not be the
+                # retryable 503 (a re-send would ask it twice). A plain 500
+                # with a string detail says what happened.
+                raise HTTPException(
+                    status_code=500, detail=ASK_ANSWER_NOT_STORED_DETAIL
+                ) from None
             response = {
                 "request_id": uuid.uuid4().hex,
                 "conversation_id": conversation_id,
@@ -2930,7 +3057,8 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 "provenance": {"tool_calls": len(result["tool_trace"])},
                 "verification": result["verification"],
                 "attachments": result.get("attachments", attachments),
-                "freshness": _ask_freshness(ctx, payload["as_of"]),
+                "freshness": await asyncio.to_thread(
+                    _ask_freshness, ctx, payload["as_of"]),
             }
             if ask_extra is not None:
                 try:

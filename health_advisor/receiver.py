@@ -841,6 +841,49 @@ VAULT_BUSY_DETAIL = ("The vault is busy saving other data, so this request "
 ASK_ANSWER_NOT_STORED_DETAIL = (
     "The question was saved, but the vault was busy and its answer could not "
     "be stored. Do not re-send the question; reload the conversation.")
+ASK_AFTER_ANSWER_DETAIL = (
+    "The question and its answer were saved, but the vault was busy while "
+    "the response was being finished. Do not re-send the question; reload "
+    "the conversation.")
+#: The answer /v1/ask stores and returns when the vault stayed busy while the
+#: question was being answered (downstream #734). The question is already
+#: stored at that point, so a retryable 503 would invite a duplicate question;
+#: this closes the turn instead, as a fallback the client renders as withheld.
+ASK_VAULT_BUSY_ANSWER = (
+    "I couldn't read your records just now because they were busy saving "
+    "other data, so there is no answer this time. Ask again in a moment.")
+ASK_VAULT_BUSY_CAUSE = "vault_busy"
+
+
+def _ask_vault_busy_result(attachments: list[dict]) -> dict:
+    """The fallback result for a question the busy vault kept from answering."""
+    return {
+        "text": ASK_VAULT_BUSY_ANSWER, "mode": "fallback", "tool_trace": [],
+        "figures": [], "attachments": list(attachments),
+        "verification": {
+            "ok": False, "grounded": False, "unsupported": [],
+            "reason": "the vault was busy while the question was answered",
+            "cause": ASK_VAULT_BUSY_CAUSE, "figures_verified": 0,
+            "figures_total": 0, "tool_calls": 0,
+        },
+    }
+
+
+def _ask_freshness_or_none(ctx, as_of: str | None) -> dict | None:
+    """`_ask_freshness`, or None when the vault is busy (downstream #734).
+
+    It runs after the answer is stored, so a busy vault must not fail the
+    request: the response then carries ``freshness: null`` (unknown), never an
+    invented empty coverage. Any other error still propagates.
+    """
+    try:
+        return _ask_freshness(ctx, as_of)
+    except sqlite3.OperationalError as exc:
+        if not db.is_busy_error(exc):
+            raise
+        print(f"ask-freshness skipped, vault busy: {exc}",
+              file=sys.stderr, flush=True)
+        return None
 
 #: An ingest whose main transaction, or whose derive step, holds the vault's
 #: write lock longer than this also emits an `ingest-slow-lock` trace
@@ -2824,7 +2867,30 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
         turn's latency behind a fire-and-forget acknowledgement. The assistant
         turn stores the request's ``progress_id`` and its narration/fallback/status
         recovery mode at insertion.
+
+        downstream #734: once the question is stored, no busy-vault error may
+        leave this route, because an app-level handler (the engine's
+        ``_vault_busy`` or a consumer's own) would answer it as a retryable
+        503 and a re-send would ask the question twice. The steps below
+        handle the busy cases they expect; this guard turns any other one
+        into a non-retryable 500. Before the store, busy is still 503.
         """
+        stage = {"question_stored": False, "answer_stored": False}
+        try:
+            return await _ask(request, raw, x_health_secret, stage)
+        except sqlite3.OperationalError as exc:
+            if not stage["question_stored"] or not db.is_busy_error(exc):
+                raise
+            print(f"vault-busy /v1/ask after the question was stored: {exc}",
+                  file=sys.stderr, flush=True)
+            raise HTTPException(
+                status_code=500,
+                detail=(ASK_AFTER_ANSWER_DETAIL if stage["answer_stored"]
+                        else ASK_ANSWER_NOT_STORED_DETAIL)) from None
+
+    async def _ask(request: Request, raw: bytes, x_health_secret: str | None,
+                   stage: dict) -> dict:
+        """The body of `ask`; ``stage`` records what has been stored."""
         _require_ask_secret(x_health_secret)
         payload = _ask_payload(raw)
         # downstream #734: the vault writes run OFF the event loop (a lock
@@ -2846,6 +2912,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 status_code=404,
                 detail=f"unknown conversation: {payload['conversation_id']}"
             ) from None
+        stage["question_stored"] = True
         loop = asyncio.get_running_loop()
         attachments: list[dict] = []
 
@@ -3019,6 +3086,18 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
             result = await asyncio.to_thread(
                 chat.answer_question, ctx, payload["question"],
                 **answer_kwargs)
+        except sqlite3.OperationalError as exc:
+            if not db.is_busy_error(exc):
+                if progress_id is not None:
+                    PROGRESS_REGISTRY.finish(progress_id, "error")
+                raise
+            # downstream #734: the question is stored, so this is not the
+            # retryable 503. Close the turn with a fallback answer instead;
+            # storing it below may itself find the vault busy, which is the
+            # non-retryable 500 there.
+            print(f"vault-busy /v1/ask while answering: {exc}",
+                  file=sys.stderr, flush=True)
+            result = _ask_vault_busy_result(attachments)
         except BaseException:
             if progress_id is not None:
                 PROGRESS_REGISTRY.finish(progress_id, "error")
@@ -3050,6 +3129,7 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 raise HTTPException(
                     status_code=500, detail=ASK_ANSWER_NOT_STORED_DETAIL
                 ) from None
+            stage["answer_stored"] = True
             response = {
                 "request_id": uuid.uuid4().hex,
                 "conversation_id": conversation_id,
@@ -3063,8 +3143,10 @@ def create_app(ctx, *, analyst_complete_fn=None, analyst_run_code_fn=None,
                 "provenance": {"tool_calls": len(result["tool_trace"])},
                 "verification": result["verification"],
                 "attachments": result.get("attachments", attachments),
+                # Null when the vault is busy: the answer is already stored
+                # and must be returned (downstream #734).
                 "freshness": await asyncio.to_thread(
-                    _ask_freshness, ctx, payload["as_of"]),
+                    _ask_freshness_or_none, ctx, payload["as_of"]),
             }
             if ask_extra is not None:
                 try:

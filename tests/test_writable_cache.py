@@ -90,8 +90,11 @@ def test_use_ingest_cache_changes_only_the_cache(big_vault):
         db.use_ingest_cache(w)
         assert w.execute("PRAGMA cache_size").fetchone()[0] == -db.INGEST_CACHE_KIB
         page = w.execute("PRAGMA page_size").fetchone()[0]
-        assert (w.execute("PRAGMA cache_spill").fetchone()[0]
-                == db.INGEST_CACHE_KIB * 1024 // page)
+        spill = w.execute("PRAGMA cache_spill").fetchone()[0]
+        # 0 is how SQLite before 3.54 reports spilling switched off.
+        assert spill == db.ingest_spill_pages(page) != 0
+        assert db.INGEST_CACHE_KIB * 1024 // page - 1 <= spill
+        assert spill <= db.INGEST_CACHE_KIB * 1024 // page
         assert w.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         assert w.execute("PRAGMA synchronous").fetchone()[0] == 1
     finally:
@@ -143,8 +146,24 @@ def test_a_sync_sized_batch_leaves_readers_able_to_read(big_vault):
     assert not _reader_refused_mid_transaction(big_vault)
 
 
-def test_control_the_stock_cache_would_lock_readers_out(big_vault, monkeypatch):
-    # The same transaction with a library-default-sized cache proves the test
-    # can fail.
-    monkeypatch.setattr(db, "INGEST_CACHE_KIB", 2_000)
+# 2,000 KiB is about the library default. 2,048 KiB is 512 pages, a multiple
+# of 256: SQLite before 3.54 reads such a spill threshold as "spilling off" as
+# well, so without ingest_spill_pages' one-page step the batch would never
+# spill there and this control would pass for the wrong reason.
+@pytest.mark.parametrize("kib", [2_000, 2_048])
+def test_control_a_small_cache_would_lock_readers_out(big_vault, monkeypatch,
+                                                      kib):
+    # The same transaction with a small cache proves the test can fail, and
+    # that the spill threshold use_ingest_cache sets is a threshold, not off.
+    monkeypatch.setattr(db, "INGEST_CACHE_KIB", kib)
     assert _reader_refused_mid_transaction(big_vault)
+
+
+@pytest.mark.parametrize("page", [512, 1024, 4096, 8192, 65536])
+def test_the_spill_threshold_never_reads_as_off(page, monkeypatch):
+    for kib in (1, 1_024, 2_000, 32_768, 65_536):
+        monkeypatch.setattr(db, "INGEST_CACHE_KIB", kib)
+        pages = db.ingest_spill_pages(page)
+        assert pages % 256 != 0
+        assert pages >= 1
+        assert pages <= max(1, kib * 1024 // page)

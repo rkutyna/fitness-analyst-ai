@@ -181,8 +181,24 @@ def use_ingest_cache(conn: sqlite3.Connection) -> None:
     # pin it to the same budget so both the no-spill margin and the memory
     # bound are INGEST_CACHE_KIB.
     page_size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
-    conn.execute(
-        f"PRAGMA cache_spill = {max(1, INGEST_CACHE_KIB * 1024 // page_size)}")
+    conn.execute(f"PRAGMA cache_spill = {ingest_spill_pages(page_size)}")
+
+
+def ingest_spill_pages(page_size: int) -> int:
+    """The spill threshold, in pages, that ``use_ingest_cache`` sets.
+
+    INGEST_CACHE_KIB in pages, one page less when that count is a multiple of
+    256. SQLite releases before 3.54 read ``PRAGMA cache_spill = N`` twice: as
+    the threshold, and as an on/off switch truncated to its low byte, so any N
+    that is a multiple of 256 (8,192 is one) sets the threshold AND turns
+    spilling off altogether. With spilling off the cache has no bound inside a
+    transaction. One page less keeps the switch on in every release and the
+    threshold within the budget.
+    """
+    pages = max(1, INGEST_CACHE_KIB * 1024 // page_size)
+    if pages % 256 == 0:
+        pages -= 1
+    return pages
 
 
 # Columns added after the initial schema. `CREATE TABLE IF NOT EXISTS` won't add

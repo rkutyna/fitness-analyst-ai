@@ -45,10 +45,14 @@ def test_a_non_foot_non_cycling_workout_with_a_distance_gets_no_pace_or_speed(
     assert wf[speed_key] is None
     assert wf[jog_key] is None
     assert wf["pace_label"] is None
-    # The distance and the duration are still reported.
+    # The distance and the duration are still reported; a swim's distance in
+    # whole metres in every unit system (0.9 mi = 1448.4 m).
     assert wf["duration_min"] == 40.0
-    assert wf["distance_km" if metric_units else "distance_mi"] == (
-        1.4 if metric_units else 0.9)
+    if kind == "swimming":
+        assert wf["distance_m"] == 1448
+    else:
+        assert wf["distance_km" if metric_units else "distance_mi"] == (
+            1.4 if metric_units else 0.9)
 
 
 @pytest.mark.parametrize("kind", ["swimming", "rowing", "other"])
@@ -56,9 +60,10 @@ def test_talking_points_says_the_distance_of_a_non_foot_workout_with_no_pace(
         conn, kind):
     seed_workout(conn, kind, DAY, duration_min=40.0, distance_mi=0.9)
     seeds = _workout_seeds(A.workout_focus(conn, AS_OF))
+    shown, numbers = ("1448 m", [1448]) if kind == "swimming" else ("0.9 mi", [0.9])
     assert seeds == [{"topic": "workout",
-                      "seed": f"{kind} workout today: 0.9 mi",
-                      "numbers": [0.9]}]
+                      "seed": f"{kind} workout today: {shown}",
+                      "numbers": numbers}]
     text = seeds[0]["seed"]
     for word in ("pace", "min/mi", "min/km", "mph", "kph", "blended"):
         assert word not in text
@@ -69,7 +74,7 @@ def test_the_distance_only_seed_is_dated_when_the_workout_is_not_today(conn):
                  distance_mi=0.9)
     seeds = _workout_seeds(A.workout_focus(conn, AS_OF))
     assert [s["seed"] for s in seeds] == [
-        "swimming workout on 2026-06-09 (not today): 0.9 mi"]
+        "swimming workout on 2026-06-09 (not today): 1448 m"]
 
 
 def test_a_days_jog_pace_is_not_attached_to_a_swim(conn, monkeypatch):
@@ -94,7 +99,7 @@ def test_the_recent_effort_nudge_for_a_swim_states_a_distance_not_a_pace(conn):
     wf = A.workout_focus(conn, AS_OF)
     out = A.suggestions({"band": "strong"},
                         {"acwr": 1.0, "acwr_band": "optimal"}, wf)
-    assert [s["because"] for s in out] == ["recent 0.9 mi effort; ACWR 1.0 (optimal)"]
+    assert [s["because"] for s in out] == ["recent 1448 m effort; ACWR 1.0 (optimal)"]
     assert "pace" not in " ".join(s["text"] for s in out)
 
 

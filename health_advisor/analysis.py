@@ -1701,6 +1701,9 @@ def workout_focus(conn, as_of: str | None = None, *,
     distance_key = "distance_km" if metric_units else "distance_mi"
     distance, _ = V.convert_for_unit_system(dist, "mi", display_system)
     distance = mx.r(distance, 1) if distance is not None else None
+    if row["workout_type"] in V.SWIM_WORKOUT_TYPES:
+        # A swim reads in whole metres in every unit system (as list_workouts).
+        distance_key, distance = "distance_m", V.swim_distance_m(dist)
     energy_key = "energy_kj" if metric_units else "energy_kcal"
     energy, _ = V.convert_for_unit_system(row["energy_kcal"], "kcal", display_system)
     energy = mx.r(energy) if energy is not None else None
@@ -1895,7 +1898,8 @@ def highlights(conn, as_of: str | None = None, *,
 
 
 def suggestions(readiness_d: dict, load_d: dict,
-                workout_d: dict | None = None) -> list[dict]:
+                workout_d: dict | None = None, *,
+                metric_units: bool = False) -> list[dict]:
     """Safe, reversible, non-medical nudges with a `because` citing numbers."""
     out = []
     band = readiness_d.get("band")
@@ -1925,16 +1929,21 @@ def suggestions(readiness_d: dict, load_d: dict,
     # the ramping-fast guidance instead, so skip this generic nudge to avoid repetition.
     if (load_d.get("acwr_band") == "ramping-fast"
             and not (workout_d and (workout_d.get("distance_mi")
-                                    or workout_d.get("distance_km")))):
+                                    or workout_d.get("distance_km")
+                                    or workout_d.get("distance_m")))):
         out.append({"text": "You've ramped training load quickly — watch for niggles "
                             "and maybe slot in a lighter day.",
                     "because": f"ACWR {load_d.get('acwr')} (>1.5)"})
 
-    if workout_d and workout_d.get("distance_mi"):
-        dist = workout_d["distance_mi"]
+    # A swim's metres stand where its miles stood: the advice is given where
+    # it was before (a vault that did not declare metric), in the swim's unit.
+    swim_m = (workout_d.get("distance_m") if workout_d and not metric_units
+              else None)
+    if workout_d and (workout_d.get("distance_mi") or swim_m):
+        dist = workout_d.get("distance_mi") or swim_m
         acwr_band = load_d.get("acwr_band")
         acwr = load_d.get("acwr")
-        why = f"recent {dist} mi effort"
+        why = f"recent {dist} {'mi' if workout_d.get('distance_mi') else 'm'} effort"
         if acwr is not None:
             why += f"; ACWR {acwr} ({acwr_band})"
         # The written plan (docs/fitness/week-NN.md) owns progression — ≤10%/week,
@@ -1969,7 +1978,8 @@ def talking_points(parts: dict) -> list[dict]:
                 else "pace_min_per_km")
     speed_key = ("speed_mph" if wf and "speed_mph" in wf
                  else "speed_kph")
-    distance_key = ("distance_mi" if wf and "distance_mi" in wf
+    distance_key = ("distance_m" if wf and "distance_m" in wf
+                    else "distance_mi" if wf and "distance_mi" in wf
                     else "distance_km")
     jog_pace_key = ("jog_pace_min_per_mi" if wf and "jog_pace_min_per_mi" in wf
                     else "jog_pace_min_per_km")
@@ -1983,7 +1993,7 @@ def talking_points(parts: dict) -> list[dict]:
         # Say the distance and stop; a pace is a foot-travel reading.
         when = "today" if wf.get("date") == parts.get("as_of") \
             else f"on {wf.get('date')} (not today)"
-        distance_unit = "mi" if distance_key == "distance_mi" else "km"
+        distance_unit = {"distance_mi": "mi", "distance_m": "m"}.get(distance_key, "km")
         tp.append({"topic": "workout",
                    "seed": f"{wf['type']} workout {when}: "
                            f"{wf[distance_key]} {distance_unit}",
@@ -2094,7 +2104,7 @@ def build_briefing(conn, scope: str = "daily", as_of: str | None = None, *,
         "movers_status_text": mv["status_text"],
         "movers_cold_start": mv["cold_start"],
         "long_term": long_term(conn, as_of) if scope == "deep" else [],
-        "suggestions": suggestions(rd, tl, wf),
+        "suggestions": suggestions(rd, tl, wf, metric_units=metric_units),
         "highlights": highlights(conn, as_of, through=through),
         "workout_focus": wf,
     }

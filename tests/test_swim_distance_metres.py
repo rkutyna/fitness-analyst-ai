@@ -7,16 +7,17 @@ metres rounded half up from the stored miles, in place of ``distance_mi`` /
 set publishes ``distance_m`` with unit ``m``, so a narration of the swim in
 miles has no fact to stand on.
 
-Synthetic swims: 1,000 yd (914.4 m) and 1,500 m, 30 minutes each, stored as the
-client sends them (unrounded miles) and to three decimals (0.568 / 0.932 mi).
-Oracles worked by hand: 914.4 -> 914; 0.568 mi = 914.107 m -> 914;
-1,500 m -> 1500; 0.932 mi = 1499.909 m -> 1500.
+Synthetic swims, stored as the client sends them: unrounded miles, which the
+ingest stores as sent (pinned below through the production ingest), so a pool
+distance comes back as itself. Miles rounded to two or three decimals would
+not (1,000 m stored as 0.621 mi is 999 m); no live path rounds them.
+Oracles worked by hand: 1,000 yd = 914.4 m -> 914; 1,650 yd = 1508.76 m -> 1509.
 """
 from __future__ import annotations
 
 import pytest
 
-from health_advisor import fact_template
+from health_advisor import db, fact_template, mcp_server
 from health_advisor import vault as vault_mod
 
 METRES_PER_MILE = 1609.344
@@ -25,10 +26,32 @@ DAY_YD, DAY_M, DAY_RIDE, DAY_RUN = "2030-01-07", "2030-01-08", "2030-01-09", "20
 
 
 @pytest.mark.parametrize("miles, metres", [
-    (1000 * YARD_MI, 914), (0.568, 914), (1500 / METRES_PER_MILE, 1500), (0.932, 1500),
-    (None, None)])
-def test_swim_distance_m_is_whole_metres_half_up(miles, metres):
+    *[(m / METRES_PER_MILE, m) for m in (25, 50, 400, 1000, 1500, 3800)],
+    (1000 * YARD_MI, 914), (1650 * YARD_MI, 1509), (None, None)])
+def test_unrounded_stored_miles_give_back_the_pool_distance(miles, metres):
     assert vault_mod.swim_distance_m(miles) == metres
+
+
+def test_the_ingest_stores_the_miles_it_was_sent_unrounded(vault, vault_path, monkeypatch):
+    """The metres depend on it: a 1,650 yd swim sent as unrounded miles is
+    stored bit for bit and listed as 1509 m."""
+    from tests.test_hk_ingest import _client, _payload, _workout
+
+    sent = 1650 * YARD_MI
+    swim = {**_workout(), "workout_activity_type": "HKWorkoutActivityTypeSwimming",
+            "distance_mi": sent}
+    with _client(vault, monkeypatch) as client:
+        response = client.post("/v1/ingest", json=_payload(batch_id="swim", workouts=[swim]),
+                               headers={"x-health-secret": "hk-secret"})
+    assert response.status_code == 200, response.text
+    conn = db.connect(vault_path, read_only=True)
+    try:
+        (stored,) = conn.execute("SELECT distance_mi FROM workouts").fetchone()
+    finally:
+        conn.close()
+    assert stored == sent
+    listed = mcp_server.list_workouts(vault, start="2026-08-22", end="2026-08-22")
+    assert [row["distance_m"] for row in listed["workouts"]] == [1509]
 
 
 def _seed(conn, rows):
@@ -98,3 +121,33 @@ def test_the_closed_fact_set_carries_the_swim_in_metres(conn, tools):
     assert swims == [(914, "m"), (1500, "m")]
     assert not [fact for fact in facts.values()
                 if "swimming" in fact["workout"] and fact["unit"] in ("mi", "km")]
+
+
+# --------------------------------------------------------------------------- #
+# get_briefing: the workout focus, its talking point and its suggestion
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("system", [None, "imperial", "metric"])
+def test_get_briefing_hands_the_model_a_swim_in_metres(conn, vault, system):
+    _seed(conn, [(DAY_YD, "swimming", 1000 * YARD_MI)])
+    if system is not None:
+        vault_mod.set_unit_system(conn, system)
+        conn.commit()
+    got = mcp_server.get_briefing(vault, scope="deep", day=DAY_YD)
+    focus = got["workout_focus"]
+    assert focus["distance_m"] == 914
+    assert not {"distance_mi", "distance_km"} & set(focus)
+    (point,) = [tp for tp in got["talking_points"] if tp["topic"] == "workout"]
+    assert point == {"topic": "workout", "seed": "swimming workout today: 914 m",
+                     "numbers": [914]}
+    because = [s["because"] for s in got["suggestions"] if "effort" in s["because"]]
+    # Where a next-day suggestion was given before (not metric), it is in metres.
+    assert because == ([] if system == "metric" else ["recent 914 m effort"])
+
+
+def test_a_ride_in_the_briefing_keeps_its_miles(conn, vault):
+    _seed(conn, [(DAY_RIDE, "cycling", 12.4)])
+    got = mcp_server.get_briefing(vault, scope="deep", day=DAY_RIDE)
+    assert got["workout_focus"]["distance_mi"] == 12.4
+    assert "distance_m" not in got["workout_focus"]
+    (point,) = [tp for tp in got["talking_points"] if tp["topic"] == "workout"]
+    assert point["seed"].startswith("cycling workout today: 12.4 mi at ")

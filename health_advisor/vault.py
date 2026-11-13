@@ -292,9 +292,11 @@ SWIM_WORKOUT_TYPES: frozenset[str] = frozenset({"swimming"})
 def swim_distance_m(distance_mi) -> int | None:
     """A swim's stored miles as whole metres, rounded half up; None stays None.
 
-    Whole metres is the precision a pool length is stated in. It returns a
-    1,500 m swim as 1500 whether the miles were stored unrounded or to three
-    decimals (0.932 mi is 1499.9 m), and a 1,000 yd swim as 914 (914.4 m).
+    Whole metres is the precision a pool length is stated in. The client
+    sends unrounded miles and the ingest stores them as sent, so a pool
+    distance comes back as itself (1,500 m as 1500, 1,000 yd as 914, which is
+    914.4 m). Miles rounded before storage would not: 1,000 m stored as
+    0.621 mi is 999 m.
     """
     if distance_mi is None:
         return None

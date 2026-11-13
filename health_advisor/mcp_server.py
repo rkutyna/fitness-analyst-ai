@@ -1216,7 +1216,7 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
                   limit: int = 50) -> dict:
     """List workouts between start and end (YYYY-MM-DD; default = last 90 days),
     most recent first. Returns type, duration (min), energy (kcal), distance
-    (mi), average/max heart rate (bpm), local start/end times (HH:MM), whether
+    (mi; whole metres for a swim), average/max heart rate (bpm), local start/end times (HH:MM), whether
     a GPS route exists, workout_key, and n_segments — how many splits get_workout_segments
     reports for that session (0 = none stored; it counts one partition, not
     every stored event, so the two tools always agree).

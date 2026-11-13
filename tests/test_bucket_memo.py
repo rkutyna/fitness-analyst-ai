@@ -92,8 +92,16 @@ def computations(monkeypatch):
 
 
 def _fresh(conn, predicate, args, **kwargs):
+    """The same call with no memo open: the live path, computed afresh.
+
+    Not the SQL reference: the live path is the Python port, whose sums are
+    compensated, and SQLite before 3.43 sums naively, so the two can differ in
+    the last bit of a float there. The memo's claim is that it changes nothing
+    about what the live path returns, so the live path is the oracle.
+    """
+    assert mx._BUCKET_MEMO.get() is None
     return copy.deepcopy(
-        mx._impact_bucket_rows_sql(conn, predicate, args, **kwargs))
+        mx.impact_bucket_rows(conn, predicate, args, **kwargs))
 
 
 def test_the_memo_runs_each_distinct_window_once(vault, computations):

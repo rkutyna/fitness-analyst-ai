@@ -1192,11 +1192,16 @@ def _workout_window_facts(conn, active: str, start: str, end: str, *,
             if top is None:
                 continue
             value = top["v"]
-            if name == "distance" and metric_units:
+            fact_unit = unit
+            if name == "distance" and kind in V.SWIM_WORKOUT_TYPES:
+                value, fact_unit = V.swim_distance_m(value), "m"
+            elif name == "distance" and metric_units:
                 value = value * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"]
+            if fact_unit != "m":
+                value = _r(value, 1 if name == "duration" else 2)
             facts.append({
-                "id": f"{base}/longest_{name}", "unit": unit,
-                "value": _r(value, 1 if name == "duration" else 2),
+                "id": f"{base}/longest_{name}", "unit": fact_unit,
+                "value": value,
                 "label": f"The longest {kind} workout {scope} by {name}"})
             facts.append({
                 "id": f"{base}/longest_{name}_date",
@@ -1229,7 +1234,8 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
     counting sessions or totalling minutes: the returned rows are the most
     recent ones, not the range. 'workout_counts' is the full-range count by
     workout type. Distance and energy use the vault's declared display units:
-    miles/kcal for imperial and kilometres/kJ for metric. `list_workouts` publishes
+    miles/kcal for imperial and kilometres/kJ for metric, except a swim, whose
+    distance is `distance_m`, whole metres, in every unit system. `list_workouts` publishes
     full-range per-type counts as
     `workout_counts: [{type, count}]`; cite the `count` leaf at its exact path
     with `metric` omitted, and never count the possibly truncated `workouts`
@@ -1332,11 +1338,16 @@ def list_workouts(ctx: VaultContext, start: str | None = None, end: str | None =
             row["energy_kj"] = _r(
                 r["energy_kcal"] * V.UNIT_CONVERSION_FACTORS["energy_kcal_to_kj"], 1
             ) if r["energy_kcal"] is not None else None
+        else:
+            row["energy_kcal"] = _r(r["energy_kcal"], 1)
+        if r["workout_type"] in V.SWIM_WORKOUT_TYPES:
+            # A swim reads in whole metres in every unit system.
+            row["distance_m"] = V.swim_distance_m(r["distance_mi"])
+        elif metric_units:
             row["distance_km"] = _r(
                 r["distance_mi"] * V.UNIT_CONVERSION_FACTORS["distance_mi_to_km"], 2
             ) if r["distance_mi"] is not None else None
         else:
-            row["energy_kcal"] = _r(r["energy_kcal"], 1)
             row["distance_mi"] = _r(r["distance_mi"], 2)
         if r["workout_type"] in _PACE_WORKOUT_TYPES:
             pace = _pace_minutes(r["duration_min"], r["distance_mi"],

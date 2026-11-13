@@ -1319,6 +1319,8 @@ _WORKOUT_ROW_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("max_heart_rate", "max_heart_rate", "bpm"),
     ("distance_mi", "distance_mi", "mi"),
     ("distance_km", "distance_km", "km"),
+    # A swim's distance, whole metres in every unit system.
+    ("distance_m", "distance_m", "m"),
     # Only list_workouts rows carry energy, in the vault's declared unit; no
     # other workout tool restates it, so no rounding conflict can withhold it
     # (downstream issue #578).

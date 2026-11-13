@@ -283,6 +283,24 @@ _METRIC_UNIT_TWINS: dict[str, tuple[str, str]] = {
     "ft/s": ("m/s", "speed_ft_per_s_to_m_per_s"),
 }
 
+# A swim's distance reads in metres in every unit system: a pool is measured in
+# lengths, and a mile figure to one or two decimals says nothing a swimmer can
+# use. Storage stays miles (the client sends every workout distance in miles).
+SWIM_WORKOUT_TYPES: frozenset[str] = frozenset({"swimming"})
+
+
+def swim_distance_m(distance_mi) -> int | None:
+    """A swim's stored miles as whole metres, rounded half up; None stays None.
+
+    Whole metres is the precision a pool length is stated in. It returns a
+    1,500 m swim as 1500 whether the miles were stored unrounded or to three
+    decimals (0.932 mi is 1499.9 m), and a 1,000 yd swim as 914 (914.4 m).
+    """
+    if distance_mi is None:
+        return None
+    metres = float(distance_mi) * UNIT_CONVERSION_FACTORS["distance_mi_to_km"] * 1000.0
+    return math.floor(metres + 0.5)
+
 
 def convert_for_unit_system(value, unit: str | None,
                             unit_system: str | None) -> tuple[object, str | None]:
